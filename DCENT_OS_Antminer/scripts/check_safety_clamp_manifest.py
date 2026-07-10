@@ -79,12 +79,12 @@ def classify(path: str, context: str) -> str | None:
     return None
 
 
-def collect_sites(: Path) -> list[ClampSite]:
-    dcentrald_root =  / "dcentrald"
+def collect_sites(project_root: Path) -> list[ClampSite]:
+    dcentrald_root = project_root / "dcentrald"
     sites: list[ClampSite] = []
 
     for source in sorted(dcentrald_root.rglob("*.rs")):
-        rel = source.relative_to.as_posix()
+        rel = source.relative_to(project_root).as_posix()
         lines = source.read_text(encoding="utf-8").splitlines()
         for index, line in enumerate(lines):
             stripped = line.strip()
@@ -137,8 +137,8 @@ def verify(sites: list[ClampSite], *, quiet: bool = False) -> bool:
     return False
 
 
-def self_test(: Path) -> bool:
-    sites = collect_sites
+def self_test(project_root: Path) -> bool:
+    sites = collect_sites(project_root)
     if verify(sites, quiet=True):
         synthetic = sites + [
             ClampSite(
@@ -165,15 +165,15 @@ def main() -> int:
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
-     = repo_root(Path(__file__))
-    sites = collect_sites
+    project_root = repo_root(Path(__file__))
+    sites = collect_sites(project_root)
     if args.print_current:
         print(f"count={len(sites)}")
         print(f"digest={digest_sites(sites)}")
         print_sites(sites)
         return 0
     if args.self_test:
-        return 0 if self_test else 1
+        return 0 if self_test(project_root) else 1
     return 0 if verify(sites) else 1
 
 

@@ -533,7 +533,7 @@ struct WsPowerTelemetryProjection {
     note: &'static str,
 }
 
-fn (
+fn project_ws_power_telemetry(
     power: &dcentrald_autotuner::LivePowerEstimate,
 ) -> WsPowerTelemetryProjection {
     let live_power_available = power.board_watts.is_finite()
@@ -648,7 +648,7 @@ impl EnergyAccumulator {
 /// HA Energy dashboard models what the grid delivers — what the operator pays
 /// for.
 pub fn energy_integration_watts(power: &dcentrald_autotuner::LivePowerEstimate) -> f64 {
-    if (power).live_power_available {
+    if project_ws_power_telemetry(power).live_power_available {
         power.wall_watts
     } else {
         0.0
@@ -669,7 +669,7 @@ pub fn build_stats_message(
     power: &dcentrald_autotuner::LivePowerEstimate,
     energy_kwh: f64,
 ) -> String {
-    let power_projection = (power);
+    let power_projection = project_ws_power_telemetry(power);
     let live_power_available = power_projection.live_power_available;
     let (power_watts, wall_watts, efficiency_jth, btu_h) = if live_power_available {
         (

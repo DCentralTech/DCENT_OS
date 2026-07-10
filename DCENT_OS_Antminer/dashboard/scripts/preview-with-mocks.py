@@ -297,12 +297,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _send_index(self, wizard=False):
+    def _send_index(self, wizard=False, mode="standard"):
         try:
             html = INDEX.read_text(encoding="utf-8")
         except OSError as e:
             self.send_error(500, f"dist/index.html not built: {e}")
             return
+        if mode not in ("standard", "heater", "hacker"):
+            mode = "standard"
+        # The heater skin's home page id differs from the other two modes.
+        page = "heater-home" if mode == "heater" else "dashboard"
         # Inject a pre-boot script that swallows any unmocked /api/* fetch with
         # an empty {} JSON and seeds setupComplete=true so the dashboard skips
         # the wizard during the preview. This runs BEFORE the bundled React
@@ -315,7 +319,16 @@ class Handler(BaseHTTPRequestHandler):
         seed_settings = (
             ""
             if wizard
-            else "try { localStorage.setItem('dcentos-settings', JSON.stringify({setupComplete:true,mode:'standard',minerName:'Preview miner',electricityRate:0.10,btcPrice:62000,btcPriceAuto:true,temperatureUnit:'C'})); } catch (_) {}"
+            else "try { localStorage.setItem('dcentos-settings', JSON.stringify({setupComplete:true,mode:'"
+            + mode
+            + "',minerName:'Preview miner',electricityRate:0.10,btcPrice:62000,btcPriceAuto:true,temperatureUnit:'C'})); } catch (_) {}"
+            + (
+                # Preview aid: skip the (real, shipped) hacker-mode risk gate so
+                # screenshots/QA land on the dashboard itself.
+                " try { sessionStorage.setItem('hacker-gate-dismissed','1'); } catch (_) {}"
+                if mode == "hacker"
+                else ""
+            )
         )
         wiz_clear = (
             "try { localStorage.removeItem('dcentos-settings'); } catch (_) {}"
@@ -329,7 +342,7 @@ class Handler(BaseHTTPRequestHandler):
   var __WIZ__ = %WIZ%;
   %WIZ_CLEAR%
   %SEED%
-  try { localStorage.setItem('dcentos-current-page','dashboard'); localStorage.setItem('dcentos-nav-standard','dashboard'); } catch (_) {}
+  try { localStorage.setItem('dcentos-current-page','%PAGE%'); localStorage.setItem('dcentos-nav-standard','dashboard'); } catch (_) {}
   var _origFetch = window.fetch.bind(window);
   window.fetch = function (input, init) {
     try {
@@ -366,6 +379,7 @@ class Handler(BaseHTTPRequestHandler):
             boot.replace("%WIZ%", wiz_status)
                 .replace("%WIZ_CLEAR%", wiz_clear)
                 .replace("%SEED%", seed_settings)
+                .replace("%PAGE%", page)
         )
         # Inject as the first child of <head>
         if "<head>" in html:
@@ -390,7 +404,32 @@ class Handler(BaseHTTPRequestHandler):
             # and uses its synthesized/endpointMissing fallback. Returning 200 + {}
             # causes components like BootPhaseBanner to crash on undefined fields.
             return self._send_json({"error": "endpoint not mocked"}, code=404)
-        return self._send_index(wizard=("wizard=1" in self.path))
+        # Serve real static assets from dist/ when they exist (lazy-loaded
+        # route chunks, fonts, images). Anything else falls through to the
+        # SPA index. Path is resolved and confined to DIST.
+        if path not in ("", "/"):
+            cand = (DIST / path.lstrip("/")).resolve()
+            if cand.is_file() and str(cand).startswith(str(DIST.resolve())):
+                import mimetypes
+
+                ctype = mimetypes.guess_type(str(cand))[0] or "application/octet-stream"
+                data = cand.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(data)
+                return
+        # PREVIEW-ONLY dev toggle: `?mode=heater|standard|hacker` seeds the
+        # requested dashboard skin (QA/screenshot aid — not shipped to firmware).
+        mode = "standard"
+        if "?" in self.path:
+            from urllib.parse import parse_qs
+
+            qs = parse_qs(self.path.split("?", 1)[1])
+            mode = (qs.get("mode") or ["standard"])[0]
+        return self._send_index(wizard=("wizard=1" in self.path), mode=mode)
 
     def do_POST(self):
         # Echo a generic ack for action endpoints

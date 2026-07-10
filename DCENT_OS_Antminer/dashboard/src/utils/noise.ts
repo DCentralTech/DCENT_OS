@@ -7,7 +7,7 @@ export function getTachBackedNoiseDb(heater: HeaterStatusResponse | null | undef
   if (heater.noise_source === 'tach_estimate') {
     return heater.noise_db;
   }
-  if (heater.fans?.rpm_ && (heater.fans.rpm ?? 0) > 0) {
+  if (heater.fans?.rpm_feedback_available && (heater.fans.rpm ?? 0) > 0) {
     return heater.noise_db;
   }
   return null;

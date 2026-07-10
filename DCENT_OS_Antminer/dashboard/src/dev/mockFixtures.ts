@@ -391,7 +391,7 @@ export const FIXTURES: Record<string, unknown> = {
     "message": "calibration available",
     "enabled": false,
     "multiplier": 1,
-    "": null,
+    "reference_wall_watts": null,
     "estimated_wall_watts": 3180,
     "estimated_unit_watts": 3100,
     "updated_at_ms": 1717400000000,
@@ -2241,7 +2241,7 @@ export const FIXTURES: Record<string, unknown> = {
           "pwm_percent": 28
         }
       ],
-      "rpm_": true,
+      "rpm_feedback_available": true,
       "tach_suspect": false,
       "min_pwm": 10,
       "max_pwm": 100,
@@ -2666,7 +2666,7 @@ export const FIXTURES: Record<string, unknown> = {
       "pwm": 30,
       "rpm": 3200,
       "max_rpm": 6000,
-      "rpm_": true
+      "rpm_feedback_available": true
     }
   },
   "/api/home/presets": {
@@ -2798,7 +2798,7 @@ export const FIXTURES: Record<string, unknown> = {
       "pwm": 30,
       "rpm": 3200,
       "max_rpm": 6000,
-      "rpm_": true
+      "rpm_feedback_available": true
     }
   },
   "/api/offgrid/status": {

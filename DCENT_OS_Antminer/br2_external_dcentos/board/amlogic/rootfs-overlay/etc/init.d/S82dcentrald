@@ -70,8 +70,8 @@ fan_safety_override() {
                 # Amlogic A113D sysfs PWM: period=100000ns (10kHz). PWM 30 of 100
                 # is duty=30000ns. Matches Rust runtime helper
                 # amlogic_pwm_percent_to_duty_ns(pwm=30, period=100000) = 30000.
-                # NEVER above PWM 30 — /
-                # .
+                # NEVER above PWM 30 — see feedback_fan_max_30pwm /
+                # feedback_fan_never_blast.
                 echo 30000 > /sys/class/pwm/pwmchip0/pwm0/duty_cycle 2>/dev/null
                 echo 30000 > /sys/class/pwm/pwmchip0/pwm1/duty_cycle 2>/dev/null
             fi

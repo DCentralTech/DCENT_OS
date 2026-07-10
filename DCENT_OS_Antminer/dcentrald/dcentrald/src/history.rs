@@ -219,7 +219,7 @@ struct HistoryPowerProjection {
     note: &'static str,
 }
 
-fn (power: &LivePowerEstimate) -> HistoryPowerProjection {
+fn project_history_power(power: &LivePowerEstimate) -> HistoryPowerProjection {
     let live_power_available = power.board_watts.is_finite()
         && power.board_watts > 0.0
         && power.wall_watts.is_finite()
@@ -281,7 +281,7 @@ pub fn sample_from_runtime(
         .map(|chain| chain.temp_c)
         .reduce(f32::max)
         .unwrap_or(0.0);
-    let power_projection = (power);
+    let power_projection = project_history_power(power);
 
     HistorySample {
         timestamp_s,

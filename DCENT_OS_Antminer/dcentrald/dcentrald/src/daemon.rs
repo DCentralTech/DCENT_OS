@@ -2859,7 +2859,7 @@ impl Daemon {
                 } else {
                     min_freq
                 };
-                let fallback_ = if self.config.power.target_watts > 0 {
+                let fallback_reference_watts = if self.config.power.target_watts > 0 {
                     self.config.power.target_watts
                 } else {
                     self.config.power.max_watts.max(1)
@@ -2936,10 +2936,10 @@ impl Daemon {
                                             .unwrap_or_default()
                                             .as_millis() as u64;
                                         last_success_ms = Some(now_ms);
-                                        let  = if mining_watts > 0 {
-                                            mining_watts.max((fallback_ / 2).max(1))
+                                        let reference_watts = if mining_watts > 0 {
+                                            mining_watts.max((fallback_reference_watts / 2).max(1))
                                         } else {
-                                            fallback_.max(1)
+                                            fallback_reference_watts.max(1)
                                         };
                                         let decision = crate::solar::decide_policy(
                                             &source_profile,
@@ -2948,7 +2948,7 @@ impl Daemon {
                                             mining_watts,
                                             max_freq,
                                             min_freq,
-                                            ,
+                                            reference_watts,
                                             solar_forced_sleep,
                                         );
 

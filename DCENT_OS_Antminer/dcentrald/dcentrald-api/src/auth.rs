@@ -2237,7 +2237,7 @@ mod tests {
         // skip-password route is 403'd on release so the flag can never be set,
         // but even a (hypothetical) stale opt_out flag must FAIL CLOSED here —
         // preserving the placeholder-pubkey / signed-trust release posture
-        //.
+        // (feedback_toolbox_placeholder_release_pubkey_no_production_trust).
         assert!(
             !opt_out_grants_write_for_image(true, true, true),
             "release image must NEVER grant write access via the password opt-out"

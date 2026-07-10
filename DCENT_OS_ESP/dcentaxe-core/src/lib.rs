@@ -1678,7 +1678,7 @@ mod dcent_design_language_guards {
     // the shared table (with a per-key literal fallback). Pin that they reference
     // it so a future edit cannot silently re-hardcode a scattered label.
     #[test]
-    fn served_components_() {
+    fn served_components_reference_glossary() {
         let core = collapse_ws(CORE_JS);
         assert!(
             core.contains("window.gloss") && core.contains("window_headline_10m"),

@@ -111,7 +111,7 @@ const thermalPostureBody = {
     pwm: 30,
     rpm: 3000,
     per_fan: [],
-    rpm_: true,
+    rpm_feedback_available: true,
     tach_suspect: false,
     min_pwm: 20,
     max_pwm: 100,

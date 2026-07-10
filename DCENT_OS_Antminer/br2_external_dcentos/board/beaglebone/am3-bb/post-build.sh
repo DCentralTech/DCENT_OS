@@ -130,7 +130,7 @@ fi
 
 #  W12-B: also ship the stock-Bitmain manifest (parity with
 # zynq + amlogic boards). The daemon probes /etc/dcentos/ first.
-MANIFEST_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../../../extractions/firmware-archive/stock-bitmain-manifest.json"
+MANIFEST_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../../../knowledge-base/firmware-archive/stock-bitmain-manifest.json"
 if [ -f "$MANIFEST_SRC" ]; then
     mkdir -p "${TARGET_DIR}/etc/dcentos"
     cp "$MANIFEST_SRC" "${TARGET_DIR}/etc/dcentos/stock-bitmain-manifest.json"

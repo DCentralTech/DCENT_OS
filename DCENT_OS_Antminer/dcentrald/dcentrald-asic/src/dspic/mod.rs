@@ -150,7 +150,7 @@ pub const CMD_ENABLE_VOLTAGE: u8 = 0x15;
 /// keepalive effect is the watchdog-reset side effect, and the bytes that come
 /// back are DAC-readback data, not a heartbeat ACK. The S17 dsPIC33EP16GS202
 /// jig confirms the same opcode framing (`pic_heart_beat@3100C.c`, reads 6
-/// bytes). Source: D-Central internal reverse-engineering
+/// bytes). Source: knowledge-base goldmine `findings/s16b-nbp1901-pic-whatsminer.md`
 /// A08/IC-A2. (Separately, the `a lab unit` cold strace proves bosminer never sends
 /// 0x16 at all — do not rely on it as the canonical app-mode keepalive.)
 pub const CMD_HEARTBEAT: u8 = 0x16;
@@ -3118,7 +3118,7 @@ impl DspicService {
                 bare = self.use_bare_protocol,
                 "dsPIC service bare LM75A pre-voltage read SKIPPED (bare echoes 0x86 \
                  only — bus writes appear to corrupt dsPIC parser for following \
-                 SetVoltage on fw=0x86)"
+                 SetVoltage on fw=0x86; see project_s19jpro_139_progress_2026_04_26_evening)"
             );
         } else {
             // Keep-alive (default-OFF): byte-identical `read_all_temperatures`

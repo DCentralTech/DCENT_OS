@@ -28,7 +28,7 @@ export function HarvestModeBanner() {
         if (!cancelled) setStatus(s);
       } catch {
         // Silent — endpoint may be unavailable while the unit is
-        // booting.
+        // booting. Per feedback_dashboard_must_degrade_gracefully
         // we don't blank.
       }
     };

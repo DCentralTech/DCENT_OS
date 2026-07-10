@@ -283,7 +283,7 @@ pub const S19_REFERENCE: &[DiodeReadingExpectation] = &[
 ];
 
 /// Look up the reference table for a chip family.
-pub fn (family: DiodeFamily) -> &'static [DiodeReadingExpectation] {
+pub fn reference_table(family: DiodeFamily) -> &'static [DiodeReadingExpectation] {
     match family {
         DiodeFamily::S17Family => S17_REFERENCE,
         DiodeFamily::S17eFamily => S17E_REFERENCE,
@@ -293,7 +293,7 @@ pub fn (family: DiodeFamily) -> &'static [DiodeReadingExpectation] {
 
 /// Look up the expectation for a specific (family, pin) tuple.
 pub fn expectation(family: DiodeFamily, pin: DiodePin) -> Option<&'static DiodeReadingExpectation> {
-    (family).iter().find(|e| e.pin == pin)
+    reference_table(family).iter().find(|e| e.pin == pin)
 }
 
 /// Classify a measured voltage against the reference table.
@@ -395,7 +395,7 @@ mod tests {
             DiodeFamily::S17eFamily,
             DiodeFamily::S19Family,
         ] {
-            let table = (fam);
+            let table = reference_table(fam);
             assert_eq!(table.len(), 7, "{:?} should have 7 pin entries", fam);
         }
     }

@@ -131,7 +131,7 @@ export interface PowerCalibrationResponse {
   message?: string;
   enabled: boolean;
   multiplier: number;
-  : number | null;
+  reference_wall_watts: number | null;
   estimated_wall_watts: number | null;
   estimated_unit_watts: number | null;
   updated_at_ms: number | null;
@@ -1111,7 +1111,7 @@ export interface ThermalPowerPostureResponse {
     pwm: number;
     rpm: number | null;
     per_fan: PerFanReading[];
-    rpm_: boolean;
+    rpm_feedback_available: boolean;
     tach_suspect: boolean;
     min_pwm: number;
     max_pwm: number;
@@ -2679,7 +2679,7 @@ export interface HeaterStatusResponse {
     pwm?: number;
     rpm?: number;
     max_rpm?: number;
-    rpm_?: boolean;
+    rpm_feedback_available?: boolean;
   };
 }
 
@@ -3243,7 +3243,7 @@ export interface WsHeaterMessage {
     pwm?: number;
     rpm?: number;
     max_rpm?: number;
-    rpm_?: boolean;
+    rpm_feedback_available?: boolean;
   };
   airflow_cfm: number;
   preset: string;

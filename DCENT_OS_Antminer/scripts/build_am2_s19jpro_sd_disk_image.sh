@@ -257,7 +257,7 @@ EOF
 }
 
 # Default bitstream: the 2026-05-15 first-accepted-shares milestone path.
-DEFAULT_BITSTREAM="$REPO_ROOT/extractions/s19j/fpga_bitstream.bit"
+DEFAULT_BITSTREAM="$REPO_ROOT/knowledge-base/extractions/s19j/fpga_bitstream.bit"
 BITSTREAM_SRC=""
 if [ -n "$BITSTREAM_OVERRIDE" ]; then
     BITSTREAM_SRC="$BITSTREAM_OVERRIDE"

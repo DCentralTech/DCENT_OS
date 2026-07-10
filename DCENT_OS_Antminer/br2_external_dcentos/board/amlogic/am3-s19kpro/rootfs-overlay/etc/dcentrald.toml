@@ -71,7 +71,7 @@ hashrate_step_ths = 11.0
 
 [hashboard]
 eeprom_parser = "x21_aes"
-decoded_ = "/etc/dcentos/hashboard_decoded.json"
+decoded_reference_file = "/etc/dcentos/hashboard_decoded.json"
 
 [experimental]
 rambo_mode_max_bad_responses = 0

@@ -12,7 +12,7 @@ Source dossier:
 
 ## Status: SCAFFOLD — NOT integrated (intentionally)
 
-This crate is a clean-room driver + protocol **skeleton**. It is a workspace
+This crate is an original driver + protocol **skeleton**. It is a workspace
 member but:
 
 - the `dcentaxe` binary does **not** depend on it,

@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn fw86_read_temp_bare_is_4_byte() {
-        //: this frame goes on the
+        // Per feedback_dspic_fw86_single_byte_response: this frame goes on the
         // wire but the bare reply is only the FW echo; LM75 data is unavailable.
         assert_eq!(read_temp_frame_bare(0x48), vec![0x55, 0xAA, 0x30, 0x48]);
     }

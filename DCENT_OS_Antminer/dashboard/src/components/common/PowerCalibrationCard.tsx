@@ -132,7 +132,7 @@ export function PowerCalibrationCard() {
         </div>
         <div style={{ padding: 10, borderRadius: 10, background: 'var(--bg)', border: '1px solid var(--border)' }}>
           <div style={{ fontSize: '0.72rem', color: 'var(--text-dim)', marginBottom: 4 }}>Reference Meter Reading</div>
-          <div style={{ fontWeight: 700 }}>{formatMaybeWatts(calibration?.)}</div>
+          <div style={{ fontWeight: 700 }}>{formatMaybeWatts(calibration?.reference_wall_watts)}</div>
         </div>
       </div>
 
@@ -154,7 +154,7 @@ export function PowerCalibrationCard() {
           fontSize: '0.78rem', color: 'var(--text-secondary)', lineHeight: 1.5,
         }}>
           Calibrated from {formatMaybeWatts(calibration.estimated_wall_watts)} estimated wall / {formatMaybeWatts(calibration.estimated_unit_watts)} estimated unit
-          to {formatMaybeWatts(calibration.)} measured wall.
+          to {formatMaybeWatts(calibration.reference_wall_watts)} measured wall.
           {updatedAt && ` Saved ${updatedAt}.`}
         </div>
       )}

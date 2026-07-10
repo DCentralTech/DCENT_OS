@@ -29,7 +29,7 @@ use dcentrald_api_types::boot_orchestration::{
 };
 use dcentrald_api_types::chip_init::ChipFamily;
 use dcentrald_api_types::diode_voltage::{
-    classify_diode_ohms, classify_voltage, , DiodeFamily, DiodePin,
+    classify_diode_ohms, classify_voltage, reference_table, DiodeFamily, DiodePin,
 };
 use dcentrald_api_types::dspic_frame::{DspicOpcode, NAK_BYTE, PREAMBLE};
 use dcentrald_api_types::eeprom_record::{chip_family_for_sku, BHB_SKU_CATALOG};
@@ -466,7 +466,7 @@ async fn get_boot_orchestration() -> Json<BootOrchestrationCatalog> {
 
 #[derive(Debug, Clone, Serialize)]
 struct ThermalConstantsCatalog {
-    : f32,
+    reference_temp_c: f32,
     derating_threshold_c: f32,
     derating_per_c: f32,
     emergency_temp_c: f32,
@@ -507,7 +507,7 @@ fn thermal_model_catalog() -> ThermalModelCatalog {
         meta: ReadOnlyMeta::default(),
         defaults: ThermalCompConfig::default(),
         constants: ThermalConstantsCatalog {
-            : DEFAULT_REFERENCE_TEMP_C,
+            reference_temp_c: DEFAULT_REFERENCE_TEMP_C,
             derating_threshold_c: DEFAULT_DERATING_THRESHOLD_C,
             derating_per_c: DEFAULT_DERATING_PER_C,
             emergency_temp_c: DEFAULT_EMERGENCY_TEMP_C,
@@ -794,7 +794,7 @@ async fn get_apw_psu() -> Json<serde_json::Value> {
             "set_12_5v": build_apw_frame(ApwCommand::SetVoltage, &[0xC8]),
         },
         "dac_formula": {
-            "": DAC_REFERENCE_V,
+            "reference_v": DAC_REFERENCE_V,
             "offset_per_count_v": DAC_OFFSET_PER_COUNT_V,
             "dac_0xc8_voltage_v": dac_code_to_voltage(0xC8),
             "voltage_12_5_dac_code": voltage_to_dac_code(12.5),
@@ -939,7 +939,7 @@ async fn get_diode_voltage() -> Json<serde_json::Value> {
         .map(|family| {
             serde_json::json!({
                 "family": family,
-                "reference": (family),
+                "reference": reference_table(family),
             })
         })
         .collect();

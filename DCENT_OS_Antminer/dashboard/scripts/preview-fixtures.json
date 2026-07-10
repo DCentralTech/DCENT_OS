@@ -99,7 +99,7 @@
       "pwm": 30,
       "rpm": 3000,
       "per_fan": [],
-      "rpm_": true,
+      "rpm_feedback_available": true,
       "tach_suspect": false,
       "min_pwm": 20,
       "max_pwm": 100,
@@ -342,7 +342,7 @@
       "pwm": 10,
       "rpm": 0,
       "max_rpm": 0,
-      "rpm_": false
+      "rpm_feedback_available": false
     }
   },
   "heaterPresetsBody": {
@@ -1181,7 +1181,7 @@
     "status": "ok",
     "enabled": false,
     "multiplier": 1.0,
-    "": null,
+    "reference_wall_watts": null,
     "estimated_wall_watts": 3200,
     "estimated_unit_watts": 3050,
     "updated_at_ms": null,

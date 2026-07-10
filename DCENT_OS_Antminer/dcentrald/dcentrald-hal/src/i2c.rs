@@ -2748,7 +2748,7 @@ const DSPIC_RAIL_HARD_CAP_MV: u16 = 14_500;
 /// host-testable. NOTE: this is the HAL backstop only; the coordinated
 /// enforcement at the dsPIC DRIVER (dcentrald-asic, DSPIC_MAX_VOLTAGE_MV=15140)
 /// + the autotuner 15000 ceiling + the AMTC 15.0V lab-pre-open override is a
-/// separate EE-reviewed pass.
+/// separate EE-reviewed pass (see reference_voltage_hard_cap_not_enforced_at_driver_boundaries).
 #[inline]
 fn clamp_dspic_mv(requested: u16) -> u16 {
     requested.min(DSPIC_RAIL_HARD_CAP_MV)

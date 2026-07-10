@@ -396,7 +396,7 @@ case "$1" in
         #       is dropped on read.
         #
         # FIX (NEVER raw nandwrite mtd4 — load-bearing
-        # ): mirror the PROVEN
+        # feedback_am2_uboot_env_flip_must_use_fw_setenv): mirror the PROVEN
         # sysupgrade write path —
         #   1. clear each var with the BARE form `fw_setenv <key>` (no value,
         #      NO --script). See BUG 4 below: on this libubootenv build the

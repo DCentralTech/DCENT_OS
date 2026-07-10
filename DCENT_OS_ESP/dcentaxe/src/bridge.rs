@@ -76,7 +76,7 @@ pub fn sv2_job_to_mining_work(
 
     // BIP320 canonical version-rolling mask (BIP320 positions 13..28). MUST equal
     // dcentaxe_mining::dispatcher::BIP320_DEFAULT_VERSION_MASK and DCENT_OS's am2
-    // BM1362 load-bearing rule (;
+    // BM1362 load-bearing rule (feedback_am2_serial_dispatch_bip320_version_rolling_required;
     // SERIAL_VERSION_ROLLING_FIELD_MASK = 0x1FFF_E000 in dcentrald serial_mining.rs).
     //
     // SV2 standard channels carry no negotiated version_mask today, so SV2 NewJob

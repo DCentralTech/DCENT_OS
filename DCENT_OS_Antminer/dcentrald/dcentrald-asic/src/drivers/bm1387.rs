@@ -72,7 +72,7 @@ pub mod regs {
     /// the wire — yet places MISC_CONTROL at the BM1397 address. A future BM1391
     /// driver that inherits this BM1387 path MUST override MISC_CONTROL to 0x18;
     /// do NOT let it regress to 0x1C.
-    /// Source: D-Central internal reverse-engineering R13/IC-2
+    /// Source: knowledge-base goldmine `findings/s9-registers-pll.md` R13/IC-2
     /// (`BM1391_set_baud@13280.c` in S17/single-board-test:
     /// `BM1391_set_config(chain, 0, 0x18, gBM1391_MISC_CONTROL_reg, 1)`);
     /// cross-chip register map in the same file confirms 0x1C → 0x18 at BM1391.

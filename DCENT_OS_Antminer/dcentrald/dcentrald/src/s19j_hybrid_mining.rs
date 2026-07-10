@@ -1262,7 +1262,7 @@ impl Am2ThermalSupervisor {
             return;
         }
         let (board, die) = self.read_board_and_die();
-        let (Some, Some(raw_die_c)) = (board, die) else {
+        let (Some(reference_pcb_c), Some(raw_die_c)) = (board, die) else {
             info!(
                 board_present = board.is_some(),
                 die_present = die.is_some(),
@@ -1272,18 +1272,18 @@ impl Am2ThermalSupervisor {
         };
         let outcome = self
             .die_calibration
-            .capture_baseline(, &[raw_die_c]);
+            .capture_baseline(reference_pcb_c, &[raw_die_c]);
         if outcome.is_captured() {
             info!(
                 chips = self.die_calibration.chip_count(),
-                ,
+                reference_pcb_c,
                 raw_die_c,
                 "R-13 die-calibration cold baseline captured — die temp is now offset-corrected (never below raw)"
             );
         } else {
             warn!(
                 outcome = ?outcome,
-                ,
+                reference_pcb_c,
                 raw_die_c,
                 "R-13 die-calibration baseline NOT captured — staying on RAW die temp (fail-safe)"
             );
@@ -5115,7 +5115,7 @@ fn pic_read_fw_version_service(i2c: &I2cServiceHandle, addr: u8) -> Result<u8> {
     //       immediately; an FF/garbage-but-no-error reply is retried within the
     //       same clean budget.
     // The short [55 AA 17] form stays as a fallback but is ALSO issued WITHOUT
-    // a preceding flush. No RESET/JUMP is ever emitted.
+    // a preceding flush. No RESET/JUMP is ever emitted (feedback_pic_no_reset_s19j).
     // This is fail-closed-safe: worst case is still all-FF → the caller's
     // trust-rail / fw-whitelist gates refuse voltage. Best case: the dsPIC
     // versions cleanly and mining is unblocked.
@@ -12599,7 +12599,7 @@ impl S19jHybridMiner {
                             // ⚠️ R5 (2026-05-31): this verdict is a HEURISTIC
                             // INFERENCE from die TEMPERATURE — 0x3B/0x3C(0x48) are
                             // LM75A temperature reads (°C), NOT a rail-voltage read
-                            // (RE: ...`).
+                            // (RE: `reference_wave58_25_reanalysis_0x3c_is_lm75...`).
                             // "RAIL_UP" here means "chips are warm ⇒ probably drawing
                             // power"; it is NOT a measured rail mV and must NEVER gate
                             // mining/voltage/enum. Observability-only.

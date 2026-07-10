@@ -189,7 +189,7 @@ describe('First-boot wizard - Quick Start path', () => {
         enabled: false,
         calibrated: false,
         multiplier: 1,
-        : null,
+        reference_wall_watts: null,
         estimated_wall_watts: null,
         estimated_unit_watts: null,
         updated_at_ms: null,

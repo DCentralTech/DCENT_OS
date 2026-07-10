@@ -133,7 +133,7 @@ pub const LUXOS_S19J_PRO_RAMP: &[RampPoint] = &[
 ];
 
 /// Look up the canonical reference point for a milestone.
-pub fn (milestone: RampMilestone) -> Option<&'static RampPoint> {
+pub fn reference_point(milestone: RampMilestone) -> Option<&'static RampPoint> {
     LUXOS_S19J_PRO_RAMP
         .iter()
         .find(|p| p.milestone == milestone)
@@ -155,7 +155,7 @@ pub enum RampVerdict {
 /// Classify a measured (milestone, observed_seconds) tuple against the
 /// canonical curve.
 pub fn classify_ramp_progress(milestone: RampMilestone, observed_seconds: u32) -> RampVerdict {
-    let p = match (milestone) {
+    let p = match reference_point(milestone) {
         Some(p) => p,
         None => return RampVerdict::OnTrack,
     };
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn csv_begin_anchors_at_t_zero() {
-        let p = (RampMilestone::CsvBegin).unwrap();
+        let p = reference_point(RampMilestone::CsvBegin).unwrap();
         assert_eq!(p.at_seconds, 0);
         assert_eq!(p.expected_watts, 0);
         assert_eq!(p.expected_hashrate_th, 0.0);
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn first_hashrate_anchored_at_re_doc_value() {
         // RE doc line 157: T+~115s "FIRST HASHRATE: 3,179,960 H/s = 3.18 GH/s".
-        let p = (RampMilestone::FirstHashrate).unwrap();
+        let p = reference_point(RampMilestone::FirstHashrate).unwrap();
         assert_eq!(p.expected_hashrate_th, 3.18);
         assert_eq!(p.at_seconds, 115);
     }
@@ -217,7 +217,7 @@ mod tests {
     fn open_core_voltage_at_canonical_14_92_v() {
         // RE doc line 103: "Ramping board voltage 0/1/2 → voltage=14.92".
         // This is the open-core overshoot canonical value.
-        let p = (RampMilestone::OpenCoreVoltageRamp).unwrap();
+        let p = reference_point(RampMilestone::OpenCoreVoltageRamp).unwrap();
         // Description must reference 14.92 V verbatim.
         assert!(p.description.contains("14.92"));
     }
@@ -225,7 +225,7 @@ mod tests {
     #[test]
     fn voltage_trimmed_milestone_includes_138_value() {
         // RE doc: voltage trimmed back from 14.92 to autotune target ~13.8 V.
-        let p = (RampMilestone::VoltageTrimmed).unwrap();
+        let p = reference_point(RampMilestone::VoltageTrimmed).unwrap();
         assert!(p.description.contains("13.8"));
     }
 
@@ -274,7 +274,7 @@ mod tests {
 
     #[test]
     fn ramp_point_serializes_to_documented_shape() {
-        let p = (RampMilestone::FirstHashrate).unwrap();
+        let p = reference_point(RampMilestone::FirstHashrate).unwrap();
         let json = serde_json::to_string(p).unwrap();
         assert!(json.contains("\"milestone\":\"first_hashrate\""));
         assert!(json.contains("\"at_seconds\":115"));

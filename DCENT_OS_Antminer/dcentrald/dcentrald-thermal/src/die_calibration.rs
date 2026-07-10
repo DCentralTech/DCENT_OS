@@ -74,8 +74,8 @@ pub struct DieCalibrationConfig {
     /// Reject baseline capture unless the reference PCB temperature is at or
     /// below this (celsius) — i.e. the unit really was cold/idle. Prevents
     /// seeding calibration from a hot, already-mining unit. Default 60 °C.
-    #[serde(default = "default_baseline_max_")]
-    pub baseline_max_: f32,
+    #[serde(default = "default_baseline_max_reference_c")]
+    pub baseline_max_reference_c: f32,
 
     /// Tiny epsilon (celsius) for the "never report below raw" guard. A
     /// calibrated reading below `raw - apply_epsilon_c` is rejected (uses raw);
@@ -90,7 +90,7 @@ fn default_max_abs_offset_c() -> f32 {
 fn default_max_chip_spread_c() -> f32 {
     10.0
 }
-fn default_baseline_max_() -> f32 {
+fn default_baseline_max_reference_c() -> f32 {
     60.0
 }
 fn default_apply_epsilon_c() -> f32 {
@@ -103,7 +103,7 @@ impl Default for DieCalibrationConfig {
             enabled: false,
             max_abs_offset_c: default_max_abs_offset_c(),
             max_chip_spread_c: default_max_chip_spread_c(),
-            baseline_max_: default_baseline_max_(),
+            baseline_max_reference_c: default_baseline_max_reference_c(),
             apply_epsilon_c: default_apply_epsilon_c(),
         }
     }
@@ -126,9 +126,9 @@ pub enum BaselineOutcome {
     /// One or more raw die readings were non-finite — a garbage sensor must
     /// never seed calibration.
     RejectedRawNonFinite,
-    /// The reference PCB temperature was above `baseline_max_ — the
+    /// The reference PCB temperature was above `baseline_max_reference_c` — the
     /// unit was not cold, so this is not a trustworthy baseline.
-    RejectedNotCold { : f32, max_c: f32 },
+    RejectedNotCold { reference_c: f32, max_c: f32 },
     /// A per-chip |offset| exceeded `max_abs_offset_c`.
     RejectedOffsetTooLarge { worst_abs_c: f32, max_c: f32 },
     /// The spread of per-chip offsets exceeded `max_chip_spread_c`.
@@ -210,34 +210,34 @@ impl DieCalibration {
         self.offsets.as_ref().map(Vec::len).unwrap_or(0)
     }
 
-    /// Capture the per-chip baseline offset =  - raw_die[i]`.
+    /// Capture the per-chip baseline offset = `reference_pcb_c - raw_die[i]`.
     ///
     /// Validates the sample and either stores the offsets (calibration becomes
     /// active) or rejects it (calibration stays a raw passthrough). Idempotent
     /// only in the sense that a later successful capture replaces an earlier
     /// one; a rejection leaves any prior good baseline untouched EXCEPT that a
     /// fresh capture attempt clears nothing until it succeeds.
-    pub fn capture_baseline(&mut self, : f32, raw_die: &[f32]) -> BaselineOutcome {
+    pub fn capture_baseline(&mut self, reference_pcb_c: f32, raw_die: &[f32]) -> BaselineOutcome {
         if !self.cfg.enabled {
             return BaselineOutcome::Disabled;
         }
         if raw_die.is_empty() {
             return BaselineOutcome::RejectedNoSample;
         }
-        if !.is_finite() {
+        if !reference_pcb_c.is_finite() {
             return BaselineOutcome::RejectedReferenceNonFinite;
         }
         if raw_die.iter().any(|v| !v.is_finite()) {
             return BaselineOutcome::RejectedRawNonFinite;
         }
-        if  > self.cfg.baseline_max_ {
+        if reference_pcb_c > self.cfg.baseline_max_reference_c {
             return BaselineOutcome::RejectedNotCold {
-                : ,
-                max_c: self.cfg.baseline_max_,
+                reference_c: reference_pcb_c,
+                max_c: self.cfg.baseline_max_reference_c,
             };
         }
 
-        let offsets: Vec<f32> = raw_die.iter().map(|&raw|  - raw).collect();
+        let offsets: Vec<f32> = raw_die.iter().map(|&raw| reference_pcb_c - raw).collect();
 
         let worst_abs = offsets.iter().fold(0.0_f32, |acc, o| acc.max(o.abs()));
         if worst_abs > self.cfg.max_abs_offset_c {
@@ -315,7 +315,7 @@ mod tests {
         assert!(!cfg.enabled, "die-temp calibration must default OFF");
         assert_eq!(cfg.max_abs_offset_c, 15.0);
         assert_eq!(cfg.max_chip_spread_c, 10.0);
-        assert_eq!(cfg.baseline_max_, 60.0);
+        assert_eq!(cfg.baseline_max_reference_c, 60.0);
         assert_eq!(cfg.apply_epsilon_c, 0.5);
     }
 
@@ -367,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn non_finite_() {
+    fn non_finite_reference_or_raw_rejected() {
         let mut cal = DieCalibration::new(DieCalibrationConfig {
             enabled: true,
             ..Default::default()
@@ -388,13 +388,13 @@ mod tests {
     fn hot_unit_is_not_a_valid_cold_baseline() {
         let mut cal = DieCalibration::new(DieCalibrationConfig {
             enabled: true,
-            baseline_max_: 60.0,
+            baseline_max_reference_c: 60.0,
             ..Default::default()
         });
         // Reference 75 °C > 60 °C → the unit was not cold → reject.
         match cal.capture_baseline(75.0, &[74.0]) {
-            BaselineOutcome::RejectedNotCold { , max_c } => {
-                assert_eq!(, 75.0);
+            BaselineOutcome::RejectedNotCold { reference_c, max_c } => {
+                assert_eq!(reference_c, 75.0);
                 assert_eq!(max_c, 60.0);
             }
             other => panic!("expected RejectedNotCold, got {other:?}"),

@@ -8,11 +8,18 @@ firmware architecture covers many models**. Mixed control-board/hash-board
 operation is a validated/lab compatibility capability, not a blanket
 production-install promise for every board mix.
 
-This page is the honest, per-model picture. **"Mining proven"** means DCENT_OS has produced accepted
-pool shares on that hardware on the bench; cold-boot or nonce evidence alone does not promote a platform
-to mining-proven. **"Bring-up"** means the driver paths exist and per-model validation is expanding. The
-**public install readiness** column is separate from mining evidence and should match DCENT_Toolbox
-readiness output; help from the community is welcome (see the platform-bring-up issue template).
+This page is the honest, per-model picture. **"Mining achieved"** means DCENT_OS has produced accepted
+pool shares on that hardware on our bench; cold-boot or nonce evidence alone does not earn that label.
+Where a row says **"untested on latest binaries"**, the mining achievement stands on an earlier build of
+the daemon and has not yet been re-run on the current release binaries — the code paths are unchanged or
+regression-pinned, but we don't re-claim a live proof we haven't re-run. **"Bring-up"** means the driver
+paths exist and per-model validation is expanding. The **public install readiness** column is separate
+from mining evidence and should match DCENT_Toolbox readiness output; help from the community is welcome
+(see the platform-bring-up issue template).
+
+> **Privacy note on published evidence:** live-capture logs and examples published in this repository
+> have operator IP and MAC addresses rewritten to RFC 5737 / documentation values (e.g. `203.0.113.x`)
+> as a privacy measure. The captures themselves come from real bench hardware.
 
 ## Control-board families
 
@@ -27,11 +34,11 @@ readiness output; help from the community is welcome (see the platform-bring-up 
 
 | Miner | ASIC | Board | Mining / driver evidence | Public install readiness |
 | --- | --- | --- | --- | --- |
-| **Antminer S9** | BM1387 | Zynq | Mining proven: sustained cold-boot mining, 3/3 chains, accepted shares | Lab-gated: Toolbox route exists, public artifact + witnessed live-install capstone still required |
-| **Antminer S19 Pro** | BM1398 | Zynq | Experimental bring-up: cold boot, 3 chains x 114 chips, 146K nonces, 0 HW errors; accepted-share gate open | Lab-gated: dedicated signed package/runbook/live capstone pending |
-| **Antminer S19j Pro** | BM1362 | Zynq | Mining proven: accepted pool shares, standalone cold-boot | Lab-gated: Xilinx public beta remains pending public artifact + witnessed clean-unit capstone |
-| **Antminer S19j Pro** | BM1362 | BeagleBone | Mining proven: accepted pool shares, all chains enumerated | Lab-gated: SD/runtime path only, not a general NAND/sysupgrade production install |
-| **Antminer S21** | BM1368 | Amlogic | Mining proven: first Amlogic hash, ~66 TH/s sustained, 30K nonces | Lab-gated: runtime evidence exists; stock AMLCtrl in-place install remains blocked |
+| **Antminer S9** | BM1387 | Zynq | **Mining achieved** — sustained standalone cold-boot mining with accepted pool shares | Lab-gated: Toolbox route exists, public artifact + witnessed live-install capstone still required |
+| **Antminer S19 Pro** | BM1398 | Zynq | Hashing achieved (cold boot, full chain enumeration, clean nonce flow); accepted shares untested on latest binaries | Lab-gated: dedicated signed package/runbook/live capstone pending |
+| **Antminer S19j Pro** | BM1362 | Zynq | **Mining achieved** — standalone cold-boot mining with accepted pool shares | Lab-gated: Xilinx public beta remains pending public artifact + witnessed clean-unit capstone |
+| **Antminer S19j Pro** | BM1362 | BeagleBone | **Mining achieved** — accepted pool shares, all chains enumerated (runtime path); untested on latest binaries | Lab-gated: SD/runtime path only, not a general NAND/sysupgrade production install |
+| **Antminer S21** | BM1368 | Amlogic | **Mining achieved** — sustained hashing with accepted pool shares (runtime path); untested on latest binaries | Lab-gated: runtime evidence exists; stock AMLCtrl in-place install remains blocked |
 | **Antminer S17 / S17 Pro** | BM1397 | Zynq | Bring-up: drivers in place; validation expanding | Evidence gap: no public install route |
 | **Antminer T17** | BM1397 | Zynq | In development: explicit model profile and X17 runtime identity exist; validation expanding | Evidence gap: no public install route |
 | **Antminer S19** | BM1398 | Zynq | Bring-up: shares the S19 Pro driver path | Evidence gap: does not inherit S19 Pro install readiness |

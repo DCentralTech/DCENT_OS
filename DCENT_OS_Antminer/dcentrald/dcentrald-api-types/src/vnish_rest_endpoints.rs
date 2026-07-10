@@ -264,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn vnish_default_password_pinned_per_() {
+    fn vnish_default_password_pinned_per_reference_doc() {
         // : VNish 1.2.6 default
         // is `admin` (NOT `root` as old RE doc claimed).
         assert_eq!(VNISH_DEFAULT_PASSWORD, "admin");

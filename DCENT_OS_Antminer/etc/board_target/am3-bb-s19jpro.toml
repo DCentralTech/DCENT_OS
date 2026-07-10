@@ -36,7 +36,7 @@ mining_baud = 3000000         # fast-baud target after BM1362 0x28 handoff; exac
 [i2c]
 eeprom_bus = 0                # HW OMAP I2C, hashboard EEPROMs
 eeprom_addrs = [0x50, 0x51, 0x52]
-eeprom_write_deny = true      # HAL refuses writes 0x50-0x57
+eeprom_write_deny = true      # HAL refuses writes 0x50-0x57 (feedback_eeprom_addresses_protected)
 psu_bus = 1                   # bit-banged i2c-gpio (gpio4=SDA/gpio5=SCL)
 psu_addr = 0x10
 psu_kind = "apw12-uart-tunnel"

@@ -1,13 +1,3 @@
-DCENT_OS is Copyright (C) 2016-2026 D-Central Technologies and is licensed under
-the GNU General Public License v3.0, the full text of which follows below.
-
-Third-party components reused, patched, or depended upon by DCENT_OS (the
-BraiinsOS-derived Zynq boot chain, the Dropbear patch, and the Rust/npm
-dependencies) retain their own upstream licenses; see THIRD_PARTY_NOTICES.md
-for the authoritative attribution record.
-
-----------------------------------------------------------------------
-
                     GNU GENERAL PUBLIC LICENSE
                        Version 3, 29 June 2007
 

@@ -104,7 +104,7 @@ fi
 # /etc/dcentos/stock-bitmain-manifest.json first, then falls back to
 # the in-tree path. Mirroring W10-A's pattern keeps the source-of-truth
 # in knowledge-base/ and the runtime copy in the overlay.
-MANIFEST_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../../../extractions/firmware-archive/stock-bitmain-manifest.json"
+MANIFEST_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../../../knowledge-base/firmware-archive/stock-bitmain-manifest.json"
 if [ -f "$MANIFEST_SRC" ]; then
     cp "$MANIFEST_SRC" "${TARGET_DIR}/etc/dcentos/stock-bitmain-manifest.json"
     chmod 644 "${TARGET_DIR}/etc/dcentos/stock-bitmain-manifest.json" 2>/dev/null || true

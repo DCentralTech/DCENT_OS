@@ -66,7 +66,7 @@ echo "emmc-sysupgrade-disabled-pending-3-roundtrip-bench-proof"    > "${TARGET_D
 # stages whatever the operator drops at $FACTORY_KERNEL_SRC and otherwise
 # leaves a placeholder marker so revert_to_stock_cv1835.sh can detect the
 # missing-evidence state.
-FACTORY_KERNEL_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../../../extractions/firmware-archive/cv1835/factory_kernel.bin"
+FACTORY_KERNEL_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../../../knowledge-base/firmware-archive/cv1835/factory_kernel.bin"
 FACTORY_KERNEL_DST="${TARGET_DIR}/config/factory_kernel.bin"
 if [ -f "$FACTORY_KERNEL_SRC" ]; then
     cp "$FACTORY_KERNEL_SRC" "$FACTORY_KERNEL_DST"
@@ -85,7 +85,7 @@ recovery) requires a known-good factory kernel sitting at
 /config/factory_kernel.bin so U-Boot can restore it after 3 failed boots.
 
 Drop the verified BMU-extracted CVCtrl kernel at:
-  extractions/firmware-archive/cv1835/factory_kernel.bin
+  knowledge-base/firmware-archive/cv1835/factory_kernel.bin
 
 then rebuild. Until that file exists, eMMC sysupgrade stays gated by
 DCENT_CV1835_EMMC_PROVEN=1 + 3 round-trip bench proof.
@@ -125,7 +125,7 @@ fi
 
 # Stage stock-bitmain-manifest for restore-to-stock parity (same as am3-bb /
 # zynq / amlogic boards).
-MANIFEST_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../../../extractions/firmware-archive/stock-bitmain-manifest.json"
+MANIFEST_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../../../knowledge-base/firmware-archive/stock-bitmain-manifest.json"
 if [ -f "$MANIFEST_SRC" ]; then
     cp "$MANIFEST_SRC" "${TARGET_DIR}/etc/dcentos/stock-bitmain-manifest.json"
     chmod 0644 "${TARGET_DIR}/etc/dcentos/stock-bitmain-manifest.json" 2>/dev/null || true

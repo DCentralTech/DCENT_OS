@@ -160,7 +160,7 @@ export function useMinerData() {
         const previousHeaterStatus = useMinerStore.getState().heaterStatus;
         const noiseBackedByRpm =
           msg.noise_source === 'tach_estimate' ||
-          (!!msg.fans?.rpm_ && (msg.fans.rpm ?? 0) > 0);
+          (!!msg.fans?.rpm_feedback_available && (msg.fans.rpm ?? 0) > 0);
         const heaterWsHasPowerProvenance =
           msg.power_source !== undefined ||
           msg.power_source_detail !== undefined ||

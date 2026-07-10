@@ -605,13 +605,13 @@ pub fn validate(bundle: &ProfileBundle) -> Result<(), String> {
     if bundle.metadata.secure_boot_set_seen {
         return Err(
             "SECURE_BOOT_SET-tainted firmware (eFuse-burning blob); refused per \
-              (no override available)"
+             feedback_secure_boot_set_blocklist (no override available)"
                 .to_string(),
         );
     }
     if bundle.metadata.hashcore_root_hash_seen {
         return Err("Hashcore SHA-512 universal root hash present; refused per \
-              (no override available)"
+             feedback_hashcore_universal_root_hash_blocklist (no override available)"
             .to_string());
     }
 

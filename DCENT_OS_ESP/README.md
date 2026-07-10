@@ -2,7 +2,8 @@
 
 > AI-native open-source firmware for the BitAxe-class ESP32-S3 family, built by
 > [D-Central Technologies](https://d-central.tech/).
-> A clean-room Rust rewrite of BitAxe firmware with a built-in
+> An original Rust firmware for BitAxe-class hardware (informed by the
+> open-source ESP-Miner project, not a fork) with a built-in
 > **MCP (Model Context Protocol) server** — supported BitAxe-class
 > devices expose a local AI-control surface while preserving the current
 > proof boundary for live mining validation.
@@ -15,7 +16,7 @@ but on ESP32-S3 BitAxe-class boards instead of industrial Antminers. The
 D-Central DCENT_axe open-hardware boards live in `projects/dcent-axe/` and
 run this firmware.
 
-It is a **clean-room rewrite in Rust**, informed by the public
+It is an **original rewrite in Rust**, informed by the public
 [ESP-Miner](https://github.com/bitaxeorg/ESP-Miner) project as a protocol
 reference, but not a fork: every line of `dcentaxe` is D-Central's own,
 GPL-3.0 from day one.
@@ -42,7 +43,7 @@ it is healthy. So why build another firmware?
 Three reasons:
 
 1. **Memory-safe Rust on ESP-IDF v5.3+.** The BitAxe runs on an ESP32-S3
-   with ~300 KB of internal heap. Rust's ownership model plus a clean-room
+   with ~300 KB of internal heap. Rust's ownership model plus a ground-up
    architecture make it possible to fix entire bug *classes* (use-after-free
    on shared work objects, partial-frame UART corruption, allocator
    fragmentation under sustained mining) instead of one report at a time.
@@ -389,7 +390,7 @@ every layer: mining, tools, hardware, communication.
 
 ## Acknowledgments
 
-DCENT_axe is a clean-room project, but it stands on the shoulders of
+DCENT_axe is an original implementation, and it stands on the shoulders of
 public work that made the BitAxe ecosystem what it is:
 
 - **[BitAxe](https://bitaxe.org/)** and **[ESP-Miner](https://github.com/bitaxeorg/ESP-Miner)**

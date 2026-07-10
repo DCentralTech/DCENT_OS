@@ -442,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn sv2_extended_p() {
+    fn sv2_extended_preference_is_independent_of_extended_channel_flag() {
         // The "should prefer" hint is informational and keys off hashrate.
         // The actual `sv2_extended_channel` config flag is a separate switch
         // (the consumer of the hint) — pin that the hint does not depend on

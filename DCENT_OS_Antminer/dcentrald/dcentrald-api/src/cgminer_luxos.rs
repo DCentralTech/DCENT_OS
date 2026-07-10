@@ -950,7 +950,7 @@ fn telemetry_metrics(state: &Arc<AppState>) -> serde_json::Value {
         .lock()
         .map(|guard| guard.clone())
         .unwrap_or_default();
-    let power_projection = crate::rest::(&power, &miner, &hardware);
+    let power_projection = crate::rest::project_power_telemetry(&power, &miner, &hardware);
     let power_fields = luxos_metrics_power_fields(&power_projection);
     envelope(
         serde_json::json!({ "METRICS": [{

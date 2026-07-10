@@ -156,9 +156,9 @@ if [ -n "${DCENT_AM3_AML_KERNEL:-}" ] && [ -f "${DCENT_AM3_AML_KERNEL}" ]; then
 elif [ -f "${PROJECT_ROOT}/extractions/s21/kernel_uimage.bin" ]; then
     KERNEL="${PROJECT_ROOT}/extractions/s21/kernel_uimage.bin"
     KERNEL_SRC="docker-staged extractions/s21"
-elif [ -f "${REPO_ROOT}/extractions/s21/kernel_uimage.bin" ]; then
-    KERNEL="${REPO_ROOT}/extractions/s21/kernel_uimage.bin"
-    KERNEL_SRC="extractions/s21"
+elif [ -f "${REPO_ROOT}/knowledge-base/extractions/s21/kernel_uimage.bin" ]; then
+    KERNEL="${REPO_ROOT}/knowledge-base/extractions/s21/kernel_uimage.bin"
+    KERNEL_SRC="knowledge-base/extractions/s21"
 fi
 
 if [ -z "$KERNEL" ]; then
@@ -166,7 +166,7 @@ if [ -z "$KERNEL" ]; then
     echo "  Expected one of:" >&2
     echo "    \$DCENT_AM3_AML_KERNEL" >&2
     echo "    ${PROJECT_ROOT}/extractions/s21/kernel_uimage.bin" >&2
-    echo "    ${REPO_ROOT}/extractions/s21/kernel_uimage.bin" >&2
+    echo "    ${REPO_ROOT}/knowledge-base/extractions/s21/kernel_uimage.bin" >&2
     echo "  Refusing to package S21 without a verified S21 kernel." >&2
     exit 1
 fi

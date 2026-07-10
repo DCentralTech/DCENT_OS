@@ -1,0 +1,137 @@
+# DCENT_OS public CI — runs on every push and pull request.
+#
+# Gate policy (honest by design):
+#   - BLOCKING jobs are verified green on a clean checkout: the daemon
+#     type-check over the DEFAULT workspace members with the committed
+#     Cargo.lock, the dashboard build + unit tests + lint, and repo hygiene.
+#   - The daemon check uses `cargo check --locked` (NOT `--workspace`): the
+#     `pic-recovery` recovery tool embeds a non-redistributable stock FPGA
+#     bitstream that is not shipped, so it is excluded from `default-members`
+#     and built only on demand (`-p pic-recovery`) by an operator who supplies
+#     the bitstream. `--workspace` would force it and fail.
+#   - ADVISORY jobs (continue-on-error, clearly labeled): rustfmt (the daemon
+#     source is not yet maintained to `fmt --check` cleanliness), clippy, and
+#     the full test suite. Promoted to blocking once proven green on runners.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  daemon-check:
+    name: Rust daemon · type-check (blocking)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: DCENT_OS_Antminer/dcentrald
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: DCENT_OS_Antminer/dcentrald
+      # Default members (pic-recovery excluded — it needs an operator-supplied
+      # stock bitstream). This is exactly how a user builds the daemon.
+      - name: Type-check (default members, locked)
+        run: cargo check --locked
+
+  daemon-fmt:
+    name: Rust daemon · fmt (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: DCENT_OS_Antminer/dcentrald
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.90.0
+          components: rustfmt
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+  daemon-tests:
+    name: Rust daemon · full test suite (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: DCENT_OS_Antminer/dcentrald
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: DCENT_OS_Antminer/dcentrald
+      - name: Tests (default members, locked)
+        run: cargo test --locked
+
+  daemon-clippy:
+    name: Rust daemon · clippy (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: DCENT_OS_Antminer/dcentrald
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.90.0
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: DCENT_OS_Antminer/dcentrald
+      - name: Clippy
+        run: cargo clippy --locked -- -D warnings
+
+  dashboard:
+    name: Dashboard · build + tests + lint (blocking)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: DCENT_OS_Antminer/dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: DCENT_OS_Antminer/dashboard/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Build (includes i18n parity + bundle-size guards)
+        run: npm run build
+      - name: Unit tests
+        run: npm test
+      - name: Lint
+        run: npm run lint -- --quiet
+
+  hygiene:
+    name: Repo hygiene gates (blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: License file is present and verbatim GPL-3.0
+        run: |
+          test -f LICENSE
+          head -2 LICENSE | grep -q "GNU GENERAL PUBLIC LICENSE"
+          grep -q "Version 3, 29 June 2007" LICENSE
+      - name: No secrets or private keys committed
+        run: |
+          ! grep -rInE 'BEGIN [A-Z ]*PRIVATE KEY' --include='*' . || { echo "private key material found"; exit 1; }
+      - name: Cargo.lock is committed (reproducible builds)
+        run: test -f DCENT_OS_Antminer/dcentrald/Cargo.lock
+      - name: Security policy is present
+        run: test -f SECURITY.md

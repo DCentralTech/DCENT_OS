@@ -38,7 +38,7 @@ and understand their own hardware.
 
 ## What is DCENT_OS?
 
-**DCENT_OS** is D-Central's clean-room, open-source firmware family for two Bitcoin-mining hardware
+**DCENT_OS** is D-Central's original, open-source firmware family for two Bitcoin-mining hardware
 classes: selected industrial Bitmain Antminers and ESP32-S3 Bitaxe-class miners, with exact model
 readiness shown in the matrix below. On
 Antminer it replaces the stock firmware with a modern **Rust mining daemon (`dcentrald`)**, a
@@ -82,7 +82,7 @@ fixes each one:
 | **PSU whitelists** — refuses unrecognized or "non-smart" PSUs | **PSU bypass.** No Loki board or smart-PSU requirement on proven lanes; PSU paths stay per-platform/live-gated. |
 | **Closed firmware** — no source, no audit trail, no way to fix a bug | **Open source (GPL-3.0).** Read every line, build it yourself, fork it. |
 | **One firmware per chip** — locked to a single board generation | **Universal hash boards.** One firmware, five chip families, ChipID auto-detection. Mix generations on one control board. |
-| **Vendor lock-in** — the vendor goes dark, your upgrade path goes dark | **Yours forever.** Clean-room code, no license server, no phone-home, no remote backdoor. |
+| **Vendor lock-in** — the vendor goes dark, your upgrade path goes dark | **Yours forever.** Original open code, no license server, no phone-home, no remote backdoor. |
 
 DCENT_OS is **original code** — a clean rewrite, not a fork of BraiinsOS or VNish. It is informed
 by public reverse-engineering work (BraiinsOS, ESP-Miner, Mujina), but every line of `dcentrald`
@@ -251,11 +251,11 @@ host-tested, with live validation called out where it exists.
 
 | Family | Hardware | ASIC | Mining / driver evidence | Public install readiness |
 | --- | --- | --- | --- | --- |
-| Industrial Antminer | **Antminer S9** | BM1387 | Mining proven — sustained cold-boot mining on real hardware | Public-gated route: Toolbox route exists, public artifact + witnessed live-install capstone still required |
-| Industrial Antminer | **Antminer S19 Pro** | BM1398 | Bring-up — cold-boot, 3 chains, 146K nonces, 0 HW errors | Lab-gated route: dedicated signed package/runbook/live capstone pending |
-| Industrial Antminer | **Antminer S19j Pro** (Zynq) | BM1362 | Mining proven — accepted pool shares, standalone | Public-gated route: Xilinx public beta remains pending public artifact + witnessed clean-unit capstone |
-| Industrial Antminer | **Antminer S19j Pro** (BeagleBone) | BM1362 | Mining proven — accepted pool shares | Lab-gated route: SD/runtime path only, not a general NAND/sysupgrade production install |
-| Industrial Antminer | **Antminer S21** | BM1368 | Mining proven — first Amlogic hash, ~66 TH/s sustained | Lab-gated route: runtime evidence exists; stock AMLCtrl in-place install remains blocked |
+| Industrial Antminer | **Antminer S9** | BM1387 | **Mining achieved** — sustained standalone cold-boot mining with accepted pool shares | Public-gated route: Toolbox route exists, public artifact + witnessed live-install capstone still required |
+| Industrial Antminer | **Antminer S19 Pro** | BM1398 | Hashing achieved — cold boot, full chain enumeration, clean nonce flow; accepted shares untested on latest binaries | Lab-gated route: dedicated signed package/runbook/live capstone pending |
+| Industrial Antminer | **Antminer S19j Pro** (Zynq) | BM1362 | **Mining achieved** — standalone cold-boot mining with accepted pool shares | Public-gated route: Xilinx public beta remains pending public artifact + witnessed clean-unit capstone |
+| Industrial Antminer | **Antminer S19j Pro** (BeagleBone) | BM1362 | **Mining achieved** — accepted pool shares (runtime path); untested on latest binaries | Lab-gated route: SD/runtime path only, not a general NAND/sysupgrade production install |
+| Industrial Antminer | **Antminer S21** | BM1368 | **Mining achieved** — sustained hashing with accepted pool shares (runtime path); untested on latest binaries | Lab-gated route: runtime evidence exists; stock AMLCtrl in-place install remains blocked |
 | Industrial Antminer | **Antminer S17 / S17 Pro** | BM1397 | Bring-up — drivers in place, validation expanding | Evidence gap: no customer write route in this release |
 | Industrial Antminer | **Antminer T17** | BM1397 | In development — explicit model profile and X17 runtime identity exist; validation expanding | Evidence gap: no customer write route in this release |
 | Industrial Antminer | **Antminer S19** | BM1398 | Bring-up — shares the S19 Pro (Zynq) driver path | Evidence gap: does not inherit S19 Pro install readiness; no customer write route in this release |
@@ -272,8 +272,11 @@ host-tested, with live validation called out where it exists.
 | Future DCENT_OS | **AvalonMiner (Canaan)** | — | In development — see [`dcentos-avalon`](https://github.com/DCentralTech) | Not public-install-ready |
 | Future DCENT_OS | **WhatsMiner (M-series)** | — | In development — see [`dcentos-whatsminer`](https://github.com/DCentralTech) | Not public-install-ready |
 
-> **Mining-proven** means DCENT_OS has produced accepted pool shares on that hardware on the
-> bench; cold-boot or nonce evidence alone does not promote a platform to mining-proven. The ESP32 tier is not being
+> **Mining achieved** means DCENT_OS has produced accepted pool shares on that hardware on our
+> bench; cold-boot or nonce evidence alone does not earn that label. Rows marked *untested on latest
+> binaries* achieved mining on an earlier build and haven't been re-run on current release binaries —
+> we don't re-claim a live proof we haven't re-run. Published live-capture evidence has operator
+> IP/MAC addresses rewritten to RFC 5737 documentation values as a privacy measure. The ESP32 tier is not being
 > presented as having passed the industrial two-Xilinx public-beta gate. LoRa mesh is planned/default-OFF
 > and is not included in this release route. Always keep a known-good
 > recovery path before flashing experimental firmware, and read [`docs/PLATFORMS.md`](docs/PLATFORMS.md)
@@ -383,7 +386,7 @@ Your miner is critical infrastructure sitting in your home. A memory-safety bug 
 brick hardware or worse. Rust eliminates that entire class of bug by construction.
 
 **Which miners actually work today?**
-The ones marked ✅ *Mining proven* above have produced accepted pool shares on real hardware. ESP32
+The ones marked **Mining achieved** above have produced accepted pool shares on real hardware. ESP32
 Bitaxe-class support is driver-proven/host-tested, with Gamma live-verified and legacy BM1370 lab evidence kept
 as BM1370 lab context; other ESP rows are honest bring-up status. See
 [`docs/PLATFORMS.md`](docs/PLATFORMS.md).

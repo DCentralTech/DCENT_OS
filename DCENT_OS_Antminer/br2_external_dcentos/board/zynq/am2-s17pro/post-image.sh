@@ -114,16 +114,16 @@ KERNEL=""
 if [ -n "${DCENT_AM2_S17_KERNEL:-}" ] && [ -f "${DCENT_AM2_S17_KERNEL}" ]; then
     KERNEL="${DCENT_AM2_S17_KERNEL}"
     KERNEL_SRC="env override"
-elif [ -f "${REPO_ROOT}/extractions/s17/kernel.bin" ]; then
-    KERNEL="${REPO_ROOT}/extractions/s17/kernel.bin"
-    KERNEL_SRC="extractions/s17"
+elif [ -f "${REPO_ROOT}/knowledge-base/extractions/s17/kernel.bin" ]; then
+    KERNEL="${REPO_ROOT}/knowledge-base/extractions/s17/kernel.bin"
+    KERNEL_SRC="knowledge-base/extractions/s17"
 fi
 
 if [ -z "$KERNEL" ]; then
     echo "WARNING: no kernel.bin found for am2-s17p sysupgrade packaging." >&2
     echo "  Expected one of:" >&2
     echo "    \$DCENT_AM2_S17_KERNEL" >&2
-    echo "    ${REPO_ROOT}/extractions/s17/kernel.bin" >&2
+    echo "    ${REPO_ROOT}/knowledge-base/extractions/s17/kernel.bin" >&2
     echo "" >&2
     echo "  RUNTIME-ONLY: there is no live S17 / S17 Pro on the fleet and no" >&2
     echo "  extracted S17 kernel in the knowledge base. Skipping sysupgrade" >&2

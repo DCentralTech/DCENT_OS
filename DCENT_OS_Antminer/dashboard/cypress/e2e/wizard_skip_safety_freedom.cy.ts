@@ -4,7 +4,7 @@
 //
 // The EXACT parallel of wizard_skip_password_freedom.cy.ts. Covers the
 // operator requirement (memory rule
-// ): the FULL wizard must
+// feedback_wizard_never_blocks_dashboard_full_skip): the FULL wizard must
 // be skippable straight to the Standard dashboard + logs — not just the
 // password but ALSO the circuit/breaker/safety-ack step — with a
 // persistent dismissible warning and a Settings page that can complete

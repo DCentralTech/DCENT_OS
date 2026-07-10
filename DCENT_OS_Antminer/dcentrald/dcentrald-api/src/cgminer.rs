@@ -772,7 +772,7 @@ struct CgStatsChain {
 /// monitored fan header, RPM reported honestly — including 0 for a dead/unspun
 /// fan), falling back to the legacy single primary-tach RPM when the per-fan
 /// vector is empty. Reporting-only: no fan/thermal control effect.
-fn (fans: &crate::FanState) -> Vec<u32> {
+fn project_fan_rpms(fans: &crate::FanState) -> Vec<u32> {
     if !fans.per_fan.is_empty() {
         fans.per_fan.iter().map(|reading| reading.rpm).collect()
     } else if fans.rpm > 0 {
@@ -963,7 +963,7 @@ async fn handle_stats(state: &AppState) -> serde_json::Value {
     // telemetry from this single object via the `chain_*{N}` / `temp*{N}`
     // key family), then the legacy per-chain rows.
     // P1-5 (D-14): project live per-fan RPM into the bmminer `fan_num`/`fan{N}`.
-    let fan_rpms = (&miner.fans);
+    let fan_rpms = project_fan_rpms(&miner.fans);
     let mut stats = vec![build_bmminer_stats_object(
         &projected,
         miner.uptime_s,
@@ -2449,7 +2449,7 @@ mod tests {
     // ── P1-5 (D-14/D-15): fan_num + Best Share projected from real data ──
 
     #[test]
-    fn fan_rpms_() {
+    fn fan_rpms_project_from_per_fan_then_legacy_then_empty() {
         use crate::{FanState, PerFanReading};
         // Per-fan telemetry present → one entry per monitored fan, in order.
         let two = FanState {
@@ -2468,21 +2468,21 @@ mod tests {
                 },
             ],
         };
-        assert_eq!((&two), vec![2940, 3720]);
+        assert_eq!(project_fan_rpms(&two), vec![2940, 3720]);
         // No per-fan breakdown but a legacy primary tach → a single fan.
         let legacy = FanState {
             pwm: 20,
             rpm: 3660,
             per_fan: vec![],
         };
-        assert_eq!((&legacy), vec![3660]);
+        assert_eq!(project_fan_rpms(&legacy), vec![3660]);
         // No fan data at all → empty (honest "no fans known"), never a phantom.
         let none = FanState {
             pwm: 0,
             rpm: 0,
             per_fan: vec![],
         };
-        assert!((&none).is_empty());
+        assert!(project_fan_rpms(&none).is_empty());
     }
 
     // Required pin: fan_num and Best Share are NON-ZERO when the underlying

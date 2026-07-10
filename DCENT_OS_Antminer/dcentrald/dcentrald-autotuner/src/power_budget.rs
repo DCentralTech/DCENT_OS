@@ -50,7 +50,7 @@ pub struct PowerCalibration {
     #[serde(default = "default_power_calibration_multiplier")]
     pub multiplier: f64,
     #[serde(default)]
-    pub : Option<f64>,
+    pub reference_wall_watts: Option<f64>,
     #[serde(default)]
     pub estimated_wall_watts: Option<f64>,
     #[serde(default)]
@@ -76,7 +76,7 @@ impl Default for PowerCalibration {
         Self {
             enabled: false,
             multiplier: 1.0,
-            : None,
+            reference_wall_watts: None,
             estimated_wall_watts: None,
             estimated_board_watts: None,
             updated_at_ms: None,
@@ -108,7 +108,7 @@ impl PowerCalibration {
         if !self.enabled || !self.operator_confirmed {
             return None;
         }
-        let watts = self.?;
+        let watts = self.reference_wall_watts?;
         let ths = self.confirmed_hashrate_ths?;
         if !(watts.is_finite() && ths.is_finite()) || ths <= 0.0 || watts <= 0.0 {
             return None;

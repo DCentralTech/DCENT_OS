@@ -1,0 +1,285 @@
+name: dcentos-esp-release
+
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - feature: bitaxe-max
+            board_target: bitaxe-max
+            publish: true
+          - feature: bitaxe-ultra
+            board_target: bitaxe-ultra
+            publish: true
+          - feature: bitaxe-supra
+            board_target: bitaxe-supra
+            publish: true
+          - feature: bitaxe-gamma
+            board_target: bitaxe-gamma
+            publish: true
+          - feature: bitaxe-hex-ultra
+            board_target: bitaxe-hex-ultra
+            publish: true
+          - feature: bitaxe-hex-supra
+            board_target: bitaxe-hex-supra
+            publish: true
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: DCENT_OS_ESP
+
+    env:
+      CARGO_TARGET_DIR: /tmp/bt
+      CC_xtensa_esp32s3_espidf: xtensa-esp32s3-elf-gcc
+      CFLAGS_xtensa_esp32s3_espidf: -mlongcalls
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install esptool
+        run: pip install esptool
+
+      - name: Install xtensa toolchain
+        uses: esp-rs/xtensa-toolchain@v1
+        with:
+          default: true
+          ldproxy: true
+          espidf: v5.4
+
+      - name: Prepare OTA signing key
+        if: matrix.publish
+        run: |
+          if [ -n "${{ secrets.DCENT_OTA_PRIVATE_KEY_PEM_B64 }}" ]; then
+            echo "${{ secrets.DCENT_OTA_PRIVATE_KEY_PEM_B64 }}" | base64 -d > /tmp/dcent-ota-signing.pem
+            chmod 600 /tmp/dcent-ota-signing.pem
+          elif [ -n "${{ secrets.DCENT_OTA_PRIVATE_KEY_PEM }}" ]; then
+            printf '%s\n' "${{ secrets.DCENT_OTA_PRIVATE_KEY_PEM }}" > /tmp/dcent-ota-signing.pem
+            chmod 600 /tmp/dcent-ota-signing.pem
+          else
+            echo "Missing OTA signing private key secret" >&2
+            exit 1
+          fi
+          {
+            echo "DCENT_OTA_PRIVATE_KEY_PEM=/tmp/dcent-ota-signing.pem"
+            echo "DCENT_OTA_PUBLIC_KEY_HEX=${{ secrets.DCENT_OTA_PUBLIC_KEY_HEX }}"
+            echo "DCENT_OTA_KEY_ID=${{ secrets.DCENT_OTA_KEY_ID }}"
+            echo "DCENT_ENFORCE_SIGNED_OTA=1"
+          } >> "$GITHUB_ENV"
+          test -n "${{ secrets.DCENT_OTA_PUBLIC_KEY_HEX }}"
+          test -n "${{ secrets.DCENT_OTA_KEY_ID }}"
+
+      - name: Verify OTA signing key pair
+        if: matrix.publish
+        run: |
+          test -f "$DCENT_OTA_PRIVATE_KEY_PEM"
+          test -n "$DCENT_OTA_PUBLIC_KEY_HEX"
+          DERIVED=$(openssl pkey -in "$DCENT_OTA_PRIVATE_KEY_PEM" -pubout -outform DER | tail -c 32 | xxd -p -c 256 | tr -d '\n')
+          EXPECTED=$(printf '%s' "$DCENT_OTA_PUBLIC_KEY_HEX" | tr '[:upper:]' '[:lower:]')
+          test "$DERIVED" = "$EXPECTED"
+
+      - name: Reject non-monotonic release version
+        if: matrix.publish
+        run: |
+          VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | sed -n '1p')
+          test -n "$VERSION"
+          git -C ../.. fetch --tags --force
+          python - "$VERSION" <<'PY'
+          import re
+          import subprocess
+          import sys
+
+          current = sys.argv[1]
+          tag_prefix = "dcentos-esp-v"
+          tags = subprocess.check_output(
+              ["git", "-C", "../..", "tag", "--list", f"{tag_prefix}*"],
+              text=True,
+          ).splitlines()
+
+          def parse(version):
+              match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:[-+].*)?", version)
+              if not match:
+                  raise SystemExit(f"Release version {version!r} is not semver-like")
+              return tuple(int(part) for part in match.groups())
+
+          current_key = parse(current)
+          exact_tag = f"{tag_prefix}{current}"
+          if exact_tag in tags:
+              raise SystemExit(f"{exact_tag} already exists; signed OTA versions must be strictly newer")
+
+          parsed = []
+          for tag in tags:
+              raw = tag.removeprefix(tag_prefix)
+              try:
+                  parsed.append((parse(raw), tag))
+              except SystemExit:
+                  continue
+          if parsed:
+              latest_key, latest_tag = max(parsed)
+              if current_key <= latest_key:
+                  raise SystemExit(
+                      f"Cargo version {current} is not newer than latest release tag {latest_tag}; "
+                      "devices reject signed OTA versions that do not advance the rollback floor"
+                  )
+          PY
+
+      - name: Build firmware
+        run: cargo build --locked --release -p dcentaxe --no-default-features --features "${{ matrix.feature }}"
+
+      - name: Install stable Rust for host OTA policy gate
+        if: matrix.publish
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Verify firmware OTA signature capability
+        if: matrix.publish
+        env:
+          DCENT_EXPECT_OTA_SIGNATURE_REQUIRED: "1"
+          DCENT_OTA_PUBLIC_KEY_HEX: ${{ secrets.DCENT_OTA_PUBLIC_KEY_HEX }}
+          DCENT_OTA_KEY_ID: ${{ secrets.DCENT_OTA_KEY_ID }}
+        run: |
+          cargo +stable test --locked -p dcentaxe-core --lib --target x86_64-unknown-linux-gnu release_gate_can_require_signature_capable_build
+          python - <<'PY'
+          import os
+          import pathlib
+          import sys
+
+          elf = pathlib.Path(os.environ["CARGO_TARGET_DIR"]) / "xtensa-esp32s3-espidf/release/dcentaxe"
+          if not elf.is_file():
+              raise SystemExit(f"firmware ELF not found: {elf}")
+
+          key_hex = os.environ.get("DCENT_OTA_PUBLIC_KEY_HEX", "").strip()
+          key_id = os.environ.get("DCENT_OTA_KEY_ID", "").strip()
+          if len(key_hex) != 64:
+              raise SystemExit("DCENT_OTA_PUBLIC_KEY_HEX must be a 32-byte hex key")
+          if not key_id:
+              raise SystemExit("DCENT_OTA_KEY_ID is required")
+
+          data = elf.read_bytes()
+          key_needles = {
+              key_hex.encode("ascii"),
+              key_hex.lower().encode("ascii"),
+              key_hex.upper().encode("ascii"),
+          }
+          if not any(needle in data for needle in key_needles):
+              raise SystemExit("compiled firmware ELF does not contain the OTA public key marker")
+          if key_id.encode("ascii") not in data:
+              raise SystemExit("compiled firmware ELF does not contain the OTA key-id marker")
+          print("OTA signature capability marker present in firmware ELF")
+          PY
+
+      - name: Canonical DCENT_OS release stem
+        id: release-stem
+        run: |
+          RELEASE_DATE=$(date -u +%Y%m%d)
+          RELEASE_STEM=$(sh ../dcentos/scripts/firmware_release_name.sh "${{ matrix.board_target }}" beta "$RELEASE_DATE")
+          echo "DCENT_RELEASE_STEM=$RELEASE_STEM" >> "$GITHUB_ENV"
+          echo "stem=$RELEASE_STEM" >> "$GITHUB_OUTPUT"
+          echo "release_stem=$RELEASE_STEM"
+
+      - name: Package firmware
+        run: |
+          chmod +x scripts/package-firmware.sh
+          VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | sed -n '1p')
+          ./scripts/package-firmware.sh "$CARGO_TARGET_DIR/xtensa-esp32s3-espidf/release" "${{ matrix.board_target }}" "$VERSION"
+
+      - name: Validate packaged artifacts
+        if: matrix.publish
+        env:
+          BOARD_TARGET: ${{ matrix.board_target }}
+          REQUIRE_SIGNATURE: "1"
+          DCENT_OTA_PUBLIC_KEY_HEX: ${{ secrets.DCENT_OTA_PUBLIC_KEY_HEX }}
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, pathlib, subprocess, sys
+          expected_models = {
+              'bitaxe-max': 'max',
+              'bitaxe-ultra': 'ultra',
+              'bitaxe-supra': 'supra',
+              'bitaxe-gamma': 'gamma',
+              'bitaxe-hex-ultra': 'hexultra',
+              'bitaxe-hex-supra': 'suprahex',
+          }
+          board = os.environ['BOARD_TARGET']
+          dist = pathlib.Path('dist') / board
+          manifest_path = next(dist.glob('*-manifest.json'))
+          subprocess.run(
+              [
+                  sys.executable,
+                  'scripts/verify_ota_package.py',
+                  '--require-signatures',
+                  # Hard-fail an unsigned public-target artifact on the publish
+                  # path (this whole step is `if: matrix.publish`). The PR/unsigned
+                  # path in bitaxe-build-matrix.yml does NOT pass this flag and
+                  # stays warn-only/exit-0.
+                  '--strict-public',
+                  '--public-key-hex',
+                  os.environ['DCENT_OTA_PUBLIC_KEY_HEX'],
+                  str(manifest_path),
+              ],
+              check=True,
+          )
+          manifest = json.loads(manifest_path.read_text(encoding='ascii'))
+          assert manifest.get('product') == 'DCENT_axe', 'product mismatch'
+          assert manifest.get('family') == 'bitaxe', 'family mismatch'
+          assert manifest.get('packageType') == 'esp32-factory-and-ota-bundle', 'packageType mismatch'
+          assert manifest.get('boardTarget') == board, 'boardTarget mismatch'
+          assert manifest.get('deviceModel') == expected_models.get(board, board), 'deviceModel mismatch'
+          payloads = {entry['name']: entry for entry in manifest['payloads']}
+          assert payloads['update']['path'].endswith('-update.bin'), 'update payload path mismatch'
+          assert payloads['factory']['path'].endswith('-factory.bin'), 'factory payload path mismatch'
+          for name in ('factory', 'update'):
+              payload = payloads[name]
+              path = dist / payload['path']
+              data = path.read_bytes()
+              assert payload['size'] == len(data), f'{name} size mismatch'
+              assert payload['sha256'] == hashlib.sha256(data).hexdigest(), f'{name} sha mismatch'
+          assert payloads['update']['size'] <= manifest['ota']['slotSize'], 'update image too large'
+          assert manifest.get('otaSignatureAlgorithm') == 'ed25519'
+          assert manifest.get('otaKeyId')
+          assert manifest.get('otaSignature')
+          checksums_path = next(dist.glob('*SHA256SUMS.txt'))
+          checksums = checksums_path.read_text(encoding='ascii')
+          assert manifest_path.name in checksums, 'manifest checksum missing'
+          PY
+
+      # Defense-in-depth: run the offline release-gate script (test_ota_e2e.sh)
+      # against the just-packaged board. Default OFFLINE mode re-validates the
+      # manifest + payloads and prints the live OTA upload headers — it makes NO
+      # network/serial contact (live legs gated behind DCENT_OTA_E2E_LIVE /
+      # DCENT_OTA_E2E_FLASH, intentionally unset here).
+      - name: Offline OTA e2e gate (manifest + payloads + headers)
+        if: matrix.publish
+        env:
+          BOARD: ${{ matrix.board_target }}
+          # test_ota_e2e.sh invokes verify_ota_package.py WITHOUT
+          # --require-signatures, so an unsigned public-target package would only
+          # WARN here. On the release publish path (this step is `if:
+          # matrix.publish`) escalate that warning to a HARD failure. The
+          # PR/unsigned path (bitaxe-build-matrix.yml) does NOT set this env and
+          # stays warn-only/exit-0.
+          DCENT_OTA_STRICT_PUBLIC: "1"
+        run: |
+          chmod +x scripts/test_ota_e2e.sh
+          bash scripts/test_ota_e2e.sh
+
+      - name: Upload packaged artifacts
+        if: matrix.publish
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.release-stem.outputs.stem }}
+          path: |
+            DCENT_OS_ESP/dist/${{ matrix.board_target }}/*.bin
+            DCENT_OS_ESP/dist/${{ matrix.board_target }}/*.json
+            DCENT_OS_ESP/dist/${{ matrix.board_target }}/*SHA256SUMS.txt

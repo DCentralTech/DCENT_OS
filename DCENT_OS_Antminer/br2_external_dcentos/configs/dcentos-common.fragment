@@ -87,7 +87,7 @@ BR2_PACKAGE_UTIL_LINUX=y
 # which is the brick-back vector documented in
 # . Mandatory on am2 (S19j Pro /
 # .139), shipped on S9 too for parity, mandatory on am3-aml because the
-# /dev/nand_env layout is standard U-Boot env (
+# /dev/nand_env layout is standard U-Boot env (see reference_am3_aml_uboot
 # _env_format.md), and mandatory on am3-bb so the AM335x SD/NAND recovery
 # paths can promote firstboot=1 -> 0 cleanly.
 # =============================================================================

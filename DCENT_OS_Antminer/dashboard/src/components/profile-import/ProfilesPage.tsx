@@ -32,7 +32,7 @@ export function ProfilesPage() {
       const list = await siliconProfilesApi.list();
       setProfiles(list);
     } catch (e) {
-      // — surface
+      // Per feedback_dashboard_must_degrade_gracefully — surface
       // the error inline, don't blank the page.
       setProfiles([]);
       setErrorMsg(e instanceof Error ? e.message : 'Failed to load profiles');

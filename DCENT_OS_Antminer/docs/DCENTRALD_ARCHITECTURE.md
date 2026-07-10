@@ -2662,7 +2662,7 @@ The **PivotalPleb Loki board** ($29-$46 hardware) solves this by sitting on the 
 
 ### DCENT_OS Solution: Built-in PSU Bypass (Zero Cost)
 
-Since DCENT_OS is a clean-room firmware, **we never implemented a PSU whitelist in the first place**. PSU bypass is the default behavior — not a workaround, but a design decision.
+Since DCENT_OS is an original (non-forked) firmware, **we never implemented a PSU whitelist in the first place**. PSU bypass is the default behavior — not a workaround, but a design decision.
 
 ```
 [power]

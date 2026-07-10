@@ -49,7 +49,7 @@ impl EfficiencyOptimizer {
         min_voltage_mv: u16,
         min_freq_mhz: u16,
         chip_id: u16,
-        : u16,
+        reference_voltage_mv: u16,
         preferred_voltage_mv: Option<u16>,
     ) -> (u16, Vec<u16>) {
         if chip_profiles.is_empty() {
@@ -71,7 +71,7 @@ impl EfficiencyOptimizer {
 
         // At lower voltage, chips may not reach their characterized max_stable_mhz.
         // Apply a conservative derating based on the voltage ratio.
-        let voltage_ratio = optimal_voltage_mv as f64 /  as f64;
+        let voltage_ratio = optimal_voltage_mv as f64 / reference_voltage_mv as f64;
 
         // Derating factor: approximate that max frequency scales with sqrt(V)
         // This is conservative — real silicon may derate more or less.
@@ -439,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn test_s9_() {
+    fn test_s9_reference_efficiency() {
         let model = PowerModel::new_bm1387();
         let profiles = make_test_profiles(189, 650);
 

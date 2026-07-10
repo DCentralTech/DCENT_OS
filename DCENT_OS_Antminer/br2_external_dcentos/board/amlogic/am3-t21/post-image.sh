@@ -172,12 +172,12 @@ elif [ -f "${PROJECT_ROOT}/extractions/t21/kernel_uimage.bin" ]; then
 elif [ -f "${PROJECT_ROOT}/extractions/s21/kernel_uimage.bin" ]; then
     KERNEL="${PROJECT_ROOT}/extractions/s21/kernel_uimage.bin"
     KERNEL_SRC="docker-staged extractions/s21 (verified AXG fallback)"
-elif [ -f "${REPO_ROOT}/extractions/t21/kernel_uimage.bin" ]; then
-    KERNEL="${REPO_ROOT}/extractions/t21/kernel_uimage.bin"
-    KERNEL_SRC="extractions/t21"
-elif [ -f "${REPO_ROOT}/extractions/s21/kernel_uimage.bin" ]; then
-    KERNEL="${REPO_ROOT}/extractions/s21/kernel_uimage.bin"
-    KERNEL_SRC="extractions/s21 (verified AXG fallback)"
+elif [ -f "${REPO_ROOT}/knowledge-base/extractions/t21/kernel_uimage.bin" ]; then
+    KERNEL="${REPO_ROOT}/knowledge-base/extractions/t21/kernel_uimage.bin"
+    KERNEL_SRC="knowledge-base/extractions/t21"
+elif [ -f "${REPO_ROOT}/knowledge-base/extractions/s21/kernel_uimage.bin" ]; then
+    KERNEL="${REPO_ROOT}/knowledge-base/extractions/s21/kernel_uimage.bin"
+    KERNEL_SRC="knowledge-base/extractions/s21 (verified AXG fallback)"
 fi
 
 if [ -z "$KERNEL" ]; then
@@ -186,8 +186,8 @@ if [ -z "$KERNEL" ]; then
     echo "    \$DCENT_AM3_AML_KERNEL" >&2
     echo "    ${PROJECT_ROOT}/extractions/t21/kernel_uimage.bin" >&2
     echo "    ${PROJECT_ROOT}/extractions/s21/kernel_uimage.bin" >&2
-    echo "    ${REPO_ROOT}/extractions/t21/kernel_uimage.bin" >&2
-    echo "    ${REPO_ROOT}/extractions/s21/kernel_uimage.bin" >&2
+    echo "    ${REPO_ROOT}/knowledge-base/extractions/t21/kernel_uimage.bin" >&2
+    echo "    ${REPO_ROOT}/knowledge-base/extractions/s21/kernel_uimage.bin" >&2
     echo "  Refusing to package am3-t21 without a verified am3-family kernel." >&2
     exit 1
 fi

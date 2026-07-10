@@ -2334,7 +2334,7 @@ mod tests {
         assert_eq!(
             BIP320_DEFAULT_VERSION_MASK, 0x1FFF_E000,
             "BIP320 canonical version-rolling mask regressed — must be 0x1FFFE000 \
-             (see DCENT_OS )"
+             (see DCENT_OS feedback_am2_serial_dispatch_bip320_version_rolling_required)"
         );
 
         // (b) The mask must occupy exactly bit positions 13..=28 (16 bits),

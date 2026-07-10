@@ -118,20 +118,20 @@ KERNEL=""
 if [ -n "${DCENT_AM2_S19J_KERNEL:-}" ] && [ -f "${DCENT_AM2_S19J_KERNEL}" ]; then
     KERNEL="${DCENT_AM2_S19J_KERNEL}"
     KERNEL_SRC="env override"
-elif [ -f "${REPO_ROOT}/extractions/s19j/kernel.bin" ]; then
-    KERNEL="${REPO_ROOT}/extractions/s19j/kernel.bin"
-    KERNEL_SRC="extractions/s19j"
-elif [ -f "${REPO_ROOT}/extractions/s19j/kernel.bin" ]; then
-    KERNEL="${REPO_ROOT}/extractions/s19j/kernel.bin"
-    KERNEL_SRC="extractions/s19j"
+elif [ -f "${REPO_ROOT}/knowledge-base/extractions/s19j/kernel.bin" ]; then
+    KERNEL="${REPO_ROOT}/knowledge-base/extractions/s19j/kernel.bin"
+    KERNEL_SRC="knowledge-base/extractions/s19j"
+elif [ -f "${REPO_ROOT}/knowledge-base/research/s19j/live-probe-139/kernel.bin" ]; then
+    KERNEL="${REPO_ROOT}/knowledge-base/research/s19j/live-probe-139/kernel.bin"
+    KERNEL_SRC="knowledge-base/research/s19j/live-probe-139"
 fi
 
 if [ -z "$KERNEL" ]; then
     echo "ERROR: no kernel.bin found for am2-s19j sysupgrade packaging." >&2
     echo "  Expected one of:" >&2
     echo "    \$DCENT_AM2_S19J_KERNEL" >&2
-    echo "    ${REPO_ROOT}/extractions/s19j/kernel.bin" >&2
-    echo "    ${REPO_ROOT}/extractions/s19j/kernel.bin" >&2
+    echo "    ${REPO_ROOT}/knowledge-base/extractions/s19j/kernel.bin" >&2
+    echo "    ${REPO_ROOT}/knowledge-base/research/s19j/live-probe-139/kernel.bin" >&2
     echo "  Refusing to package am2-s19j with an S9 kernel placeholder." >&2
     exit 1
 fi
@@ -151,8 +151,8 @@ echo "  SHA256: ${KERNEL_SHA256}"
 BITSTREAM=""
 if [ -n "${DCENT_AM2_S19J_BITSTREAM:-}" ] && [ -f "${DCENT_AM2_S19J_BITSTREAM}" ]; then
     BITSTREAM="${DCENT_AM2_S19J_BITSTREAM}"
-elif [ -f "${REPO_ROOT}/extractions/s19j/fpga_bitstream.bit" ]; then
-    BITSTREAM="${REPO_ROOT}/extractions/s19j/fpga_bitstream.bit"
+elif [ -f "${REPO_ROOT}/knowledge-base/extractions/s19j/fpga_bitstream.bit" ]; then
+    BITSTREAM="${REPO_ROOT}/knowledge-base/extractions/s19j/fpga_bitstream.bit"
 fi
 
 # -----------------------------------------------------------------------------

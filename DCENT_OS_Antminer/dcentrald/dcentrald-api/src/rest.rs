@@ -1494,7 +1494,7 @@ struct PowerCalibrationPowerContract {
     calibration_multiplier: Option<f64>,
 }
 
-pub(crate) fn (
+pub(crate) fn project_power_telemetry(
     live: &dcentrald_autotuner::LivePowerEstimate,
     miner: &crate::MinerState,
     hardware: &crate::HardwareInfo,
@@ -1567,7 +1567,7 @@ pub(crate) fn (
     }
 }
 
-fn (
+fn project_power_costs(
     projection: &PowerTelemetryProjection,
     electricity_rate_usd_per_kwh: f64,
     heating_offset_fraction: f64,
@@ -1606,7 +1606,7 @@ fn (
     }
 }
 
-fn (
+fn project_power_calibration_contract(
     projection: &PowerTelemetryProjection,
     projected_multiplier: Option<f64>,
 ) -> PowerCalibrationPowerContract {
@@ -1741,7 +1741,7 @@ fn primary_frequency_source(chain: Option<&crate::ChainState>) -> &'static str {
 /// Build the per-chain hashrate/voltage provenance projection (see
 /// [`ChainTelemetryProjection`]). Pure over its inputs so it is host-testable
 /// without an `AppState`/HAL.
-fn (
+fn project_chain_telemetry(
     chains: &[crate::ChainState],
     topline_ghs: f64,
     default_voltage_mv: u16,
@@ -1751,7 +1751,7 @@ fn (
     // (empty measured map) so it stays host-testable without touching the AT-3
     // process-global slot; production callers use
     // [].
-    (
+    project_chain_telemetry_with_measured(
         chains,
         topline_ghs,
         default_voltage_mv,
@@ -1769,13 +1769,13 @@ fn (
 /// default) or no fresh reading exists, the snapshot is empty and the result is
 /// byte-identical to the commanded-only []. A fresh,
 /// plausible reading flips that chain's `voltage_source` to `measured`.
-fn (
+fn project_chain_telemetry_live(
     chains: &[crate::ChainState],
     topline_ghs: f64,
     default_voltage_mv: u16,
 ) -> Vec<ChainTelemetryProjection> {
     let measured = dcentrald_common::at3_rail::snapshot_fresh_default();
-    (chains, topline_ghs, default_voltage_mv, &measured)
+    project_chain_telemetry_with_measured(chains, topline_ghs, default_voltage_mv, &measured)
 }
 
 /// AT-1 (chip-rail voltage read-back): the per-chain projection, with an optional
@@ -1795,7 +1795,7 @@ fn (
 /// `measured_voltage_mv` yet, because a safe quiet-window 0x3A read cadence is
 /// AT-3..13 work (the hot-path 0x3A read can corrupt the dsPIC parser). Today
 /// every caller passes an empty map via [].
-fn (
+fn project_chain_telemetry_with_measured(
     chains: &[crate::ChainState],
     topline_ghs: f64,
     default_voltage_mv: u16,
@@ -2459,7 +2459,7 @@ fn fleet_discovery_reported_power_watts(
     miner: &crate::MinerState,
     hw: &crate::HardwareInfo,
 ) -> Option<f64> {
-    let projection = (power, miner, hw);
+    let projection = project_power_telemetry(power, miner, hw);
     let measured_wall_watts = measured_wall_watts_for_unprovenanced_surface(&projection);
     if measured_wall_watts > 0.0 {
         Some(measured_wall_watts)
@@ -2787,7 +2787,7 @@ fn mcp_status_payload(
     power: &dcentrald_autotuner::LivePowerEstimate,
     hardware: &crate::HardwareInfo,
 ) -> serde_json::Value {
-    let power_projection = (power, miner, hardware);
+    let power_projection = project_power_telemetry(power, miner, hardware);
     serde_json::json!({
         "status": "ok",
         "source": "dcentrald-api",
@@ -2910,7 +2910,7 @@ fn mcp_tool_payload(state: &AppState, name: &str) -> Result<serde_json::Value, &
                 .to_string();
             let ipv4 = eth0_ipv4();
             let power = state.power_rx.borrow().clone();
-            let power_projection = (&power, &miner, &hw);
+            let power_projection = project_power_telemetry(&power, &miner, &hw);
             let measured_wall_watts =
                 measured_wall_watts_for_unprovenanced_surface(&power_projection);
             Ok(serde_json::to_value(swarm_status_payload(
@@ -8329,7 +8329,7 @@ async fn get_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .lock()
         .map(|guard| guard.clone())
         .unwrap_or_default();
-    let power_projection = (&power, &miner, &hardware);
+    let power_projection = project_power_telemetry(&power, &miner, &hardware);
     let targeting = build_power_targeting_state(mode, &power_projection);
 
     // P0-2 (C-2 / D-1 / D-2): project per-chain hashrate + voltage with explicit
@@ -8346,7 +8346,7 @@ async fn get_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // opts the am2 hybrid path into the quiet-window 0x3A read; then a fresh,
     // plausible reading tags that chain's voltage_source `measured`).
     let chain_telemetry =
-        (&miner.chains, miner.hashrate_ghs, default_voltage_mv);
+        project_chain_telemetry_live(&miner.chains, miner.hashrate_ghs, default_voltage_mv);
 
     let chains: Vec<serde_json::Value> = miner
         .chains
@@ -8622,7 +8622,7 @@ async fn get_thermal_posture(State(state): State<Arc<AppState>>) -> impl IntoRes
     };
     let max_temp_c = max_temp.map(|(_, temp)| temp as f64);
     let hottest_chain_id = max_temp.map(|(chain_id, _)| chain_id);
-    let fan_ = !miner.fans.per_fan.is_empty() || miner.fans.rpm > 0;
+    let fan_feedback_available = !miner.fans.per_fan.is_empty() || miner.fans.rpm > 0;
     let fan_tach_suspect = miner.fans.pwm > 0
         && miner.fans.rpm == 0
         && miner.chains.iter().any(|chain| chain.chips > 0);
@@ -8648,7 +8648,7 @@ async fn get_thermal_posture(State(state): State<Arc<AppState>>) -> impl IntoRes
     } else {
         None
     };
-    let power_projection = (&power, &miner, &hardware);
+    let power_projection = project_power_telemetry(&power, &miner, &hardware);
     let watt_cap = power.watt_cap.clone();
     let power_cap_active = watt_cap.as_ref().map(|cap| cap.throttling).unwrap_or(false);
     let per_fan = miner.fans.per_fan.clone();
@@ -8700,16 +8700,16 @@ async fn get_thermal_posture(State(state): State<Arc<AppState>>) -> impl IntoRes
             },
         },
         "fans": {
-            "available": fan_ || miner.fans.pwm > 0,
+            "available": fan_feedback_available || miner.fans.pwm > 0,
             "pwm": miner.fans.pwm,
             "rpm": if miner.fans.rpm > 0 { serde_json::json!(miner.fans.rpm) } else { serde_json::Value::Null },
             "per_fan": per_fan,
-            "rpm_": fan_,
+            "rpm_feedback_available": fan_feedback_available,
             "tach_suspect": fan_tach_suspect,
             "min_pwm": thresholds.fan_min_pwm,
             "max_pwm": thresholds.fan_max_pwm,
             "range_source": threshold_source,
-            "reason": if fan_ {
+            "reason": if fan_feedback_available {
                 "Fan feedback is present in miner state."
             } else {
                 "No fan RPM feedback is currently available; PWM is still reported from miner state."
@@ -8724,7 +8724,7 @@ async fn get_thermal_posture(State(state): State<Arc<AppState>>) -> impl IntoRes
             "reason": "Observed curtailment state only; no sleep or wake action was invoked.",
         },
         "hardware_support": {
-            "fan_rpm_feedback": fan_,
+            "fan_rpm_feedback": fan_feedback_available,
             "power_source": power_projection.source.as_str(),
             "power_calibrated": power_projection.calibrated,
             "pmbus_measured": power_projection.source_detail == "pmbus_measured",
@@ -8947,7 +8947,7 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .lock()
         .map(|guard| guard.clone())
         .unwrap_or_default();
-    let power_projection = (&power, &miner, &hardware);
+    let power_projection = project_power_telemetry(&power, &miner, &hardware);
     let targeting = build_power_targeting_state(mode, &power_projection);
 
     // Daily profitability estimate — read economics from config. P2-4 (§4.E):
@@ -8973,7 +8973,7 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // published wall power only. Static fallback watts are useful for display
     // estimates but must not become bare current-cost claims.
     let power_cost =
-        (&power_projection, stats_elec_rate, heating_offset_fraction);
+        project_power_costs(&power_projection, stats_elec_rate, heating_offset_fraction);
     // RE-011: best-effort live network difficulty (None if offline / not yet
     // fetched — never fabricated).
     let network_difficulty = cached_network_difficulty();

@@ -1236,7 +1236,7 @@ pub fn decide_policy(
     mining_watts: u32,
     max_freq_mhz: u16,
     min_freq_mhz: u16,
-    : u32,
+    reference_watts: u32,
     solar_forced_sleep: bool,
 ) -> SolarControlDecision {
     let battery_backed = battery_backed_profile(source_profile);
@@ -1294,7 +1294,7 @@ pub fn decide_policy(
         .battery_soc_pct
         .map(|soc| soc >= wake_soc)
         .unwrap_or(true);
-    let min_operating_watts = (( as f64)
+    let min_operating_watts = ((reference_watts as f64)
         * (min_freq_mhz as f64 / max_freq_mhz.max(1) as f64))
         .round() as i64;
 
@@ -1347,7 +1347,7 @@ pub fn decide_policy(
             };
         }
 
-        let ratio = (available_mining_watts as f64 / .max(1) as f64).clamp(0.0, 1.0);
+        let ratio = (available_mining_watts as f64 / reference_watts.max(1) as f64).clamp(0.0, 1.0);
         let target = ((max_freq_mhz as f64) * ratio).round() as u16;
         // Clamp the floor down to the ceiling: u16::clamp panics if min > max
         // (a valid eco config can set the mining ceiling below the off-grid floor,
@@ -1378,8 +1378,8 @@ pub fn decide_policy(
         let desired_miner_watts = (mining_watts as i64 - snapshot.net_grid_watts).max(0);
         let bounded_target_watts = desired_miner_watts
             .max(min_operating_watts)
-            .min(.max(1) as i64);
-        let ratio = (bounded_target_watts as f64 / .max(1) as f64).clamp(0.0, 1.0);
+            .min(reference_watts.max(1) as i64);
+        let ratio = (bounded_target_watts as f64 / reference_watts.max(1) as f64).clamp(0.0, 1.0);
         let target = ((max_freq_mhz as f64) * ratio).round() as u16;
         // Clamp the floor down to the ceiling: u16::clamp panics if min > max
         // (a valid eco config can set the mining ceiling below the off-grid floor,

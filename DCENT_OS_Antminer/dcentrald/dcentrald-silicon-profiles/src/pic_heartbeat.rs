@@ -192,7 +192,7 @@ pub const fn pic_heartbeat_config(platform: Platform, fw: PicFw) -> HeartbeatCon
             nopic: false,
         },
         (S19Am2, Dspic33epDegraded) => HeartbeatConfig {
-            // Refused-by-default:. We
+            // Refused-by-default: see feedback_voltage_fw_whitelist. We
             // still tick the heartbeat to detect recovery, but no
             // voltage commands fire.
             interval_ms: 1_000,

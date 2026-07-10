@@ -104,7 +104,7 @@ Next steps before live flash:
   2. Capture live mmc part output, store at
      docs/dev/<date>-cv1835-emmc-evidence/mmc_part_dump.txt.
   3. Drop the BMU-extracted factory kernel at
-     extractions/firmware-archive/cv1835/factory_kernel.bin and
+     knowledge-base/firmware-archive/cv1835/factory_kernel.bin and
      rebuild so post-build.sh stages /config/factory_kernel.bin.
   4. Run safe_sysupgrade_cv_emmc.sh --dry-run on the bench unit first.
   5. After 3 successful round-trip flashes, set

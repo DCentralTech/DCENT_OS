@@ -57,7 +57,7 @@ BUILDROOT_OUTPUT="$FIRMWARE_DIR/buildroot/output/images"
 SD_OUTPUT_DIR="$BUILDROOT_OUTPUT/sd_card"
 
 # Fallback extraction location used by this workspace today
-KB_EXTRACTIONS_DIR="$WORKSPACE_ROOT/extractions/s9"
+KB_EXTRACTIONS_DIR="$WORKSPACE_ROOT/knowledge-base/extractions/s9"
 
 # FIT image input files (extracted from BraiinsOS recovery FIT)
 RECOVERY_FIT="$EXTRACTIONS_DIR/mtd6_recovery.bin"

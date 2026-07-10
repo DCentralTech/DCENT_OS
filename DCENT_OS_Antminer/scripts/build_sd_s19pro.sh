@@ -32,7 +32,7 @@ PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 SUDO="sudo"; [ "$(id -u)" = "0" ] && SUDO=""
 # Writable work dir: WSL $HOME if usable, else /tmp (Docker).
 WORKDIR="${WORKDIR:-${HOME:-/tmp}/dcentos_sd_s19pro}"; case "$WORKDIR" in /root/*|/home/*) [ -w "$(dirname "$WORKDIR")" ] || WORKDIR=/tmp/dcentos_sd_s19pro;; esac
-BRAIINS_IMG="$PROJ/extractions/firmware-archive/braiins-os_am2-s17_sd.img"
+BRAIINS_IMG="$PROJ/knowledge-base/firmware-archive/braiins-os_am2-s17_sd.img"
 DCENTOS_ROOTFS="$PROJ/DCENT_OS_Antminer/dcentos_rootfs.squashfs"
 NEW_BINARY="$PROJ/DCENT_OS_Antminer/dcentrald/target/armv7-unknown-linux-musleabihf/release/dcentrald"
 S19PRO_TOML="$PROJ/DCENT_OS_Antminer/dcentrald/dcentrald-s19pro.toml"

@@ -1,8 +1,11 @@
 # Third-Party Notices — DCENT_OS
 
-DCENT_OS (`dcentrald`, the Buildroot tree, the dashboard, and the ESP firmware) is original D-Central
-code released under **GPL-3.0** (see [`LICENSE`](LICENSE)). It is a clean-room rewrite — **not** a fork
-of any existing firmware.
+DCENT_OS is Copyright (C) 2016-2026 D-Central Technologies. DCENT_OS (`dcentrald`, the Buildroot tree,
+the dashboard, and the ESP firmware) is original D-Central code released under **GPL-3.0** (see
+[`LICENSE`](LICENSE) — the verbatim license text). It is an original implementation — **not** a fork of
+any existing firmware — written from live hardware probing, datasheets, our own reverse engineering, and
+study of public open-source references (ESP-Miner, cgminer, BraiinsOS-published components). Where code
+or protocol knowledge derives from a specific upstream project, that lineage is attributed below.
 
 To boot and build, however, DCENT_OS reuses, references, or depends on a number of third-party
 components. This file is the authoritative attribution record for them. Where a component carries its

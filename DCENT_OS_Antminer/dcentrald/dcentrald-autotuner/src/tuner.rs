@@ -560,7 +560,7 @@ pub struct AutoTuner {
     /// Baseline snapshot used to derive an effective rolling accepted-work window.
     accepted_work_baseline: Option<crate::AcceptedWorkSignal>,
     /// Reference accepted-difficulty-per-kWh established after tuning.
-    accepted_work_: Option<f64>,
+    accepted_work_reference_difficulty_per_kwh: Option<f64>,
     /// W13-A: operator-selected silicon profile id per
     /// `(miner_model_snake_case, hashboard)` chain. Populated by
     /// `AutoTunerCommand::ApplySiliconProfile`. The autotuner consults
@@ -739,15 +739,15 @@ impl AutoTuner {
         let delta_efficiency = delta_difficulty / delta_energy;
         self.accepted_work_baseline = Some(current);
 
-        let Some(reference) = self.accepted_work_ else {
-            self.accepted_work_ = Some(delta_efficiency);
+        let Some(reference) = self.accepted_work_reference_difficulty_per_kwh else {
+            self.accepted_work_reference_difficulty_per_kwh = Some(delta_efficiency);
             return ShareEfficiencyValidation::Unknown;
         };
 
         if delta_efficiency < reference * 0.75 {
             ShareEfficiencyValidation::Degraded
         } else {
-            self.accepted_work_ =
+            self.accepted_work_reference_difficulty_per_kwh =
                 Some(reference * 0.8 + delta_efficiency * 0.2);
             ShareEfficiencyValidation::Healthy
         }
@@ -1667,7 +1667,7 @@ impl AutoTuner {
             capabilities,
             resolved_policy,
             accepted_work_baseline: None,
-            accepted_work_: None,
+            accepted_work_reference_difficulty_per_kwh: None,
             active_silicon_profile_ids: HashMap::new(),
             active_silicon_profile_presets: HashMap::new(),
             last_applied_silicon_targets: HashMap::new(),
@@ -6635,7 +6635,7 @@ impl AutoTuner {
                             && self.capabilities.voltage_optimization_supported
                             && self.capabilities.profile_key == "bm1387-home-pic16";
                         // Look up reference voltage for this chip type
-                        let  =
+                        let reference_voltage_mv =
                             dcentrald_asic::drivers::MinerProfile::for_chip(chain_chip_id)
                                 .map(|p| p.default_voltage_mv)
                                 .unwrap_or(9100);
@@ -6644,8 +6644,8 @@ impl AutoTuner {
                         } else {
                             voltage_mv
                         };
-                        let optimizer_ = if runtime_voltage_supported {
-                            
+                        let optimizer_reference_voltage_mv = if runtime_voltage_supported {
+                            reference_voltage_mv
                         } else {
                             voltage_mv
                         };
@@ -6660,7 +6660,7 @@ impl AutoTuner {
                             optimizer_min_voltage_mv,
                             self.config.min_freq_mhz,
                             chain_chip_id,
-                            optimizer_,
+                            optimizer_reference_voltage_mv,
                             preferred_voltage_mv,
                         );
 

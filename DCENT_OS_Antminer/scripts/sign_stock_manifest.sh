@@ -27,8 +27,8 @@
 set -eu
 
 KEY_PATH=${1:-}
-MANIFEST_PATH=${2:-extractions/firmware-archive/stock-bitmain-manifest.json}
-SIG_OUT_PATH=${3:-extractions/firmware-archive/stock-bitmain-manifest.json.sig}
+MANIFEST_PATH=${2:-knowledge-base/firmware-archive/stock-bitmain-manifest.json}
+SIG_OUT_PATH=${3:-knowledge-base/firmware-archive/stock-bitmain-manifest.json.sig}
 
 if [ -z "$KEY_PATH" ]; then
     echo "Usage: $0 <private_key.pem> [manifest_path] [sig_out_path]" >&2

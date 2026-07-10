@@ -1,0 +1,182 @@
+name: BitAxe Build Matrix
+
+# Root xtensa matrix owner for public DCENT_axe packages. Public-target
+# compiler ICE exceptions must be documented in
+# DCENT_OS_ESP/docs/WAVE9D7_XTENSA_ICE_QUARANTINE.md.
+
+on:
+  workflow_dispatch:
+jobs:
+  host-tests:
+    name: Host tests (pure Rust crates)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: DCENT_OS_ESP
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run host tests
+        shell: bash
+        run: |
+          cargo +stable test --locked --target x86_64-unknown-linux-gnu \
+            -p dcentaxe-core \
+            -p dcentaxe-bap \
+            -p dcentaxe-stratum \
+            -p dcentaxe-mining \
+            -p dcentaxe-stratum-v2 \
+            -p dcentaxe-asic \
+            -p dcentaxe-lora
+          # dcentaxe-hal carries the fail-closed safety/thermal/power suite
+          # (safety / tps546_guard / fan_pid / cml_escalation / emc2103 /
+          # temp_decode / board — 60 tests). It needs its own feature flags
+          # (--no-default-features --features pins-bitaxe), so it runs as a
+          # separate invocation. The root dcentos-esp-gates.yml also covers it.
+          cargo +stable test --locked --target x86_64-unknown-linux-gnu \
+            -p dcentaxe-hal --no-default-features --features pins-bitaxe
+
+      - name: Avalon feature host check
+        shell: bash
+        run: |
+          cargo +stable check --locked --target x86_64-unknown-linux-gnu \
+            -p dcentaxe-asic --features asic-avalon
+          cargo +stable check --locked --target x86_64-unknown-linux-gnu \
+            -p dcentaxe-mining --features asic-avalon
+
+  build-matrix:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: DCENT_OS_ESP
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install esp tool dependencies
+        shell: bash
+        run: |
+          pip install esptool
+          cargo install ldproxy espup --locked
+          espup install
+          . "$HOME/export-esp.sh"
+          xtensa-esp32s3-elf-gcc --version
+
+      - name: Prepare OTA signing key
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          DCENT_OTA_PRIVATE_KEY_PEM_CONTENT: ${{ secrets.DCENT_OTA_PRIVATE_KEY_PEM }}
+        run: |
+          test -n "$DCENT_OTA_PRIVATE_KEY_PEM_CONTENT"
+          KEY_PATH="$RUNNER_TEMP/dcent-ota-signing-key.pem"
+          printf '%s\n' "$DCENT_OTA_PRIVATE_KEY_PEM_CONTENT" > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          printf 'DCENT_OTA_PRIVATE_KEY_PEM=%s\n' "$KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Verify signing key pair
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          DCENT_OTA_PUBLIC_KEY_HEX: ${{ secrets.DCENT_OTA_PUBLIC_KEY_HEX }}
+        run: |
+          test -f "$DCENT_OTA_PRIVATE_KEY_PEM"
+          test -n "$DCENT_OTA_PUBLIC_KEY_HEX"
+          DERIVED=$(openssl pkey -in "$DCENT_OTA_PRIVATE_KEY_PEM" -pubout -outform DER | tail -c 32 | xxd -p -c 256 | tr -d '\n')
+          EXPECTED=$(printf '%s' "$DCENT_OTA_PUBLIC_KEY_HEX" | tr '[:upper:]' '[:lower:]')
+          test "$DERIVED" = "$EXPECTED"
+
+      - name: Build and package matrix
+        shell: bash
+        env:
+          CC_xtensa_esp32s3_espidf: xtensa-esp32s3-elf-gcc
+          DCENT_ENFORCE_SIGNED_OTA: ${{ github.event_name != 'pull_request' && '1' || '' }}
+          DCENT_OTA_KEY_ID: ${{ secrets.DCENT_OTA_KEY_ID }}
+          DCENT_OTA_PUBLIC_KEY_HEX: ${{ secrets.DCENT_OTA_PUBLIC_KEY_HEX }}
+        run: |
+          . "$HOME/export-esp.sh"
+          chmod +x scripts/build-matrix.sh scripts/package-firmware.sh
+          ./scripts/build-matrix.sh
+
+      - name: Validate packaged artifacts
+        shell: bash
+        env:
+          REQUIRE_SIGNATURE: ${{ github.event_name != 'pull_request' && '1' || '' }}
+          DCENT_OTA_PUBLIC_KEY_HEX: ${{ secrets.DCENT_OTA_PUBLIC_KEY_HEX }}
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, pathlib, subprocess, sys
+          expected_models = {
+              'bitaxe-max': 'max',
+              'bitaxe-ultra': 'ultra',
+              'bitaxe-supra': 'supra',
+              'bitaxe-gamma': 'gamma',
+              'bitaxe-hex-ultra': 'hexultra',
+              'bitaxe-hex-supra': 'suprahex',
+          }
+          manifests = list(pathlib.Path('dist').glob('*/*-manifest.json'))
+          assert manifests, 'no packaged manifests found'
+          found_boards = {manifest_path.parent.name for manifest_path in manifests}
+          assert found_boards == set(expected_models), (
+              f'public package matrix mismatch: expected {sorted(expected_models)}, '
+              f'found {sorted(found_boards)}'
+          )
+          for manifest_path in manifests:
+              dist = manifest_path.parent
+              cmd = [sys.executable, 'scripts/verify_ota_package.py', str(manifest_path)]
+              if os.environ.get('REQUIRE_SIGNATURE'):
+                  cmd[2:2] = ['--require-signatures', '--public-key-hex', os.environ['DCENT_OTA_PUBLIC_KEY_HEX']]
+              subprocess.run(cmd, check=True)
+              manifest = json.loads(manifest_path.read_text(encoding='ascii'))
+              assert manifest.get('product') == 'DCENT_axe', f'{manifest_path}: product mismatch'
+              assert manifest.get('family') == 'bitaxe', f'{manifest_path}: family mismatch'
+              assert manifest.get('packageType') == 'esp32-factory-and-ota-bundle', f'{manifest_path}: packageType mismatch'
+              assert manifest.get('boardTarget') == dist.name, f'{manifest_path}: boardTarget mismatch'
+              assert manifest.get('deviceModel') == expected_models.get(dist.name, dist.name), f'{manifest_path}: deviceModel mismatch'
+              payloads = {entry['name']: entry for entry in manifest['payloads']}
+              assert payloads['update']['path'].endswith('-update.bin'), f'{manifest_path}: update payload path mismatch'
+              assert payloads['factory']['path'].endswith('-factory.bin'), f'{manifest_path}: factory payload path mismatch'
+              for name in ('factory', 'update'):
+                  payload = payloads[name]
+                  path = dist / payload['path']
+                  data = path.read_bytes()
+                  assert payload['size'] == len(data), f'{manifest_path}: {name} size mismatch'
+                  assert payload['sha256'] == hashlib.sha256(data).hexdigest(), f'{manifest_path}: {name} sha mismatch'
+              assert payloads['update']['size'] <= manifest['ota']['slotSize'], f'{manifest_path}: update image too large'
+              if os.environ.get('REQUIRE_SIGNATURE'):
+                  assert manifest.get('otaSignatureAlgorithm') == 'ed25519', manifest_path
+                  assert manifest.get('otaKeyId'), manifest_path
+                  assert manifest.get('otaSignature'), manifest_path
+              checksums_path = next(dist.glob('*SHA256SUMS.txt'))
+              checksums = checksums_path.read_text(encoding='ascii')
+              assert manifest_path.name in checksums, f'{manifest_path}: manifest checksum missing'
+          PY
+
+      # Defense-in-depth: run the offline release-gate script (test_ota_e2e.sh)
+      # against each packaged board. Default OFFLINE mode re-validates the
+      # manifest + payloads via verify_ota_package.py and prints the exact live
+      # OTA upload headers — it makes NO network/serial contact (live legs gated
+      # behind DCENT_OTA_E2E_LIVE / DCENT_OTA_E2E_FLASH, intentionally unset).
+      - name: Offline OTA e2e gate (manifest + payloads + headers)
+        shell: bash
+        run: |
+          chmod +x scripts/test_ota_e2e.sh
+          for board_dir in dist/*/; do
+            board=$(basename "$board_dir")
+            echo "==> Offline OTA e2e gate: $board"
+            BOARD="$board" bash scripts/test_ota_e2e.sh
+          done
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event_name == 'pull_request' && 'bitaxe-dcentaxe-dist-unsigned-pr' || 'bitaxe-dcentaxe-dist-signed' }}
+          path: DCENT_OS_ESP/dist/**

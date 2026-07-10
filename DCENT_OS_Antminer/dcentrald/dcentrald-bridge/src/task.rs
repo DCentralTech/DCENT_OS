@@ -386,9 +386,9 @@ async fn serve_loop(
 
                 match client.poll_telemetry().await {
                     Ok(t) => {
-                        let  = t.accessories.temperature_feedback.enabled;
+                        let feedback_enabled = t.accessories.temperature_feedback.enabled;
                         let temp = client.record_and_extract_temp(&t);
-                        if cfg.feed_thermal &&  {
+                        if cfg.feed_thermal && feedback_enabled {
                             if let Some(c) = temp {
                                 let c10 = clamp_room_temp_c10(c);
                                 sink.set_room_temp_c10(c10);

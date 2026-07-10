@@ -39,7 +39,7 @@ fn round_watts_for_metrics(watts: f64) -> u32 {
     watts.max(0.0).round().min(u32::MAX as f64) as u32
 }
 
-fn (power: &LivePowerEstimate) -> MetricsPowerProjection {
+fn project_metrics_power(power: &LivePowerEstimate) -> MetricsPowerProjection {
     if !power.wall_watts.is_finite() || power.wall_watts <= 0.0 {
         return MetricsPowerProjection {
             wall_watts: 0,
@@ -138,7 +138,7 @@ pub fn metrics_sample_from_runtime(
         .map(|chain| chain.temp_c)
         .reduce(f32::max)
         .unwrap_or(0.0);
-    let power_projection = (power);
+    let power_projection = project_metrics_power(power);
     let hw_errors: u64 = state.chains.iter().map(|chain| chain.errors as u64).sum();
     // P1-3 (D-6): hardware-error rate as a fraction of *diff1 work done*, NOT of
     // pool shares. Pool shares (accepted + rejected) are only the rare nonces

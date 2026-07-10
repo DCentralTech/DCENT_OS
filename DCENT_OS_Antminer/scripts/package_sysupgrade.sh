@@ -262,10 +262,10 @@ case "$BOARD_NAME" in
             EXTRACTIONS_DIR="$FIRMWARE_DIR/extractions/s9"
         elif [ -d "$PROJECT_ROOT/extractions/s9" ]; then
             EXTRACTIONS_DIR="$PROJECT_ROOT/extractions/s9"
-        elif [ -d "$REPO_ROOT/extractions/s9" ]; then
-            EXTRACTIONS_DIR="$REPO_ROOT/extractions/s9"
+        elif [ -d "$REPO_ROOT/knowledge-base/extractions/s9" ]; then
+            EXTRACTIONS_DIR="$REPO_ROOT/knowledge-base/extractions/s9"
         else
-            error "No extractions dir for am1-s9. Searched: \$DCENT_EXTRACTIONS_DIR, $FIRMWARE_DIR/extractions/s9, $PROJECT_ROOT/extractions/s9, $REPO_ROOT/extractions/s9"
+            error "No extractions dir for am1-s9. Searched: \$DCENT_EXTRACTIONS_DIR, $FIRMWARE_DIR/extractions/s9, $PROJECT_ROOT/extractions/s9, $REPO_ROOT/knowledge-base/extractions/s9"
         fi
         BOARD_FAMILY="am1"
         ;;
@@ -278,22 +278,22 @@ case "$BOARD_NAME" in
         REPO_ROOT="$(dirname "$PROJECT_ROOT")"
         if [ -n "${DCENT_EXTRACTIONS_DIR:-}" ] && [ -d "$DCENT_EXTRACTIONS_DIR" ]; then
             EXTRACTIONS_DIR="$DCENT_EXTRACTIONS_DIR"
-        elif [ -d "$REPO_ROOT/extractions/s19j" ]; then
-            EXTRACTIONS_DIR="$REPO_ROOT/extractions/s19j"
-        elif [ -d "$REPO_ROOT/extractions/s19j" ]; then
-            EXTRACTIONS_DIR="$REPO_ROOT/extractions/s19j"
-        elif [ -d "$REPO_ROOT/extractions/s9" ]; then
+        elif [ -d "$REPO_ROOT/knowledge-base/extractions/s19j" ]; then
+            EXTRACTIONS_DIR="$REPO_ROOT/knowledge-base/extractions/s19j"
+        elif [ -d "$REPO_ROOT/knowledge-base/research/s19j/live-probe-139" ]; then
+            EXTRACTIONS_DIR="$REPO_ROOT/knowledge-base/research/s19j/live-probe-139"
+        elif [ -d "$REPO_ROOT/knowledge-base/extractions/s9" ]; then
             # CE-056: fail closed by default. An S9 kernel/DTB is a PLACEHOLDER
             # for am2-s19j — packaging a wrong-board AM2 image bricks the unit.
             # Only an explicit lab opt-in produces a clearly NON-FLASHABLE build.
             if [ "${DCENT_ALLOW_AM2_S9_PLACEHOLDER:-0}" != "1" ]; then
-                error "am2-s19j: no real S19j kernel input (searched \$DCENT_EXTRACTIONS_DIR, $REPO_ROOT/extractions/s19j, $REPO_ROOT/extractions/s19j). Refusing to package am2-s19j with an S9 placeholder kernel/DTB — a wrong-board AM2 image bricks the unit. Supply DCENT_AM2_S19J_KERNEL / a real s19j extractions dir, or set DCENT_ALLOW_AM2_S9_PLACEHOLDER=1 for an explicitly NON-FLASHABLE lab placeholder build."
+                error "am2-s19j: no real S19j kernel input (searched \$DCENT_EXTRACTIONS_DIR, $REPO_ROOT/knowledge-base/extractions/s19j, $REPO_ROOT/knowledge-base/research/s19j/live-probe-139). Refusing to package am2-s19j with an S9 placeholder kernel/DTB — a wrong-board AM2 image bricks the unit. Supply DCENT_AM2_S19J_KERNEL / a real s19j extractions dir, or set DCENT_ALLOW_AM2_S9_PLACEHOLDER=1 for an explicitly NON-FLASHABLE lab placeholder build."
             fi
             warn "am2-s19j: DCENT_ALLOW_AM2_S9_PLACEHOLDER=1 — NON-FLASHABLE S9-placeholder lab artifact only (DO NOT FLASH)."
             AM2_S9_PLACEHOLDER=1
-            EXTRACTIONS_DIR="$REPO_ROOT/extractions/s9"
+            EXTRACTIONS_DIR="$REPO_ROOT/knowledge-base/extractions/s9"
         else
-            error "No extractions dir for am2-s19j. Searched: \$DCENT_EXTRACTIONS_DIR, $REPO_ROOT/extractions/s19j, $REPO_ROOT/extractions/s19j, $REPO_ROOT/extractions/s9"
+            error "No extractions dir for am2-s19j. Searched: \$DCENT_EXTRACTIONS_DIR, $REPO_ROOT/knowledge-base/extractions/s19j, $REPO_ROOT/knowledge-base/research/s19j/live-probe-139, $REPO_ROOT/knowledge-base/extractions/s9"
         fi
         BOARD_FAMILY="am2"
         ;;

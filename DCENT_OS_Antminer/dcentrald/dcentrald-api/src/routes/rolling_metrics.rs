@@ -341,7 +341,7 @@ struct MetricsPowerProjection {
     calibrated: bool,
 }
 
-fn (power: &LivePowerEstimate) -> MetricsPowerProjection {
+fn project_metrics_power(power: &LivePowerEstimate) -> MetricsPowerProjection {
     if !power.wall_watts.is_finite() || power.wall_watts <= 0.0 {
         return MetricsPowerProjection {
             wall_watts: 0,
@@ -384,7 +384,7 @@ fn sample_from_state(state: &AppState, ts_ms: u64) -> (MetricsSample, u64, u64) 
             ms.rejected,
         )
     };
-    let power_projection = (&state.power_rx.borrow());
+    let power_projection = project_metrics_power(&state.power_rx.borrow());
     let sample = MetricsSample {
         timestamp_ms: ts_ms,
         hashrate_ths,
@@ -616,7 +616,7 @@ mod tests {
             ..LivePowerEstimate::default()
         };
 
-        let projection = (&power);
+        let projection = project_metrics_power(&power);
 
         assert_eq!(projection.wall_watts, 0);
         assert_eq!(projection.source, MetricsPowerSource::Unavailable);
@@ -633,7 +633,7 @@ mod tests {
             ..LivePowerEstimate::default()
         };
 
-        let projection = (&power);
+        let projection = project_metrics_power(&power);
 
         assert_eq!(projection.wall_watts, 1_300);
         assert_eq!(

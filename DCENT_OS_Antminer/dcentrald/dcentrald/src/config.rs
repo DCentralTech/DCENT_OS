@@ -3418,7 +3418,7 @@ protocol = "sv2"
             r#"
 [hashboard]
 eeprom_parser = "x21_aes"
-decoded_ = "/etc/dcentos/hashboard_decoded.json"
+decoded_reference_file = "/etc/dcentos/hashboard_decoded.json"
 "#,
         )
         .expect("x21_aes hashboard config should deserialize");
@@ -5794,7 +5794,7 @@ pub struct HashboardConfig {
 
     /// Optional decoded metadata reference captured from bosminer/luxminer.
     #[serde(default)]
-    pub decoded_: Option<String>,
+    pub decoded_reference_file: Option<String>,
 }
 
 impl HashboardConfig {
@@ -5818,7 +5818,7 @@ impl Default for HashboardConfig {
         Self {
             eeprom_parser: Self::default_eeprom_parser(),
             eeprom_key_file: None,
-            decoded_: None,
+            decoded_reference_file: None,
         }
     }
 }

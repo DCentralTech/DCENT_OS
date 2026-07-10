@@ -252,7 +252,7 @@ mod tests {
     /// feedback-network schematic; it is NOT changed here (would alter the live
     /// rail on Max/Ultra/Supra — out of scope for behavior-preserving extraction).
     #[test]
-    fn ds4432u_dac_code_() {
+    fn ds4432u_dac_code_reference_voltages_pin_rust_behavior() {
         assert_eq!(ds4432u_dac_code(1000, CEIL), Some(0xB7)); // 55 | 0x80
         assert_eq!(ds4432u_dac_code(1200, CEIL), Some(0x80)); //  0 | 0x80
         assert_eq!(ds4432u_dac_code(1550, CEIL), Some(0xE0)); // 96 | 0x80

@@ -60,6 +60,9 @@ Usage:
                            into stock Bitmain on next boot. Cannot be
                            undone without re-flashing DCENT_OS.
 
+References:
+  knowledge-base/research/ecosystem/LUXOS_LIVE_PROBE_78_RE.md
+  knowledge-base/research/ecosystem/BACK_TO_STOCK_TRIGGERS.md
 EOF
             exit 0
             ;;

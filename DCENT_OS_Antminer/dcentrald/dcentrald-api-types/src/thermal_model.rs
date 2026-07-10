@@ -37,7 +37,7 @@ pub const DEFAULT_IMMERSION_OFFSET_C: f32 = 20.0;
 /// Configuration for the continuous derating loop.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ThermalCompConfig {
-    pub : f32,
+    pub reference_temp_c: f32,
     pub derating_threshold_c: f32,
     pub derating_per_c: f32,
     pub emergency_temp_c: f32,
@@ -48,7 +48,7 @@ pub struct ThermalCompConfig {
 impl Default for ThermalCompConfig {
     fn default() -> Self {
         Self {
-            : DEFAULT_REFERENCE_TEMP_C,
+            reference_temp_c: DEFAULT_REFERENCE_TEMP_C,
             derating_threshold_c: DEFAULT_DERATING_THRESHOLD_C,
             derating_per_c: DEFAULT_DERATING_PER_C,
             emergency_temp_c: DEFAULT_EMERGENCY_TEMP_C,
@@ -63,7 +63,7 @@ impl ThermalCompConfig {
     /// confirmed-immersion is signaled at platform startup.
     pub fn with_immersion_offset(self) -> Self {
         Self {
-            : self. + DEFAULT_IMMERSION_OFFSET_C,
+            reference_temp_c: self.reference_temp_c + DEFAULT_IMMERSION_OFFSET_C,
             derating_threshold_c: self.derating_threshold_c + DEFAULT_IMMERSION_OFFSET_C,
             emergency_temp_c: self.emergency_temp_c + DEFAULT_IMMERSION_OFFSET_C,
             ..self
@@ -408,7 +408,7 @@ mod tests {
     #[test]
     fn default_thermal_config_matches_re_doc() {
         let cfg = ThermalCompConfig::default();
-        assert!((cfg. - 55.0).abs() < 1e-3);
+        assert!((cfg.reference_temp_c - 55.0).abs() < 1e-3);
         assert!((cfg.derating_threshold_c - 60.0).abs() < 1e-3);
         assert!((cfg.derating_per_c - 0.003).abs() < 1e-6);
         assert!((cfg.emergency_temp_c - 75.0).abs() < 1e-3);
@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn immersion_offset_shifts_thresholds_by_20c() {
         let cfg = ThermalCompConfig::default().with_immersion_offset();
-        assert!((cfg. - 75.0).abs() < 1e-3);
+        assert!((cfg.reference_temp_c - 75.0).abs() < 1e-3);
         assert!((cfg.derating_threshold_c - 80.0).abs() < 1e-3);
         assert!((cfg.emergency_temp_c - 95.0).abs() < 1e-3);
         // Per-C and hysteresis are unchanged

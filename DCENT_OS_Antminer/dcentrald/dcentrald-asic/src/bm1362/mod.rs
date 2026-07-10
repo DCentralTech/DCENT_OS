@@ -318,7 +318,7 @@ mod tests {
 
     /// CRC5 reference vector: `crc5([0,0,0,0,0]) == 3` per BM1387 datasheet.
     #[test]
-    fn crc5_() {
+    fn crc5_reference_vector_holds() {
         // This isn't strictly a BM1362 test, but it locks the CRC5 implementation
         // that every cold-boot frame depends on.
         let frame = build_get_address_frame();

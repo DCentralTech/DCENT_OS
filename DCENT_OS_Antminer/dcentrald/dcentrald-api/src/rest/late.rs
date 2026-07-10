@@ -1670,7 +1670,7 @@ end_hour = 5
             ..fallback.clone()
         };
 
-        let fallback_cost = (&fallback, 0.10, 1.0);
+        let fallback_cost = project_power_costs(&fallback, 0.10, 1.0);
         assert_eq!(fallback_cost.wall_watts, 0);
         assert!(!fallback_cost.live_power_available);
         assert!(fallback_cost.note.contains("suppressed"));
@@ -1680,7 +1680,7 @@ end_hour = 5
             "0.00"
         );
 
-        let live_modeled_cost = (&live_modeled, 0.10, 1.0);
+        let live_modeled_cost = project_power_costs(&live_modeled, 0.10, 1.0);
         assert_eq!(live_modeled_cost.wall_watts, 1_100);
         assert!(live_modeled_cost.live_power_available);
         assert!(live_modeled_cost.modeled);
@@ -1813,7 +1813,7 @@ end_hour = 5
             note: "Live power has not published a positive reading; values are modeled from miner state and chip-profile defaults.",
         };
 
-        let contract = (&fallback, Some(1.2));
+        let contract = project_power_calibration_contract(&fallback, Some(1.2));
         assert_eq!(contract.current_reported_wall_watts, 0.0);
         assert_eq!(contract.current_reported_unit_watts, 0.0);
         assert_eq!(contract.projected_wall_watts, Some(0.0));
@@ -1845,7 +1845,7 @@ end_hour = 5
             note: "Power is modeled from the live dispatcher estimate; it is not a direct wall-meter measurement.",
         };
 
-        let contract = (&live_modeled, Some(1.1));
+        let contract = project_power_calibration_contract(&live_modeled, Some(1.1));
         assert_eq!(contract.current_reported_wall_watts, 1_100.0);
         assert_eq!(contract.current_reported_unit_watts, 1_000.0);
         assert_eq!(
@@ -2094,7 +2094,7 @@ end_hour = 5
         // no commanded per-chain voltage. Representative S9 commanded DAC default
         // is 8600 mV (BM1387 profile).
         let chains = vec![mk(6, 63, 0.0, 0), mk(7, 63, 0.0, 0), mk(8, 62, 0.0, 0)];
-        let proj = (&chains, 1131.0, 8600);
+        let proj = project_chain_telemetry(&chains, 1131.0, 8600);
         // No bare zero under a live topline — split proportional to chip count,
         // and the split conserves the topline.
         let total: f64 = proj.iter().map(|p| p.hashrate_ghs).sum();
@@ -2119,7 +2119,7 @@ end_hour = 5
             mk(7, 63, 377.0, 8900),
             mk(8, 62, 377.0, 8900),
         ];
-        let proj2 = (&chains2, 1131.0, 8600);
+        let proj2 = project_chain_telemetry(&chains2, 1131.0, 8600);
         assert!(proj2.iter().all(|p| (p.hashrate_ghs - 377.0).abs() < 1e-6));
         assert!(proj2.iter().all(|p| p.hashrate_source == "per_chain"));
         assert!(proj2.iter().all(|p| p.voltage_mv == 8900));
@@ -2131,7 +2131,7 @@ end_hour = 5
         // the dead chain stays a genuine measured 0 (NOT a fabricated split),
         // and the live sibling keeps its real per-chain value.
         let chains3 = vec![mk(6, 63, 800.0, 8900), mk(7, 0, 0.0, 0)];
-        let proj3 = (&chains3, 800.0, 8600);
+        let proj3 = project_chain_telemetry(&chains3, 800.0, 8600);
         assert_eq!(proj3[0].hashrate_source, "per_chain");
         assert!((proj3[0].hashrate_ghs - 800.0).abs() < 1e-6);
         assert_eq!(proj3[1].hashrate_ghs, 0.0);
@@ -2170,7 +2170,7 @@ end_hour = 5
         assert_eq!(primary_frequency_source(None), "unavailable");
 
         let chains = vec![live, active_but_missing, unavailable];
-        let projected = (&chains, 0.0, 0);
+        let projected = project_chain_telemetry(&chains, 0.0, 0);
         assert_eq!(projected[0].frequency_mhz, 525);
         assert_eq!(projected[0].frequency_source, "chain_state");
         assert_eq!(projected[1].frequency_mhz, 0);
@@ -2203,7 +2203,7 @@ end_hour = 5
         let mut measured = std::collections::HashMap::new();
         measured.insert(0u8, 13_702u16);
 
-        let proj = (&chains, 754.0, 13_700, &measured);
+        let proj = project_chain_telemetry_with_measured(&chains, 754.0, 13_700, &measured);
 
         // Chain 0: measured wins, tagged "measured".
         assert_eq!(proj[0].voltage_mv, 13_702);
@@ -2216,13 +2216,13 @@ end_hour = 5
         // by the shared resolver and must NOT masquerade as "measured".
         let mut bad = std::collections::HashMap::new();
         bad.insert(0u8, 0xFFFFu16);
-        let proj_bad = (&chains, 754.0, 13_700, &bad);
+        let proj_bad = project_chain_telemetry_with_measured(&chains, 754.0, 13_700, &bad);
         assert_eq!(proj_bad[0].voltage_mv, 13_700);
         assert_eq!(proj_bad[0].voltage_source, "commanded_not_measured");
 
         // The empty-map path is byte-identical to the legacy 3-arg projection.
-        let legacy = (&chains, 754.0, 13_700);
-        let empty = (
+        let legacy = project_chain_telemetry(&chains, 754.0, 13_700);
+        let empty = project_chain_telemetry_with_measured(
             &chains,
             754.0,
             13_700,
@@ -2259,13 +2259,13 @@ end_hour = 5
 
         // Before any AT-3 publish: both chains are commanded-tagged (the
         // default, byte-identical to the pre-AT-3 projection).
-        let before = (&chains, 754.0, 13_700);
+        let before = project_chain_telemetry_live(&chains, 754.0, 13_700);
         assert_eq!(before[0].voltage_source, "commanded_not_measured");
         assert_eq!(before[1].voltage_source, "commanded_not_measured");
 
         // AT-3 publishes a fresh, plausible 0x3A reading for CID only.
         dcentrald_common::at3_rail::publish(CID, 13_702, false);
-        let after = (&chains, 754.0, 13_700);
+        let after = project_chain_telemetry_live(&chains, 754.0, 13_700);
         assert_eq!(after[0].voltage_mv, 13_702);
         assert_eq!(after[0].voltage_source, "measured");
         // The chain with no published reading is unaffected.
@@ -8183,7 +8183,7 @@ pub(super) async fn get_system_info(State(state): State<Arc<AppState>>) -> impl 
     let primary_freq_source = primary_frequency_source(first_active_chain);
     let primary_voltage = first_active_chain.map(|c| c.voltage_mv).unwrap_or(0);
     let live_power = state.power_rx.borrow().clone();
-    let power_projection = (&live_power, &miner, &hw);
+    let power_projection = project_power_telemetry(&live_power, &miner, &hw);
     let measured_wall_watts = measured_wall_watts_for_unprovenanced_surface(&power_projection);
     let profile = chip_type_to_chip_id(&hw.chip_type).and_then(MinerProfile::for_chip);
     let device_model = profile.map(|p| p.name).unwrap_or("Antminer");
@@ -8378,7 +8378,7 @@ pub(super) async fn get_system_asic(State(state): State<Arc<AppState>>) -> impl 
         .trim()
         .to_string();
     let live_power = state.power_rx.borrow().clone();
-    let power_projection = (&live_power, &miner, &hw);
+    let power_projection = project_power_telemetry(&live_power, &miner, &hw);
     let measured_wall_watts = measured_wall_watts_for_unprovenanced_surface(&power_projection);
     let total_chips: u16 = miner.chains.iter().map(|c| c.chips as u16).sum();
     let chip_id = chip_type_to_chip_id(&hw.chip_type);
@@ -11100,13 +11100,13 @@ pub(super) async fn get_power_calibration(State(state): State<Arc<AppState>>) ->
         .lock()
         .map(|guard| guard.clone())
         .unwrap_or_default();
-    let power_projection = (&live_power, &miner, &hardware);
-    let power_contract = (&power_projection, None);
+    let power_projection = project_power_telemetry(&live_power, &miner, &hardware);
+    let power_contract = project_power_calibration_contract(&power_projection, None);
 
     Json(serde_json::json!({
         "enabled": calibration.enabled,
         "multiplier": calibration.effective_multiplier(),
-        "": calibration.,
+        "reference_wall_watts": calibration.reference_wall_watts,
         "estimated_wall_watts": calibration.estimated_wall_watts,
         "estimated_unit_watts": calibration.estimated_board_watts,
         "updated_at_ms": calibration.updated_at_ms,
@@ -11164,8 +11164,8 @@ pub(super) async fn post_power_calibration(
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
-        let power_projection = (&live_power, &miner, &hardware);
-        let power_contract = (&power_projection, None);
+        let power_projection = project_power_telemetry(&live_power, &miner, &hardware);
+        let power_contract = project_power_calibration_contract(&power_projection, None);
         push_rest_audit_free(&state, "power_calibration", "Power calibration cleared");
         return Json(serde_json::json!({
             "status": "ok",
@@ -11205,8 +11205,8 @@ pub(super) async fn post_power_calibration(
         .lock()
         .map(|guard| guard.clone())
         .unwrap_or_default();
-    let power_projection = (&live_power, &miner, &hardware);
-    let power_contract = (&power_projection, None);
+    let power_projection = project_power_telemetry(&live_power, &miner, &hardware);
+    let power_contract = project_power_calibration_contract(&power_projection, None);
     if power_contract.current_reported_wall_watts <= 0.0 {
         return Json(serde_json::json!({
             "status": "error",
@@ -11243,7 +11243,7 @@ pub(super) async fn post_power_calibration(
     let calibration = dcentrald_autotuner::PowerCalibration {
         enabled: true,
         multiplier,
-        : Some(measured_wall_watts),
+        reference_wall_watts: Some(measured_wall_watts),
         estimated_wall_watts: Some(power_contract.current_reported_wall_watts),
         estimated_board_watts: Some(power_contract.current_reported_unit_watts),
         updated_at_ms: Some(
@@ -11270,7 +11270,7 @@ pub(super) async fn post_power_calibration(
     if let Ok(mut guard) = state.power_calibration.write() {
         *guard = calibration.clone();
     }
-    let power_contract = (
+    let power_contract = project_power_calibration_contract(
         &power_projection,
         Some(calibration.effective_multiplier()),
     );
@@ -11289,7 +11289,7 @@ pub(super) async fn post_power_calibration(
         "message": "Power calibration saved. Updated wall and unit estimates will appear on the next power refresh.",
         "enabled": true,
         "multiplier": calibration.effective_multiplier(),
-        "": calibration.,
+        "reference_wall_watts": calibration.reference_wall_watts,
         "estimated_wall_watts": calibration.estimated_wall_watts,
         "estimated_unit_watts": calibration.estimated_board_watts,
         "projected_wall_watts": power_contract.projected_wall_watts,
@@ -14218,18 +14218,18 @@ pub(super) fn home_noise_from_fans(
         .max()
         .unwrap_or(fans.rpm)
         .max(fans.rpm);
-    let fan_rpm_ = max_fan_rpm > 0;
-    let noise_db = if fan_rpm_ {
+    let fan_rpm_feedback_available = max_fan_rpm > 0;
+    let noise_db = if fan_rpm_feedback_available {
         Some(std::cmp::min(75, 30 + (max_fan_rpm / 120)))
     } else {
         None
     };
-    let noise_source = if fan_rpm_ {
+    let noise_source = if fan_rpm_feedback_available {
         "tach_estimate"
     } else {
         "unavailable_no_rpm_feedback"
     };
-    let noise_note = if fan_rpm_ {
+    let noise_note = if fan_rpm_feedback_available {
         "Estimated from live fan RPM; verify room dB for AM2 low-PWM floor diagnosis"
     } else {
         "No noise estimate: PWM command alone is not acoustic proof"
@@ -14239,7 +14239,7 @@ pub(super) fn home_noise_from_fans(
         noise_source,
         noise_note,
         max_fan_rpm,
-        fan_rpm_,
+        fan_rpm_feedback_available,
     )
 }
 
@@ -14261,10 +14261,10 @@ pub(super) async fn get_home_status(State(state): State<Arc<AppState>>) -> impl 
         .lock()
         .map(|guard| guard.clone())
         .unwrap_or_default();
-    let home_power = (&live, &miner, &hardware);
+    let home_power = project_power_telemetry(&live, &miner, &hardware);
     let targeting = build_power_targeting_state(mode, &home_power);
 
-    let (noise_db, noise_source, noise_note, max_fan_rpm, fan_rpm_) =
+    let (noise_db, noise_source, noise_note, max_fan_rpm, fan_rpm_feedback_available) =
         home_noise_from_fans(&miner.fans);
 
     // Estimate airflow from live RPM only (rough: 1 CFM per 30 RPM for S9-class fans).
@@ -14285,7 +14285,7 @@ pub(super) async fn get_home_status(State(state): State<Arc<AppState>>) -> impl 
         .and_then(|v| v.as_integer())
         .map(|v| v as u32)
         .unwrap_or(1800);
-    let home_cost = (&home_power, electricity_rate, 0.0);
+    let home_cost = project_power_costs(&home_power, electricity_rate, 0.0);
     let circuit_headroom_pct = if circuit_capacity > 0 {
         ((circuit_capacity as f64 - home_cost.wall_watts as f64) / circuit_capacity as f64 * 100.0)
             .max(0.0)
@@ -14409,7 +14409,7 @@ pub(super) async fn get_home_status(State(state): State<Arc<AppState>>) -> impl 
             "pwm": miner.fans.pwm,
             "rpm": miner.fans.rpm,
             "max_rpm": max_fan_rpm,
-            "rpm_": fan_rpm_,
+            "rpm_feedback_available": fan_rpm_feedback_available,
         },
     }))
 }
@@ -14687,7 +14687,7 @@ pub(super) async fn get_swarm_status(State(state): State<Arc<AppState>>) -> impl
         .to_string();
     let ipv4 = eth0_ipv4();
     let live_power = state.power_rx.borrow().clone();
-    let power_projection = (&live_power, &miner, &hw);
+    let power_projection = project_power_telemetry(&live_power, &miner, &hw);
     let measured_wall_watts = measured_wall_watts_for_unprovenanced_surface(&power_projection);
 
     Json(swarm_status_payload(
@@ -17570,8 +17570,8 @@ pub(super) async fn get_mining_ramp() -> impl IntoResponse {
         "schema": "dcentrald-api-types::mining_ramp v1",
         "read_only": true,
         "note": "Canonical boot-to-mining ramp reference + autotune phase config. Read-only; classify_ramp_progress(milestone, observed_seconds) is the runtime verdict helper. No hardware I/O.",
-        "luxos_": serde_json::to_value(LUXOS_S19J_PRO_RAMP).unwrap_or(serde_json::Value::Null),
-        "ramp_": "LuxOS .79 trace — S19j Pro BM1362 3x126 (O-live-performance.md); other models scale ±20%",
+        "luxos_reference_ramp": serde_json::to_value(LUXOS_S19J_PRO_RAMP).unwrap_or(serde_json::Value::Null),
+        "ramp_reference_source": "LuxOS .79 trace — S19j Pro BM1362 3x126 (O-live-performance.md); other models scale ±20%",
         "ramp_verdicts": ["on_track", "ahead", "stuck"],
         "autotune_config_default": serde_json::to_value(AutotuneConfig::default()).unwrap_or(serde_json::Value::Null),
         "_source": "dcentrald-api-types::{ramp_curve,autotune_phase}",
@@ -22211,7 +22211,7 @@ pub(super) fn build_prometheus_snapshot(
     webhook_integration_up: Option<bool>,
 ) -> dcentrald_api_types::prometheus_metrics::PrometheusSnapshot {
     use dcentrald_api_types::prometheus_metrics::{ChainMetric, FanMetric, PrometheusSnapshot};
-    let power_projection = (power, miner, hardware);
+    let power_projection = project_power_telemetry(power, miner, hardware);
 
     // Per-fan: prefer the detailed per-fan readings; fall back to the
     // single legacy aggregate fan when no per-fan list is published.
@@ -23710,7 +23710,7 @@ mod group_b_monitoring_profiles_tests {
             ..crate::HardwareInfo::default()
         };
 
-        let projected = (
+        let projected = project_power_telemetry(
             &dcentrald_autotuner::LivePowerEstimate::default(),
             &miner,
             &hardware,
@@ -23741,7 +23741,7 @@ mod group_b_monitoring_profiles_tests {
             ..dcentrald_autotuner::LivePowerEstimate::default()
         };
 
-        let projected = (
+        let projected = project_power_telemetry(
             &live,
             &minimal_miner_state(),
             &crate::HardwareInfo::default(),
@@ -23767,7 +23767,7 @@ mod group_b_monitoring_profiles_tests {
             ..dcentrald_autotuner::LivePowerEstimate::default()
         };
 
-        let projected = (
+        let projected = project_power_telemetry(
             &live,
             &minimal_miner_state(),
             &crate::HardwareInfo::default(),
@@ -23800,7 +23800,7 @@ mod group_b_monitoring_profiles_tests {
             ..dcentrald_autotuner::LivePowerEstimate::default()
         };
 
-        let projected = (
+        let projected = project_power_telemetry(
             &live,
             &miner,
             &crate::HardwareInfo {
@@ -23987,7 +23987,7 @@ mod group_b_monitoring_profiles_tests {
             source: "pmbus".to_string(),
             ..dcentrald_autotuner::LivePowerEstimate::default()
         };
-        let projected = (
+        let projected = project_power_telemetry(
             &live,
             &minimal_miner_state(),
             &crate::HardwareInfo::default(),

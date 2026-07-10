@@ -265,7 +265,7 @@ mod tests {
         /// silently promote `0x1393` into driver dispatch (which would
         /// re-open the caveat in the wrong direction).
         #[test]
-        fn bm1393_() {
+        fn bm1393_reference_catalog_id_is_not_the_runtime_key() {
             assert_eq!(crate::bm1393::CHIP_ID, 0x1393);
             assert_ne!(
                 crate::bm1393::CHIP_ID,

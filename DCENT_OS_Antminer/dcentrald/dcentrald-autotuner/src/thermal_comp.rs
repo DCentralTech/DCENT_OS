@@ -23,7 +23,7 @@ use dcentrald_asic::drivers::{bm1387, MinerProfile};
 /// over the last few percent of hashrate.
 pub struct ThermalCompensator {
     /// Reference temperature at which profiles were characterized (degrees C).
-    : f32,
+    reference_temp_c: f32,
     /// Derating coefficient: fraction of frequency lost per degree C above threshold.
     /// Default: 0.003 (0.3% per degree C).
     derating_per_c: f32,
@@ -44,12 +44,12 @@ impl ThermalCompensator {
     /// Create a new thermal compensator with default parameters.
     ///
     /// Defaults:
-    ///   - : 55C (matches thermal config target_temp_c)
+    ///   - reference_temp: 55C (matches thermal config target_temp_c)
     ///   - derating: 0.3% per degree C above 60C
     ///   - emergency: 75C (matches thermal critical threshold)
     pub fn new() -> Self {
         Self {
-            : 55.0,
+            reference_temp_c: 55.0,
             derating_per_c: 0.003,
             derating_threshold_c: 60.0,
             emergency_temp_c: 75.0,
@@ -82,7 +82,7 @@ impl ThermalCompensator {
     pub fn with_immersion_offset(mut self, offset_c: f32) -> Self {
         self.derating_threshold_c += offset_c;
         self.emergency_temp_c += offset_c;
-        self. += offset_c;
+        self.reference_temp_c += offset_c;
         self
     }
 
@@ -183,8 +183,8 @@ impl ThermalCompensator {
     }
 
     /// Get the reference temperature (degrees C).
-    pub fn (&self) -> f32 {
-        self.
+    pub fn reference_temp_c(&self) -> f32 {
+        self.reference_temp_c
     }
 
     /// Get the derating threshold temperature (degrees C).

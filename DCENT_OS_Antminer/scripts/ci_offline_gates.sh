@@ -889,8 +889,8 @@ require_pattern 'dcentrald/dcentrald/src/runtime/notifications.rs' 'mapping_then
 require_pattern 'dcentrald/dcentrald-asic/src/lib.rs' 'deterministic_mock_chain_mini_soak_covers_share_failover_and_ota_preflight' 'MockChain mini-soak executes in dcentrald-asic host tests'
 require_pattern '../dcentos-esp/dcentaxe-hal/src/board.rs' 'board_version_deep_parity_pins_power_and_support_attributes' 'ESP board-version deep parity pins power/fan/temp/support attributes'
 require_pattern '../dcentos-esp/dcentaxe-hal/src/board.rs' 'every_model_has_explicit_default_board_version' 'ESP every BitAxeModel has an explicit default board-version pin'
-require_pattern '../dcentos-esp/extractions/upstream/esp-miner/fixture_manifest.json' 'last_synced_on' 'ESP-Miner fixture manifest records last sync date'
-require_pattern '../dcentos-esp/extractions/upstream/esp-miner/fixture_manifest.json' 'no_network_fetch_in_ci' 'ESP-Miner fixture drift gate stays source-only'
+require_pattern '../dcentos-esp/knowledge-base/upstream/esp-miner/fixture_manifest.json' 'last_synced_on' 'ESP-Miner fixture manifest records last sync date'
+require_pattern '../dcentos-esp/knowledge-base/upstream/esp-miner/fixture_manifest.json' 'no_network_fetch_in_ci' 'ESP-Miner fixture drift gate stays source-only'
 require_pattern '../dcentos-esp/docs/DCENT_AXE_OPERATOR_BENCH_RUNBOOK.md' 'ESP-9: ESP-Miner Fixture Sync Review' 'operator runbook carries ESP-Miner fixture sync checklist'
 require_pattern '../../.github/workflows/bitaxe-build-matrix.yml' './scripts/build-matrix.sh' 'root bitaxe build workflow runs the ESP public build matrix'
 require_pattern '../../.github/workflows/bitaxe-build-matrix.yml' 'WAVE9D7_XTENSA_ICE_QUARANTINE.md' 'root bitaxe build workflow points to xtensa ICE quarantine policy'
@@ -1064,11 +1064,11 @@ require_pattern 'br2_external_dcentos/board/zynq/am2-s19jpro/post-build.sh' 'sto
 # files) are updated together.
 require_identical \
     'dcentrald/dcentrald-api/assets/stock-bitmain-manifest.json' \
-    '../../extractions/firmware-archive/stock-bitmain-manifest.json' \
+    '../../knowledge-base/firmware-archive/stock-bitmain-manifest.json' \
     'baked (assets) and shipped (firmware-archive) stock-bitmain manifests are byte-identical'
 require_identical \
     'dcentrald/dcentrald-api/assets/stock-bitmain-manifest.json.sig' \
-    '../../extractions/firmware-archive/stock-bitmain-manifest.json.sig' \
+    '../../knowledge-base/firmware-archive/stock-bitmain-manifest.json.sig' \
     'baked and shipped stock-bitmain manifest signatures are byte-identical'
 # R-F6: the legacy SSH flashers write ACTIVE firmware paths (brick risk) and are
 # DISABLED with an early error+exit. Pin the disable guard in each so it cannot be

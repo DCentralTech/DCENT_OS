@@ -259,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn () {
+    fn reference_capture_constants_pinned() {
         // 444 bytes / 5 events per the live `a lab unit` capture.
         assert_eq!(LUXOS_AUDIT_LOG_REFERENCE_SIZE_BYTES, 444);
         assert_eq!(LUXOS_AUDIT_LOG_REFERENCE_EVENT_COUNT, 5);

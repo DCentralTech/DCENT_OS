@@ -40,7 +40,7 @@ use dcentrald_api_types::perf_efficiency::{
     EfficiencyConfidence, EfficiencyReport, EfficiencySource,
 };
 
-use crate::rest::{, PowerTelemetryProjection};
+use crate::rest::{project_power_telemetry, PowerTelemetryProjection};
 use crate::AppState;
 
 /// POST body for `/api/perf/calibrate`.
@@ -116,7 +116,7 @@ fn efficiency_report_from_projection(
             source: EfficiencySource::Operator,
             confidence,
             measured_at_ms: calibration.updated_at_ms,
-            operator_wall_watts: calibration.,
+            operator_wall_watts: calibration.reference_wall_watts,
             operator_hashrate_ths: calibration.confirmed_hashrate_ths,
             jth_target_active,
         };
@@ -209,7 +209,7 @@ async fn post_calibrate(
         .lock()
         .map(|info| info.clone())
         .unwrap_or_default();
-    let power_projection = (&live_power, &live_state, &hardware);
+    let power_projection = project_power_telemetry(&live_power, &live_state, &hardware);
     let (estimated_wall_watts, estimated_board_watts) =
         calibration_power_estimates(&power_projection, measured_wall_watts);
 
@@ -218,7 +218,7 @@ async fn post_calibrate(
     let calibration = dcentrald_autotuner::PowerCalibration {
         enabled: true,
         multiplier,
-        : Some(measured_wall_watts),
+        reference_wall_watts: Some(measured_wall_watts),
         estimated_wall_watts: Some(estimated_wall_watts),
         estimated_board_watts: Some(estimated_board_watts),
         updated_at_ms: Some(now_ms()),
@@ -278,7 +278,7 @@ async fn get_efficiency(State(state): State<Arc<AppState>>) -> impl IntoResponse
         .lock()
         .map(|info| info.clone())
         .unwrap_or_default();
-    let power_projection = (&live_power, &miner, &hardware);
+    let power_projection = project_power_telemetry(&live_power, &miner, &hardware);
     let autotuner = state.autotuner_status_rx.borrow().clone();
 
     // The autotuner publishes the active runtime objective via
@@ -349,7 +349,7 @@ mod tests {
         let cal = PowerCalibration {
             enabled: true,
             multiplier: 1.0,
-            : Some(1310.0),
+            reference_wall_watts: Some(1310.0),
             estimated_wall_watts: Some(1310.0),
             estimated_board_watts: Some(1218.0),
             updated_at_ms: Some(1_700_000_000_000),
@@ -367,7 +367,7 @@ mod tests {
         let cal = PowerCalibration {
             enabled: false,
             operator_confirmed: true,
-            : Some(1310.0),
+            reference_wall_watts: Some(1310.0),
             confirmed_hashrate_ths: Some(13.5),
             ..Default::default()
         };
@@ -382,7 +382,7 @@ mod tests {
         let cal = PowerCalibration {
             enabled: true,
             multiplier: 1.05,
-            : Some(1310.0),
+            reference_wall_watts: Some(1310.0),
             confirmed_hashrate_ths: None,
             ..Default::default()
         };
@@ -394,7 +394,7 @@ mod tests {
         let cal = PowerCalibration {
             enabled: true,
             operator_confirmed: true,
-            : Some(1310.0),
+            reference_wall_watts: Some(1310.0),
             confirmed_hashrate_ths: Some(0.0),
             ..Default::default()
         };

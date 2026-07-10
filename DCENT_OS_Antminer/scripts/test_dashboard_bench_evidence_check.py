@@ -368,7 +368,7 @@ class DashboardBenchEvidenceCheckTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 bench.init_bundle_dir(base)
 
-    def test_fails_when_probe_reports_(self) -> None:
+    def test_fails_when_probe_reports_reference_different_targets(self) -> None:
         bundle = valid_bundle()
         reports = default_reports()
         reports["ws.json"] = websocket_report()
