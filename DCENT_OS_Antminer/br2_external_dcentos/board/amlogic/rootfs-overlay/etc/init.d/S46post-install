@@ -1,0 +1,103 @@
+#!/bin/sh
+#
+# S46post-install - one-shot DCENT_OS post-install hook for Amlogic NAND.
+#
+# The installer may write a tarball into the read-only system partition and
+# store its ASCII hex length in the adjacent length slot. On first boot this
+# script extracts /tmp/post_install/run.sh, executes it, and erases the slot so
+# it cannot run twice. Missing partition/tooling is treated as "nothing to do".
+
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+. /lib/functions/dcentos-defaults.sh
+. /lib/functions/system.sh
+
+log() {
+    echo "S46post-install: $*"
+}
+
+have_tools() {
+    command -v nanddump >/dev/null 2>&1 || return 1
+    command -v flash_erase >/dev/null 2>&1 || return 1
+    command -v tar >/dev/null 2>&1 || return 1
+    return 0
+}
+
+read_tar_size() {
+    raw=$(nanddump -q -s "$DCENTOS_LOCAL_RO_POST_INSTALL_TAR_LENGTH_OFFSET" -l 10 "$DCENTOS_SYSTEM_MTD" 2>/dev/null \
+        | tr -cd '0-9A-Fa-fx')
+    [ -n "$raw" ] || raw=0
+    case "$raw" in
+        0x*|0X*) echo "$raw" ;;
+        *) echo "0x$raw" ;;
+    esac
+}
+
+run_post_install() {
+    if [ "$DCENTOS_MODE" != "nand" ]; then
+        log "mode=$DCENTOS_MODE; skipping NAND post-install hook"
+        return 0
+    fi
+    if [ -z "${DCENTOS_SYSTEM_MTD:-}" ] || [ ! -e "$DCENTOS_SYSTEM_MTD" ]; then
+        log "system MTD not present; skipping"
+        return 0
+    fi
+    if [ -z "${DCENTOS_LOCAL_RO_POST_INSTALL_TAR_LENGTH_OFFSET:-}" ] \
+        || [ -z "${DCENTOS_LOCAL_RO_POST_INSTALL_TAR_OFFSET:-}" ]; then
+        log "post-install offsets unavailable; skipping"
+        return 0
+    fi
+    if ! have_tools; then
+        log "nanddump/flash_erase/tar missing; skipping"
+        return 0
+    fi
+
+    tar_size_hex=$(read_tar_size)
+    tar_size_dec=$((tar_size_hex))
+    if [ "$tar_size_dec" -le 0 ]; then
+        return 0
+    fi
+    if [ "$tar_size_dec" -gt "$DCENTOS_POST_INSTALL_TAR_MAX_DECIMAL_SIZE" ]; then
+        log "tar size $tar_size_dec exceeds max $DCENTOS_POST_INSTALL_TAR_MAX_DECIMAL_SIZE; erasing slot and skipping"
+        flash_erase -q "$DCENTOS_SYSTEM_MTD" "$DCENTOS_LOCAL_RO_POST_INSTALL_TAR_LENGTH_OFFSET" "$DCENTOS_POST_INSTALL_TAR_BLOCK_COUNT" 2>/dev/null || true
+        return 0
+    fi
+
+    rm -rf "/tmp/$DCENTOS_POST_INSTALL_DIR"
+    log "extracting post-install tar ($tar_size_dec bytes)"
+    if nanddump -q -s "$DCENTOS_LOCAL_RO_POST_INSTALL_TAR_OFFSET" -l "$tar_size_dec" "$DCENTOS_SYSTEM_MTD" \
+        | tar -x -C /tmp; then
+        log "erasing post-install slot"
+        flash_erase -q "$DCENTOS_SYSTEM_MTD" "$DCENTOS_LOCAL_RO_POST_INSTALL_TAR_LENGTH_OFFSET" "$DCENTOS_POST_INSTALL_TAR_BLOCK_COUNT" 2>/dev/null || true
+    else
+        log "extract failed; erasing slot to prevent boot loop"
+        flash_erase -q "$DCENTOS_SYSTEM_MTD" "$DCENTOS_LOCAL_RO_POST_INSTALL_TAR_LENGTH_OFFSET" "$DCENTOS_POST_INSTALL_TAR_BLOCK_COUNT" 2>/dev/null || true
+        return 1
+    fi
+
+    script="/tmp/$DCENTOS_POST_INSTALL_DIR/$DCENTOS_POST_INSTALL_SCRIPT"
+    if [ -f "$script" ]; then
+        log "running $script"
+        (cd "/tmp/$DCENTOS_POST_INSTALL_DIR" && DCENTOS_POST_INSTALL=1 sh "$script")
+        rc=$?
+        log "run.sh exited with code $rc"
+        return "$rc"
+    fi
+
+    log "no run.sh in post-install tar"
+    return 0
+}
+
+case "$1" in
+    start|"")
+        run_post_install
+        ;;
+    stop)
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

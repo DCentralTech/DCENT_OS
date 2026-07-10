@@ -1,0 +1,492 @@
+/* DCENTos Global Styles — Glassmorphism + industrial orange
+   Shared across all modes */
+
+/* Pruned :root — tokens.css (loaded first) is the canonical foundation.
+   Tokens removed here because they are byte-identical to tokens.css:
+   --font-mono, --accent, --accent-deep, --sphere-hi, --accent-glow,
+   --green, --yellow, --red, --blue, --radius-sm, --radius-lg, --radius-pill,
+   --ease-standard, valueFlash @keyframes.
+   Tokens also removed (PR-047 dedup): --bg-void, --bg-base, --bg-subtle,
+   --bg-raised, --bg-overlay, --surface-glass-card, --surface-glass-sidebar,
+   --surface-glass-topbar, --accent-hover, --accent-gradient, --accent-glow-hi,
+   --accent-border, --blue-dim, --border-glass, --dur-fast, --dur-med, --dur-slow,
+   --fg-primary, --fg-secondary, --shadow-btn — all reconciled to tokens.css
+   with global.css's cascade-winning value (tokens.css loaded first; global.css
+   loaded second; same specificity → last wins = global.css was the rendered value).
+   Tokens kept here are unique to global.css (not defined in tokens.css). */
+:root {
+  --font-display: var(--font-heading);
+  --brand-black: #070710;
+  --brand-amber: #FFC94D;
+  --brand-orange: #FAA500;
+  --brand-orange-deep: #FA6700;
+  --surface-operational: rgba(19, 19, 29, 0.92);
+  --surface-operational-hover: rgba(28, 28, 42, 0.96);
+  --border: rgba(255, 255, 255, 0.1);
+  --border-strong: rgba(255, 255, 255, 0.18);
+  --text: #f5f5f7;
+  --text-secondary: #b7b7c6;
+  --text-dim: #78788a;
+  --fg-muted: var(--text-dim);
+  --accent-light: #FFC94D;
+  --focus-ring: var(--accent);
+  --focus-ring-soft: rgba(250, 165, 0, 0.28);
+  --radius: 12px;
+  --shadow-surface: 0 10px 30px rgba(0, 0, 0, 0.34);
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  line-height: 1.5;
+  overflow-x: hidden;
+  background: var(--bg-void);
+  color: var(--fg-primary);
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+code, pre, .mono {
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* ─── Tabular Numerals ────────────────────────────────── */
+.kpi-value,
+.value-transition,
+.sats-counter-main,
+.sats-counter-dollar,
+.history-summary-value,
+.preset-btn .watts,
+.btu-hero-value,
+.status-card .value,
+code, pre, .mono {
+  font-variant-numeric: tabular-nums;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button {
+  cursor: pointer;
+  font-family: inherit;
+  border: none;
+  background: none;
+  color: inherit;
+}
+
+input, select, textarea {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+}
+
+/* D-16 RECONCILED (F1, ): visual reconciled to the single canonical
+   focus ring in design-system.css §F1-FOCUS (adds the 14px ambient accent
+   glow + 8px radius). Kept here because global.css loads before
+   design-system.css and this catches the early-paint window; the values
+   now match so there is no divergent ring across the cascade. */
+:where(a, button, [role="button"], input, select, textarea, summary, [tabindex]:not([tabindex="-1"])):focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  box-shadow:
+    0 0 0 4px var(--focus-ring-soft),
+    0 0 14px var(--accent-glow-hi, rgba(250, 165, 0, 0.35));
+  border-radius: var(--radius-sm);
+}
+
+:where(a, button, [role="button"], input, select, textarea, summary, [tabindex]:not([tabindex="-1"])):focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* ─── Scrollbar ─────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.1); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.2); }
+
+/* ─── Minimum Font Sizes ──────────────────────────────── */
+/* Override any 0.6rem or 0.65rem labels to readable minimum */
+.kpi-label,
+.preset-btn .preset-specs,
+.history-bar-value,
+.history-bar-label,
+.settings-info-row,
+.chain-card .chain-row .value {
+  font-size: max(0.75rem, inherit) !important;
+}
+
+/* ─── Glassmorphism Utility Classes ─────────────────────── */
+
+.glass-panel {
+  background: var(--surface-operational);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-lg);
+  /* Layered: surface shadow + soft top inner highlight to fake a lit pane edge. */
+  box-shadow: var(--shadow-surface), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.glass-card {
+  background: var(--surface-glass-card);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  /* Subtle inner highlight at top edge — Apple-esque "lit pane" hint. */
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  transition: border-color var(--dur-med) ease, box-shadow var(--dur-med) ease, background var(--dur-med) ease;
+}
+
+.glass-card:hover {
+  background: var(--surface-operational-hover);
+  border-color: var(--accent-border);
+  box-shadow: var(--shadow-surface);
+}
+
+.glass-sidebar {
+  background: var(--surface-glass-sidebar);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-right: 1px solid var(--border);
+}
+
+.glass-topbar {
+  background: var(--surface-glass-topbar);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border-bottom: 1px solid var(--border);
+}
+
+/* Fallback for browsers without backdrop-filter support */
+@supports not (backdrop-filter: blur(1px)) {
+  .glass-panel {
+    background: #1c1c2a;
+  }
+  .glass-card {
+    background: #14141f;
+  }
+  .glass-sidebar {
+    background: #070710;
+  }
+  .glass-topbar {
+    background: #0e0e18;
+  }
+}
+
+/* ─── Utility ───────────────────────────────────────────── */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  border: 0;
+}
+
+/* ─── Value Transition (animated number changes) ────────── */
+.value-transition {
+  transition: color 0.3s ease, transform 0.15s ease;
+}
+
+.value-transition.value-changed {
+  animation: valueFlash 0.4s ease-out;
+}
+/* @keyframes valueFlash lives in tokens.css (single source of truth). */
+
+/* ─── Animations ────────────────────────────────────────── */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pageEnter {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.page-enter {
+  animation: pageEnter 150ms ease-out;
+}
+
+@keyframes skeletonPulse {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+@keyframes glowPulse {
+  0%, 100% { box-shadow: 0 0 15px rgba(250, 165, 0, 0.1); }
+  50% { box-shadow: 0 0 25px rgba(250, 165, 0, 0.2); }
+}
+
+.fade-in { animation: fadeIn 0.3s ease-out; }
+.pulse { animation: pulse 2s ease-in-out infinite; }
+
+/* ─── Spacing Utilities ───────────────────────────────── */
+.gap-xs { gap: 4px; }
+.gap-sm { gap: 8px; }
+.gap-md { gap: 16px; }
+.gap-lg { gap: 24px; }
+.gap-xl { gap: 32px; }
+
+.p-section { padding: 20px 24px; }
+.p-card { padding: 16px 20px; }
+.p-compact { padding: 12px 16px; }
+
+.sparkline-inline {
+  display: inline-flex;
+  vertical-align: middle;
+  margin-left: 8px;
+  opacity: 0.8;
+}
+
+/* ─── Layout Utilities ─────────────────────────────────── */
+.flex { display: flex; }
+.flex-col { display: flex; flex-direction: column; }
+.flex-row { display: flex; flex-direction: row; }
+.items-center { align-items: center; }
+.items-start { align-items: flex-start; }
+.justify-between { justify-content: space-between; }
+.justify-center { justify-content: center; }
+.flex-1 { flex: 1; }
+.flex-wrap { flex-wrap: wrap; }
+
+/* ─── Text Utilities ───────────────────────────────────── */
+.text-xs { font-size: 0.75rem; }
+.text-sm { font-size: 0.85rem; }
+.text-base { font-size: 1rem; }
+.text-lg { font-size: 1.1rem; }
+.text-mono { font-family: 'JetBrains Mono', monospace; }
+.text-heading { font-family: var(--font-heading); }
+.text-center { text-align: center; }
+.text-right { text-align: right; }
+.text-uppercase { text-transform: uppercase; letter-spacing: 0.05em; }
+.font-bold { font-weight: 700; }
+.font-semibold { font-weight: 600; }
+
+/* ─── Color Utilities ──────────────────────────────────── */
+.text-primary { color: var(--text, #f0f0f0); }
+.text-secondary { color: var(--text-secondary, #8b8b9e); }
+.text-dim { color: var(--text-dim, #6E6E80); }
+.text-accent { color: var(--accent, #FAA500); }
+.text-green { color: var(--green, #2DD4A0); }
+.text-red { color: var(--red, #EF4444); }
+.text-yellow { color: var(--yellow, #F0B429); }
+
+/* ─── Shared Controls ───────────────────────────────────── */
+.mode-pill-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+  flex-wrap: wrap;
+  max-width: 100%;
+}
+
+.mode-pill-btn {
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  color: var(--text-secondary, #8b8b9e);
+  font-size: 0.74rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  transition: all 0.15s ease;
+}
+
+.mode-pill-btn:hover:not(:disabled) {
+  color: var(--text, #f0f0f0);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.mode-pill-btn.active {
+  color: var(--accent, #FAA500);
+  background: var(--accent-glow, rgba(250, 165, 0, 0.12));
+  border-color: rgba(250, 165, 0, 0.22);
+}
+
+.mode-pill-btn:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+/* ─── Spacing Margins ─────────────────────────────────── */
+.mt-1 { margin-top: 4px; }
+.mt-2 { margin-top: 8px; }
+.mt-3 { margin-top: 12px; }
+.mt-4 { margin-top: 16px; }
+.mt-6 { margin-top: 24px; }
+.mb-1 { margin-bottom: 4px; }
+.mb-2 { margin-bottom: 8px; }
+.mb-3 { margin-bottom: 12px; }
+.mb-4 { margin-bottom: 16px; }
+.mb-6 { margin-bottom: 24px; }
+
+/* ─── LedSettings component (PR-075, inline→class migration) ── */
+/* Note: --input-bg and --text-primary are not defined in any CSS
+   theme layer; the fallback hex values (#0d0d1a / #eee) are
+   preserved verbatim so computed styles remain identical. */
+
+.led-settings-panel {
+  padding: 0 4px;
+}
+
+.led-loading {
+  color: var(--text-secondary);
+  padding: 12px;
+}
+
+.led-header {
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: var(--text-primary, #eee);
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.led-saved-badge {
+  font-size: 0.75rem;
+  color: var(--accent);
+  font-weight: 400;
+}
+
+.led-section {
+  margin-bottom: 16px;
+}
+
+.led-label-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 0;
+  font-size: 0.9rem;
+}
+
+.led-desc {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  margin-top: 2px;
+}
+
+.led-select-label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-bottom: 6px;
+  display: block;
+}
+
+.led-select {
+  width: 100%;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: var(--input-bg, #0d0d1a);
+  color: var(--text-primary, #eee);
+  border: 1px solid var(--border, #333);
+  font-size: 0.9rem;
+}
+
+.led-range-input {
+  width: 100%;
+}
+
+.led-range-value {
+  font-size: 0.85rem;
+  color: var(--accent);
+}
+
+.led-subsection-title {
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.led-input-row {
+  display: flex;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.led-input-col {
+  flex: 1;
+}
+
+.led-input-label {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+}
+
+.led-input {
+  width: 100%;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--input-bg, #0d0d1a);
+  color: var(--text-primary);
+  border: 1px solid var(--border, #333);
+  font-size: 0.85rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html:focus-within {
+    scroll-behavior: auto !important;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  .fade-in,
+  .page-enter,
+  .pulse,
+  .value-transition.value-changed {
+    animation: none !important;
+  }
+
+  :where(.ds-btn, .btn, .glass-card, .kpi-card, .current-block-card, .ops-action-btn, .preset-btn, .chip-cell):hover {
+    transform: none !important;
+  }
+}

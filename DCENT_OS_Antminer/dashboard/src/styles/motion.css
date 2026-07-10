@@ -1,0 +1,606 @@
+/* ─────────────────────────────────────────────────────────
+   DCENT_OS — Motion + Micro-interactions Layer
+   Owned by Agent 7 (UI/UX deep redesign wave, 2026-05-15).
+   Additive layer: loaded AFTER tokens / global / mode CSS /
+   design-system / canonical / current-block / features /
+   responsive. Composes on top — never re-declares brand
+   primitives or duplicates existing keyframes.
+
+   Vocabulary:
+     - Hover lift on cards + buttons + ops-summary panels.
+     - Snappy button press.
+     - Universal accent focus ring (additive to Agent 1's base).
+     - Page-content entrance for all 3 modes (Standard had it,
+       Hacker + Basic now get the same slideUp stagger).
+     - Mode-switch fade-in on first render of each mode wrapper.
+     - Toast slide+fade enter/exit.
+     - Modal backdrop+content scale-up with backdrop-filter ramp.
+     - Skeleton shimmer using accent glow.
+     - Number ticker change pulse (.kpi-value-changed).
+     - Live-pulse dot (.ds-dot-live).
+     - Subtle hashrate-active aura on the primary KPI card.
+     - prefers-reduced-motion global override + print-safe.
+
+   Reuses existing keyframes from tokens.css + design-system.css
+   (slideUp, fadeIn, pulse, valueFlash, breathingGlow, glowPulse,
+   bmFade, bmPop, ds-shimmer, ds-modalIn). New keyframes are
+   prefixed 'dcm-' (dcentos-motion) to avoid clashes.
+   ── */
+
+
+/* ──1. UNIVERSAL HOVER LIFT
+   Cards / KPI cards / ops-summary panels / buttons get a 1px
+   translateY lift on hover with an elevation upgrade. Smooth
+   ~150 ms ease — premium without being bouncy.
+   ── */
+
+.kpi-card,
+.section .card,
+.ds-btn {
+  /* Keep existing transitions intact by layering both transform
+     and box-shadow into the standard easing. Other CSS may set
+     transition: all .18s — ours is more specific by listing the
+     exact properties so we don't clobber color/background. */
+  transition:
+    transform 150ms var(--ease-standard, cubic-bezier(.2,0,0,1)),
+    box-shadow 150ms var(--ease-standard, cubic-bezier(.2,0,0,1)),
+    border-color 150ms var(--ease-standard, cubic-bezier(.2,0,0,1));
+  will-change: transform;
+}
+
+.kpi-card:hover,
+.section .card:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--elevation-floating, 0 8px 32px rgba(0,0,0,.40));
+}
+
+.ds-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-btn, 0 2px 8px rgba(250, 103, 0, 0.30));
+}
+
+
+/* ──2. BUTTON PRESS FEEDBACK
+   Snappier than hover (~80 ms). Settles into a slightly
+   compressed state on :active.
+   ── */
+
+.ds-btn:active:not(:disabled) {
+  transform: translateY(0);
+  box-shadow: var(--elevation-base, 0 1px 2px rgba(0,0,0,.35));
+  transition:
+    transform 80ms var(--ease-standard, cubic-bezier(.2,0,0,1)),
+    box-shadow 80ms var(--ease-standard, cubic-bezier(.2,0,0,1));
+}
+
+
+/* ──3. UNIVERSAL FOCUS RING
+   Agent 1 sets a base focus-ring; we layer an accent glow
+   suitable for the dark UI. Additive — uses outline-offset so
+   it doesn't shift layout. Visible against all backgrounds.
+   ── */
+
+button:focus-visible,
+a:focus-visible,
+.ds-btn:focus-visible,
+.ds-toggle:focus-visible,
+.ds-input:focus-visible,
+.ds-chip:focus-visible,
+[role="button"]:focus-visible,
+[role="tab"]:focus-visible,
+[role="switch"]:focus-visible,
+[role="menuitem"]:focus-visible,
+[tabindex]:not([tabindex="-1"]):focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  box-shadow:
+    0 0 0 4px var(--accent-glow),
+    0 0 14px var(--accent-glow-hi);
+}
+
+/* In hacker mode swap the accent glow for phosphor so the ring
+   doesn't fight the CRT aesthetic. Layered additive — base
+   tokens still drive the outline color. */
+.mode-hacker button:focus-visible,
+.mode-hacker a:focus-visible,
+.mode-hacker [tabindex]:not([tabindex="-1"]):focus-visible,
+.mode-hacker input:focus-visible,
+.mode-hacker select:focus-visible,
+.mode-hacker textarea:focus-visible {
+  outline-color: var(--fg-hacker-green, #00FF41);
+  box-shadow:
+    0 0 0 4px rgba(0, 255, 65, 0.18),
+    0 0 14px rgba(0, 255, 65, 0.32);
+}
+
+
+/* ──4. PAGE-CONTENT STAGGERED ENTRANCE (all 3 modes)
+   Standard mode already gets this from design-system.css.
+   We extend it additively to Hacker + Basic so all 3 modes
+   share the same smooth entrance. Same keyframe (slideUp).
+   ── */
+
+.mode-hacker .page-content > *,
+.mode-hacker .page-scroll > *,
+.mode-basic .page-content > *,
+.mode-basic .page-scroll > * {
+  animation: slideUp 0.45s var(--ease-standard, cubic-bezier(.2,0,0,1)) both;
+}
+
+.mode-hacker .page-content > *:nth-child(1),
+.mode-hacker .page-scroll > *:nth-child(1),
+.mode-basic  .page-content > *:nth-child(1),
+.mode-basic  .page-scroll > *:nth-child(1)  { animation-delay:   0ms; }
+
+.mode-hacker .page-content > *:nth-child(2),
+.mode-hacker .page-scroll > *:nth-child(2),
+.mode-basic  .page-content > *:nth-child(2),
+.mode-basic  .page-scroll > *:nth-child(2)  { animation-delay:  40ms; }
+
+.mode-hacker .page-content > *:nth-child(3),
+.mode-hacker .page-scroll > *:nth-child(3),
+.mode-basic  .page-content > *:nth-child(3),
+.mode-basic  .page-scroll > *:nth-child(3)  { animation-delay:  80ms; }
+
+.mode-hacker .page-content > *:nth-child(4),
+.mode-hacker .page-scroll > *:nth-child(4),
+.mode-basic  .page-content > *:nth-child(4),
+.mode-basic  .page-scroll > *:nth-child(4)  { animation-delay: 120ms; }
+
+.mode-hacker .page-content > *:nth-child(5),
+.mode-hacker .page-scroll > *:nth-child(5),
+.mode-basic  .page-content > *:nth-child(5),
+.mode-basic  .page-scroll > *:nth-child(5)  { animation-delay: 160ms; }
+
+.mode-hacker .page-content > *:nth-child(n+6),
+.mode-hacker .page-scroll > *:nth-child(n+6),
+.mode-basic  .page-content > *:nth-child(n+6),
+.mode-basic  .page-scroll > *:nth-child(n+6) { animation-delay: 200ms; }
+
+
+/* ──5. MODE-SWITCH ENTRANCE
+   When the wrapper class changes from 'mode-standard' to
+   'mode-hacker' (etc.), the new mode wrapper mounts fresh.
+   We can't intercept the class transition, but we can ensure
+   the first-render content of each mode wrapper gets a soft
+   fade+pop entrance.
+   ── */
+
+.mode-standard,
+.mode-hacker,
+.mode-basic {
+  animation: dcm-mode-enter 320ms var(--ease-out-soft, cubic-bezier(.22,.61,.36,1)) both;
+}
+
+@keyframes dcm-mode-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.998);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+
+/* ──6. TOAST SLIDE-IN / FADE-OUT
+   Universal entry + exit. Slides in from the right edge,
+   fades out + slides out the same way.
+   ── */
+
+.toast,
+.dcm-toast {
+  animation: dcm-toast-in 250ms var(--ease-out-soft, cubic-bezier(.22,.61,.36,1)) both;
+}
+
+.toast.toast-exit,
+.toast-exit,
+.dcm-toast-exit {
+  animation: dcm-toast-out 220ms var(--ease-standard, cubic-bezier(.2,0,0,1)) both;
+}
+
+@keyframes dcm-toast-in {
+  from {
+    opacity: 0;
+    transform: translateX(24px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes dcm-toast-out {
+  from {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(28px);
+  }
+}
+
+
+/* ──7. MODAL ENTRANCE
+   Backdrop fades in + blur ramps up. Content pops in from
+   scale(0.96). Reuses existing bmFade / bmPop keyframes for
+   continuity with the rest of the system.
+   ── */
+
+.modal-backdrop,
+.dcm-modal-backdrop {
+  animation: bmFade 300ms var(--ease-out-soft, cubic-bezier(.22,.61,.36,1)) both;
+}
+
+.modal-content,
+.modal-dialog,
+.dcm-modal-content {
+  animation: bmPop 300ms var(--ease-spring, cubic-bezier(.34,1.56,.64,1)) both;
+  transform-origin: center center;
+}
+
+
+/* ──8. SKELETON SHIMMER
+   Diagonal gradient sweep across .skeleton-shimmer / .skeleton
+   every ~1.6 s. Uses accent glow for the highlight stripe so
+   it feels D-Central branded rather than generic white.
+   ── */
+
+.skeleton-shimmer,
+.dcm-skeleton {
+  position: relative;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: var(--radius-sm, 8px);
+}
+
+.skeleton-shimmer::after,
+.dcm-skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    115deg,
+    transparent 0%,
+    transparent 35%,
+    rgba(250, 165, 0, 0.10) 50%,
+    rgba(255, 201, 77, 0.18) 52%,
+    rgba(250, 165, 0, 0.10) 54%,
+    transparent 65%,
+    transparent 100%
+  );
+  background-size: 220% 100%;
+  background-repeat: no-repeat;
+  animation: dcm-skeleton-sweep 1.6s linear infinite;
+  pointer-events: none;
+}
+
+@keyframes dcm-skeleton-sweep {
+  0%   { background-position: -130% 0; }
+  100% { background-position: 230% 0; }
+}
+
+
+/* ──9. NUMBER TICKER (KPI value change)
+   Quick scale pulse when the displayed value changes. Reuses
+   the existing valueFlash keyframe but with a shorter
+   duration suited to high-frequency updates (hashrate / temp
+   tick rates ~1 Hz).
+   ── */
+
+.kpi-value-changed,
+.dcm-value-changed {
+  animation: valueFlash 520ms var(--ease-out-soft, cubic-bezier(.22,.61,.36,1)) both;
+  font-variant-numeric: tabular-nums;
+  will-change: transform;
+}
+
+
+/* ──10. LIVE-PULSE DOT
+   Universal pulsing dot. Soft 1.8 s cycle. Composes with any
+   color via currentColor — the inner glow inherits from text.
+   ── */
+
+.ds-dot-live,
+.dcm-dot-live {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 6px currentColor;
+  animation: pulse 1.8s ease-in-out infinite;
+  vertical-align: middle;
+}
+
+
+/* ──11. HASHRATE-ACTIVE AURA
+   Subtle glowPulse on the primary KPI card when the daemon is
+   mining. Activated by a '.is-mining' flag on the wrapper, or
+   '.kpi-card.is-active', or the convention class
+   '.kpi-card--primary.is-mining'. Very gentle — never a
+   distraction.
+   ── */
+
+.is-mining .kpi-card--primary,
+.kpi-card--primary.is-mining,
+.kpi-card--primary.is-active,
+.kpi-card.is-mining {
+  animation: glowPulse 4s ease-in-out infinite;
+}
+
+
+/* ──12. PREFERS-REDUCED-MOTION OVERRIDE
+   Honor user accessibility preference. Disable all transforms
+   and motion-bearing animations, but keep opacity fades so
+   the UI still gives state feedback (toast visibility, modal
+   open/close, focus state changes).
+   ── */
+
+@media (prefers-reduced-motion: reduce) {
+  .kpi-card,
+  .section .card,
+  .ds-btn {
+    transition: none;
+    will-change: auto;
+  }
+
+  .kpi-card:hover,
+  .section .card:hover,
+  .ds-btn:hover:not(:disabled),
+  .ds-btn:active:not(:disabled) {
+    transform: none;
+  }
+
+  /* Neutralize motion-bearing animations defined in this file +
+     decorative loops we own (mode-enter, skeleton sweep,
+     hashrate aura, toast slide). */
+  .mode-standard,
+  .mode-hacker,
+  .mode-basic,
+  .mode-hacker .page-content > *,
+  .mode-hacker .page-scroll > *,
+  .mode-basic .page-content > *,
+  .mode-basic .page-scroll > *,
+  .toast,
+  .dcm-toast,
+  .toast.toast-exit,
+  .toast-exit,
+  .dcm-toast-exit,
+  .modal-content,
+  .modal-dialog,
+  .dcm-modal-content,
+  .skeleton-shimmer::after,
+  .dcm-skeleton::after,
+  .kpi-value-changed,
+  .dcm-value-changed,
+  .ds-dot-live,
+  .dcm-dot-live,
+  .is-mining .kpi-card--primary,
+  .kpi-card--primary.is-mining,
+  .kpi-card--primary.is-active,
+  .kpi-card.is-mining {
+    animation-duration: 0.01ms;
+    animation-iteration-count: 1;
+    transform: none;
+  }
+
+  /* Focus rings stay visible — they are state feedback, not
+     decoration. The box-shadow halo we add is preserved. */
+}
+
+
+/* ──13. PRINT-SAFE
+   Disable all motion entirely when printing. Cards lay flat;
+   shimmer / live dots / hover lift do not render. tokens.css
+   already strips backdrop-filter + shadow tokens for print —
+   we just need to make sure no animation/transition lingers.
+   ── */
+
+@media print {
+  .kpi-card,
+  .section .card,
+  .ds-btn,
+  .toast,
+  .dcm-toast,
+  .modal-backdrop,
+  .dcm-modal-backdrop,
+  .modal-content,
+  .modal-dialog,
+  .dcm-modal-content,
+  .skeleton-shimmer,
+  .dcm-skeleton,
+  .kpi-value-changed,
+  .dcm-value-changed,
+  .ds-dot-live,
+  .dcm-dot-live,
+  .mode-standard,
+  .mode-hacker,
+  .mode-basic {
+    animation: none;
+    transition: none;
+    transform: none;
+    box-shadow: none;
+  }
+  .skeleton-shimmer::after,
+  .dcm-skeleton::after {
+    display: none;
+  }
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * WAVE-5 MOTION ADDITIONS (Phase-2 / Agent F1 — 2026-05-17)
+ *
+ * Strictly ADDITIVE. New keyframes 'dcm-' prefixed (no clashes). 0 !important.
+ * Full prefers-reduced-motion + @media print guards at the foot of this block.
+ * Phase-3 agents apply these classes; F1 provides the vocabulary only.
+ *
+ *   .dcm-press            — refined tactile press (any button/interactive)
+ *   .dcm-card-enter       — single card/section premium entrance
+ *   .dcm-flash            — value-change accent flash (telemetry value swap)
+ *   .dcm-telemetry-pulse  — gentle 1Hz-safe live-update micro-pulse
+ *   .dcm-asic-glow        — tasteful animated-ASIC glow shell (P6 wires viz)
+ *   .dcm-tooltip-in       — tooltip/popover fade+scale entrance (Tooltip.tsx)
+ *   .dcm-shimmer-soft     — low-contrast skeleton sweep (dense tables)
+ *   .dcm-glow-breathe     — slow halo breathing (hero "is it mining?" cue)
+ * ── */
+
+/* ──14. REFINED PRESS
+   A softer, more premium press than §2's button-only rule. Opt-in on any
+   interactive (chips, tiles, nav items) that wants tactile feedback. */
+.dcm-press {
+  transition: transform 110ms var(--ease-out-soft, cubic-bezier(.22,.61,.36,1)),
+              box-shadow 110ms var(--ease-out-soft, cubic-bezier(.22,.61,.36,1));
+}
+.dcm-press:active:not(:disabled) {
+  transform: scale(0.975);
+}
+
+/* ──15. SINGLE CARD ENTRANCE
+   For surfaces that mount on their own (modals' inner cards, lazily-loaded
+   tool panels) and want a premium settle instead of the stagger. */
+.dcm-card-enter {
+  animation: dcm-card-enter 420ms var(--ease-out-soft, cubic-bezier(.22,.61,.36,1)) both;
+}
+@keyframes dcm-card-enter {
+  from { opacity: 0; transform: translateY(10px) scale(0.99); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* ──16. VALUE-CHANGE FLASH
+   Distinct from §9's scale ticker — a color+glow flash with no transform, so
+   it never nudges layout in dense telemetry grids. */
+.dcm-flash {
+  animation: dcm-flash 560ms var(--ease-out-soft, cubic-bezier(.22,.61,.36,1)) both;
+  font-variant-numeric: tabular-nums;
+}
+@keyframes dcm-flash {
+  0%   { color: var(--accent); text-shadow: 0 0 10px var(--accent-glow-hi, rgba(250,165,0,.35)); }
+  55%  { color: var(--accent); text-shadow: 0 0 4px var(--accent-glow, rgba(250,165,0,.15)); }
+  100% { color: inherit; text-shadow: none; }
+}
+
+/* ──17. TELEMETRY MICRO-PULSE
+   Very gentle 2.4s opacity-only pulse on a live-data badge/dot. Opacity-only
+   ⇒ zero jitter at 1Hz update rates (no transform/filter recalculation). */
+.dcm-telemetry-pulse {
+  animation: dcm-telemetry-pulse 2.4s ease-in-out infinite;
+}
+@keyframes dcm-telemetry-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.62; }
+}
+
+/* ──18. ANIMATED-ASIC GLOW SHELL
+   Reusable shell class for the LiveAsicVisual/chart trio (P6 wires the actual
+   chip-grid visuals — F1 only ships the keyframe + class so P6 doesn't invent
+   its own). Slow 5s warm drop-shadow breathe; opt-in via '.is-mining'. */
+.dcm-asic-glow.is-mining {
+  animation: dcm-asic-glow 5s ease-in-out infinite;
+}
+@keyframes dcm-asic-glow {
+  0%, 100% { filter: drop-shadow(0 0 6px rgba(250,165,0,0.16)); }
+  50%      { filter: drop-shadow(0 0 16px rgba(250,165,0,0.34)); }
+}
+.mode-hacker .dcm-asic-glow.is-mining {
+  animation-name: dcm-asic-glow-neon;
+}
+@keyframes dcm-asic-glow-neon {
+  0%, 100% { filter: drop-shadow(0 0 6px rgba(0,255,65,0.18)); }
+  50%      { filter: drop-shadow(0 0 16px rgba(0,255,65,0.38)); }
+}
+
+/* ──19. TOOLTIP / POPOVER ENTRANCE
+   Fast premium fade + slight scale-up from the trigger. Consumed by
+   Tooltip.tsx (both the React panel and the [data-tooltip] CSS path). */
+.dcm-tooltip-in {
+  animation: dcm-tooltip-in 140ms var(--ease-out-soft, cubic-bezier(.22,.61,.36,1)) both;
+}
+@keyframes dcm-tooltip-in {
+  from { opacity: 0; transform: translateY(3px) scale(0.96); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* ──20. SOFT SHIMMER
+   Lower-contrast sweep than §8 — for dense Advanced tables where the bright
+   accent stripe would be visually noisy. */
+.dcm-shimmer-soft {
+  position: relative;
+  overflow: hidden;
+  background: rgba(255,255,255,0.03);
+}
+.dcm-shimmer-soft::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(110deg,
+    transparent 0%, transparent 40%,
+    rgba(255,255,255,0.06) 50%,
+    transparent 60%, transparent 100%);
+  background-size: 220% 100%;
+  background-repeat: no-repeat;
+  animation: dcm-shimmer-soft 1.9s linear infinite;
+  pointer-events: none;
+}
+@keyframes dcm-shimmer-soft {
+  0%   { background-position: -120% 0; }
+  100% { background-position: 220% 0; }
+}
+
+/* ──21. HALO BREATHE
+   Slow box-shadow breathing for the "are you actually earning?" hero cue
+   (R1 pain #1/#5). Gentle 4.6s — never a distraction. */
+.dcm-glow-breathe {
+  animation: dcm-glow-breathe 4.6s ease-in-out infinite;
+}
+@keyframes dcm-glow-breathe {
+  0%, 100% { box-shadow: var(--elevation-base, 0 1px 2px rgba(0,0,0,.35)), 0 0 14px rgba(250,165,0,0.12); }
+  50%      { box-shadow: var(--elevation-raised, 0 2px 4px rgba(0,0,0,.35)), 0 0 26px rgba(250,165,0,0.26); }
+}
+
+/* ──22. WAVE-5 REDUCED-MOTION GUARD
+   Neutralize every motion-bearing Wave-5 addition. Opacity end-state held so
+   tooltips/cards still appear (state feedback preserved). */
+@media (prefers-reduced-motion: reduce) {
+  .dcm-press,
+  .dcm-card-enter,
+  .dcm-flash,
+  .dcm-telemetry-pulse,
+  .dcm-asic-glow.is-mining,
+  .mode-hacker .dcm-asic-glow.is-mining,
+  .dcm-tooltip-in,
+  .dcm-shimmer-soft::after,
+  .dcm-glow-breathe {
+    animation-duration: 0.01ms;
+    animation-iteration-count: 1;
+    transition: none;
+    transform: none;
+    filter: none;
+  }
+  .dcm-press:active:not(:disabled) { transform: none; }
+}
+
+/* ──23. WAVE-5 PRINT-SAFE */
+@media print {
+  .dcm-press,
+  .dcm-card-enter,
+  .dcm-flash,
+  .dcm-telemetry-pulse,
+  .dcm-asic-glow,
+  .dcm-tooltip-in,
+  .dcm-shimmer-soft,
+  .dcm-glow-breathe {
+    animation: none;
+    transition: none;
+    transform: none;
+    box-shadow: none;
+    filter: none;
+  }
+  .dcm-shimmer-soft::after { display: none; }
+}

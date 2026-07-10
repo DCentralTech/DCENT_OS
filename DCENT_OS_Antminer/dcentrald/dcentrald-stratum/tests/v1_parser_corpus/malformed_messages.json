@@ -1,0 +1,52 @@
+[
+  {
+    "name": "unknown_method_preserves_line",
+    "input": "{\"id\":null,\"method\":\"mining.future_extension\",\"params\":[1]}",
+    "expect": { "variant": "unknown", "contains": "mining.future_extension" }
+  },
+  {
+    "name": "notify_params_not_array",
+    "input": "{\"id\":null,\"method\":\"mining.notify\",\"params\":42}",
+    "expect": { "variant": "unknown", "contains": "params is not an array" }
+  },
+  {
+    "name": "notify_prev_hash_null",
+    "input": "{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"job-8\",null,\"cb1\",\"cb2\",[],\"20000000\",\"170fffff\",\"65f0abcd\",true]}",
+    "expect": { "variant": "unknown", "contains": "prev_hash is missing or non-string" }
+  },
+  {
+    "name": "notify_clean_jobs_string",
+    "input": "{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"job-9\",\"00\",\"cb1\",\"cb2\",[],\"20000000\",\"170fffff\",\"65f0abcd\",\"true\"]}",
+    "expect": { "variant": "unknown", "contains": "clean_jobs is missing or non-bool" }
+  },
+  {
+    "name": "set_difficulty_zero",
+    "input": "{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[0]}",
+    "expect": { "variant": "unknown", "contains": "not a finite positive number" }
+  },
+  {
+    "name": "set_extranonce_size_string",
+    "input": "{\"id\":null,\"method\":\"mining.set_extranonce\",\"params\":[\"abcd\",\"8\"]}",
+    "expect": { "variant": "unknown", "contains": "extranonce2_size present but not a" }
+  },
+  {
+    "name": "set_version_mask_empty",
+    "input": "{\"id\":null,\"method\":\"mining.set_version_mask\",\"params\":[\"\"]}",
+    "expect": { "variant": "unknown", "contains": "mask string is empty" }
+  },
+  {
+    "name": "reconnect_empty_host",
+    "input": "{\"id\":null,\"method\":\"client.reconnect\",\"params\":[\"\",3333,1]}",
+    "expect": { "variant": "unknown", "contains": "host string is empty" }
+  },
+  {
+    "name": "reconnect_port_out_of_range",
+    "input": "{\"id\":null,\"method\":\"client.reconnect\",\"params\":[\"pool.example.com\",70000,1]}",
+    "expect": { "variant": "unknown", "contains": "out of range" }
+  },
+  {
+    "name": "malformed_json",
+    "input": "{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"unterminated\"",
+    "expect": { "variant": "parse_error" }
+  }
+]

@@ -1,0 +1,36 @@
+# Buildroot (cloned by 'make setup', ~1GB)
+buildroot/
+
+# Build output
+output/
+
+# Downloaded toolchain/sources (inside buildroot/)
+dl/
+
+# Editor temp files
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build artifacts (large binary output, regenerated from source)
+releases/
+*.squashfs
+*.uimage
+dcentrald/backups/
+dcentrald/target/
+
+# Scratch / temp dirs
+.tmp_*/
+
+# Extractions / firmware dumps belong in , not the firmware tree
+extractions/
+
+# Ad-hoc runtime logs from live-miner debugging (committed reviews stay under docs/reviews/)
+boot_log_*.txt
+docs/dcentrald_log_*.txt
+docs/dcentrald_coldboot_*.txt
+docs/RE_BRAIINS_LIVE_DUMP_*.txt

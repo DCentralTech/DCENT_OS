@@ -1,0 +1,13 @@
+{
+  "schema": "dcentos-esp.upstream-fixture.v1",
+  "fixture": "esp-miner-device-config",
+  "source_repository": "https://github.com/bitaxeorg/ESP-Miner",
+  "source_file": "main/device_config.h",
+  "local_file": "device_config.h",
+  "upstream_commit": "b4c3dcbb9ed36c2a0eb9ae7d57a4132e8c52c14b",
+  "upstream_commit_date": "2026-07-03",
+  "last_synced_on": "2026-07-04",
+  "license": "GPL-3.0-or-later",
+  "network_ci_policy": "no_network_fetch_in_ci",
+  "operator_checklist_item": "Before public ESP release, compare this fixture with ESP-Miner main/device_config.h at a named commit and update this manifest if board-version rows changed."
+}

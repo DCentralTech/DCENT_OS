@@ -1,0 +1,38 @@
+[package]
+name = "dcentaxe-asic"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "ASIC driver crate for DCENT_axe — BM1366, BM1368, BM1370, BM1397"
+
+[features]
+# Default: no research drivers compiled.
+default = []
+# Research-only BM1373 scaffold. Pre-hardware and default OFF; do not enable
+# in production images until register values and nonce format are verified.
+asic-bm1373-research = []
+# Research-only KF1950 (WhatsMiner K-series) driver.
+# UNTESTED — produces zero nonces in upstream fork. Do not enable in
+# production builds.
+asic-kf1950 = []
+# Canaan Avalon A-series shim driver. Used by `projects/dcentaxe-avalon/` and
+# `DCENT_OS_AvalonMiner/` to plug the K230 mm_pkg shim into the same
+# AsicDriver trait + dispatcher used by Bitmain BM-family chips. Phase 1 talks
+# to Canaan's encrypted asic_miner_e RT-Smart blob via SysV msgq + 266-byte
+# mm_pkg — and
+#  memory entry.
+asic-avalon = []
+
+[dependencies]
+# Logging
+log = "0.4"
+
+# Serialization for register data / telemetry
+serde = { version = "1", features = ["derive"] }
+
+# Fixed-size buffers for UART RX/TX
+heapless = { version = "0.9", features = ["serde"] }
+
+[target.'cfg(target_os = "espidf")'.dependencies]
+# ESP-IDF for UART access. Host tests use the non-ESP serial stub.
+esp-idf-hal = "0.46"

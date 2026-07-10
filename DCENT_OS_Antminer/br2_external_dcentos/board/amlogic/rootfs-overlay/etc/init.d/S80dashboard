@@ -1,0 +1,188 @@
+#!/bin/sh
+#
+# S80dashboard - Start DCENT_OS dashboard reverse proxy
+#
+# The dashboard owns port 80. It serves the static UI and proxies dcentrald
+# REST/WebSocket requests to the daemon API on 127.0.0.1:8080.
+#
+
+SERVER="/root/web/server.py"
+PIDFILE="/var/run/dashboard.pid"
+CHILD_PIDFILE="/var/run/dashboard-child.pid"
+EXPECTFILE="/tmp/dashboard.expected_exit.pid"
+LOGFILE="/tmp/dashboard.log"
+PORT=80
+BIND="0.0.0.0"
+MAX_CRASH_RESTARTS=5
+RESTART_DELAY=2
+
+# SEC-W24-1: per-boot trusted-loopback nonce.
+#
+# dcentrald can still accept X-Dcentos-Dashboard-Proxy from explicit same-host
+# trusted helpers, but the LAN-facing dashboard server.py does not stamp this
+# header on proxied browser requests; it forwards Bearer auth instead. A STATIC
+# header value ("1") is forgeable by any LAN client, so on a release image the
+# daemon must reject it. We replace the static value with a random per-boot
+# secret written to a root-only tmpfs file. A LAN attacker cannot read the 0600
+# root-only file and cannot guess the 256-bit nonce.
+#
+# On a DEV/LAB image dcentrald still accepts the legacy static "1" (byte-
+# identical to today); the nonce is the ONLY accepted value on a release image.
+PROXY_NONCE_DIR="/run/dcentos"
+PROXY_NONCE_FILE="$PROXY_NONCE_DIR/proxy_nonce"
+
+generate_proxy_nonce() {
+    # Idempotent: only (re)generate if the per-boot file is missing. /run is
+    # tmpfs, so the nonce is naturally fresh every boot. 32 random bytes hex.
+    [ -f "$PROXY_NONCE_FILE" ] && return 0
+    mkdir -p "$PROXY_NONCE_DIR" 2>/dev/null || true
+    chmod 700 "$PROXY_NONCE_DIR" 2>/dev/null || true
+    NONCE=""
+    if [ -r /dev/urandom ] && command -v od >/dev/null 2>&1; then
+        NONCE=$(od -An -tx1 -N32 /dev/urandom 2>/dev/null | tr -d ' \n')
+    fi
+    if [ -z "$NONCE" ]; then
+        # CE-114: on a RELEASE image, REFUSE the weak date+pid+uptime fallback.
+        # A guessable proxy nonce must never gate loopback trust on a release
+        # image; if /dev/urandom is unavailable, leave the nonce file ABSENT so
+        # the proxy trust path stays disabled and LAN clients fall back to bearer
+        # auth (fail closed). The dcentrald-api release path also rejects any
+        # non-64-hex nonce (auth.rs is_strong_proxy_nonce), so this is
+        # defense-in-depth. On dev images the weak-but-non-static fallback is
+        # retained for debug-friendliness (the backend still rejects literal "1").
+        if [ -f /etc/dcentos/release-image ]; then
+            echo "  [WARN] dashboard: /dev/urandom unavailable on a release-image;" \
+                 "refusing weak proxy-nonce fallback (loopback proxy trust disabled," \
+                 "bearer auth required)." >&2
+            return 0
+        fi
+        # Fallback entropy if od/urandom unavailable (DEV image only). Date + pid
+        # + uptime is weak but non-static; the release-image verifier still
+        # rejects the literal "1".
+        NONCE=$(date +%s%N 2>/dev/null)$$$(cat /proc/uptime 2>/dev/null | tr -d ' .')
+    fi
+    # Write atomically and lock down to root-only before exposing the value.
+    UMASK_OLD=$(umask)
+    umask 077
+    printf '%s' "$NONCE" > "$PROXY_NONCE_FILE.tmp.$$" 2>/dev/null \
+        && mv "$PROXY_NONCE_FILE.tmp.$$" "$PROXY_NONCE_FILE" 2>/dev/null
+    umask "$UMASK_OLD"
+    chmod 600 "$PROXY_NONCE_FILE" 2>/dev/null || true
+}
+
+case "$1" in
+    start)
+        if [ ! -f "$SERVER" ]; then
+            echo "  [SKIP] dashboard: server.py not found at $SERVER"
+            exit 0
+        fi
+
+        # SEC-W24-1: mint the per-boot trusted-loopback nonce before dcentrald
+        # starts so explicit same-host helpers and auth.rs see one stable value.
+        generate_proxy_nonce
+
+        if [ -f "$PIDFILE" ]; then
+            WRAPPER_PID=$(cat "$PIDFILE" 2>/dev/null || true)
+            if [ -n "$WRAPPER_PID" ] && kill -0 "$WRAPPER_PID" 2>/dev/null; then
+                echo "  [OK] dashboard already running (wrapper PID $WRAPPER_PID)"
+                exit 0
+            fi
+        fi
+
+        rm -f "$PIDFILE" "$CHILD_PIDFILE" "$EXPECTFILE"
+        echo "Starting dashboard on :$PORT..."
+
+        start-stop-daemon -S -b -m -p "$PIDFILE" \
+            -x /bin/sh -- -c "
+                CRASH_COUNT=0
+                while true; do
+                    if [ -x $SERVER ]; then
+                        $SERVER --bind $BIND --port $PORT >>$LOGFILE 2>&1 &
+                    else
+                        python3 $SERVER --bind $BIND --port $PORT >>$LOGFILE 2>&1 &
+                    fi
+                    CHILD_PID=\$!
+                    echo \$CHILD_PID > $CHILD_PIDFILE
+                    wait \$CHILD_PID
+                    EXIT_CODE=\$?
+                    EXPECTED_PID=\$(cat $EXPECTFILE 2>/dev/null || true)
+                    rm -f $CHILD_PIDFILE
+
+                    if [ \"\$EXPECTED_PID\" = \"\$CHILD_PID\" ]; then
+                        rm -f $EXPECTFILE
+                        echo \"\$(date): expected dashboard exit for PID \$CHILD_PID (code \$EXIT_CODE)\" >> $LOGFILE
+                        exit \$EXIT_CODE
+                    fi
+
+                    rm -f $EXPECTFILE
+                    if [ \$EXIT_CODE -eq 0 ]; then
+                        echo \"\$(date): dashboard exited cleanly\" >> $LOGFILE
+                        exit 0
+                    fi
+
+                    CRASH_COUNT=\$((CRASH_COUNT + 1))
+                    echo \"\$(date): dashboard exited with code \$EXIT_CODE (crash \$CRASH_COUNT/$MAX_CRASH_RESTARTS)\" >> $LOGFILE
+                    if [ \$CRASH_COUNT -ge $MAX_CRASH_RESTARTS ]; then
+                        echo \"\$(date): dashboard restart limit reached\" >> $LOGFILE
+                        exit \$EXIT_CODE
+                    fi
+                    sleep $RESTART_DELAY
+                done
+            "
+        echo "  [OK] dashboard supervisor started (HTTP :$PORT)"
+        echo "  Log: $LOGFILE"
+        ;;
+
+    stop)
+        echo "Stopping dashboard..."
+        CHILD_PID=$(cat "$CHILD_PIDFILE" 2>/dev/null || true)
+        WRAPPER_PID=$(cat "$PIDFILE" 2>/dev/null || true)
+        [ -n "$CHILD_PID" ] && echo "$CHILD_PID" > "$EXPECTFILE"
+        [ -n "$CHILD_PID" ] && kill -TERM "$CHILD_PID" 2>/dev/null
+
+        for i in $(seq 1 10); do
+            if [ -z "$CHILD_PID" ] || ! kill -0 "$CHILD_PID" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+
+        if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+            rm -f "$EXPECTFILE"
+            kill -9 "$CHILD_PID" 2>/dev/null
+        fi
+
+        if [ -n "$WRAPPER_PID" ] && kill -0 "$WRAPPER_PID" 2>/dev/null; then
+            kill -TERM "$WRAPPER_PID" 2>/dev/null
+            sleep 1
+            kill -9 "$WRAPPER_PID" 2>/dev/null
+        fi
+
+        rm -f "$PIDFILE" "$CHILD_PIDFILE" "$EXPECTFILE"
+        echo "  [OK] dashboard stopped"
+        ;;
+
+    restart)
+        $0 stop
+        sleep 1
+        $0 start
+        ;;
+
+    status)
+        if [ -f "$CHILD_PIDFILE" ]; then
+            CHILD_PID=$(cat "$CHILD_PIDFILE" 2>/dev/null || true)
+            if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+                echo "dashboard is running (PID $CHILD_PID, HTTP :$PORT)"
+                exit 0
+            fi
+        fi
+        echo "dashboard is not running"
+        ;;
+
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
+
+exit 0

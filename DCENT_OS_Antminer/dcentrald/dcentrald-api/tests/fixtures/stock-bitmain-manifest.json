@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "generated": "2026-05-06",
+  "wave": 10,
+  "notes": [
+    "TEST FIXTURE — used by tests/restore_to_stock_routes.rs to drive lookup_in_stock_manifest. Synthetic SHAs only."
+  ],
+  "stock_images": [
+    {
+      "model": "S9",
+      "platform_signature": "zynq-am1-bm1387",
+      "chip_family": "BM1387",
+      "stock_version": "Antminer-S9-fixture-revertable",
+      "url": null,
+      "local_path": null,
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "size_bytes": 100,
+      "dcentos_revertable": true,
+      "revert_notes": "Fixture entry — known-safe + revertable.",
+      "added_by_wave": 10
+    },
+    {
+      "model": "S19 Pro",
+      "platform_signature": "zynq-am2-bm1398",
+      "chip_family": "BM1398",
+      "stock_version": "Antminer-S19-Pro-fixture-wrong-model",
+      "url": null,
+      "local_path": null,
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "size_bytes": 200,
+      "dcentos_revertable": true,
+      "revert_notes": "Fixture entry — different platform_signature, used for wrong-model test.",
+      "added_by_wave": 10
+    },
+    {
+      "model": "S9",
+      "platform_signature": "zynq-am1-bm1387",
+      "chip_family": "BM1387",
+      "stock_version": "Antminer-S9-fixture-non-revertable",
+      "url": null,
+      "local_path": null,
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "size_bytes": 300,
+      "dcentos_revertable": false,
+      "revert_notes": "Fixture entry — matched but NOT revertable; operator must ack High.",
+      "added_by_wave": 10
+    },
+    {
+      "model": "S19j Pro Amlogic placeholder",
+      "platform_signature": "amlogic-a113d-bm1362",
+      "chip_family": "BM1362",
+      "stock_version": "TBD",
+      "url": null,
+      "local_path": null,
+      "sha256": "UNKNOWN",
+      "size_bytes": 0,
+      "dcentos_revertable": false,
+      "revert_notes": "Fixture placeholder — UNKNOWN sha must be skipped during lookup.",
+      "added_by_wave": 10
+    }
+  ]
+}

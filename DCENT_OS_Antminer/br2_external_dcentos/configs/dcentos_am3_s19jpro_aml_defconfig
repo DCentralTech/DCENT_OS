@@ -1,0 +1,32 @@
+# DCENTos Buildroot defconfig — Antminer S19j Pro Amlogic (am3-aml PIC1704).
+# D-Central Technologies, Phase 4B (2026-05-15).
+#
+# Target: Amlogic A113D (ARM Cortex-A53 quad, aarch64).
+# Chip:   BM1362 (3x126 chips per `levels.json`, BHB42801 hashboard 0x04 0x11).
+# PSU:    APW12 / APW12+ class (PMBus enable + GPIO 437 rail gate).
+# PIC:    PIC1704 short-form I²C voltage controller at 0x20 (CV/BB/AML
+#         S19j Pro whitelist).
+# Boot:   BL2 -> FIP -> U-Boot 2015.01 -> kernel 4.9.113 (no FPGA bitstream).
+#
+# Per-product OVERRIDE layer. Shared content lives in:
+#   dcentos-common.fragment           (workspace-wide package set + identity)
+#   dcentos_am3_aml_common.fragment   (aarch64 + Linaro toolchain + cpio.gz)
+#
+# Sibling of dcentos_am3_s21_defconfig and dcentos_am3_s19kpro_defconfig —
+# same Amlogic SoC, same boot chain, only product identity + voltage
+# controller path differ. PIC1704 routing is selected at runtime via
+# /etc/subtype + i2cdetect 0x20 ACK.
+
+# =============================================================================
+# Per-product identity.
+# =============================================================================
+BR2_TARGET_GENERIC_HOSTNAME="dcentos-s19jpro-aml"
+BR2_TARGET_GENERIC_ISSUE="DCENTos for S19j Pro (am3-aml PIC1704) - D-Central Technologies"
+
+# =============================================================================
+# Overlay-on-overlay — shared amlogic overlay first, am3-s19jpro-aml identity
+# last. Buildroot applies overlays left-to-right; the last write wins.
+# =============================================================================
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/am3-s19jpro-aml/rootfs-overlay"
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/am3-s19jpro-aml/post-build.sh"
+BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/am3-s19jpro-aml/post-image.sh"

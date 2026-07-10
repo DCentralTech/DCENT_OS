@@ -1,0 +1,146 @@
+# dcentaxe-lora
+
+SX1262 LoRa driver + the lightweight **DCENT mesh** stack for the DCENT_axe board
+line. Every DCENT_axe board (BM1397 single → 6× Hex) carries an onboard SX1262 on
+its **own dedicated SPI bus** — never the BAP/J4 header — so a UART-mode BAP
+accessory can never kill the radio.
+
+Source dossier:
+- §4.4 (LoRa stack), §6 (guardrails)
+- §1 (subcircuit, GPIO map, use-cases)
+- (SX1262 electricals)
+
+## Status: SCAFFOLD — NOT integrated (intentionally)
+
+This crate is a clean-room driver + protocol **skeleton**. It is a workspace
+member but:
+
+- the `dcentaxe` binary does **not** depend on it,
+- it registers **no** `/mcp` tools and adds **no** URI handlers,
+- it is behind a **default-OFF** Cargo feature so it never enters a SKU image
+  until a board explicitly selects it (per-board feature-gating, precedent
+  `--features bitaxe-gt`; protects the ~89%-full OTA slot).
+
+A non-functional "LoRa enabled" control would be a lying UI, so wiring is a
+deliberate follow-up (see **Integration — NOT done** below).
+
+## What's here
+
+| File | Role |
+|------|------|
+| `src/lib.rs` | Module wiring + the host-testable `SpiBus` / `GpioPin` traits + `LoraError`. Mock SPI/GPIO doubles for tests. |
+| `src/sx1262.rs` | Register-level SX1262 driver skeleton: command opcodes, register/IRQ constants, BUSY-poll handshake, DIO1 IRQ decode, region select, RF-frequency-word maths, cold-boot `begin`. |
+| `src/mesh.rs` | The DCENT mesh protocol (frame types `Telemetry` / `BlockFound` / `Identify` / owner-authed `Command` / `Ack`) on the wire `$DCM,<TOK>,<src-hex8>,<seq-hex2>,<ttl-hex>,<fields…>*XX\r\n` — the BAP `$…,<TOK>,…*XX` grammar plus a per-source `seq` (dedup + anti-replay key) and a `ttl` hop budget for store-and-forward relay. `meshtastic-interop` Phase-2 stub gated behind a feature. |
+| `src/auth.rs` | Owner-command authentication: HMAC-SHA256 (RustCrypto `hmac`/`sha2`, `subtle`-backed constant-time verify) over `dcm-cmd:<src>:<seq>:<verb>:<param>:<value>`, plus a bounded `ReplayGuard` and the combined `MeshAuthenticator` (MAC-then-freshness). Replaces the scaffold's placeholder string compare. |
+| `src/mcp.rs` | MCP tool **definitions** `lora_status` (read), `lora_send_beacon` (owner-control), `get_mesh_peers` (read) + their serde I/O structs — ready to register, **not** registered. |
+| `src/esp_hal.rs` | Real ESP32-S3 SPI3/HSPI + GPIO transport. Feature-gated `esp-idf` (off by default, like dcentaxe-bap's `uart.rs`). Integration seam — verify against esp-idf-hal 0.46 at wire-up. |
+
+## Host-test story
+
+The driver logic is written against the abstract `SpiBus` + `GpioPin` traits, so
+every byte-level command is exercised on the dev machine with a mock bus — no
+ESP32 required. The real ESP-IDF transport (`esp_hal.rs`) is gated behind the
+`esp-idf` feature so host `cargo test` stays pure-Rust (mirrors `dcentaxe-bap`).
+
+```
+cargo test -p dcentaxe-lora --target x86_64-pc-windows-msvc
+```
+
+`--target <host-triple>` overrides the workspace's xtensa default; `+stable`
+(or any non-`esp` toolchain) bypasses the workspace `build-std`. **24 host tests
+pass**, covering: BUSY-wait (success + timeout), the `SetRfFrequency` word for
+915 MHz (`0x39300000`) and 868 MHz (`0x36400000`), IRQ-status decode,
+`GetIrqStatus` read framing, mesh frame round-trips (telemetry / block-found /
+identify / command with reserved-char escaping), the owner-auth gate, and the MCP
+access-class contract. `cargo clippy -- -D warnings` is clean.
+
+> Note: the in-tree `cargo test -p dcentaxe-lora` requires the dcentos-esp
+> workspace to load. After the 2026-06-26 re-home, the `dcentaxe` binary's
+> `dcent-schema` path dep is `../../dcent-schema` from the new
+> `DCENT_OS_ESP/` workspace root.
+
+## Provisional GPIO map — ⚠️ NEEDS-NETLIST-LOCK
+
+From doc 05 §1.3 (the fork-plan worked example collided MOSI with the stock
+fan-tach pin; these are the corrected provisional pins). **Lock against the real
+DCENT_axe KiCad netlist before routing.**
+
+| Signal | GPIO | Notes |
+|--------|------|-------|
+| LORA_SCLK | 5 | dedicated SPI3/HSPI, non-strap |
+| LORA_MOSI | 6 | |
+| LORA_MISO | 7 | |
+| LORA_NSS | 15 | active-low CS |
+| LORA_BUSY | 16 | readable GPIO, polled before every command |
+| LORA_DIO1 | 21 | IRQ-capable (TxDone/RxDone) |
+| LORA_NRESET | 8 | or a shared RC power-on reset to save a pin |
+
+SX1262 electricals (doc 08): SPI ≤ 16 MHz (ESP32-S3 ≤ 40 MHz clears it >2×); TCXO
+enabled via DIO3 (`SetDIO3AsTcxoCtrl`, mandatory or RF is dead; 1.8 V on the E22);
+DIO1 = IRQ; BUSY polled; region 868 (EU) / 915 (NA) selectable on one populated
+board.
+
+## DCENT_Raven harmonization
+
+`dcent-raven` is the sibling LoRa-mesh BAP **accessory** (its own MCU as BAP host).
+This crate is aligned with it so the two projects share register-level + protocol
+vocabulary:
+
+- **Same silicon & control set** — SX1262 (Ebyte E22-900M22S class, on-module
+  32 MHz TCXO), SPI + BUSY + DIO1(IRQ) + NRESET, TCXO via DIO3, region 915 default
+  / 868 EU. The driver opcodes/registers/IRQ bits match the Raven `DESIGN_FREEZE`.
+- **Same mesh telemetry vocabulary** — `mesh::Telemetry` / `BlockFound` /
+  `Identify` field names mirror Raven's `MinerState` (hashrate, chip_temp, power,
+  shares acc/rej, best_diff, block_height, device_model, asic_model). The
+  block-found beacon maps directly to Raven's `found_block` rising edge →
+  high-priority broadcast.
+- **Same control safety posture** — air-gap control is owner-gated
+  (`MeshCommand::authorize`), mirroring Raven's fail-closed monitor-only default.
+- **One grammar** — the mesh frame reuses the BAP `$…,<TOK>,…*XX\r\n` NMEA shape +
+  XOR checksum (`dcentaxe_bap::protocol::nmea_xor`), so dashboard / MCP / BAP / LoRa
+  share one vocabulary.
+
+**Integration differs (do not copy verbatim):** Raven drives the radio from its
+**own MCU** as a BAP host and froze its pin-mux on the FSPI IOMUX quartet
+(SCK12/MOSI11/MISO13/NSS10, BUSY14/DIO1-9/NRST8). DCENT_axe wires the SX1262
+**directly to the main-board ESP32-S3** on a dedicated SPI3/HSPI bus, so its pin
+map is different (above) and constrained by the stock Bitaxe pin usage. Raven
+also runs **Meshtastic**; DCENT_axe ships the **custom DCENT mesh** for v1 with a
+feature-gated Meshtastic-interop stub for Phase 2.
+
+## Integration — NOT done (the follow-up)
+
+The following are deliberately out of scope for this scaffold:
+
+1. **HAL SPI3/HSPI bus** — add the SPI3 device + BUSY/DIO1/NRESET pins in
+   `dcentaxe-hal`; lock the GPIO map against the real netlist.
+2. **Own FreeRTOS task** — run the radio on its own stack (never blocking the
+   mining/safety loops); wire `esp_hal::EspSpiBus` + `EspInputPin`/`EspOutputPin`
+   into `Sx1262`.
+3. **MCP registration** — fold `mcp::tools` into the binary's `/mcp` registry;
+   route `lora_send_beacon` through `authorize_mcp_control` (owner auth) and the
+   per-board operating-point clamp.
+4. **Dashboard surface** — an MCP-tool-backed inline panel (NOT a 9th page —
+   `MAX_URI_HANDLERS`/≤8-page budget).
+5. **Per-board Cargo feature** — add `dcentaxe-lora` as an optional dep behind a
+   `lora` feature in the `dcentaxe` binary so only boards that select it pay the
+   image size; verify against the `updateFitsSlot` OTA-slot gate.
+6. **Region duty-cycle/dwell clamp** — enforce the EU 1% / NA dwell envelope as a
+   firmware policy (the driver only does a coarse legal-band reject today).
+7. **Mesh peer table + live telemetry** — back `get_mesh_peers` / `lora_status`
+   with a real RX peer table and live `Sx1262` state.
+8. ~~**Constant-time owner-auth MAC**~~ — ✅ DONE (`src/auth.rs`): `MeshCommand::authorize`
+   now runs an HMAC-SHA256 verify (`subtle`-backed constant-time) bound to
+   `src`/`seq`/`verb`/`param`/`value`, with a `ReplayGuard` anti-replay window and
+   the combined `MeshAuthenticator`. The integrator still routes an authorized
+   command through the host operating-point clamp before any write.
+
+## Guardrails honored
+
+- Standalone crate + default-OFF feature; **no** URI handlers, **no** changes to
+  the `dcentaxe` binary's wiring.
+- Zero new *lock* entries — `log` / `serde` / `serde_json` (dev) and the owner-auth
+  `hmac` / `sha2` crates were all already in the workspace lock (via
+  dcentaxe-stratum / -v2), so the `--locked` reproducibility discipline is
+  preserved; `esp-idf-hal` is the existing optional transport dep.
+- GPL-3.0; register magic values preserved exactly per the Semtech datasheet.

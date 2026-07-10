@@ -1,0 +1,47 @@
+[package]
+name = "dcentrald-re-catalog"
+version.workspace = true  # Single source: dcentrald/Cargo.toml [workspace.package]
+edition = "2021"
+license = "GPL-3.0"
+description = "STUB (content not yet ported): intended pure-no-HAL Rust mirror of the RE competitor-firmware catalogs (fan curves, PLL register bibles, model rolls) for DCENT_OS — currently exports nothing and has no consumers"
+
+#  W7.1 + W7.2 + W7.3 (DCENT_RE + DCENT_Thermal + DCENT_Perf, 2026-05-07):
+#
+# STATUS (2026-05-29): STUB., a
+# research wave that produces a master catalog should land a Rust `pub static`
+# consumer mirror. This crate is the INTENDED mirror for the +6 catalogs,
+# but the content has NOT been ported — the three modules are empty stubs and
+# the crate exports nothing. PLANNED source -> target mapping (not yet done):
+#
+#          -> src/fan_curves.rs
+#     -> src/pll_bible.rs
+#         -> src/model_catalog.rs
+#
+# PLANNED consumers (NONE wired yet — verified 2026-05-29, gap-swarm #4):
+#   - `dcentrald-thermal::profiles::ThermalProfile::for_chip_family()`  (planned)
+#   - `dcentrald-asic::drivers::*` chip-family `pll_frequencies()` lookup (planned)
+#   - the API re-catalog route — TODAY it reads from `dcentrald-api-types`, NOT
+#     this crate (no `serve_master_model_catalog()` symbol exists anywhere)
+#   - dashboard `wizard/ModelSelectStep.tsx`  (planned)
+#
+# This crate is intentionally HAL-free so that — WHEN the catalog content is
+# ported — Windows/macOS/Linux host tests run without an ARM cross-compile and a
+# catalog typo can't reach `mmap(/dev/mem)`. The drift-guard regression suite
+# (`tests/` pinning row counts + representative rows) does NOT exist yet; it must
+# be added in lockstep with the content port (the serde_json dev-dep below is
+# reserved for it).
+
+[dependencies]
+# Plain serde for optional REST serialization. Never pulls in serde_json
+# directly — that's the API crate's responsibility.
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+# W4.7 lint inheritance (DCENT_DevOps + DCENT_QA, 2026-05-07).
+# New crate, no grandfather list. Inherit workspace `warn` and keep this
+# crate at zero unwrap/panic. Promote to `deny` after one full wave of
+# stable usage.
+[lints]
+workspace = true

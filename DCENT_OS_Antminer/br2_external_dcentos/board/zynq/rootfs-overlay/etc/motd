@@ -1,0 +1,20 @@
+
+     ___  ___ ___ _  _ ___
+    |   \/ __| __| \| |_   _|
+    | |) | (__| _|| .` | | |
+    |___/ \___|___|_|\_| |_|  ___ ___
+                             / _ \ __|
+                            | (_) \__ \
+                             \___/|___/
+
+  DCENTos — D-Central Technologies
+  Open source mining firmware for the plebs.
+
+  Dashboard:    http://this-miner:80/
+  Mining API:   http://this-miner:8080/
+  CGMiner API:  port 4028
+
+  First boot: set the dashboard owner password before enabling mining.
+  SSH `root` access is bootstrap/recovery only.
+
+  Type 'dcent-shell' for the interactive toolkit.

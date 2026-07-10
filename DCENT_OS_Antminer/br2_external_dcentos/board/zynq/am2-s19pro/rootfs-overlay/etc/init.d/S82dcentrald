@@ -1,0 +1,526 @@
+#!/bin/sh
+#
+# S82dcentrald - Start DCENTos mining daemon (am2-s19jpro variant)
+#
+# This init script overlays on top of the shared board/zynq init script
+# (via overlay-on-overlay in the defconfig). It adds am2-specific logic:
+#
+#   1. Reads /etc/dcentos/platform + /etc/dcentos/board_target to detect am2
+#      (zynq-bm3-am2 / am2-s19j) vs am1-s9.
+#   2. Injects --s19j-hybrid into dcentrald launch on am2 (belt-and-suspenders
+#      with Agent α's /etc/bos_platform auto-detection in main.rs).
+#   3. **MILESTONE-PATH ENV VARS (Phase 4A, 2026-05-15 .109 FIRST ACCEPTED
+#      SHARES)** — exports the three DCENT_AM2_* env vars that unlocked the
+#      first AM2 accepted-share proof on Public Pool (20/20 accepted in 5
+#      minutes). Without them, dcentrald falls through to the FPGA-FIFO path
+#      which has never produced an AM2 nonce, S99upgrade health gate fails,
+#      and U-Boot auto-reverts the firmware. See:
+#        -  (CE finding #4)
+#
+#
+#   4. Leaves I2C ownership to dcentrald. The production .139 path can use
+#      gpio_bitbang PSU transport and must not force-bind xiic-i2c from init.
+#
+# Variant scope: only zynq-bm3-am2 (AM2 S19j Pro / S19 Pro Zynq) gets the
+# milestone env-var + --s19j-hybrid injection. am1-s9 (the empty/unmatched
+# fallback in the case below) keeps the legacy launch shape so S9 cold-boot
+# mining is NOT regressed.
+#
+# SAFETY: unchanged from shared script — command fans to PWM 30 on crash/timeout.
+# NEVER PWM 127. Home mining.
+#
+# D-Central Technologies - DCENTos
+#
+
+DAEMON="/usr/local/bin/dcentrald"
+PIDFILE="/var/run/dcentrald.pid"
+CHILD_PIDFILE="/var/run/dcentrald-child.pid"
+EXPECTFILE="/tmp/dcentrald.expected_exit.pid"
+LOGFILE="/tmp/dcentrald.log"
+FAN_BASE=0x42800000
+# AM2 persistent fan-custodian pidfile (see am2_start_fan_custodian below).
+FANHOLD_PIDFILE="/var/run/dcentrald-fanhold.pid"
+DEFAULT_COMPAT="/etc/default/dcentos-compat"
+PERSISTENT_COMPAT="/data/dcentos-compat"
+API_PORT=8080
+MAX_CRASH_RESTARTS=5
+RESTART_DELAY=2
+SCRIPT="$0"
+
+# Use persistent config if available, otherwise default.
+#
+# Config search order (highest priority first):
+#   1. /data/dcentrald.toml             — operator override (persists across upgrades)
+#   2. /etc/dcentrald/xil_override.toml — baked am2 milestone-path override
+#                                          (zynq-bm3-am2 only; see post-build.sh,
+#                                          source: dcentrald/configs/dcentrald_s19jpro_xil.toml)
+#   3. /etc/dcentrald.toml              — shared default (post-build.sh stamps
+#                                          dcentrald_s19jpro_am2.toml here today)
+if [ -f /data/dcentrald.toml ]; then
+    CONFIG="/data/dcentrald.toml"
+elif [ -f /etc/dcentrald/xil_override.toml ]; then
+    CONFIG="/etc/dcentrald/xil_override.toml"
+else
+    CONFIG="/etc/dcentrald.toml"
+fi
+
+migrate_legacy_api_port() {
+    [ -f "$CONFIG" ] || return 0
+
+    # Rewrite legacy dcentrald API http_port 80 to 8080 so S80dashboard owns :80.
+    if ! grep -Eq '^[[:space:]]*http_port[[:space:]]*=[[:space:]]*80([[:space:]]*(#.*)?)?$' "$CONFIG" 2>/dev/null; then
+        return 0
+    fi
+
+    TMPFILE="${CONFIG}.tmp.$$"
+    if awk '
+        BEGIN { in_api = 0 }
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            in_api = ($0 ~ /^[[:space:]]*\[api\][[:space:]]*$/)
+        }
+        in_api && /^[[:space:]]*http_port[[:space:]]*=[[:space:]]*80([[:space:]]*(#.*)?)?$/ {
+            sub(/80/, "8080")
+        }
+        { print }
+    ' "$CONFIG" > "$TMPFILE" 2>/dev/null; then
+        if mv "$TMPFILE" "$CONFIG" 2>/dev/null; then
+            echo "  [MIGRATE] dcentrald API http_port 80 to 8080 in $CONFIG"
+        else
+            rm -f "$TMPFILE"
+            echo "  [WARN] Could not migrate legacy dcentrald API port in $CONFIG"
+        fi
+    else
+        rm -f "$TMPFILE"
+        echo "  [WARN] Could not inspect dcentrald API port in $CONFIG"
+    fi
+}
+
+# Platform + board target are written by post-build.sh.
+#   /etc/dcentos/platform     — "zynq-bm3-am2" (am2-s19jpro), "am1-s9" (S9)
+#   /etc/dcentos/board_target — "am2-s19j"     (am2-s19jpro), "am1-s9" (S9)
+# Both keys are consulted so a half-stamped image still routes correctly.
+PLATFORM=""
+[ -r /etc/dcentos/platform ] && PLATFORM=$(cat /etc/dcentos/platform 2>/dev/null)
+BOARD_TARGET=""
+[ -r /etc/dcentos/board_target ] && BOARD_TARGET=$(cat /etc/dcentos/board_target 2>/dev/null)
+
+# Extra CLI args populated per platform below.
+EXTRA_ARGS=""
+
+# am2 detection — either marker matches. Empty/unmatched values fall through
+# to the S9 (am1-s9) launch shape unchanged.
+IS_AM2=0
+case "$PLATFORM" in
+    zynq-bm3-am2) IS_AM2=1 ;;
+esac
+case "$BOARD_TARGET" in
+    am2-s17|am2-s17p|am2-s17pro|am2-s17plus|am2-t17|am2-t17plus|am2-s19|am2-s19j|am2-s19jpro|am2-s19jpro-zynq|am2-s19pro|am2-t19) IS_AM2=1 ;;
+esac
+
+if [ "$IS_AM2" = "1" ]; then
+    # am2 S19j Pro Zynq — hybrid profile (s19-am2 FPGA + BM1362 chain).
+    # Belt-and-suspenders alongside Agent α's main.rs auto-detection: if
+    # Rust-side detection breaks, the CLI flag still forces the right
+    # profile. dcentrald treats the flag as idempotent.
+    EXTRA_ARGS="$EXTRA_ARGS --s19j-hybrid"
+
+    # **MILESTONE-PATH ENV VARS** — `a lab unit` FIRST ACCEPTED SHARES (2026-05-15,
+    # 20/20 accepted on Public Pool). These three flags re-create the exact
+    # `dcentrald` runtime that proved AM2 native mining. They are exported
+    # here (not just prefixed on one launch line) so the wrapper's restart
+    # loop, the safety subcommand, and any child `sh -c` re-fork all inherit
+    # them. finding #4.
+    #
+    #   DCENT_AM2_SKIP_FAST_UART      — keep command/work path at 115200
+    #                                    (FastUART handoff never produced an
+    #                                    AM2 nonce in our 2026-05-12/14 runs)
+    #   DCENT_AM2_SERIAL_WORK_DISPATCH — route work through the proven BM1362
+    #                                    88-byte serial frame over the chain
+    #                                    UART (FPGA WORK_TX FIFO bypassed)
+    #   DCENT_AM2_SKIP_115200_PER_CHIP — leave BM1362 cores broadcast-only
+    #                                    activated (per-chip A8/MiscCtrl x3
+    #                                    sequence collapses chain addressing
+    #                                    on AM2 — proven on .79 only)
+    #
+    # NOT exported (operator-opt-in diagnostic only, default-OFF, additive):
+    #   DCENT_AM2_VERIFY_PRESENCE_AFTER_EACH_PHASE — PR-019 / R11-2 ablation.
+    #                                    Per-phase read-only GetAddress probe
+    #                                    + [AM2-ABLATION] / [AM2-ABLATION-PARAMS]
+    #                                    log lines to localize the 126->28
+    #                                    chain-collapse. Zero behaviour / wire
+    #                                    change when unset. Operators set it
+    #                                    explicitly per bring-up run.
+    export DCENT_AM2_SKIP_FAST_UART=1
+    export DCENT_AM2_SERIAL_WORK_DISPATCH=1
+    export DCENT_AM2_SKIP_115200_PER_CHIP=1
+
+    # Clear lab-only overrides that could mask a manageability regression on
+    # a flashed image. Operators can re-export from /data/dcentrald-env if a
+    # bring-up override is ever needed.
+    unset DCENT_AM2_TRUST_DEGRADED_FW
+    unset DCENT_AM2_FORCE_FAST_UART
+    unset DCENT_AM2_FAST_UART_VALUE
+    unset DCENT_AM2_FAST_UART_BAUD
+    unset DCENT_AM2_FASTUART_SWITCH_HOST_FIRST
+    unset DCENT_AM2_WORK_TX_BOSMODE
+fi
+
+# Operator escape hatch for live debugging on a flashed unit — sourced AFTER
+# the milestone defaults so /data overrides win. Format: standard sh export
+# lines. Never shipped in the image (/data/ is persistent storage).
+if [ -r /data/dcentrald-env ]; then
+    . /data/dcentrald-env
+fi
+
+bosminer_pic_bootstrap_enabled() {
+    BOSMINER_PIC_BOOTSTRAP=0
+    [ -f "$DEFAULT_COMPAT" ] && . "$DEFAULT_COMPAT"
+    [ -f "$PERSISTENT_COMPAT" ] && . "$PERSISTENT_COMPAT"
+
+    case "$BOSMINER_PIC_BOOTSTRAP" in
+        1|true|TRUE|yes|YES|on|ON|enabled|ENABLED)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+compat_bootstrap_model_allowed() {
+    BOSMINER_PIC_BOOTSTRAP_ALLOW_MODEL="am1-s9"
+    [ -f "$DEFAULT_COMPAT" ] && . "$DEFAULT_COMPAT"
+    [ -f "$PERSISTENT_COMPAT" ] && . "$PERSISTENT_COMPAT"
+
+    [ "$BOSMINER_PIC_BOOTSTRAP_ALLOW_MODEL" = "am1-s9" ] || return 1
+    [ -d /sys/class/uio ] || return 1
+
+    UIO_COUNT=$(ls -d /sys/class/uio/uio* 2>/dev/null | wc -l)
+    [ "$UIO_COUNT" -gt 0 ] || return 1
+    [ "$UIO_COUNT" -le 14 ] || return 1
+
+    for name_file in /sys/class/uio/*/name; do
+        [ -f "$name_file" ] || continue
+        if grep -q "board-control" "$name_file" 2>/dev/null; then
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+# am2 preflight: ensure the kernel xiic-i2c driver is bound to the FPGA AXI IIC
+# controller at 41600000.i2c and that /dev/i2c-0 exists. Mirrors the Rust-side
+# logic in dcentrald_hal; duplicating at shell level guarantees the char device
+# is present even if the binary is a stale build that skipped the call.
+#
+# Safe on am1-s9 because we gate the caller on PLATFORM=zynq-bm3-am2.
+ensure_i2c0_kernel_bound() {
+    # Already bound + visible → nothing to do.
+    [ -c /dev/i2c-0 ] && return 0
+
+    # Bind xiic-i2c (no-op if already bound, logs to stderr we silence).
+    if [ -d /sys/bus/platform/drivers/xiic-i2c ]; then
+        echo 41600000.i2c > /sys/bus/platform/drivers/xiic-i2c/bind 2>/dev/null
+        # Give udev a beat to pick it up and create the node.
+        sleep 1
+    fi
+
+    # Fallback: if udev/mdev didn't materialize /dev/i2c-0, create it manually.
+    # Major 89 = i2c-dev, minor 0 = bus 0. Standard kernel assignment.
+    if [ ! -c /dev/i2c-0 ]; then
+        mknod /dev/i2c-0 c 89 0 2>/dev/null
+        chmod 600 /dev/i2c-0 2>/dev/null
+    fi
+
+    if [ -c /dev/i2c-0 ]; then
+        echo "  [OK] /dev/i2c-0 ready (xiic-i2c bound)"
+    else
+        echo "  [WARN] /dev/i2c-0 still missing — dcentrald devmem fallback must cover it"
+    fi
+}
+
+# Safety: command fans to the home cap. Tach/RPM is the physical noise proof.
+# PIC watchdog cuts voltage within 10-60s if dcentrald is dead.
+# NEVER PWM 127 — home mining, noise is unacceptable.
+# AUDIT FIX (2026-05-29, ):
+# On AM2 (XIL Zynq) the fan PWM is held only while a process owns the uio16 mmap
+# AND keeps re-commanding it. The old `$DAEMON --set-fan N` wrote the PWM once
+# and EXITED, so the board's fan IP drifted the fans back to full speed — a home
+# unit blasts and the documented AM2 safety remediation silently failed. The fix
+# is a BACKGROUNDED persistent custodian (`dcentrald --hold-fan N`) that stays
+# resident and re-asserts the PWM every ~5 s (mmap-hold alone is not enough). We
+# kill any prior custodian first so only one owns the mmap. AM2 ONLY ($IS_AM2);
+# S9/am1 fan registers hold via devmem so that branch is unchanged. PWM is only
+# ever driven DOWN (<= 30).
+am2_start_fan_custodian() {
+    # $1 = PWM (0..30). Kill any existing custodian, then background a new one.
+    _pwm="$1"
+    if [ -f "$FANHOLD_PIDFILE" ]; then
+        start-stop-daemon -K -q -p "$FANHOLD_PIDFILE" -x "$DAEMON" 2>/dev/null
+        rm -f "$FANHOLD_PIDFILE"
+    fi
+    if start-stop-daemon -S -b -m -p "$FANHOLD_PIDFILE" -x "$DAEMON" -- --hold-fan "$_pwm" >> $LOGFILE 2>&1; then
+        echo "$(date): SAFETY: am2 persistent fan custodian started at PWM $_pwm ($DAEMON --hold-fan $_pwm, pid $(cat "$FANHOLD_PIDFILE" 2>/dev/null))" >> $LOGFILE
+        return 0
+    fi
+    echo "$(date): WARN: am2 fan custodian (--hold-fan $_pwm) failed to start" >> $LOGFILE
+    return 1
+}
+
+fan_safety_override() {
+    if [ "$IS_AM2" = "1" ]; then
+        if [ -x "$DAEMON" ]; then
+            # Persistent custodian, NOT the exit-immediately --set-fan one-shot.
+            am2_start_fan_custodian 30
+        else
+            echo "$(date): WARN: am2 dcentrald binary absent at $DAEMON; fan cap not applied" >> $LOGFILE
+        fi
+    elif command -v devmem > /dev/null 2>&1; then
+        devmem $((FAN_BASE + 0x10)) 32 30 2>/dev/null
+        devmem $((FAN_BASE + 0x14)) 32 30 2>/dev/null
+        echo "$(date): SAFETY: fans commanded to PWM 30 (dcentrald exited)" >> $LOGFILE
+    fi
+}
+
+case "$1" in
+    start)
+        if [ ! -x "$DAEMON" ]; then
+            echo "  [SKIP] dcentrald: binary not found at $DAEMON"
+            exit 0
+        fi
+
+        # W1.5 (2026-05-07): re-assert tight perms on /data/dcent/ + auth.json
+        # before launching the daemon. dcentrald will also auto-correct via
+        # verify_auth_file_perms() at startup, but doing it here closes the
+        # window between mount(/data) and the first daemon write.
+        if [ -d /data/dcent ]; then
+            chmod 0700 /data/dcent 2>/dev/null
+        fi
+        if [ -f /data/dcent/auth.json ]; then
+            chmod 0600 /data/dcent/auth.json 2>/dev/null
+        fi
+
+        # Reap any persistent AM2 fan custodian left resident by a prior
+        # stop/safety so the main daemon can own the uio16 fan mmap (AM2 only).
+        if [ "$IS_AM2" = "1" ] && [ -f "$FANHOLD_PIDFILE" ]; then
+            start-stop-daemon -K -q -p "$FANHOLD_PIDFILE" -x "$DAEMON" 2>/dev/null
+            rm -f "$FANHOLD_PIDFILE"
+            echo "  [OK] reaped prior am2 fan custodian before daemon launch"
+        fi
+
+        # Do not force xiic-i2c from init. The Rust AM2 path binds kernel I2C
+        # only when its configured transport requires it.
+
+        # Legacy compatibility mode only. Native DCENT_OS cold boot is the
+        # default product path, so only wait for S15pic_boot when the explicit
+        # compat bootstrap is enabled and the board is positively allowlisted.
+        if bosminer_pic_bootstrap_enabled && compat_bootstrap_model_allowed && [ -x /usr/bin/bosminer ] && [ ! -f /tmp/pic_init_done ]; then
+            echo "  [WAIT] dcentrald: waiting for legacy PIC bootstrap..."
+            for i in $(seq 1 120); do
+                [ -f /tmp/pic_init_done ] && break
+                [ -f /tmp/pic_init_failed ] && break
+                sleep 1
+            done
+            if [ -f /tmp/pic_init_done ]; then
+                :
+            elif [ -f /tmp/pic_init_failed ]; then
+                echo "  [WARN] S15pic_boot did not confirm PIC init - starting dcentrald native path"
+            else
+                echo "  [WARN] PIC init flag not found after 120s - starting anyway"
+            fi
+        fi
+
+        echo "Starting dcentrald mining daemon..."
+        migrate_legacy_api_port
+        echo "  Config:   $CONFIG"
+        echo "  Platform: ${PLATFORM:-unknown}"
+        echo "  API: REST/WebSocket :$API_PORT"
+        echo "  Dashboard: HTTP :80 via S80dashboard"
+        [ -n "$EXTRA_ARGS" ] && echo "  Extra args:$EXTRA_ARGS"
+        if [ "$IS_AM2" = "1" ]; then
+            echo "  AM2 milestone env: DCENT_AM2_SKIP_FAST_UART=${DCENT_AM2_SKIP_FAST_UART:-unset} DCENT_AM2_SERIAL_WORK_DISPATCH=${DCENT_AM2_SERIAL_WORK_DISPATCH:-unset} DCENT_AM2_SKIP_115200_PER_CHIP=${DCENT_AM2_SKIP_115200_PER_CHIP:-unset}"
+        fi
+
+        # Do not kill all Python interpreters here.
+        # S81mcp starts immediately before us and must keep running.
+
+        # NOTE (updated 2026-03-26): dcentrald uses devmem AXI IIC bypass for I2C.
+        # It unbinds the kernel xiic-i2c driver internally on startup.
+        # The kernel driver is NOT used - devmem provides direct register access
+        # with proper clock timing (THIGH/TLOW=993 for 100kHz).
+
+        # Kill any orphaned dcentrald from previous manual runs.
+        # Expected exits are marked so the wrapper does not misclassify replacement
+        # as a crash and blast the fans.
+        # Reap ALL live dcentrald PIDs, not just the first: two stale energized
+        # daemons would otherwise survive and fight the new daemon over the single
+        # /dev/i2c-0 owner + PWR_CONTROL + chain UART (single-I2C-owner violation).
+        # Mirrors the base zynq/amlogic/am3-bb wrappers.
+        ORPHAN_PIDS=$(pidof dcentrald 2>/dev/null || true)
+        [ -n "$ORPHAN_PIDS" ] && {
+            echo "  [WARN] Killing orphaned dcentrald PID(s): $ORPHAN_PIDS - waiting for graceful shutdown"
+            for ORPHAN_PID in $ORPHAN_PIDS; do
+                echo "$ORPHAN_PID" > "$EXPECTFILE"
+                kill -TERM "$ORPHAN_PID" 2>/dev/null
+            done
+            for i in $(seq 1 30); do
+                pidof dcentrald > /dev/null 2>&1 || break
+                sleep 1
+            done
+            REMAINING_PIDS=$(pidof dcentrald 2>/dev/null || true)
+            [ -n "$REMAINING_PIDS" ] && {
+                echo "  [WARN] Orphan PID(s) did not exit in 30s - force killing: $REMAINING_PIDS"
+                rm -f "$EXPECTFILE"
+                fan_safety_override
+                for ORPHAN_PID in $REMAINING_PIDS; do
+                    kill -9 "$ORPHAN_PID" 2>/dev/null
+                done
+                sleep 1
+            }
+            rm -f "$CHILD_PIDFILE"
+        }
+
+        # Start dcentrald with a wrapper that distinguishes expected replacement
+        # from a real crash. $EXTRA_ARGS is quoted outside so platform-specific
+        # flags (e.g. --s19j-hybrid on am2) propagate to the shell.
+        start-stop-daemon -S -b -m -p "$PIDFILE" \
+            -x /bin/sh -- -c "
+                CRASH_COUNT=0
+                while true; do
+                    $DAEMON --config $CONFIG $EXTRA_ARGS >>$LOGFILE 2>&1 &
+                    CHILD_PID=\$!
+                    echo \$CHILD_PID > $CHILD_PIDFILE
+                    wait \$CHILD_PID
+                    EXIT_CODE=\$?
+                    EXPECTED_PID=\$(cat $EXPECTFILE 2>/dev/null || true)
+                    rm -f $CHILD_PIDFILE
+
+                    if [ \"\$EXPECTED_PID\" = \"\$CHILD_PID\" ]; then
+                        rm -f $EXPECTFILE
+                        echo \"\$(date): expected dcentrald exit for PID \$CHILD_PID (code \$EXIT_CODE)\" >> $LOGFILE
+                        exit \$EXIT_CODE
+                    fi
+
+                    rm -f $EXPECTFILE
+                    if [ \$EXIT_CODE -eq 0 ]; then
+                        echo \"\$(date): dcentrald exited cleanly\" >> $LOGFILE
+                        exit 0
+                    fi
+
+                    CRASH_COUNT=\$((CRASH_COUNT + 1))
+                    echo \"\$(date): dcentrald exited with code \$EXIT_CODE (crash \$CRASH_COUNT/$MAX_CRASH_RESTARTS)\" >> $LOGFILE
+                    \"$SCRIPT\" safety
+                    if [ \$CRASH_COUNT -ge $MAX_CRASH_RESTARTS ]; then
+                        echo \"\$(date): dcentrald restart limit reached\" >> $LOGFILE
+                        exit \$EXIT_CODE
+                    fi
+                    sleep $RESTART_DELAY
+                done
+            "
+        echo "  [OK] dcentrald started (REST/WebSocket :$API_PORT, CGMiner :4028)"
+        echo "  Log: $LOGFILE"
+        ;;
+
+    stop)
+        echo "Stopping dcentrald mining daemon..."
+        # Send SIGTERM for graceful shutdown. dcentrald keeps PIC heartbeats alive
+        # while disabling voltage, then cools fans. Full sequence takes ~12s:
+        #   0.5s nonce drain + voltage disable + 2s heartbeat stop + 2s cap discharge
+        #   + 5s fan cooldown = ~12s total
+        # NEVER SIGKILL before voltage is off - kills heartbeat thread, PIC watchdog
+        # fires, corrupts I2C bus, requires PSU power cycle.
+        CHILD_PID=$(cat "$CHILD_PIDFILE" 2>/dev/null || pidof dcentrald 2>/dev/null | awk '{print $1}')
+        WRAPPER_PID=$(cat "$PIDFILE" 2>/dev/null || true)
+        [ -n "$CHILD_PID" ] && echo "$CHILD_PID" > "$EXPECTFILE"
+        [ -n "$CHILD_PID" ] && kill -TERM "$CHILD_PID" 2>/dev/null
+        # Wait up to 30 seconds for graceful shutdown.
+        # S9 shutdown can legitimately take ~18s when voltage-disable replies are slow.
+        for i in $(seq 1 30); do
+            if [ -z "$CHILD_PID" ] || ! kill -0 "$CHILD_PID" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+        TIMED_OUT=0
+        if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+            echo "  [WARN] dcentrald did not exit in 30s - force killing (I2C bus may need PSU power cycle)"
+            rm -f "$EXPECTFILE"
+            TIMED_OUT=1
+        fi
+        [ "$TIMED_OUT" -eq 1 ] && kill -9 "$CHILD_PID" 2>/dev/null
+        if [ -n "$WRAPPER_PID" ] && kill -0 "$WRAPPER_PID" 2>/dev/null; then
+            kill -TERM "$WRAPPER_PID" 2>/dev/null
+            sleep 1
+            kill -9 "$WRAPPER_PID" 2>/dev/null
+        fi
+        rm -f "$PIDFILE" "$CHILD_PIDFILE"
+        if [ "$TIMED_OUT" -eq 1 ]; then
+            fan_safety_override
+            echo "  [WARN] Forced-stop path left fans in safety mode"
+        else
+            # Clean stop on AM2: leave a PERSISTENT custodian holding idle PWM
+            # (the board reverts fans to full speed otherwise) — not the
+            # exit-immediately --set-fan one-shot.
+            #.
+            if [ "$IS_AM2" = "1" ]; then
+                if [ -x "$DAEMON" ]; then
+                    if am2_start_fan_custodian 10; then
+                        echo "  [OK] dcentrald stopped, am2 persistent fan custodian holding idle PWM 10 (--hold-fan)"
+                    else
+                        echo "  [WARN] dcentrald stopped, but am2 fan custodian failed to start"
+                    fi
+                else
+                    echo "  [WARN] dcentrald stopped but binary absent; am2 fans NOT lowered"
+                fi
+            elif command -v devmem > /dev/null 2>&1; then
+                devmem $((FAN_BASE + 0x10)) 32 10 2>/dev/null
+                devmem $((FAN_BASE + 0x14)) 32 10 2>/dev/null
+                echo "  [OK] dcentrald stopped, fans at idle"
+            else
+                echo "  [OK] dcentrald stopped"
+            fi
+        fi
+        ;;
+
+    restart)
+        $0 stop
+        sleep 2
+        $0 start
+        ;;
+
+    safety)
+        # G22 (no-brick safety, gap-swarm 2026-05-28): the emergency safety response
+        # must CUT HASH POWER, not just cap fans. Delegate to the daemon's audited
+        # per-platform one-shot `--safe-off` (cuts hash power, then quiets fans —
+        # cut-hash-before-noise) instead of hardcoding GPIO/devmem here. Falls back to
+        # the fan-only override if the binary is absent or the cut fails.
+        if [ -x "$DAEMON" ]; then
+            if "$DAEMON" --safe-off >> $LOGFILE 2>&1; then
+                echo "$(date): SAFETY: --safe-off completed (hash power cut + fans quiet) via $DAEMON" >> $LOGFILE
+            else
+                echo "$(date): WARN: $DAEMON --safe-off failed (rc=$?) — falling back to fan-only safety override" >> $LOGFILE
+                fan_safety_override
+            fi
+        else
+            echo "$(date): WARN: $DAEMON absent — PSU cut unavailable, fan-only safety override" >> $LOGFILE
+            fan_safety_override
+        fi
+        ;;
+
+    status)
+        if start-stop-daemon -K -p "$PIDFILE" -t -q 2>/dev/null; then
+            PID=$(cat "$PIDFILE" 2>/dev/null)
+            echo "dcentrald is running (PID $PID)"
+        else
+            echo "dcentrald is not running"
+        fi
+        ;;
+
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
+
+exit 0

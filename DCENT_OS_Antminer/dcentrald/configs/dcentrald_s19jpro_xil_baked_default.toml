@@ -1,0 +1,209 @@
+# DCENT_OS dcentrald — AM2 S19j Pro (zynq-bm3-am2, BM1362) BAKED FIRST-BOOT
+# DEFAULT (F4, 2026-05-17).
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# `S82dcentrald` prefers `/etc/dcentrald/xil_override.toml` over
+# `/etc/dcentrald.toml`. Until F4 that baked file was a verbatim copy of
+# `dcentrald_s19jpro_xil_override.toml` — the `a lab unit`-SPECIFIC Loki-Mod
+# bring-up runtime (pool = public-pool.io worker bc1q04…-xil,
+# `[mining] enabled = true`). On EVERY fresh am2 unit that is NOT the `a lab unit`
+# milestone unit, that config's `mining.enabled = true` made dcentrald
+# cold-boot the chain and run the PIC preflight at first boot. On `a lab unit` the
+# dsPIC at 0x20 answered all-`0xFF`, the s19j-hybrid path hard-bailed, and
+# (pre-F1) the whole daemon — including the in-process `:8080` API — exited;
+# `S82dcentrald` then crash-looped 5× and permanently gave up, so the
+# onboarding wizard was unreachable and the unit could not even be
+# re-flashed. Root cause:
+# .
+#
+# F4: the BAKED default is now this file — conservative,
+# mining-DISABLED-until-configured — so a fresh unit comes up
+# management-only by *config* (the F5 gate in main.rs sees
+# `mining_start_enabled() == false` → API/dashboard/wizard up, NO PIC
+# preflight, NO cold boot, NO crash). The operator configures a pool + flips
+# `[mining] enabled = true` via the dashboard/wizard, restarts the daemon,
+# and mining bring-up runs.
+#
+# BRICK-SAFETY INVARIANT — DO NOT REGRESS (carried over verbatim from
+# post-build.sh / dcentrald_s19jpro_xil_override.toml):
+#   `[power.psu_override] enabled = true model = "APW3" voltage_v = 12.8`
+#   STAYS in this baked default. With the Loki board physically installed
+#   (campaign-wide operator decision —
+#   ) an `enabled = false`
+#   bake takes the Apw121215a smart-PSU path which self-disables the chip
+#   rail in ~30 s on the first cold boot — bricking the first mining attempt
+#   on a flashed unit. So when the operator DOES enable mining post-wizard,
+#   the proven `a lab unit` Loki path runs. F4 makes the `a lab unit` pool/worker
+#   opt-in, NOT the silent crash-looping default — it does NOT remove the
+#   brick-safe override.
+#   See:
+#     - dcentrald_s19jpro_xil_override.toml (the G1-proven `a lab unit` runtime —
+#       UNCHANGED; still the operator-opt-in `/tmp` overlay file referenced
+#       by )
+#
+#
+#
+# Safety knobs are byte-equivalent to the G1-proven `a lab unit` run
+# (voltage_mv = 13700, fan_max_pwm = 30, dangerous_temp_c = 80,
+# hash_on_disconnect = false, am2_no_nonce_timeout_s = 90,
+# frequency_mhz = 525, am2_pll_ramp = false). The ONLY differences vs
+# dcentrald_s19jpro_xil_override.toml are first-boot sanitization:
+#   * pool.url / pool.worker = ""        (operator configures via wizard)
+#   * mining.enabled         = false     (idle-first until pool configured)
+#   * donation.enabled       = true      (transparent 2% —  policy)
+#   * watchdog.enabled       = true      (HW watchdog ON by default — workspace
+#                                          safety rule, default_watchdog_enabled)
+#   * api.cgminer_port       = 4028      (clean image owns the port; the
+#                                          bring-up file uses 4027 to dodge
+#                                          BraiinsOS BOSer)
+#   * api.http_port          = 8080
+#
+# `mining.voltage_mv` is hard-clamped <= 14_500 mV on am2 by
+# `DcentraldConfig::validate()`; post-build.sh re-verifies voltage_mv and
+# fan_max_pwm at BUILD time and refuses to ship an out-of-envelope image.
+
+[general]
+hostname = "dcentos-s19jpro-am2"
+log_level = "info"
+
+[pool]
+# F4: NO baked pool. The operator configures this via the first-boot
+# onboarding wizard (or /data/dcentrald.toml). Empty url/worker keeps
+# `mining_start_enabled()` false so the F5 gate parks the unit in
+# management-only mode at first boot — no PIC preflight, no crash.
+url = ""
+worker = ""
+password = "x"
+protocol = "sv1"
+
+[mining]
+# F4: idle-first. Mining bring-up (PIC preflight + chain cold boot) is NOT
+# attempted until the operator enables mining AND configures a pool, then
+# restarts the daemon. This is the production-correct fresh-unit behavior.
+enabled = false
+
+# Proven `a lab unit` profile values — used the moment the operator enables mining.
+frequency_mhz = 525
+am2_pll_ramp = false
+
+# Home/lab safety guard: after the first work dispatch, force PWR_CONTROL low
+# if the FPGA never returns a nonce. Prevents overnight PWR-high stalls.
+am2_no_nonce_timeout_s = 90
+
+# PER-CHAIN target (mV) the hashboard dsPIC regulates to — NOT the PSU rail.
+# Hard-clamped <= 14_500 mV on am2 by validate().
+voltage_mv = 13700
+
+# Low-difficulty accepted-share proof target (carried over from BB `a lab unit`).
+suggest_difficulty = 256
+
+# Cold-boot init path (NOT passthrough — passthrough on am2 post-bosminer
+# produces zero RX; proven on .139 Phase 13/14).
+passthrough = false
+
+# ASIC-side version rolling stays DISABLED on the hybrid FPGA dispatch path.
+version_rolling = false
+
+serial_device = "/dev/ttyS1"
+serial_chip_count = 126
+serial_chip_type = "BM1362"
+
+fpga_chain_base = "0x43C00000"
+fpga_chain_id = 1
+
+# Force the BM1362 MinerProfile, bypassing chip auto-detect.
+model = "s19jpro"
+
+# Only effective with passthrough=true.
+skip_fifo_reset = false
+
+# When true, thermal controller falls back to XADC die temp only.
+skip_board_temp = false
+
+[power]
+psu_bypass = false
+
+# Home-quiet ceiling for the single-chain am2 profile.
+max_watts = 1200
+
+circuit_capacity_watts = 4800
+circuit_voltage_v = 240
+circuit_amperage_a = 20
+
+# --- PSU OVERRIDE ("Loki bypass") -------------------------------------------
+# BRICK-SAFETY INVARIANT (see header): enabled = true STAYS. enabled = false
+# + Loki present + APW3 => Apw121215a smart path => ~30 s rail self-disable
+# brick on first cold boot once the operator enables mining. The proven
+# `a lab unit` milestone path REQUIRES enabled = true / model = "APW3" /
+# voltage_v = 12.8 with the Loki board installed. F4 makes the `a lab unit`
+# pool/worker opt-in (idle-first above), NOT the brick-safe override.
+[power.psu_override]
+enabled = true
+model = "APW3"
+voltage_v = 12.8
+
+[psu]
+# APW121215a rail params — consumed only when [power.psu_override].enabled =
+# false (which it never is in this baked default; see invariant above).
+voltage_mv = 15200
+heartbeat_hz = 1
+watchdog_enabled = true
+i2c_address = 0x10
+transport = "gpio_bitbang"
+pwr_control_gpio = "gpio:907"
+
+[thermal]
+target_temp_c = 60
+hot_temp_c = 70
+dangerous_temp_c = 80
+
+# Home-mining fan ceiling — NEVER raise above 30 without an explicit user
+# mode override ( / ).
+fan_min_pwm = 10
+fan_max_pwm = 30
+# idle/non-mining fan duty; uio16-mmap true low PWM; <= fan_max_pwm
+fan_idle_pwm = 10
+
+pid_interval_s = 2.0
+hysteresis_c = 3
+
+[api]
+# Clean baked image owns the ports (the `a lab unit` /tmp bring-up file uses 4027
+# / 8080 to dodge BraiinsOS BOSer + nginx; a flashed DCENT_OS image does
+# not have those).
+cgminer_port = 4028
+http_port = 8080
+websocket = true
+cgminer_bind_lan = false
+metrics_require_auth = true
+
+[donation]
+# Production policy: transparent 2% donation default, configurable 0-5%,
+# fully disableable. The `a lab unit` /tmp bring-up file ships this
+# off; a baked production image ships it on.
+enabled = true
+
+[watchdog]
+# HW watchdog ON by default on a baked image (workspace safety rule,
+# default_watchdog_enabled). The `a lab unit` /tmp bring-up file ships this off
+# because PIC heartbeat covered it during reversible overlay runs.
+enabled = true
+
+[hash_on_disconnect]
+# Home/unattended safety: never continue hashing stale work during a
+# pool/control failure.
+enabled = false
+
+[mode]
+active = "standard"
+
+[autotuner]
+enabled = false
+
+[led]
+enabled = true
+heartbeat_on_ms = 100
+heartbeat_off_ms = 900
+flash_on_accepted_share = true
+flash_on_rejected_share = true

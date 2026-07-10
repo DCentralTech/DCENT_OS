@@ -1,0 +1,22 @@
+# DCENT_OS first-boot SSH grace marker.
+#
+# This file is consumed once by /etc/init.d/S50dropbear on the FIRST boot
+# of a freshly-installed image. When present:
+#   1. S50dropbear stamps /data/dcent/.ssh-enabled so dropbear can come up.
+#   2. S99upgrade soft-passes its SSH:22 health check.
+#   3. The marker is deleted so the next boot re-engages the W1.1
+#      default-credential lockdown.
+#
+# The grace flag breaks the circular failure flagged by the 2026-05-15
+# DevOps Q1 report (finding 4K):
+#   - S50dropbear refuses to start until the dashboard wizard completes.
+#   - S99upgrade refuses to clear upgrade_stage until SSH:22 is up.
+#   - Without grace, every fresh install would auto-revert on the second
+#     power cycle because the operator had no way to finish the wizard.
+#
+# To rebuild a sysupgrade image WITHOUT the grace flag (paranoid lab
+# mode), delete this file from the rootfs-overlay before running
+# Buildroot.
+#
+# The dashboard wizard at http://<miner-ip>/ remains the operator's
+# hard credential gate; this file ONLY gates the first boot.

@@ -1,0 +1,191 @@
+{
+  "schema_version": 1,
+  "miner_model": "antminer_s19j_pro_a",
+  "hashboard": "BHB-S19jPro-generic",
+  "chip": "bm1362",
+  "source": {
+    "vendor": "dcent-baked",
+    "firmware_version": "dcentrald-silicon-profiles 0.1.0",
+    "extracted_from_sha256": "n/a",
+    "extraction_date": "2026-05-03",
+    "extracted_by": "scripts/migrate-baked-profiles.py"
+  },
+  "source_class": "live_confirmed",
+  "presets": [
+    {
+      "step": -16,
+      "freq_mhz": 145,
+      "voltage_v": 11.88,
+      "wall_watts": 997,
+      "hashrate_ths": 28.1,
+      "source": "live_confirmed"
+    },
+    {
+      "step": -15,
+      "freq_mhz": 170,
+      "voltage_v": 11.88,
+      "wall_watts": 1079,
+      "hashrate_ths": 33.0,
+      "source": "live_confirmed"
+    },
+    {
+      "step": -14,
+      "freq_mhz": 195,
+      "voltage_v": 11.88,
+      "wall_watts": 1162,
+      "hashrate_ths": 37.8,
+      "source": "live_confirmed"
+    },
+    {
+      "step": -13,
+      "freq_mhz": 220,
+      "voltage_v": 11.88,
+      "wall_watts": 1244,
+      "hashrate_ths": 42.7,
+      "source": "live_confirmed"
+    },
+    {
+      "step": -12,
+      "freq_mhz": 245,
+      "voltage_v": 12.0,
+      "wall_watts": 1349,
+      "hashrate_ths": 47.6,
+      "source": "live_confirmed"
+    },
+    {
+      "step": -11,
+      "freq_mhz": 270,
+      "voltage_v": 12.15,
+      "wall_watts": 1466,
+      "hashrate_ths": 52.4,
+      "source": "live_confirmed"
+    },
+    {
+      "step": -10,
+      "freq_mhz": 295,
+      "voltage_v": 12.3,
+      "wall_watts": 1588,
+      "hashrate_ths": 57.3,
+      "source": "live_confirmed"
+    },
+    {
+      "step": -9,
+      "freq_mhz": 320,
+      "voltage_v": 12.45,
+      "wall_watts": 1714,
+      "hashrate_ths": 62.1,
+      "source": "live_confirmed"
+    },
+    {
+      "step": -8,
+      "freq_mhz": 345,
+      "voltage_v": 12.6,
+      "wall_watts": 1852,
+      "hashrate_ths": 67.0,
+      "source": "live_confirmed"
+    },
+    {
+      "step": -7,
+      "freq_mhz": 370,
+      "voltage_v": 12.75,
+      "wall_watts": 1994,
+      "hashrate_ths": 71.8,
+      "source": "live_confirmed"
+    },
+    {
+      "step": -6,
+      "freq_mhz": 395,
+      "voltage_v": 12.9,
+      "wall_watts": 2142,
+      "hashrate_ths": 76.7,
+      "source": "live_confirmed"
+    },
+    {
+      "step": -5,
+      "freq_mhz": 420,
+      "voltage_v": 13.05,
+      "wall_watts": 2297,
+      "hashrate_ths": 81.6,
+      "source": "live_confirmed"
+    },
+    {
+      "step": -4,
+      "freq_mhz": 445,
+      "voltage_v": 13.2,
+      "wall_watts": 2459,
+      "hashrate_ths": 86.5,
+      "source": "reconstructed"
+    },
+    {
+      "step": -3,
+      "freq_mhz": 470,
+      "voltage_v": 13.35,
+      "wall_watts": 2627,
+      "hashrate_ths": 91.4,
+      "source": "reconstructed"
+    },
+    {
+      "step": -2,
+      "freq_mhz": 495,
+      "voltage_v": 13.5,
+      "wall_watts": 2802,
+      "hashrate_ths": 96.2,
+      "source": "reconstructed"
+    },
+    {
+      "step": -1,
+      "freq_mhz": 520,
+      "voltage_v": 13.65,
+      "wall_watts": 2960,
+      "hashrate_ths": 101.0,
+      "source": "reconstructed"
+    },
+    {
+      "step": 0,
+      "freq_mhz": 545,
+      "voltage_v": 13.8,
+      "wall_watts": 3126,
+      "hashrate_ths": 105.8,
+      "source": "operator_confirmed"
+    },
+    {
+      "step": 1,
+      "freq_mhz": 570,
+      "voltage_v": 13.95,
+      "wall_watts": 3296,
+      "hashrate_ths": 110.6,
+      "source": "reconstructed"
+    },
+    {
+      "step": 2,
+      "freq_mhz": 595,
+      "voltage_v": 14.1,
+      "wall_watts": 3470,
+      "hashrate_ths": 115.4,
+      "source": "reconstructed"
+    },
+    {
+      "step": 3,
+      "freq_mhz": 620,
+      "voltage_v": 14.25,
+      "wall_watts": 3648,
+      "hashrate_ths": 120.2,
+      "source": "reconstructed"
+    },
+    {
+      "step": 4,
+      "freq_mhz": 645,
+      "voltage_v": 14.4,
+      "wall_watts": 3830,
+      "hashrate_ths": 125.0,
+      "source": "reconstructed"
+    }
+  ],
+  "metadata": {
+    "vnish_hotelfee_devfee_present": false,
+    "secure_boot_set_seen": false,
+    "hashcore_root_hash_seen": false,
+    "atlas_ssh_key_present": false,
+    "notes": "Migrated from DCENT_OS_Antminer/dcentrald/dcentrald-silicon-profiles/src/bm1362.rs by scripts/migrate-baked-profiles.py (Wave 5 W5-D)."
+  }
+}

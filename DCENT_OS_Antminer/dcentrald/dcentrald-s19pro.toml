@@ -1,0 +1,79 @@
+# dcentrald.toml — S19 Pro (am2-s17, BM1398, dsPIC)
+# Deploy to /data/dcentrald.toml on the miner
+
+[general]
+hostname = "dcentos-s19pro"
+log_level = "info"
+
+[pool]
+url = ""
+protocol = "sv1"
+worker = ""
+password = "x"
+
+[mining]
+# S19 Pro BM1398: 3x114 chips, dsPIC voltage at 0x20/0x21/0x22
+# 500 MHz safe starting point; ramp to 675 MHz after validation
+enabled = false
+model = "s19pro"
+frequency_mhz = 500
+voltage_mv = 13800
+suggest_difficulty = 8192
+passthrough = false
+version_rolling = true
+version_rolling_mask = 0x1fffe000
+
+[power]
+mode = "bypass"
+target_watts = 0
+
+[thermal]
+target_temp_c = 60
+hot_temp_c = 70
+dangerous_temp_c = 80
+fan_min_pwm = 10
+# pass-3 fix NEW-3: was 100, violating the load-bearing PWM-30 home rule
+# (: "NEVER allow fans above PWM 30 for home
+# mining"). Capped to 30 to match the am2 safe-reference config. Raise only via
+# an explicit user override for a lab unit with adequate cooling.
+fan_max_pwm = 30
+
+[api]
+cgminer_port = 4028
+http_port = 80
+websocket = true
+auth_enabled = false
+auth_password = ""
+
+[donation]
+enabled = false
+percent = 2.0
+pool_url = ""
+worker = ""
+password = "x"
+cycle_duration_s = 3600
+
+[watchdog]
+enabled = false
+kick_interval_s = 5
+
+[hash_on_disconnect]
+enabled = true
+
+[mode]
+active = "standard"
+
+[autotuner]
+enabled = false
+
+[led]
+enabled = true
+heartbeat_on_ms = 100
+heartbeat_off_ms = 900
+locate_pattern = "imperial_march"
+locate_duration_s = 30
+flash_on_accepted_share = true
+flash_on_rejected_share = true
+night_mode_disable = false
+celebration_on_lucky_share = true
+chain_status_blink_codes = true

@@ -1,0 +1,93 @@
+# DCENTos Mining Daemon Configuration
+# D-Central Technologies — v0.5.0 Default
+#
+# This is the DEFAULT config baked into the firmware.
+# It is tuned as the clean-image AM1/S9 onboarding baseline: mining disabled,
+# quiet thermal defaults, and native-first runtime behavior.
+# To customize, copy to /data/dcentrald.toml (persistent storage)
+# and modify there. /data/ survives firmware updates.
+#
+# Override order: /data/dcentrald.toml > /etc/dcentrald.toml
+
+[general]
+hostname = "dcentos"
+log_level = "info"
+
+[pool]
+url = ""
+worker = ""
+password = "d=1"
+
+[mining]
+enabled = false
+frequency_mhz = 500
+voltage_mv = 9100
+suggest_difficulty = 8192
+passthrough = false
+version_rolling = true
+
+[power]
+mode = "bypass"
+target_watts = 0
+
+[thermal]
+target_temp_c = 55
+hot_temp_c = 65
+dangerous_temp_c = 75
+fan_min_pwm = 10
+fan_max_pwm = 30
+
+[api]
+cgminer_port = 4028
+http_port = 8080
+websocket = true
+# HTTP auth is enforced by the API's owner-password flow, not by a legacy
+# auth_enabled toggle. Ship fail-closed defaults for the surfaces that still
+# have config knobs.
+cgminer_bind_lan = false
+# API-1 (security): allow MUTATING CGMiner/LuxOS verbs (addpool/switchpool/
+# config changes) from NON-loopback LAN peers. DEFAULT false (fail-closed):
+# even with cgminer_bind_lan=true, remote mutating verbs stay blocked unless
+# this is ALSO true (loopback writes always work). Set true ONLY on a trusted LAN.
+cgminer_lan_writes = false
+metrics_require_auth = true
+
+[donation]
+# Voluntary 2% donation supports open-source firmware development.
+# Set enabled = false to disable it, or adjust percent between 0 and 5.
+enabled = true
+percent = 2.0
+pool_url = "stratum+tcp://pool.d-central.tech:3333"
+worker = "DungeonMaster"
+password = "x"
+fallback_enabled = true
+fallback_pool_url = "stratum+tcp://stratum.braiins.com:3333"
+fallback_worker = "DungeonMaster"
+fallback_password = "x"
+cycle_duration_s = 3600
+
+[watchdog]
+enabled = true
+kick_interval_s = 5
+
+[hash_on_disconnect]
+enabled = true
+
+[mode]
+active = "standard"
+
+[led]
+enabled = true
+heartbeat_on_ms = 100
+heartbeat_off_ms = 900
+locate_pattern = "imperial_march"
+locate_duration_s = 30
+flash_on_accepted_share = true
+flash_on_rejected_share = true
+night_mode_disable = false
+celebration_on_lucky_share = true
+chain_status_blink_codes = true
+
+[autotuner]
+enabled = false
+preset = "balanced_home"

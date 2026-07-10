@@ -1,0 +1,1820 @@
+/* ═════════════════════════════════════════════════════════════════════════
+   DCENT_OS — Claude-Design handoff visual recreation · HEATER (VR3)
+   Loaded LAST among the per-mode skins in main.tsx (line 25, AFTER
+   handoff-skin.css line 20) so it re-skins the production .mode-basic DOM to
+   LOOK like the handoff Heater kit — the '.nest-*' rules in
+   'ui_kits/dashboard/styles.css' (lines 1499-1873) + 'ui_kits/heater/
+   index.html' + 'ui_kits/dashboard/HeaterMode.jsx'.
+
+   PIXEL-FIDELITY pass. Every value below is pinned to the kit's literal
+   '.nest-*' declarations, cross-checked against the kit token source
+   'colors_and_type.css':
+
+     --bg-warm        #1A1410   (prod token: --bg          #1A1410)
+     --bg-warm-card   #2A2218   (prod token: --card-bg     #2A2218)  ← SOLID
+     --border-warm    #3D3228   (prod token: --border      #3D3228)
+     --accent-border  rgba(250,165,0,.32)
+     --accent         #FAA500   --accent-deep #FA6700  --accent-light #FFC94D
+     --fg-warm-*      #E8E0D6 / #A09888 / #6B5F52
+     --radius-md      12px      (.nest-card itself uses 14px)
+
+   The kit's signature is NOT a frosted orange-hairline card — that was a
+   prior over-stylisation. The kit '.nest-card' (styles.css:1639) is a SOLID
+   warm card ('background: var(--bg-warm-card)', 'border: 1px solid
+   var(--border-warm)', 'border-radius: 14px', 'padding: 16px 18px', NO
+   backdrop-filter, NO top accent line, hover → 'border-color:
+   var(--accent-border); transform: translateY(-1px)'). Only the header
+   (styles.css:1514) and the left sidebar are the frosted warm gradient.
+   This file is corrected to match that exactly.
+
+   This is a VISUAL/LAYOUT reskin only — NO data binding, store wiring,
+   props, truth-contract copy, or honest empty states are touched. Every
+   selector is scoped to .mode-basic. Tokens are referenced so the Wave-1
+   accent engine still recolors orange; only the kit's literal rgba washes
+   are inlined (exactly as handoff-skin.css does for the aurora).
+   ───────────────────────────────────────────────────────────────────────── */
+
+.mode-basic {
+  /* Kit-literal constants, pinned to the '.nest-*' spec. The card is the
+     SOLID warm card the kit actually uses — not a translucent wash. */
+  /*  premium lift: deeper, richer, spotlit-from-above floor instead of
+     the flat muddy-brown wash. A warm amber glow up top falls to a deep warm
+     near-black, giving real depth + high contrast so cards + the orange dial
+     POP (the operator's "muddy / not premium" report). */
+  --nest-shell-grad: radial-gradient(128% 92% at 50% -12%, #3a2410 0%, #1c130b 42%, #0e0a06 100%);
+  --nest-card-bg: var(--card-bg, #2A2218);
+  --nest-card-bg-hover: var(--card-hover, #34291D);
+  --nest-card-border: var(--border-warm, #3D3228);
+  --nest-card-border-hover: var(--accent-border, rgba(250, 165, 0, 0.32));
+  --nest-card-radius: 14px;
+  /* Header / sidebar frosted-gradient washes (kit '.nest-header':1518). */
+  --nest-frost-grad: linear-gradient(180deg, rgba(26, 16, 12, 0.85), rgba(26, 16, 12, 0.55) 60%, transparent);
+}
+
+/* ─── Shell — warm radial floor (kit '.nest-shell':1499) ────────────────── */
+.mode-basic .basic-shell {
+  background: var(--nest-shell-grad);
+}
+/* The page wrapper already paints --bg solid; let the shell radial win. */
+.mode-basic {
+  background: transparent;
+}
+.mode-basic .basic-main {
+  position: relative;
+  z-index: 1;
+}
+
+.mode-basic,
+.mode-basic .basic-shell,
+.mode-basic .basic-main,
+.mode-basic .heater-home-page,
+.mode-basic .heater-history-page,
+.mode-basic .heater-settings-page {
+  max-width: 100%;
+  overflow-x: clip;
+}
+
+@supports not (overflow: clip) {
+  .mode-basic,
+  .mode-basic .basic-shell,
+  .mode-basic .basic-main,
+  .mode-basic .heater-home-page,
+  .mode-basic .heater-history-page,
+  .mode-basic .heater-settings-page {
+    overflow-x: hidden;
+  }
+}
+
+/* ─── Header — frosted gradient bar (kit '.nest-header':1514) ───────────── */
+.mode-basic .dashboard-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  background: var(--nest-frost-grad);
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+  border-bottom: none;
+  padding: 18px 28px;
+}
+@supports not ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+  .mode-basic .dashboard-header { background: rgba(26, 16, 12, 0.94); }
+}
+.mode-basic .dashboard-header .logo {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  letter-spacing: -0.005em;
+  text-shadow: 0 0 14px rgba(250, 103, 0, 0.30);
+}
+.mode-basic .dashboard-header .device-name {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.74rem;
+  color: var(--fg-warm-secondary, #A09888);
+}
+.mode-basic .basic-page-copy {
+  font-size: 0.72rem;
+  color: var(--fg-warm-dim, #6B5F52);
+}
+.mode-basic .basic-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+/* ─── Status strip + chips — pill grammar (kit dial-state pills:1623) ───── */
+.mode-basic .basic-status-strip {
+  padding: 12px 28px 4px;
+  gap: 10px;
+}
+.mode-basic .basic-status-chip {
+  border-radius: 999px;
+  font-family: var(--font-ui, 'Inter', sans-serif);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 5px 14px;
+}
+/* Kit '.nest-engine-pill.on' (1733) uses the green wash for the live state. */
+.mode-basic .basic-status-chip.success {
+  background: rgba(34, 197, 94, 0.12);
+  border: 1px solid rgba(34, 197, 94, 0.40);
+  color: var(--green, #22C55E);
+}
+/* Kit '.nest-dial-state.on' (1629): rgba(250,103,0,.18) / border .4. */
+.mode-basic .basic-status-chip.warning {
+  background: rgba(250, 103, 0, 0.18);
+  border: 1px solid rgba(250, 103, 0, 0.40);
+  color: var(--accent, #FAA500);
+}
+.mode-basic .basic-status-chip.danger {
+  background: rgba(239, 68, 68, 0.16);
+  border: 1px solid rgba(239, 68, 68, 0.45);
+  color: var(--red, #EF4444);
+}
+/* Kit '.nest-dial-state.off' (1630): rgba(255,255,255,.05) / border .1. */
+.mode-basic .basic-status-chip.info,
+.mode-basic .basic-status-chip.neutral {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  color: var(--fg-warm-secondary, #A09888);
+}
+.mode-basic .basic-status-page {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.68rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-warm-dim, #6B5F52);
+}
+
+/* ─── BTC block ticker pill (kit '.nest-block-pill') ─────────────────────── */
+/* The kit has no dedicated .nest-block-pill rule; it inherits the kit chip
+   grammar. Match the solid-card warm chip: --border-warm hairline, no orange
+   wash, mono type, accent dot with the kit pulse. */
+.mode-basic .heater-block-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border-radius: 999px;
+  border: 1px solid var(--nest-card-border);
+  background: var(--card-bg, #2A2218);
+  padding: 6px 14px;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.72rem;
+  color: var(--fg-warm-secondary, #A09888);
+  transition: border-color 0.15s var(--ease-standard);
+}
+.mode-basic .heater-block-pill:hover {
+  border-color: var(--nest-card-border-hover);
+}
+.mode-basic .heater-block-pill-eyebrow {
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-warm-dim, #6B5F52);
+  font-size: 0.62rem;
+}
+.mode-basic .heater-block-pill-height {
+  color: var(--fg-warm-primary, #E8E0D6);
+  font-weight: 700;
+}
+.mode-basic .heater-block-pill-age,
+.mode-basic .heater-block-pill-na {
+  color: var(--fg-warm-secondary, #A09888);
+}
+/* Kit '.nest-status-dot' (1549): 8px, green, 0 0 8px green, pulse 1.8s. */
+.mode-basic .heater-block-pill-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent, #FAA500);
+  box-shadow: 0 0 8px var(--accent-deep, #FA6700);
+  animation: pulse 1.8s ease-in-out infinite;
+}
+.mode-basic .heater-block-pill.is-unavailable .heater-block-pill-dot {
+  background: var(--fg-warm-dim, #6B5F52);
+  box-shadow: none;
+  animation: none;
+}
+
+/* ─── Left sidebar — warm frosted rail (kit '.nest-sidebar') ────────────── */
+/* Kit '.nest-sidebar' uses a deeper frost wash than the header; the active
+   item matches the kit '.nest-mode-tile.active' (1666) gradient. */
+.mode-basic .basic-sidebar {
+  background: linear-gradient(180deg, rgba(26, 16, 12, 0.92), rgba(26, 16, 12, 0.80));
+  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px);
+  border-right: 1px solid var(--nest-card-border);
+}
+@supports not ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+  .mode-basic .basic-sidebar { background: #1d1712; }
+}
+.mode-basic .basic-sidebar-brand-name {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  text-shadow: 0 0 12px rgba(250, 103, 0, 0.28);
+}
+.mode-basic .basic-sidebar-eyebrow,
+.mode-basic .basic-sidebar-brand-tag {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.62rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--fg-warm-dim, #6B5F52);
+}
+.mode-basic .basic-sidebar-item {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.82rem;
+  color: var(--fg-warm-secondary, #A09888);
+  border-radius: 0;
+  transition: all 0.15s var(--ease-standard);
+}
+.mode-basic .basic-sidebar-item:hover {
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--fg-warm-primary, #E8E0D6);
+}
+/* Kit '.nest-mode-tile.active' (1666) — orange gradient + accent text. */
+.mode-basic .basic-sidebar-item.is-active {
+  background: linear-gradient(135deg, rgba(250, 165, 0, 0.15), rgba(250, 103, 0, 0.08));
+  color: var(--accent, #FAA500);
+}
+/* Kit '.hk-nav-bar'/'.nest-sidebar-bar' analog: 2px accent rail w/ glow. */
+.mode-basic .basic-sidebar-item.is-active .basic-sidebar-bar {
+  background: var(--accent, #FAA500);
+  box-shadow: 0 0 8px var(--accent, #FAA500);
+}
+.mode-basic .basic-sidebar-foot-row {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.72rem;
+  color: var(--fg-warm-secondary, #A09888);
+}
+/* Kit '.nest-status-dot' (1549). */
+.mode-basic .basic-sidebar-foot-dot {
+  background: var(--green, #22C55E);
+  box-shadow: 0 0 8px var(--green, #22C55E);
+  animation: pulse 1.8s ease-in-out infinite;
+}
+
+/* ─── Page column — keep the centered single-column hero. The kit '.nest-page'
+   is a 1200px 2-col grid; production heater is a single column, so keep it
+   centered & give the hero the kit's vertical rhythm (gap:16px, pad:18/24). */
+.mode-basic .heater-home-page,
+.mode-basic .heater-history-page,
+.mode-basic .heater-settings-page {
+  max-width: 560px;
+  padding: 18px 24px 24px;
+  gap: 16px;
+}
+
+/* ─── The Nest hero dial (kit '.nest-dial':1604) ────────────────────────── */
+/* Production renders the dial as a 280px SVG inside .thermostat. We give it
+   the kit's dual breathing halo + glow + condensed typographic treatment
+   without touching the SVG geometry or the draggable slider wiring. */
+.mode-basic .heater-page-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  /* Kit '.nest-hero-dial' (1568): gap 18px, padding 18px 0. */
+  gap: 18px;
+  padding: 18px 0 6px;
+}
+/* Kit has no wide hero ::before halo — the halo lives on the dial itself
+   ('.nest-dial-halo-1/2'). Suppress any inherited wide hero glow so the
+   dial's own dual ring is the only halo, exactly like the kit. */
+.mode-basic .heater-page-hero::before {
+  display: none;
+}
+
+.mode-basic .thermostat-container {
+  display: flex;
+  justify-content: center;
+}
+.mode-basic .thermostat {
+  position: relative;
+  /* Shrink-wrap the box to the SVG so it can't inherit a narrower (240px) width
+     that lets the ~280px dial overflow to one side and read as off-center; the
+     flex parent (.thermostat-container) then centers it cleanly. */
+  width: fit-content;
+  margin-inline: auto;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 8px;
+  /* Kit '.nest-dial' (1604) is 340px; the SVG is 280. Box the dial so the
+     halo math (inset:-22/-44) reads against the same visual diameter. */
+}
+.mode-basic .thermostat > svg { display: block; margin-inline: auto; }
+/* Kill the production card chrome the dial used to sit on. */
+.mode-basic .thermostat::before {
+  display: none;
+}
+/* Suppress the design-system 'ds-heatPulse' filter on the thermostat box so
+   the kit's dual 'breathingGlow' halos (below) are the authoritative glow. */
+.mode-basic .thermostat.mining-glow,
+.mode-basic .thermostat[data-mining='true'] {
+  background: transparent;
+  /* The heater dial is a transparent SVG over the page; its glow comes from
+     the breathing halos below + the SVG arc halo. Reset the production face's
+     box-shadow too (not just background/animation) — otherwise basic.css's
+     mining-glow '0 0 0 1px' hairline ring + dark inset shadow leak at the
+     340px dial box and render as a stray ring/seam around the dial. */
+  box-shadow: none;
+  animation: none;
+}
+/* ──  premium dial redesign ───────────────────────────────────────
+   Even ambient bloom hugging the dial — symmetric, centered, fully faded by
+   55% so it never POOLS at the bottom (the old inset:-22/-44 radials did).
+   The arc's own even halo now lives in the SVG (#hdialArcGlow blurred-arc
+   <use> clone), so these box halos are tightened + re-centered. */
+.mode-basic .thermostat.mining-glow::before {
+  content: '';
+  position: absolute;
+  inset: -14px;
+  border-radius: 50%;
+  pointer-events: none;
+  z-index: -1;
+  background: radial-gradient(circle at 50% 50%, rgba(250, 103, 0, 0.14) 0%, transparent 55%);
+  animation: ds-breathingGlow 2.6s ease-in-out infinite;
+}
+.mode-basic .thermostat.mining-glow::after {
+  content: '';
+  position: absolute;
+  inset: -34px;
+  border-radius: 50%;
+  pointer-events: none;
+  z-index: -1;
+  background: radial-gradient(circle at 50% 50%, rgba(250, 165, 0, 0.08) 0%, transparent 55%);
+  animation: ds-breathingGlow 3.4s ease-in-out 0.4s infinite;
+}
+
+/* Crisp high-contrast background track — warm-neutral rail replacing the muddy
+   rgba(255,255,255,.06). Color driven here (the SVG path carries no stroke). */
+.mode-basic .thermostat-ring .hdial-track {
+  stroke: rgba(232, 224, 214, 0.12);
+  filter: none;
+}
+/* Quiet concentric depth ring — flat, no glow. */
+.mode-basic .thermostat-ring .hdial-inner-ring {
+  filter: none;
+}
+
+/* Crisp target arc (the TOP <use href="#htFgArc">): a single tight edge-light;
+   the broad EVEN bloom comes from the blurred clone underneath — no heavy
+   double drop-shadow / bottom blob. */
+.mode-basic .thermostat-ring .heat-ring-fill {
+  filter: drop-shadow(0 0 6px rgba(250, 103, 0, 0.45));
+  transition: stroke 0.4s ease;
+}
+.mode-basic .thermostat.mining-glow .thermostat-ring .heat-ring-fill {
+  animation: ds-heatPulse 2.4s ease-in-out infinite;
+}
+
+/* The blurred arc clone = the EVEN ring halo. Inherits the arc geometry via
+   <use>; we only set its paint (gradient + modest opacity → premium glow, not
+   a flare). Blooms uniformly along the whole arc. */
+.mode-basic .thermostat-ring .hdial-arc-halo {
+  stroke: url(#heatGradientDynamic);
+  stroke-width: 12;
+  fill: none;
+  opacity: 0.55;
+}
+.mode-basic .thermostat.mining-glow .thermostat-ring .hdial-arc-halo {
+  animation: ds-breathingGlow 2.8s ease-in-out infinite;
+}
+
+/* Room reference gem — faint warm seat so the mark reads as part of the scale. */
+.mode-basic .thermostat-ring .hdial-room-marker {
+  filter: drop-shadow(0 0 4px rgba(232, 224, 214, 0.25));
+}
+
+/* Refined flush machined thumb — soft seat shadow so it sits ON the arc as a
+   physical knob with its crisp white ring. */
+.mode-basic .thermostat-ring .thermostat-thumb {
+  filter: drop-shadow(0 2px 5px rgba(0, 0, 0, 0.45));
+}
+
+/* Center readout — the kit's huge condensed target temp ('.nest-dial-temp'
+   1614: Barlow 800, 5.4rem, line 1, ls -.02em). The production SVG is 280px
+   vs the kit's 340px ⇒ scale ≈ 280/340 ⇒ kit 5.4rem ≈ 4.45rem here. */
+.mode-basic .thermostat-inner {
+  font-family: var(--font-heading);
+}
+.mode-basic .thermostat .temp-value,
+.mode-basic .thermostat .btu-center-value {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 4.4rem;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  color: var(--fg-warm-primary, #E8E0D6);
+  font-variant-numeric: tabular-nums;
+  /* Kit '.nest-dial-temp' (1617): text-shadow 0 0 12px rgba(232,224,214,.15). */
+  text-shadow: 0 0 12px rgba(232, 224, 214, 0.15);
+  transition: text-shadow 0.4s, color 0.4s;
+}
+/* Kit '.nest-dial-temp.heating' (1621): 0 0 32px rgba(250,103,0,.5). */
+.mode-basic .thermostat.mining-glow .temp-value,
+.mode-basic .thermostat.mining-glow .btu-center-value {
+  text-shadow: 0 0 32px rgba(250, 103, 0, 0.50);
+}
+/* Kit '.nest-dial-temp .nest-dial-unit' (1622): 1.7rem secondary 600. */
+.mode-basic .thermostat .temp-unit,
+.mode-basic .thermostat .btu-center-unit {
+  font-size: 1.4rem;
+  color: var(--fg-warm-secondary, #A09888);
+  font-weight: 600;
+  margin-left: 4px;
+}
+/* Kit '.nest-dial-eyebrow' (1613): .68rem, ls .12em, uppercase, dim. */
+.mode-basic .thermostat .temp-label {
+  font-family: var(--font-ui, 'Inter', sans-serif);
+  font-size: 0.68rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-warm-dim, #6B5F52);
+}
+/* Kit '.nest-dial-room' (1633): .76rem secondary mono. */
+.mode-basic .thermostat .temp-label.temp-secondary {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.76rem;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--fg-warm-secondary, #A09888);
+}
+
+/* State line under the dial — kit '.nest-dial-state' pill (1623). */
+.mode-basic .heater-state-line {
+  padding: 2px 20px 6px;
+  font-family: var(--font-ui, 'Inter', sans-serif);
+}
+.mode-basic .heater-state-line > span:last-child {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 14px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  /* Kit '.nest-dial-state.off' (1630). */
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  color: var(--fg-warm-dim, #6B5F52);
+}
+/* Kit '.nest-dial-state.on' (1629). */
+.mode-basic .heater-state-line.is-heating > span:last-child {
+  background: rgba(250, 103, 0, 0.18);
+  border: 1px solid rgba(250, 103, 0, 0.40);
+  color: var(--accent, #FAA500);
+}
+.mode-basic .heater-state-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--fg-warm-dim, #6B5F52);
+}
+/* Kit '.nest-dial-state.on .nest-dial-state-dot' (1631). */
+.mode-basic .heater-state-line.is-heating .heater-state-dot {
+  background: var(--accent-deep, #FA6700);
+  box-shadow: 0 0 8px var(--accent-deep, #FA6700);
+  animation: pulse 1.8s ease-in-out infinite;
+}
+.mode-basic .heater-hero-note,
+.mode-basic .heater-transition-note {
+  font-family: var(--font-ui, 'Inter', sans-serif);
+  font-size: 0.78rem;
+  color: var(--fg-warm-secondary, #A09888);
+}
+
+/* ─── Shared SOLID warm-glass card primitive (kit '.nest-card':1639) ────────
+   The kit '.nest-card' is a SOLID card: background var(--bg-warm-card),
+   border 1px var(--border-warm), radius 14px, padding 16px 18px,
+   transition 'border-color .15s, transform .15s'. NO backdrop-filter, NO
+   orange hairline, NO top accent line. Applied verbatim to every production
+   card surface that composes the heater page. */
+.mode-basic .btu-hero-card,
+.mode-basic .status-card,
+.mode-basic .earning-proof,
+.mode-basic .heater-sensor,
+.mode-basic .heater-big,
+.mode-basic .history-summary-card,
+.mode-basic .session-activity-wrapper,
+.mode-basic .session-stat-cell,
+.mode-basic .heating-value-summary,
+.mode-basic .companion-heater-card,
+.mode-basic .night-mode-card {
+  position: relative;
+  background: var(--nest-card-bg);
+  border: 1px solid var(--nest-card-border);
+  border-radius: var(--nest-card-radius);
+  padding: 16px 18px;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: none;
+  transition: border-color 0.15s var(--ease-standard),
+              transform 0.15s var(--ease-standard);
+}
+/* No '::before' top accent line — the kit '.nest-card' has none. Suppress
+   any inherited one so the solid-card tell stays faithful. */
+.mode-basic .btu-hero-card::before,
+.mode-basic .earning-proof::before,
+.mode-basic .heater-sensor::before,
+.mode-basic .history-summary-card::before,
+.mode-basic .history-summary-card.accent::before {
+  display: none;
+}
+/* Kit '.nest-card:hover' analog — '.nest-gauge:hover' (1589) /
+   '.nest-mode-tile:hover' (1665): border → accent-border, lift 1px. */
+@media (hover: hover) {
+  .mode-basic .btu-hero-card:hover,
+  .mode-basic .status-card:hover,
+  .mode-basic .heater-big:hover,
+  .mode-basic .history-summary-card:hover {
+    border-color: var(--nest-card-border-hover);
+    transform: translateY(-1px);
+    background: var(--nest-card-bg-hover);
+  }
+}
+
+/* ─── Earning-proof card (kit '.nest-earning':1677) ─────────────────────── */
+.mode-basic .earning-proof {
+  padding: 16px 18px;
+}
+/* Kit '.nest-earning-eyebrow' (1678): .72rem secondary 600. */
+.mode-basic .earning-proof__headline {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  color: var(--fg-warm-primary, #E8E0D6);
+}
+.mode-basic .earning-proof--good .earning-proof__headline {
+  color: var(--green, #22C55E);
+}
+.mode-basic .earning-proof--warming .earning-proof__headline {
+  color: var(--accent, #FAA500);
+}
+.mode-basic .earning-proof__detail {
+  font-family: var(--font-ui, 'Inter', sans-serif);
+  font-size: 0.78rem;
+  color: var(--fg-warm-secondary, #A09888);
+}
+/* Kit accent dot energy ('.nest-status-dot' 1549 / earning emphasis). */
+.mode-basic .earning-proof__pulse-dot {
+  background: var(--accent, #FAA500);
+  box-shadow: 0 0 10px var(--accent-deep, #FA6700);
+}
+.mode-basic .earning-proof--good .earning-proof__pulse-dot {
+  background: var(--green, #22C55E);
+  box-shadow: 0 0 10px var(--green, #22C55E);
+}
+/* Kit '.nest-earning-rows > div > strong' (1710): mono 600 tnum. */
+.mode-basic .earning-proof__rate,
+.mode-basic .earning-proof__rejects {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-variant-numeric: tabular-nums;
+}
+.mode-basic .earning-proof__hint {
+  color: var(--fg-warm-dim, #6B5F52);
+}
+
+/* ─── BTU hero (kit '.nest-card' + '.nest-earning-usd' headline:1685) ───── */
+.mode-basic .btu-hero-card {
+  padding: 18px 20px;
+  text-align: center;
+}
+/* Kit '.nest-card-eyebrow' (1647): .7rem, ls .1em, uppercase, dim, mono. */
+.mode-basic .btu-hero-label {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.7rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fg-warm-dim, #6B5F52);
+  font-weight: 700;
+}
+.mode-basic .btu-hero-value {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  /* gradient text + halo already supplied by design-system.css:842; the kit
+     '.nest-earning-usd' glow (0 0 16px rgba(250,103,0,.4)) is consistent. */
+}
+.mode-basic .btu-hero-unit {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  color: var(--fg-warm-secondary, #A09888);
+  letter-spacing: 0.06em;
+}
+.mode-basic .btu-hero-comparison,
+.mode-basic .btu-hero-watts {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.76rem;
+  color: var(--fg-warm-secondary, #A09888);
+}
+/* Power-source tag — kit chip grammar (solid card, --border-warm hairline). */
+.mode-basic .btu-power-source {
+  border-radius: 999px;
+  border: 1px solid var(--nest-card-border);
+  background: var(--card-bg, #2A2218);
+  color: var(--accent, #FAA500);
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.66rem;
+  letter-spacing: 0.04em;
+}
+
+/* ─── Sensor module (kit '.nest-sensor') ────────────────────────────────── */
+.mode-basic .heater-sensor {
+  padding: 16px 18px;
+}
+/* Kit '.nest-sensor-eyebrow' ≈ '.nest-hero-eyebrow' (1572): .62rem mono. */
+.mode-basic .heater-sensor-eyebrow {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.62rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fg-warm-dim, #6B5F52);
+  font-weight: 700;
+}
+.mode-basic .heater-sensor-value {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  color: var(--fg-warm-primary, #E8E0D6);
+  font-variant-numeric: tabular-nums;
+}
+.mode-basic .heater-sensor-value small {
+  color: var(--fg-warm-secondary, #A09888);
+  font-weight: 600;
+}
+.mode-basic .heater-sensor-value--na {
+  color: var(--fg-warm-dim, #6B5F52);
+}
+.mode-basic .heater-sensor-active {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.72rem;
+  color: var(--fg-warm-secondary, #A09888);
+}
+/* Kit '.nest-seg button' (1868) + '.nest-mode-tile' grammar — the sensor
+   tabs are the kit's segmented selector. Inactive = transparent on the
+   card; the kit '.nest-stat' chip uses rgba(255,255,255,.025) +
+   --border-warm. */
+.mode-basic .heater-sensor-tab {
+  border-radius: 10px;
+  border: 1px solid var(--nest-card-border);
+  background: rgba(255, 255, 255, 0.025);
+  color: var(--fg-warm-secondary, #A09888);
+  font-family: var(--font-ui, 'Inter', sans-serif);
+  font-weight: 600;
+  transition: all 0.15s var(--ease-standard);
+}
+@media (hover: hover) {
+  .mode-basic .heater-sensor-tab:hover {
+    border-color: var(--nest-card-border-hover);
+  }
+}
+/* Kit '.nest-mode-tile.active' (1666) — exact gradient + accent + glow. */
+.mode-basic .heater-sensor-tab.is-active {
+  border-color: var(--accent, #FAA500);
+  background: linear-gradient(135deg, rgba(250, 165, 0, 0.15), rgba(250, 103, 0, 0.08));
+  color: var(--accent, #FAA500);
+  box-shadow: 0 0 16px rgba(250, 103, 0, 0.25);
+}
+.mode-basic .heater-sensor-tab.is-unpaired {
+  opacity: 0.6;
+}
+/* Kit '.nest-mode-sub' (1675): .66rem mono dim. */
+.mode-basic .heater-sensor-tab small {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.66rem;
+  color: var(--fg-warm-dim, #6B5F52);
+  text-transform: none;
+}
+.mode-basic .heater-sensor-feed-note {
+  font-family: var(--font-ui, 'Inter', sans-serif);
+  font-size: 0.72rem;
+  color: var(--fg-warm-dim, #6B5F52);
+  line-height: 1.5;
+}
+.mode-basic .heater-sensor-feed-input {
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--nest-card-border);
+  border-radius: 8px;
+  color: var(--fg-warm-primary, #E8E0D6);
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+}
+.mode-basic .heater-sensor-feed-input:focus-visible {
+  outline: none;
+  border-color: var(--accent, #FAA500);
+}
+/* Kit '.nest-seg button.active' (1869): accent bg, #1a0f00 fg, accent glow. */
+.mode-basic .heater-sensor-feed-btn {
+  background: var(--accent, #FAA500);
+  color: #1a0f00;
+  border: none;
+  border-radius: 8px;
+  font-family: var(--font-ui, 'Inter', sans-serif);
+  font-weight: 700;
+  box-shadow: 0 2px 8px rgba(250, 103, 0, 0.40);
+}
+.mode-basic .heater-sensor-feed-btn:disabled {
+  opacity: 0.5;
+  box-shadow: none;
+}
+
+/* ─── The 3 big readouts (kit '.nest-big-row'/'.nest-gauge':1584) ───────────
+   The HeaterMode.jsx 'BigReadout' (53) renders into the kit '.nest-big-*'
+   grammar; the closest kit CSS analog is '.nest-gauge' (1584): solid card,
+   12px radius, 12px 10px pad, eyebrow .62rem dim, value Barlow 700 1.5rem. */
+.mode-basic .heater-big-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+.mode-basic .heater-big {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 10px;
+  text-align: left;
+  border-radius: 12px;
+}
+.mode-basic .heater-big-eyebrow {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.62rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fg-warm-dim, #6B5F52);
+  font-weight: 700;
+}
+/* Kit '.nest-gauge-value' (1594): Barlow 700, 1.5rem, tnum. */
+.mode-basic .heater-big-value {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 1.7rem;
+  line-height: 1;
+  color: var(--fg-warm-primary, #E8E0D6);
+  font-variant-numeric: tabular-nums;
+}
+/* Kit '.nest-gauge-value > span' (1598): .68rem mono dim. */
+.mode-basic .heater-big-value small {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.68rem;
+  font-weight: 500;
+  color: var(--fg-warm-dim, #6B5F52);
+  margin-left: 3px;
+}
+.mode-basic .heater-big.tone-accent .heater-big-value {
+  color: var(--accent, #FAA500);
+  text-shadow: 0 0 16px rgba(250, 103, 0, 0.35);
+}
+.mode-basic .heater-big.tone-green .heater-big-value {
+  color: var(--green, #22C55E);
+}
+.mode-basic .heater-big-foot {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.66rem;
+  color: var(--fg-warm-secondary, #A09888);
+}
+
+/* ─── Status / cost cards row (kit '.nest-card' grid) ───────────────────── */
+.mode-basic .status-cards {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+}
+.mode-basic .status-card {
+  padding: 16px 18px;
+  text-align: center;
+}
+.mode-basic .status-card .value {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  color: var(--fg-warm-primary, #E8E0D6);
+  font-variant-numeric: tabular-nums;
+}
+.mode-basic .status-card .value.sats-value,
+.mode-basic .status-card.border-amber .value {
+  color: var(--accent, #FAA500);
+}
+.mode-basic .status-card .value.net-positive { color: var(--green, #22C55E); }
+.mode-basic .status-card .value.net-negative { color: var(--accent-deep, #FA6700); }
+.mode-basic .status-card .unit,
+.mode-basic .status-card .card-comparison {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.72rem;
+  color: var(--fg-warm-secondary, #A09888);
+}
+/* Kit '.nest-card-eyebrow' (1647): .7rem ls .1em uppercase dim mono. */
+.mode-basic .status-card .label {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.66rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fg-warm-dim, #6B5F52);
+  font-weight: 700;
+}
+/* Keep the semantic top-border accents — the kit has no equivalent so these
+   are a faithful-enough functional addition; thin to the kit hairline feel. */
+.mode-basic .status-card.border-orange { border-top: 2px solid var(--accent, #FAA500); }
+.mode-basic .status-card.border-amber  { border-top: 2px solid var(--accent-light, #FFC94D); }
+.mode-basic .status-card.border-blue   { border-top: 2px solid var(--blue, #3B82F6); }
+.mode-basic .status-card.border-green  { border-top: 2px solid var(--green, #22C55E); }
+.mode-basic .status-card.border-red    { border-top: 2px solid var(--red, #EF4444); }
+
+/* ─── Power presets → kit Mode-Tile grammar (kit '.nest-mode-tile':1658) ─── */
+.mode-basic .presets-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+/* Restore the responsive intent from basic.css (the old '!important' above
+   locked 3-col at every width): roomier 6-col on wide screens, 2-col on the
+   narrowest phones so the Boost/Away/Quiet tiles never cramp. */
+@media (min-width: 1280px) {
+  .mode-basic .presets-grid { grid-template-columns: repeat(6, 1fr); }
+}
+@media (max-width: 359.98px) {
+  .mode-basic .presets-grid { grid-template-columns: repeat(2, 1fr); }
+}
+/* Kit '.nest-mode-tile' (1658): col, flex-start, gap 4px, 14px 12px,
+   12px radius, 1.5px --border-warm, solid --bg-warm-card, all .2s. */
+.mode-basic .preset-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 4px;
+  padding: 14px 12px;
+  border-radius: 12px;
+  border: 1.5px solid var(--nest-card-border);
+  background: var(--nest-card-bg);
+  color: var(--fg-warm-primary, #E8E0D6);
+  font-family: var(--font-ui, 'Inter', sans-serif);
+  text-align: left;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: none;
+  transition: all 0.2s var(--ease-standard);
+}
+.mode-basic .preset-btn::before { display: none; }
+.mode-basic .preset-btn-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* Kit '.nest-mode-label' (1674): .82rem 700. */
+.mode-basic .preset-btn .preset-name {
+  font-family: var(--font-ui, 'Inter', sans-serif);
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--fg-warm-primary, #E8E0D6);
+}
+.mode-basic .preset-btn .watts {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 1.5rem;
+  color: var(--fg-warm-primary, #E8E0D6);
+  font-variant-numeric: tabular-nums;
+}
+/* Kit '.nest-mode-sub' (1675): .66rem mono dim. */
+.mode-basic .preset-btn .preset-btu {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.66rem;
+  color: var(--fg-warm-dim, #6B5F52);
+}
+/* Kit '.nest-mode-tile:hover' (1665): accent-border + lift 1px. */
+@media (hover: hover) {
+  .mode-basic .preset-btn:hover:not(.disabled):not(.active) {
+    border-color: var(--nest-card-border-hover);
+    transform: translateY(-1px);
+    box-shadow: none;
+    background: var(--nest-card-bg);
+  }
+}
+/* Kit '.nest-mode-tile.active' (1666): accent border, 135deg gradient
+   rgba(250,165,0,.15)→rgba(250,103,0,.08), 0 0 16px rgba(250,103,0,.25). */
+.mode-basic .preset-btn.active {
+  border-color: var(--accent, #FAA500);
+  background: linear-gradient(135deg, rgba(250, 165, 0, 0.15), rgba(250, 103, 0, 0.08));
+  box-shadow: 0 0 16px rgba(250, 103, 0, 0.25);
+}
+.mode-basic .preset-btn.active::before { display: none; }
+/* Kit '.nest-mode-tile.active .nest-mode-label' (1673): accent. */
+.mode-basic .preset-btn.active .preset-name,
+.mode-basic .preset-btn.active .watts {
+  color: var(--accent, #FAA500);
+}
+.mode-basic .presets-note,
+.mode-basic .presets-quiet-note {
+  font-family: var(--font-ui, 'Inter', sans-serif);
+  font-size: 0.74rem;
+  color: var(--fg-warm-dim, #6B5F52);
+}
+
+/* ─── Sats ticker → kit '.nest-earning' headline energy ─────────────────────
+   Production renders '.sats-ticker-card' as a single tappable button — the
+   kit has no 1:1 pill (its '.nest-earning' is a card). Adapt the button to a
+   kit-grammar warm pill: solid card surface, --border-warm hairline, mining
+   = accent text + the kit '.nest-earning-usd' glow. */
+.mode-basic .sats-ticker-card {
+  border-radius: 999px;
+  border: 1px solid var(--nest-card-border);
+  background: var(--card-bg, #2A2218);
+  font-family: var(--font-ui, 'Inter', sans-serif);
+  transition: border-color 0.15s var(--ease-standard);
+}
+@media (hover: hover) {
+  .mode-basic .sats-ticker-card:hover {
+    border-color: var(--nest-card-border-hover);
+  }
+}
+.mode-basic .sats-ticker-line {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  color: var(--fg-warm-primary, #E8E0D6);
+  font-variant-numeric: tabular-nums;
+}
+/* Kit '.nest-earning-usd' (1685): accent, text-shadow 0 0 16px
+   rgba(250,103,0,.4). */
+.mode-basic .sats-ticker-card.is-mining .sats-ticker-line {
+  color: var(--accent, #FAA500);
+  text-shadow: 0 0 16px rgba(250, 103, 0, 0.40);
+}
+.mode-basic .sats-ticker-usd {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.78rem;
+  color: var(--fg-warm-secondary, #A09888);
+}
+.mode-basic .sats-ticker-arrow {
+  color: var(--accent, #FAA500);
+}
+.mode-basic .sats-ticker-label {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.62rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-warm-dim, #6B5F52);
+}
+
+/* ─── History view (kit '.nest-history':1846) ───────────────────────────── */
+.mode-basic .history-title {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  color: var(--fg-warm-primary, #E8E0D6);
+}
+/* Kit '.nest-seg' (1867): rgba(255,255,255,.03), 8px radius, 2px pad,
+   1px --border-warm. */
+.mode-basic .history-period-selector {
+  display: inline-flex;
+  gap: 0;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--nest-card-border);
+  border-radius: 8px;
+  padding: 2px;
+}
+/* Kit '.nest-seg button' (1868): transparent, secondary, mono 600, 6px. */
+.mode-basic .history-period-btn {
+  background: transparent;
+  border: none;
+  color: var(--fg-warm-secondary, #A09888);
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-weight: 600;
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 0.78rem;
+  transition: all 0.15s var(--ease-standard);
+}
+/* Kit '.nest-seg button.active' (1869). */
+.mode-basic .history-period-btn.active {
+  background: var(--accent, #FAA500);
+  color: #1a0f00;
+  box-shadow: 0 2px 8px rgba(250, 103, 0, 0.40);
+}
+.mode-basic .history-summary-cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+}
+/* Kit '.nest-history-total' (1854): solid card, --border-warm, 14px, 16px. */
+.mode-basic .history-summary-card {
+  padding: 16px;
+  text-align: left;
+}
+/* Kit '.nest-history-total-value' (1856): Barlow 800, 2.2rem, accent, tnum. */
+.mode-basic .history-summary-value {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 2.2rem;
+  color: var(--fg-warm-primary, #E8E0D6);
+  font-variant-numeric: tabular-nums;
+}
+.mode-basic .history-summary-card.accent .history-summary-value {
+  color: var(--accent, #FAA500);
+}
+/* Kit '.nest-history-total-label' (1855): .68rem ls .1em uppercase dim mono. */
+.mode-basic .history-summary-label {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.68rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fg-warm-dim, #6B5F52);
+  font-weight: 700;
+}
+/* Kit '.nest-history-bar-fill' (1850): 180deg rgba(250,165,0,.7)→
+   rgba(250,103,0,.9), 0 0 12px rgba(250,103,0,.3), 4px 4px 0 0. */
+.mode-basic .history-bar-fill {
+  background: linear-gradient(180deg, rgba(250, 165, 0, 0.70), rgba(250, 103, 0, 0.90));
+  box-shadow: 0 0 12px rgba(250, 103, 0, 0.30);
+  border-radius: 4px 4px 0 0;
+}
+/* Kit '.nest-history-bar-val' (1852): .68rem primary mono 700. */
+.mode-basic .history-bar-value {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: var(--fg-warm-primary, #E8E0D6);
+}
+/* Kit '.nest-history-bar-day' (1851): .66rem dim mono. */
+.mode-basic .history-bar-label {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.66rem;
+  color: var(--fg-warm-dim, #6B5F52);
+}
+.mode-basic .history-profitability-link,
+.mode-basic .history-empty-hint,
+.mode-basic .history-empty {
+  font-family: var(--font-ui, 'Inter', sans-serif);
+  color: var(--fg-warm-secondary, #A09888);
+}
+.mode-basic .session-stat-value {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  color: var(--fg-warm-primary, #E8E0D6);
+  font-variant-numeric: tabular-nums;
+}
+.mode-basic .session-stat-value--accent { color: var(--accent, #FAA500); }
+.mode-basic .session-stat-value--green  { color: var(--green, #22C55E); }
+.mode-basic .session-stat-label,
+.mode-basic .session-activity-title {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.66rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-warm-dim, #6B5F52);
+}
+/* Kit '.nest-history-bar-fill' energy for the session sparkline. */
+.mode-basic .session-sparkline-bar {
+  background: linear-gradient(180deg, var(--accent, #FAA500), var(--accent-deep, #FA6700));
+}
+
+/* ─── Heating-value summary card (kit '.nest-history-total') ────────────── */
+.mode-basic .heating-value-amount {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 2.2rem;
+  color: var(--accent, #FAA500);
+  font-variant-numeric: tabular-nums;
+}
+.mode-basic .heating-value-label {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.68rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fg-warm-dim, #6B5F52);
+  font-weight: 700;
+}
+
+/* ─── Settings view (kit '.nest-settings':1860/'.nest-setting-row') ─────── */
+.mode-basic .heater-settings-page .glass-card,
+.mode-basic .heater-settings-page .settings-card,
+.mode-basic .heater-settings-page section > div[class*='card'] {
+  background: var(--nest-card-bg);
+  border: 1px solid var(--nest-card-border);
+  border-radius: var(--nest-card-radius);
+  padding: 16px 18px;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: none;
+}
+.mode-basic .heater-settings-page h2,
+.mode-basic .heater-settings-page h3 {
+  font-family: var(--font-heading);
+  color: var(--fg-warm-primary, #E8E0D6);
+}
+
+/* ─── Quiet-boot info banner — kit '.nest-mode-tile.active' (1666) gradient
+   tone applied to the InfoBanner inside .mode-basic without touching the
+   shared common/InfoBanner component. ───────────────────────────────────── */
+.mode-basic .basic-quiet-boot-banner {
+  background: linear-gradient(135deg, rgba(250, 165, 0, 0.12), rgba(250, 103, 0, 0.05));
+  border: 1px solid var(--accent-border, rgba(250, 165, 0, 0.32));
+  border-radius: 12px;
+}
+.mode-basic .basic-quiet-boot-banner,
+.mode-basic .basic-quiet-boot-banner * {
+  color: var(--fg-warm-secondary, #A09888);
+}
+
+/* ─── Companion + Next-steps cards inherit the solid warm card ──────────── */
+.mode-basic .companion-heater-card {
+  padding: 16px 18px;
+}
+
+/* ─── Readiness CTA pill — kit chip grammar (solid card, --border-warm) ──── */
+.mode-basic .basic-readiness-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 999px;
+  border: 1px solid var(--nest-card-border);
+  background: var(--card-bg, #2A2218);
+  color: var(--accent, #FAA500);
+  font-family: var(--font-ui, 'Inter', sans-serif);
+  font-weight: 700;
+  transition: border-color 0.15s var(--ease-standard);
+}
+.mode-basic .basic-readiness-cta:hover {
+  border-color: var(--nest-card-border-hover);
+}
+
+/* ─── LiveAsicVisual (heater variant) ≈ kit EnginePanel/MiniAsicGrid ────────
+   Production's LiveAsicVisual(variant="heater") is the real analog of the
+   kit '.nest-engine' card + '.nest-asic-mini' grid. Skin the card to the
+   solid kit card; the cell glow stays the component's own (matches LOOK,
+   does not fabricate the kit's prototype-only hashrate/temp/draw stat row,
+   which has no production data hook here — see RETURN note). */
+.mode-basic .heater-page-hero .live-asic-visual,
+.mode-basic .heater-page-hero [class*='live-asic'] {
+  background: var(--nest-card-bg);
+  border: 1px solid var(--nest-card-border);
+  border-radius: var(--nest-card-radius);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: none;
+}
+
+/* ─── Reduced-motion: hold the kit's mining halos / pulses ──────────────── */
+@media (prefers-reduced-motion: reduce) {
+  .mode-basic .thermostat.mining-glow::before,
+  .mode-basic .thermostat.mining-glow::after,
+  .mode-basic .thermostat.mining-glow .thermostat-ring .heat-ring-fill,
+  .mode-basic .thermostat.mining-glow .thermostat-ring .hdial-arc-halo,
+  .mode-basic .thermostat-ring .hdial-arc-halo,
+  .mode-basic .heater-block-pill-dot,
+  .mode-basic .heater-state-line.is-heating .heater-state-dot,
+  .mode-basic .basic-sidebar-foot-dot {
+    animation: none !important;
+  }
+}
+
+/* ─── ≤768px — preserve the existing responsive collapse; keep cards
+   readable and the readout row stacking gracefully (kit @media:1566). ───── */
+@media (max-width: 767.98px) {
+  .mode-basic .heater-home-page,
+  .mode-basic .heater-history-page,
+  .mode-basic .heater-settings-page {
+    max-width: 480px;
+    padding: 12px 14px 20px;
+  }
+  .mode-basic .dashboard-header {
+    padding: 14px 16px;
+  }
+  .mode-basic .basic-status-strip {
+    padding: 10px 16px 4px;
+  }
+  .mode-basic .thermostat .temp-value,
+  .mode-basic .thermostat .btu-center-value {
+    font-size: 3.6rem;
+  }
+  .mode-basic .heater-big-value {
+    font-size: 1.5rem;
+  }
+  .mode-basic .status-cards {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+@media (max-width: 479.98px) {
+  .mode-basic .heater-big-row {
+    grid-template-columns: 1fr;
+  }
+  .mode-basic .history-summary-cards {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Phase 1 — kit 2-column 'nest-hero-grid' (HeaterMode.jsx hero-grid).
+   The combined rule above caps ALL three heater pages at 560px single-column.
+   The kit Heater HOME is a 2-column hero (left dial stack + right nest-side
+   cards). Widen ONLY heater-home and lay the grid out; history/settings stay
+   centered (still matched only by the 560px combined rule). Loaded after
+   basic.css + later in this file ⇒ wins for .heater-home-page by source
+   order at equal specificity. Collapses to 1-col ≤980px (and the existing
+   ≤767px mobile rule still narrows it).
+   ═══════════════════════════════════════════════════════════════════════════ */
+/* History + Settings previously stayed at the cramped 560px single-column
+   (from the combined rule ~line 254) while the chrome above (banners +
+   mode-switch + status strip) spans the full main width — so the content
+   floated in a large void on the left, badly misaligned on wide screens.
+   Align them to the same content width as heater-home (1080) so every heater
+   page shares one consistent column. The Settings FORM is constrained to a
+   readable width and left-aligned within that column below. */
+.mode-basic .heater-history-page,
+.mode-basic .heater-settings-page {
+  max-width: 1080px;
+}
+
+/* The Settings form reads best in a focused, centered column — at the full
+   1080 page width the inputs stretched uncomfortably wide. Cap it to a
+   comfortable form width, centered. 'width: 100%' is required so the auto
+   margins center the capped block rather than (in a flex column) shrinking it
+   to content width. */
+.mode-basic .heater-settings-page .settings-view {
+  width: 100%;
+  max-width: 820px;
+  margin-left: auto;
+  margin-right: auto;
+}
+.mode-basic .heater-home-page {
+  /* Tightened from 1180 → 1080: at 1180 the '1fr' dial column ran ~760px wide,
+     so the fixed 340px dial floated with ~210px of dead space on each side
+     (the "empty space" + "not aligned" report). 1080 + the wider right column
+     below brings the dial column to ~600px so the dial reads centered (≈117px
+     each side), not lost, and the below-hero sections share the same width
+     (alignment). A focused, centered consumer-heater width is intentional —
+     Standard mode stays full-bleed for the technical dashboard audience. */
+  max-width: 1080px;
+}
+.mode-basic .heater-home-page .nest-hero-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(380px, 440px);
+  gap: 18px;
+  align-items: start;
+  width: 100%;
+}
+.mode-basic .heater-home-page .nest-side {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+/* Left column already flex-column-centered via .heater-page-hero; keep it
+   filling its grid cell rather than the old centered 560 cap. */
+.mode-basic .heater-home-page .heater-page-hero.nest-hero-dial {
+  width: 100%;
+}
+@media (max-width: 980px) {
+  .mode-basic .heater-home-page {
+    max-width: 560px;
+  }
+  .mode-basic .heater-home-page .nest-hero-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Phase 1 MERGE-FIX — kit 'nest-*' side-column card/tile/stat treatments
+   ───────────────────────────────────────────────────────────────────────────
+   Production's Heater side column (HeaterModeTiles / HeaterEarningCard /
+   HeaterEnginePanel) + the left hero now emit the kit 'nest-*' grammar but
+   several of those classes had NO rule and rendered as raw unstyled text.
+   This section ports the kit's EXACT treatment from
+   'ui_kits/dashboard/styles.css' — base block lines 1572-1747 plus the
+   "DCENT_OS glass card upgrade" block lines 2631-2688 (the second-pass
+   overrides the kit itself layers on '.nest-earning' / '.nest-engine').
+
+   Rules below intentionally do NOT re-declare '.nest-side' /
+   '.nest-hero-grid' layout (already shipped above, lines 1147-1172). Only
+   the card / tile / stat / earning / engine / hero-text CHROME is added.
+   Token-driven (so the Wave-1 accent engine recolors) with kit-literal
+   fallbacks; kit-literal rgba washes inlined exactly as the kit hard-codes
+   them. Everything is scoped under '.mode-basic' — zero leakage. Reduced-
+   motion + ≤768px responsive safe (stat grid and mode tiles stack narrow).
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Left hero text (kit '.nest-hero-eyebrow' / '.nest-hero-status',
+   styles.css:1572-1579) ─────────────────────────────────────────────────── */
+.mode-basic .nest-hero-eyebrow {
+  font-size: 0.68rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-warm-dim, #6B5F52);
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-weight: 700;
+}
+.mode-basic .nest-hero-status {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1.05rem;
+  color: var(--fg-warm-secondary, #A09888);
+  margin-bottom: 4px;
+}
+
+/* ── Card primitive (kit '.nest-card' base styles.css:1639 + the DCENT_OS
+   glass upgrade styles.css:2631-2643). The kit's signature side card is the
+   glass-tint warm card with an orange top hairline — that second-pass block
+   is the one the kit actually renders. ──────────────────────────────────── */
+.mode-basic .nest-side .nest-card,
+.mode-basic .heater-home-page .nest-side .nest-card {
+  position: relative;
+  /*  premium lift: a crisper, more opaque elevated surface (lighter
+     than the deepened floor so it reads as a distinct panel), a defined border,
+     a stronger drop shadow + an inset top highlight for real depth. */
+  background: linear-gradient(180deg, rgba(52, 43, 31, 0.94), rgba(34, 28, 20, 0.92));
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(250, 165, 0, 0.22);
+  border-radius: 16px;
+  padding: 16px 18px;
+  box-shadow:
+    0 12px 36px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 rgba(255, 238, 214, 0.06);
+  overflow: hidden;
+  transition: border-color 0.15s, transform 0.15s, box-shadow 0.15s;
+}
+.mode-basic .nest-side .nest-card::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent, rgba(250, 165, 0, 0.6) 50%, transparent);
+  opacity: 0.8;
+}
+.mode-basic .nest-side .nest-card:hover {
+  border-color: var(--accent-border, rgba(250, 165, 0, 0.4));
+  transform: translateY(-2px);
+  box-shadow:
+    0 16px 44px rgba(0, 0, 0, 0.6),
+    inset 0 1px 0 rgba(255, 238, 214, 0.08);
+}
+/* Kit eyebrow used by graph/schedule cards in the side column
+   (styles.css:1647-1654). */
+.mode-basic .nest-side .nest-card-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.7rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fg-warm-dim, #6B5F52);
+  font-weight: 700;
+  margin-bottom: 10px;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+}
+.mode-basic .nest-side .nest-card-meta {
+  margin-left: auto;
+  color: var(--fg-warm-secondary, #A09888);
+  text-transform: none;
+  letter-spacing: 0.02em;
+  font-weight: 500;
+  font-size: 0.68rem;
+}
+.mode-basic .nest-side .nest-card-eyebrow svg {
+  color: var(--accent, #FAA500);
+}
+
+/* ── Mode tiles (Boost / Away / Quiet) — kit '.nest-mode-*'
+   styles.css:1657-1675 + glass-tint override styles.css:2705-2711 ───────── */
+.mode-basic .nest-mode-tiles {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+.mode-basic .nest-mode-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 14px 12px;
+  border-radius: 12px;
+  border: 1.5px solid var(--border-warm, #3D3228);
+  background: rgba(42, 34, 24, 0.55);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  color: var(--fg-warm-primary, #E8E0D6);
+  font-family: var(--font-ui, 'Inter', sans-serif);
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.2s var(--ease-standard, cubic-bezier(0.4, 0, 0.2, 1));
+}
+.mode-basic .nest-mode-tile:hover {
+  border-color: var(--accent-border, rgba(250, 165, 0, 0.32));
+  transform: translateY(-1px);
+}
+.mode-basic .nest-mode-tile:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.mode-basic .nest-mode-tile:disabled:hover {
+  transform: none;
+  border-color: var(--border-warm, #3D3228);
+}
+.mode-basic .nest-mode-tile.active {
+  border-color: var(--accent, #FAA500);
+  background: linear-gradient(135deg, rgba(250, 165, 0, 0.18), rgba(250, 103, 0, 0.10));
+  box-shadow: 0 0 16px rgba(250, 103, 0, 0.25);
+}
+.mode-basic .nest-mode-icon {
+  color: var(--fg-warm-secondary, #A09888);
+  display: inline-flex;
+}
+.mode-basic .nest-mode-tile.active .nest-mode-icon,
+.mode-basic .nest-mode-tile.active .nest-mode-label {
+  color: var(--accent, #FAA500);
+}
+.mode-basic .nest-mode-label {
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+.mode-basic .nest-mode-sub {
+  font-size: 0.66rem;
+  color: var(--fg-warm-dim, #6B5F52);
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+}
+
+/* ── Earning card (kit '.nest-earning*' styles.css:1678-1712 + the glow-ring
+   override styles.css:2646-2651). '.nest-card.nest-earning' resolves the
+   radial-glow background; the card chrome comes from the side-card rule
+   above. ───────────────────────────────────────────────────────────────── */
+.mode-basic .nest-side .nest-card.nest-earning,
+.mode-basic .heater-home-page .nest-side .nest-card.nest-earning {
+  background:
+    radial-gradient(120% 80% at 100% 0%, rgba(250, 165, 0, 0.14), transparent 60%),
+    linear-gradient(180deg, rgba(42, 34, 24, 0.78), rgba(34, 28, 22, 0.72));
+  border-color: var(--accent-border, rgba(250, 165, 0, 0.28));
+}
+.mode-basic .nest-earning-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.72rem;
+  color: var(--fg-warm-secondary, #A09888);
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+.mode-basic .nest-earning-eyebrow svg {
+  color: var(--accent, #FAA500);
+}
+.mode-basic .nest-earning-amount {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.mode-basic .nest-earning-usd {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 2.2rem;
+  color: var(--accent, #FAA500);
+  text-shadow: 0 0 16px rgba(250, 103, 0, 0.4);
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.mode-basic .nest-earning-sats {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.78rem;
+  color: var(--fg-warm-secondary, #A09888);
+}
+.mode-basic .nest-earning-bar {
+  position: relative;
+  height: 26px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-warm, #3D3228);
+  overflow: hidden;
+  margin-bottom: 10px;
+}
+.mode-basic .nest-earning-bar-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: linear-gradient(90deg, var(--accent-deep, #FA6700), var(--accent, #FAA500));
+  border-radius: 999px;
+  transition: width 0.8s var(--ease-standard, cubic-bezier(0.4, 0, 0.2, 1));
+  box-shadow: 0 0 12px rgba(250, 103, 0, 0.35);
+}
+.mode-basic .nest-earning-bar-label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--fg-warm-primary, #E8E0D6);
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  letter-spacing: 0.02em;
+}
+.mode-basic .nest-earning-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-family: var(--font-ui, 'Inter', sans-serif);
+}
+.mode-basic .nest-earning-rows > div {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 0;
+  font-size: 0.78rem;
+}
+.mode-basic .nest-earning-rows > div > span {
+  color: var(--fg-warm-secondary, #A09888);
+}
+.mode-basic .nest-earning-rows > div > strong {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.mode-basic .nest-earning-net {
+  border-top: 1px dashed var(--border-warm, #3D3228);
+  margin-top: 4px;
+  padding-top: 8px !important;
+  font-size: 0.82rem !important;
+}
+.mode-basic .nest-earning-net > strong {
+  font-size: 0.88rem;
+}
+
+/* ── Engine card (kit '.nest-engine*' styles.css:1715-1747 + the orange-ring
+   override styles.css:2654-2688). Production wraps the real LiveAsicVisual
+   in '.nest-engine-asic-slot'; the kit framed its mini grid as
+   '.nest-asic-mini' (styles.css:2659-2673) — give the production slot the
+   same dark inset panel framing so the real visual sits in the kit's slot
+   chrome. ──────────────────────────────────────────────────────────────── */
+.mode-basic .nest-side .nest-card.nest-engine,
+.mode-basic .heater-home-page .nest-side .nest-card.nest-engine {
+  background:
+    radial-gradient(80% 60% at 0% 100%, rgba(250, 103, 0, 0.10), transparent 60%),
+    linear-gradient(180deg, rgba(42, 34, 24, 0.78), rgba(34, 28, 22, 0.72));
+}
+.mode-basic .nest-engine-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.68rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fg-warm-dim, #6B5F52);
+  font-weight: 700;
+  margin-bottom: 8px;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+}
+.mode-basic .nest-engine-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.mode-basic .nest-engine-name {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1.05rem;
+  color: var(--fg-warm-primary, #E8E0D6);
+}
+.mode-basic .nest-engine-meta {
+  font-size: 0.76rem;
+  color: var(--fg-warm-secondary, #A09888);
+  margin-top: 1px;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+}
+.mode-basic .nest-engine-meta strong {
+  color: var(--accent, #FAA500);
+  font-variant-numeric: tabular-nums;
+}
+.mode-basic .nest-engine-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.mode-basic .nest-engine-pill.on {
+  background: rgba(34, 197, 94, 0.12);
+  border: 1px solid rgba(34, 197, 94, 0.4);
+  color: var(--green, #22C55E);
+}
+.mode-basic .nest-engine-pill.off {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-warm, #3D3228);
+  color: var(--fg-warm-dim, #6B5F52);
+}
+.mode-basic .nest-engine-pill.on .nest-engine-pill-dot {
+  background: var(--green, #22C55E);
+  box-shadow: 0 0 6px var(--green, #22C55E);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+.mode-basic .nest-engine-pill-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--fg-warm-dim, #6B5F52);
+}
+.mode-basic .nest-engine-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+.mode-basic .nest-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 10px 6px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid var(--border-warm, #3D3228);
+}
+.mode-basic .nest-stat-icon {
+  color: var(--fg-warm-secondary, #A09888);
+  display: inline-flex;
+}
+.mode-basic .nest-stat-label {
+  font-size: 0.58rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-warm-dim, #6B5F52);
+  font-weight: 700;
+}
+.mode-basic .nest-stat-value {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-weight: 700;
+  font-size: 1rem;
+  color: var(--fg-warm-primary, #E8E0D6);
+  font-variant-numeric: tabular-nums;
+}
+.mode-basic .nest-stat-unit {
+  font-size: 0.6rem;
+  color: var(--fg-warm-dim, #6B5F52);
+  font-weight: 500;
+  margin-left: 2px;
+}
+/* The real LiveAsicVisual mini sits in this slot — frame it like the kit's
+   '.nest-asic-mini' dark inset panel (styles.css:2659-2664). */
+.mode-basic .nest-engine-asic-slot {
+  margin-top: 12px;
+  padding: 8px;
+  background: rgba(0, 0, 0, 0.32);
+  border-radius: var(--radius-sm, 8px);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+}
+.mode-basic .nest-engine-asic-slot > * {
+  display: block;
+  width: 100%;
+}
+.mode-basic .nest-engine-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border-warm, #3D3228);
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.68rem;
+}
+.mode-basic .nest-engine-foot-l {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fg-warm-secondary, #A09888);
+}
+.mode-basic .nest-engine-foot-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--fg-warm-dim, #6B5F52);
+}
+.mode-basic .nest-engine-foot-dot.on {
+  background: var(--green, #22C55E);
+  box-shadow: 0 0 6px var(--green, #22C55E);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+.mode-basic .nest-engine-foot-r {
+  color: var(--fg-warm-dim, #6B5F52);
+}
+
+/* ── Reduced-motion: kill the pill/foot pulse + the card hover-lift ──────── */
+@media (prefers-reduced-motion: reduce) {
+  .mode-basic .nest-engine-pill.on .nest-engine-pill-dot,
+  .mode-basic .nest-engine-foot-dot.on {
+    animation: none;
+  }
+  .mode-basic .nest-side .nest-card,
+  .mode-basic .nest-mode-tile,
+  .mode-basic .nest-earning-bar-fill {
+    transition: none;
+  }
+  .mode-basic .nest-side .nest-card:hover,
+  .mode-basic .nest-mode-tile:hover {
+    transform: none;
+  }
+}
+
+/* ── Narrow screens: stack the mode tiles + stat grid so they never crush
+   (the kit collapses these at small widths). ───────────────────────────── */
+@media (max-width: 768px) {
+  .mode-basic .dashboard-header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .mode-basic .basic-header-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .mode-basic .nest-mode-tiles {
+    grid-template-columns: 1fr;
+  }
+  .mode-basic .nest-engine-stats {
+    grid-template-columns: 1fr;
+  }
+  .mode-basic .nest-earning-usd {
+    font-size: 1.9rem;
+  }
+}
+@media (max-width: 479.98px) {
+  .mode-basic .nest-side .nest-card {
+    padding: 14px 14px;
+  }
+}
+
+@media (max-width: 767.98px) {
+  .mode-basic .basic-sidebar .companion-dock {
+    flex: 0 0 auto;
+    width: auto;
+    margin: 0;
+  }
+
+  .mode-basic .basic-sidebar .companion-dock-trigger {
+    width: 44px;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0;
+    justify-content: center;
+  }
+
+  .mode-basic .basic-sidebar .companion-dock-text {
+    display: none;
+  }
+}
+
+/* Cypress/layout gate: the late heater kit skin must not reintroduce a
+   fixed-width shell on phone viewports. Keep every heater chrome layer inside
+   the viewport while preserving the single-column kit collapse. */
+@media (max-width: 767.98px) {
+  .mode-basic,
+  .mode-basic .basic-shell,
+  .mode-basic .basic-main,
+  .mode-basic .page-content,
+  .mode-basic .dashboard-header,
+  .mode-basic .basic-status-strip,
+  .mode-basic .heater-home-page,
+  .mode-basic .heater-history-page,
+  .mode-basic .heater-settings-page,
+  .mode-basic .heater-home-page .nest-hero-grid,
+  .mode-basic .heater-home-page .nest-side {
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+  }
+
+  .mode-basic .basic-main,
+  .mode-basic .page-content {
+    overflow-x: hidden;
+  }
+
+  .mode-basic .heater-home-page,
+  .mode-basic .heater-history-page,
+  .mode-basic .heater-settings-page {
+    margin-left: auto;
+    margin-right: auto;
+  }
+}

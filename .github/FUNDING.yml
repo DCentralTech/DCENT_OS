@@ -1,0 +1,7 @@
+# DCENT_OS is funded by D-Central Technologies' hardware repair and product business —
+# not by skimming your hashrate. If DCENT_OS earns your miner its keep, the best way to
+# support the project is to leave the optional in-firmware donation enabled, or to support
+# D-Central directly.
+custom:
+  - "https://d-central.tech/"
+  - "https://d-central.tech/dcent-os/"

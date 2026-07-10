@@ -1,0 +1,39 @@
+From: D-Central Technologies <firmware@d-central.tech>
+Subject: [PATCH] Disable getrandom() to avoid blocking during early boot
+
+On the Zynq 7010, the entropy pool is not initialized fast enough
+during early boot, causing dropbear to block indefinitely on
+getrandom() syscall. This patch removes the getrandom() call and
+falls back to /dev/urandom, which is sufficient for a research
+firmware that runs on a private network.
+
+This is NOT suitable for production firmware exposed to the internet.
+For DCENTos production builds, we should instead seed entropy from
+hardware sources (FPGA LFSR, ADC noise) during early init.
+
+---
+ src/dbrandom.c | 12 ------------
+ 1 file changed, 12 deletions(-)
+
+diff --git a/src/dbrandom.c b/src/dbrandom.c
+index abcdef1..1234567 100644
+--- a/src/dbrandom.c
++++ b/src/dbrandom.c
+@@ -100,18 +100,6 @@ static int process_getrandom(void) {
+-#ifdef HAVE_GETRANDOM
+-static int process_getrandom() {
+-	char buf[INIT_SEED_SIZE];
+-	ssize_t ret;
+-
+-	ret = getrandom(buf, sizeof(buf), 0);
+-	if (ret == sizeof(buf)) {
+-		hash_state hs;
+-		sha1_init(&hs);
+-		sha1_process(&hs, buf, ret);
+-		sha1_done(&hs, hashpool);
+-		counter = 0;
+-		return DROPBEAR_SUCCESS;
+-	}
+-	return DROPBEAR_FAILURE;
+-}
+-#endif

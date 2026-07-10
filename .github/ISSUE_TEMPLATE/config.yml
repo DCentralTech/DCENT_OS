@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🔒 Security vulnerability
+    url: https://github.com/DCentralTech/DCENT_OS/blob/main/SECURITY.md
+    about: Do NOT open a public issue. Email security@d-central.tech — see our security policy.
+  - name: 💬 D-Central Technologies
+    url: https://d-central.tech/
+    about: Repairs, hardware, the DCENT_OS product page, and the blog.
+  - name: 📖 Documentation
+    url: https://github.com/DCentralTech/DCENT_OS/tree/main/docs
+    about: Install guides, platform support, configuration, and FAQ.

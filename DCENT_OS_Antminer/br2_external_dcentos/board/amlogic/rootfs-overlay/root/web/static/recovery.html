@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DCENT_OS Recovery</title>
+<!--
+  DCENT_OS static recovery page (GROUP B — operator recovery / daemon-down fallback).
+
+  GOAL: when dcentrald is down/crashed (no :8080 API), an operator who hits the
+  unit's web port still gets a minimal, self-contained recovery page showing the
+  unit identity, the daemon-down status, and the SAFE recovery actions — NOT a
+  dead connection. This mirrors how LuxOS / BraiinsOS serve a static fallback.
+
+  HARD DESIGN RULES (do not regress):
+    * Single self-contained static HTML. Inline CSS only. NO JS framework, NO
+      external assets, NO web fonts, NO network dependency to RENDER.
+    * Every recovery instruction is baked into the HTML BODY so the page is
+      fully useful with JavaScript disabled, with the React SPA missing, and
+      with dcentrald (:8080) completely dead. The <script> block at the bottom
+      is PURELY progressive enhancement: it fills in live identity/status from
+      server.py's always-local /api/dashboard/health endpoint IF that endpoint
+      answers, and it silently does nothing if it does not.
+    * NO secrets on the page. It states only that the default DEV login is
+      root over SSH — it never prints a password, key, token, or nonce.
+    * NO destructive action is performed by this page. The single optional
+      button (Restart dcentrald) POSTs to server.py's existing always-local
+      /api/dashboard/restart-dcentrald handler, which is a safe, non-flashing,
+      non-NAND service restart. Everything else is copy-only instructions.
+
+  Reachable at /static/recovery.html (served by server.py's static handler with
+  no routing change) and at the /recovery convenience route. Linked from the
+  diagnostic banner and the /diagnostic page.
+-->
+<style>
+  :root {
+    --bg: #0e0f12;
+    --panel: #16181d;
+    --border: #2a2d36;
+    --text: #e8eaef;
+    --muted: #8a8f9a;
+    --orange: #FAA500;
+    --orange-deep: #FA6700;
+    --red: #ff4d4d;
+    --green: #3fcf5b;
+    --yellow: #ffce4d;
+    --mono: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font-family: system-ui, -apple-system, "Segoe UI", Inter, Roboto, sans-serif;
+         padding: 24px; line-height: 1.5; max-width: 880px; margin-left: auto;
+         margin-right: auto; }
+  h1 { margin: 0 0 4px; font-size: 24px; letter-spacing: 0.3px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1.2px;
+       color: var(--muted); margin: 0 0 10px; }
+  .top { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px;
+         flex-wrap: wrap; }
+  .top .ver { color: var(--muted); font-size: 13px; }
+  .banner { padding: 16px 20px; border-radius: 8px; margin-bottom: 20px;
+            font-weight: 600; font-size: 15px; display: flex; align-items: center;
+            gap: 10px; flex-wrap: wrap;
+            background: #2a0e0e; border: 1px solid #5a1e1e; color: var(--red); }
+  .banner .pill { font-size: 11px; padding: 3px 8px; border-radius: 999px;
+                  text-transform: uppercase; letter-spacing: 1px;
+                  background: var(--red); color: #fff; }
+  .panel { background: var(--panel); border: 1px solid var(--border);
+           border-radius: 8px; padding: 16px 18px; margin-bottom: 16px; }
+  table { width: 100%; border-collapse: collapse; font-family: var(--mono);
+          font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; width: 34%; }
+  ol { margin: 0; padding-left: 22px; }
+  ol li { margin: 10px 0; }
+  code { font-family: var(--mono); font-size: 13px; background: #0a0b0d;
+         border: 1px solid var(--border); border-radius: 5px;
+         padding: 2px 7px; color: var(--orange); word-break: break-all; }
+  pre { font-family: var(--mono); font-size: 12.5px; background: #0a0b0d;
+        border: 1px solid var(--border); padding: 12px 14px; border-radius: 6px;
+        margin: 8px 0 0; white-space: pre-wrap; word-break: break-word; color: var(--text); }
+  .row { display: flex; gap: 8px; align-items: center; margin: 4px 0 18px;
+         flex-wrap: wrap; }
+  button { background: var(--orange); color: #000; border: 0;
+           padding: 8px 14px; border-radius: 6px; font-weight: 600;
+           cursor: pointer; font-size: 13px; }
+  button:hover { background: var(--orange-deep); color: #fff; }
+  a.btnlink { background: transparent; color: var(--text);
+              border: 1px solid var(--border); padding: 8px 14px;
+              border-radius: 6px; font-weight: 600; font-size: 13px;
+              text-decoration: none; }
+  a.btnlink:hover { background: var(--border); }
+  .note { color: var(--muted); font-size: 12.5px; margin-top: 6px; }
+  .warn { color: var(--yellow); }
+  #notif { position: fixed; bottom: 16px; right: 16px; background: var(--panel);
+           padding: 12px 18px; border-radius: 6px; border: 1px solid var(--border);
+           font-size: 13px; opacity: 0; transition: opacity 0.2s; pointer-events: none; }
+  #notif.show { opacity: 1; }
+  .footer { color: var(--muted); font-size: 12px; margin-top: 24px; }
+  .footer a { color: var(--orange); text-decoration: none; }
+</style>
+</head>
+<body>
+
+<div class="top">
+  <h1>DCENT_OS Recovery</h1>
+  <span class="ver" id="version">recovery mode</span>
+</div>
+
+<div class="banner">
+  <span class="pill">Daemon down</span>
+  <span id="banner-msg">The mining daemon (dcentrald) is not responding. The miner is still
+  reachable over the network — this page is served by the on-board web server and
+  does not need the daemon to load. Follow the steps below to recover.</span>
+</div>
+
+<noscript>
+  <div class="panel" style="border-color:#5a401e;background:#2a200e;">
+    JavaScript is disabled. That is fine — every recovery step below works without
+    it. The live identity/status fields will simply stay blank.
+  </div>
+</noscript>
+
+<div class="panel">
+  <h2>This unit</h2>
+  <table>
+    <tr><th>Hostname</th><td id="hostname">(open over SSH and run <code>hostname</code>)</td></tr>
+    <tr><th>IP address</th><td id="ip">(the address in your browser's URL bar)</td></tr>
+    <tr><th>MAC</th><td id="mac">—</td></tr>
+    <tr><th>Firmware slot</th><td id="slot">—</td></tr>
+    <tr><th>Daemon (dcentrald)</th><td id="status">not responding</td></tr>
+  </table>
+  <div class="note">Live values fill in automatically if the on-board status endpoint
+  is reachable. If they stay blank, use the SSH commands below instead.</div>
+</div>
+
+<div class="panel">
+  <h2>Recover now</h2>
+  <div class="row">
+    <button id="restart-btn" onclick="restartDaemon()">Restart dcentrald</button>
+    <a class="btnlink" href="/diagnostic">Open full diagnostic</a>
+    <a class="btnlink" href="/">Try the dashboard</a>
+  </div>
+  <div class="note">Restart is a safe service restart only. It does NOT flash, write
+  NAND, or change your firmware slot. Mining pauses for about 5–30 seconds while
+  the daemon comes back up.</div>
+</div>
+
+<div class="panel">
+  <h2>1 · Connect over SSH</h2>
+  <p>From a computer on the same network, connect as <code>root</code> over SSH
+  (default DEV login is the <code>root</code> account; no password is shown on this
+  page for safety):</p>
+  <pre>ssh root@&lt;this-miner-ip&gt;</pre>
+  <div class="note">Replace <code>&lt;this-miner-ip&gt;</code> with the address shown in your
+  browser's URL bar.</div>
+</div>
+
+<div class="panel">
+  <h2>2 · Restart the daemon</h2>
+  <p>Restart the mining daemon via its init script (or use the
+  <strong>Restart dcentrald</strong> button above):</p>
+  <pre>/etc/init.d/S82dcentrald restart</pre>
+  <p>Confirm it is running again:</p>
+  <pre>pidof dcentrald
+/etc/init.d/S82dcentrald status</pre>
+</div>
+
+<div class="panel">
+  <h2>3 · Check the logs</h2>
+  <p>The daemon log shows why it stopped. Look at the tail and search for errors:</p>
+  <pre>tail -n 100 /tmp/dcentrald.log
+grep -i error /tmp/dcentrald.log | tail -20</pre>
+  <p>The on-board web-server log can also help if the dashboard itself misbehaved:</p>
+  <pre>tail -n 50 /tmp/dashboard.log</pre>
+</div>
+
+<div class="panel">
+  <h2>4 · Re-flash or roll back (only if the daemon will not start)</h2>
+  <p>DCENT_OS keeps two firmware slots (A/B). If the active slot is broken, you can
+  roll back to the other, known-good slot from U-Boot environment. <span class="warn">An
+  upgrade always writes the INACTIVE slot and never the running one</span>, so rolling
+  back is safe. Check which slot is active first:</p>
+  <pre>fw_printenv firmware
+fw_printenv upgrade_stage</pre>
+  <p>To boot the other slot on the next reboot, ask the operator/team for the exact
+  <code>fw_setenv firmware &lt;slot&gt;</code> value for your hardware, then:</p>
+  <pre>reboot</pre>
+  <div class="note warn">Do not raw-write NAND (<code>dd</code> / <code>flash_erase</code> /
+  <code>nandwrite</code>) by hand. Use the supported sysupgrade / rollback flow only.
+  If you are unsure, stop here and contact D-Central support — the unit is safe and
+  reachable in this state.</div>
+</div>
+
+<div id="notif"></div>
+
+<div class="footer">
+  DCENT_OS by D-Central Technologies —
+  <a href="/diagnostic">Diagnostic Mode</a> ·
+  <a href="/">Main dashboard</a>
+</div>
+
+<script>
+// PROGRESSIVE ENHANCEMENT ONLY. The page above is fully functional with this
+// script removed. This block fills in live identity/status from server.py's
+// always-local health endpoint (which works even when dcentrald is dead) and
+// wires the optional safe-restart button. Any failure is swallowed silently —
+// the static instructions remain the source of truth.
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+
+  function notify(msg) {
+    var n = $("notif"); if (!n) return;
+    n.textContent = msg; n.classList.add("show");
+    setTimeout(function () { n.classList.remove("show"); }, 2500);
+  }
+
+  function fillIdentity() {
+    fetch("/api/dashboard/health", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (!d) return;
+        if (d.network) {
+          if (d.network.hostname) $("hostname").textContent = d.network.hostname;
+          if (d.network.ip) $("ip").textContent = d.network.ip;
+          if (d.network.mac) $("mac").textContent = d.network.mac;
+        }
+        if (d.slot && d.slot.firmware) $("slot").textContent = d.slot.firmware;
+        var status = d.dcentrald_status || (d.alive ? "alive" : "dead");
+        $("status").textContent = status;
+        $("version").textContent = "v" + (d.version || "dev") + " · recovery mode";
+        // If the daemon actually came back, soften the banner.
+        if (status === "alive") {
+          var b = document.querySelector(".banner");
+          if (b) {
+            b.style.background = "#0e2a14";
+            b.style.borderColor = "#1e5a28";
+            b.style.color = "#3fcf5b";
+            var pill = b.querySelector(".pill");
+            if (pill) { pill.textContent = "Daemon up"; pill.style.background = "#3fcf5b"; pill.style.color = "#000"; }
+            $("banner-msg").textContent = "dcentrald is responding again. You can return to the dashboard.";
+          }
+        }
+      })
+      .catch(function () { /* health endpoint unreachable — keep static guidance */ });
+  }
+
+  window.restartDaemon = function () {
+    if (!confirm("Restart dcentrald? This is a safe service restart (no flashing, no NAND write). Mining pauses for ~5-30s.")) return;
+    fetch("/api/dashboard/restart-dcentrald", { method: "POST" })
+      .then(function (r) { return r.json(); })
+      .then(function (d) { notify("Restart initiated · " + (d.status || "ok")); setTimeout(fillIdentity, 3000); })
+      .catch(function (e) {
+        notify("Could not reach the restart endpoint. Use SSH step 2 instead.");
+      });
+  };
+
+  fillIdentity();
+  setInterval(fillIdentity, 5000);
+})();
+</script>
+</body>
+</html>

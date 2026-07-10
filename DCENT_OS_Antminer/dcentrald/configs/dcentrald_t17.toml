@@ -1,0 +1,75 @@
+# DCENT_OS runtime template for Antminer T17 (BM1397).
+# Experimental management-only template; T17 pins 30 chips per chain.
+
+[general]
+hostname = "dcentos-t17"
+log_level = "info"
+
+[pool]
+url = ""
+worker = ""
+password = "x"
+protocol = "sv1"
+
+[mining]
+enabled = false
+model = "t17"
+frequency_mhz = 500
+voltage_mv = 12000
+version_rolling = false
+passthrough = false
+suggest_difficulty = 256
+serial_device = "/dev/ttyS1"
+serial_chip_count = 30
+serial_chip_type = "BM1397"
+am2_no_nonce_timeout_s = 90
+
+[power]
+mode = "bypass"
+target_watts = 900
+
+[power.psu_override]
+enabled = false
+model = "APW3"
+voltage_v = 12.8
+
+[thermal]
+target_temp_c = 60
+hot_temp_c = 70
+dangerous_temp_c = 80
+fan_min_pwm = 10
+fan_max_pwm = 30
+
+[thermal.supervisor]
+enabled = false
+min_fans = 3
+
+[api]
+cgminer_port = 4028
+http_port = 8080
+websocket = true
+
+[donation]
+enabled = false
+percent = 2.0
+pool_url = ""
+worker = ""
+password = "x"
+cycle_duration_s = 3600
+
+[watchdog]
+enabled = true
+
+[hash_on_disconnect]
+enabled = false
+
+[mode]
+active = "standard"
+
+[autotuner]
+enabled = false
+
+[led]
+enabled = true
+heartbeat_on_ms = 100
+heartbeat_off_ms = 900

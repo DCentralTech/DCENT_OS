@@ -1,0 +1,135 @@
+# DCENTos shared Buildroot config fragment — workspace-wide common.
+# D-Central Technologies, 2026.
+#
+# This fragment owns the package set + system identity bits that are
+# IDENTICAL across every DCENT_OS product (S9, am2-s19jpro, am3-s19kpro,
+# am3-s21, am3-bb, future am3-aml siblings, future Innosilicon ports).
+#
+# It is concatenated by `scripts/build_in_docker.sh` BEFORE the per-product
+# defconfig and any arch-specific fragment (e.g. dcentos_am3_aml_common.fragment).
+# Buildroot processes the resulting merged defconfig as a single input to
+# `make defconfig`. Per-product defconfigs are free to override anything
+# declared here by simply re-asserting it later in the merged file.
+#
+# DO NOT add architecture-specific Kconfig keys here:
+#   - BR2_arm / BR2_aarch64 / BR2_cortex_a* live in arch fragments.
+#   - Toolchain URL / prefix lives in arch fragments.
+#   - Hostname / issue / overlay paths live in per-product defconfigs.
+#   - Rootfs format (squashfs vs cpio.gz) lives in arch fragments.
+#
+# Touching this fragment changes ALL DCENT_OS products at once. Any change
+# here MUST be reviewed by DCENT_DevOps + DCENT_QA and accompanied by a
+# matrix rebuild (s9 + am2-s19jpro + am3-s19kpro + am3-s21 + am3-bb).
+
+# =============================================================================
+# Shared build options — size-first, LTO-on across the matrix.
+# =============================================================================
+BR2_OPTIMIZE_S=y
+BR2_ENABLE_LTO=y
+
+# =============================================================================
+# Shared system identity primitives.
+#
+# Per-product defconfigs override BR2_TARGET_GENERIC_HOSTNAME and
+# BR2_TARGET_GENERIC_ISSUE. The root password and DHCP iface are shared.
+# =============================================================================
+BR2_TARGET_GENERIC_ROOT_PASSWD="dcentral"
+BR2_SYSTEM_DHCP="eth0"
+BR2_SYSTEM_BIN_SH_BASH=y
+BR2_ROOTFS_DEVICE_CREATION_DYNAMIC_EUDEV=y
+
+# =============================================================================
+# Core userland — same shape on every DCENT_OS product.
+# Per-product defconfigs may add BR2_PACKAGE_BUSYBOX_CONFIG="..." to point at
+# an arch-specific busybox.config (Zynq does, Amlogic does not). The bare
+# BUSYBOX=y line is universal.
+# =============================================================================
+BR2_PACKAGE_BUSYBOX=y
+
+# Bash + completion + ncurses + readline — interactive shell stack.
+# WHY: BusyBox ash is too limited for our diagnostic scripts (history,
+# functions, arrays). We always ship full bash. ~1 MB cost is acceptable
+# on every target (5-6x ramdisk headroom on S9, much more on aarch64).
+BR2_PACKAGE_BASH=y
+BR2_PACKAGE_BASH_COMPLETION=y
+BR2_PACKAGE_NCURSES=y
+BR2_PACKAGE_READLINE=y
+
+# =============================================================================
+# Remote access — dropbear is universal across the DCENT_OS matrix.
+# WHY dropbear over OpenSSH: ~10x smaller, faster startup, supports SCP.
+# We accept no SFTP / no X11 forwarding / no ProxyJump as a fair tradeoff
+# for a research firmware.
+# =============================================================================
+BR2_PACKAGE_DROPBEAR=y
+
+# =============================================================================
+# Hardware diagnostic tools — same set on every product.
+# i2c-tools  : PIC voltage controllers, TMP75 sensors, EEPROM dumps, PSU.
+# mtd-utils  : NAND flash partition read/write (nandwrite, ubiformat, etc.).
+# ethtool    : network diagnostics.
+# strace     : kernel/syscall tracing for FPGA / serial / I2C debugging.
+# util-linux : standard system utilities (lsblk, dmesg, etc.).
+# devmem is a BusyBox built-in (CONFIG_DEVMEM=y in busybox.config).
+# =============================================================================
+BR2_PACKAGE_I2C_TOOLS=y
+BR2_PACKAGE_MTD=y
+BR2_PACKAGE_MTD_UBIFS_UTILS=y
+BR2_PACKAGE_ETHTOOL=y
+BR2_PACKAGE_STRACE=y
+BR2_PACKAGE_UTIL_LINUX=y
+
+# =============================================================================
+# U-Boot env tools — REQUIRED on every product so S99upgrade can drive
+# fw_setenv / fw_printenv against the platform's U-Boot env partition.
+#
+# Without these, S99upgrade falls into a fragile python+nandwrite fallback,
+# which is the brick-back vector documented in
+# . Mandatory on am2 (S19j Pro /
+# .139), shipped on S9 too for parity, mandatory on am3-aml because the
+# /dev/nand_env layout is standard U-Boot env (
+# _env_format.md), and mandatory on am3-bb so the AM335x SD/NAND recovery
+# paths can promote firstboot=1 -> 0 cleanly.
+# =============================================================================
+BR2_PACKAGE_LIBUBOOTENV=y
+BR2_PACKAGE_LIBUBOOTENV_TOOLS=y
+
+# =============================================================================
+# Python 3 — used by toolbox shims, switch_firmware.py, dashboard server.py,
+# and the post-build manifest hooks. CPython over MicroPython for stdlib
+# compatibility (struct/json/collections/select/fcntl/socket/argparse).
+# ~3 MB cost is acceptable across the matrix.
+# =============================================================================
+BR2_PACKAGE_PYTHON3=y
+BR2_PACKAGE_PYTHON3_READLINE=y
+BR2_PACKAGE_PYTHON3_PYEXPAT=y
+
+# OpenSSL — TLS for pool connections, ed25519 verification of stock-Bitmain
+# manifests at runtime, and `openssl` CLI for in-the-field debugging.
+BR2_PACKAGE_OPENSSL=y
+BR2_PACKAGE_LIBOPENSSL=y
+BR2_PACKAGE_LIBOPENSSL_BIN=y
+
+# =============================================================================
+# DCENT_OS userland packages — our custom Buildroot packages.
+# dcentos-tools : python toolbox subset shipped in the image.
+# seed-entropy  : fast SSH boot helper (ioctl-credits entropy from a hwrng).
+# =============================================================================
+BR2_PACKAGE_DCENTOS_TOOLS=y
+BR2_PACKAGE_SEED_ENTROPY=y
+
+# =============================================================================
+# Kernel + bootloader — DCENT_OS reuses each platform's vendor-proven boot
+# chain (FSBL/BL2 + U-Boot + kernel + FPGA bitstream / DTB). Buildroot must
+# NOT build either. Per-product post-image.sh stages the verified blobs.
+# =============================================================================
+# BR2_TARGET_UBOOT is not set
+# BR2_LINUX_KERNEL is not set
+
+# =============================================================================
+# Host-side tools — required across every product so post-image.sh can
+# wrap a rootfs into a uImage / FIT image (mkimage, dtc).
+# =============================================================================
+BR2_PACKAGE_HOST_UBOOT_TOOLS=y
+BR2_PACKAGE_HOST_UBOOT_TOOLS_FIT_SUPPORT=y
+BR2_PACKAGE_HOST_DTC=y

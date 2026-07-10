@@ -1,0 +1,786 @@
+/* W31 followup B3: global responsive stack layer.
+
+   ════════════════════════════════════════════════════════════════════════
+   CANONICAL BREAKPOINT LADDER  (D-17 — F1, Wave 5)  ·  PHASE-3 MUST USE THIS
+   ════════════════════════════════════════════════════════════════════════
+   CSS custom properties CANNOT be used inside @media query conditions, so
+   the '--bp-*' tokens in tokens.css are the human reference and these are
+   the EXACT pixel values every agent hardcodes. Use min-width on the token
+   value, max-width on the value − 0.02px (the standard "just below the next
+   tier" convention already used across this file). DO NOT introduce a new
+   intermediate value — snap to the nearest tier (UP, never down, so a
+   narrower-layout rule degrades gracefully and never hides content).
+
+     Token      min-width    max-width (… − .02)   Intent
+     --bp-xs    360px        359.98px              very small phones (SE)
+     --bp-sm    480px        479.98px              small phones / phablets
+     --bp-md    768px        767.98px              tablets  ← primary break
+     --bp-lg    1024px       1023.98px             small laptops
+     --bp-xl    1280px       1279.98px             desktops
+
+   Wave-5 F1 migrated the F1-owned global files (responsive / global /
+   canonical / design-system / current-block / motion / tokens) off the old
+   17-value sprawl (320/420/479/480/560/600/620/720/767.98/768/900/1100/
+   1180 …) onto this ladder. Phase-3 agents: when you touch mode CSS
+   (basic/standard/advanced/features.css) do the same — snap every hardcoded
+   @media value to one of the five numbers above (see agent-F1 handoff for
+   the full per-file old→new map you must apply).
+
+   Legacy note: 768px (no .02) is kept where it already paired with a
+   'min-width: 768px' companion (responsive.css:26/674, canonical.css:847)
+   — the .98 and integer forms intentionally don't overlap there.
+   ════════════════════════════════════════════════════════════════════════ */
+
+.mode-standard .standard-next-steps-wrap {
+  padding: 16px 24px 0;
+}
+
+.mode-standard .standard-dashboard-stack {
+  display: grid;
+  /* Beta-tester polish (2026-05-14): give major sections more breathing
+     room. Section internal padding stays similar — this only adjusts the
+     between-sections gap. var(--space-6) ≈ 24px (with a 16px floor for
+     older clients that haven't loaded design-system.css yet). */
+  gap: var(--space-6, 24px);
+}
+
+/* ── D-18 DECISION (F1, ): PROMOTE .table-wrap to ALL viewports ──
+   Prior: overflow-x was only inside @media (max-width: 479.98px). The wide
+   Advanced monospace tables (RegisterInspector / I2cScanner) overflow on
+   DESKTOP too. Contained horizontal scroll is non-destructive at any width
+   (it only engages when content actually exceeds the container) so this is
+   the safe call. The mobile-block copy stays (it adds -webkit-overflow-
+   scrolling touch momentum) — this base rule just makes the behaviour
+   universal. Phase-3 agents: keep wrapping wide tables in '.table-wrap'. */
+.table-wrap,
+.scroll-x {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.mode-standard .standard-dashboard-pair {
+  display: grid;
+  gap: var(--space-5, 20px);
+}
+
+@media (min-width: 768px) {
+  .mode-standard .standard-dashboard-pair {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+  }
+}
+
+@media (max-width: 767.98px) {
+  html,
+  body,
+  #root {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .mode-standard {
+    width: 100%;
+    overflow-x: clip;
+  }
+
+  .mode-standard .main-content {
+    width: 100%;
+    min-width: 0;
+    overflow-x: clip;
+  }
+
+  .mode-standard .standard-next-steps-wrap {
+    padding: 12px 16px 0;
+  }
+
+  .mode-standard .page-content {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    width: 100%;
+    max-width: 100%;
+    overflow-x: clip;
+  }
+
+  .mode-standard .section {
+    min-width: 0;
+    margin-bottom: 0;
+  }
+
+  .mode-standard .top-bar {
+    position: static;
+  }
+
+  .mode-standard .top-bar-primary,
+  .mode-standard .top-bar-context,
+  .mode-standard .top-bar-actions,
+  .mode-standard .device-info {
+    min-width: 0;
+  }
+
+  .mode-standard .device-model,
+  .mode-standard .device-mac,
+  .mode-standard .page-context-title,
+  .mode-standard .page-context-copy {
+    overflow-wrap: anywhere;
+  }
+
+  .mode-standard .top-bar-kpis {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  .mode-standard .top-kpi-block {
+    min-width: 0;
+    text-align: left;
+  }
+
+  .mode-standard .standard-dashboard-stack,
+  .mode-standard .standard-dashboard-pair,
+  .mode-standard .dashboard-insight-grid,
+  .mode-standard .standard-grid-2,
+  .mode-standard .standard-grid-3,
+  .mode-standard .surface-grid-2,
+  .mode-standard .metric-grid-auto {
+    grid-template-columns: 1fr !important;
+  }
+
+  .mode-standard .page-toolbar,
+  .mode-standard .page-toolbar-actions,
+  .mode-standard .page-surface-header,
+  .mode-standard .page-surface-actions,
+  .mode-standard .standard-inline-actions,
+  .mode-standard .pool-live-header,
+  .mode-standard .pool-live-health {
+    align-items: flex-start;
+  }
+
+  .mode-standard .page-toolbar-actions,
+  .mode-standard .standard-inline-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .mode-standard input,
+  .mode-standard select,
+  .mode-standard textarea,
+  .mode-standard button,
+  .mode-standard .btn {
+    max-width: 100%;
+  }
+
+  .mode-standard .pool-live-url,
+  .mode-standard .template-card-copy,
+  .mode-standard .state-panel-message,
+  .mode-standard .metric-card-note {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .ds-toolbar,
+  .ds-operational-row {
+    align-items: flex-start;
+    justify-content: flex-start;
+  }
+
+  .ds-toolbar > *,
+  .ds-operational-row > * {
+    min-width: 0;
+  }
+
+  .ds-stat-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .ds-btn {
+    justify-content: center;
+    white-space: normal;
+  }
+
+  .mode-standard .log-viewer {
+    height: min(60vh, 420px);
+    overflow-x: hidden;
+  }
+
+  .mode-standard .log-row {
+    grid-template-columns: 58px 32px minmax(0, 1fr);
+  }
+
+  .mode-standard .log-col-source {
+    display: none;
+  }
+
+  .mode-standard .fleet-table-wrap {
+    overflow-x: visible;
+  }
+
+  .mode-standard .fleet-table {
+    min-width: 0;
+  }
+
+  .mode-standard .fleet-table,
+  .mode-standard .fleet-table thead,
+  .mode-standard .fleet-table tbody,
+  .mode-standard .fleet-table tr,
+  .mode-standard .fleet-table th,
+  .mode-standard .fleet-table td {
+    display: block;
+  }
+
+  .mode-standard .fleet-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+  }
+
+  .mode-standard .fleet-table tr {
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .mode-standard .fleet-table tr:last-child {
+    border-bottom: none;
+  }
+
+  .mode-standard .fleet-table td {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    border-bottom: none;
+    white-space: normal;
+    text-align: right;
+  }
+
+  .mode-standard .fleet-table td::before {
+    content: attr(data-label);
+    color: var(--text-dim);
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-align: left;
+    text-transform: uppercase;
+  }
+}
+
+@media (max-width: 479.98px) {
+  .mode-standard .standard-next-steps-wrap {
+    padding: 10px 12px 0;
+  }
+
+  .mode-standard .page-content {
+    padding: 12px;
+    gap: 12px;
+  }
+
+  .mode-standard .top-bar {
+    padding: 10px 12px;
+  }
+
+  .mode-standard .top-bar-actions {
+    gap: 10px;
+  }
+
+  .mode-standard .top-bar-kpis {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .mode-standard .standard-subtab-bar {
+    margin: 0 12px 12px;
+    gap: 6px;
+  }
+
+  .mode-standard .standard-subtab,
+  .mode-standard .page-link-pill,
+  .mode-standard .btn {
+    min-height: 34px;
+  }
+
+  .mode-standard .fleet-summary-value,
+  .mode-standard .metric-card-value,
+  .mode-standard .top-kpi-value {
+    line-height: 1.1;
+  }
+
+  .ds-surface,
+  .ds-panel {
+    padding: 12px;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Mobile pass (2026-05-14): 375px target — canonical primitives
+   ───────────────────────────────────────────────────────────── */
+
+@media (max-width: 767.98px) {
+  /* Canonical page-scroll padding squeezes on phones (default is 24px/28px) */
+  .page-scroll {
+    padding: 16px;
+  }
+
+  /* Canonical device-context — model name + meta + hero KPIs share row */
+  .device-context {
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+
+  .device-info .device-model {
+    font-size: 1.65rem;
+  }
+
+  .device-info .device-meta {
+    line-height: 1.55;
+  }
+
+  /* Hero KPI strip reflows 4-col → 2x2 grid */
+  .hero-kpi-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    max-width: 100%;
+    width: 100%;
+  }
+
+  /* Canonical .section + .kpi-card cushion shrinks */
+  .section {
+    padding: 16px;
+    border-radius: 12px;
+  }
+
+  .kpi-card {
+    padding: 12px 14px;
+  }
+
+  /* Topbar stacks: title row above, actions below */
+  .topbar {
+    flex-wrap: wrap;
+    padding: 10px 16px;
+    gap: 10px;
+  }
+
+  .topbar-left,
+  .topbar-right {
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  /* Sidebar drawer behavior — canonical primitive */
+  .sidebar {
+    width: 240px;
+  }
+
+  /* Settings rows stack vertically on narrow screens */
+  .setting-row {
+    flex-direction: column;
+    gap: 10px;
+    padding: 14px 0;
+  }
+
+  .setting-row .setting-control {
+    min-width: 0;
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  /* Toggle grid collapses to single column */
+  .toggle-grid {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+
+  /* Log rows: hide src col, tighten grid (canonical default is 150/60/160/1fr) */
+  .log-row {
+    grid-template-columns: 88px 50px 1fr;
+    gap: 10px;
+    font-size: 0.74rem;
+    padding: 8px 10px;
+  }
+
+  .log-row .log-src {
+    display: none;
+  }
+
+  /* Modals fit screen height and become near-fullscreen */
+  .modal-backdrop {
+    padding: 12px;
+  }
+
+  .modal {
+    max-height: calc(100dvh - 24px);
+    border-radius: 12px;
+  }
+
+  .modal-head,
+  .modal-foot {
+    padding: 14px 16px;
+  }
+
+  .modal-body {
+    padding: 16px;
+  }
+
+  .modal-tabs {
+    padding: 0 16px;
+    gap: 14px;
+    overflow-x: auto;
+  }
+
+  /* Preset rows reflow */
+  .preset-row {
+    grid-template-columns: 1fr;
+    gap: 8px;
+    align-items: flex-start;
+  }
+
+  .preset-row .preset-tags {
+    margin-left: 0;
+  }
+
+  /* Range row keeps label + slider + value vertical */
+  .range-row {
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  .range-val {
+    min-width: 0;
+    text-align: left;
+  }
+
+  /* Chain card grid: 2-col already, just tighten */
+  .chain-card {
+    padding: 14px;
+  }
+
+  /* Tables inside containers should scroll horizontally instead of breaking */
+  .table-wrap,
+  .scroll-x {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* Hacker terminal-style tables — force horizontal scroll on overflow */
+  .mode-hacker table,
+  .mode-hacker .register-grid,
+  .mode-hacker .i2c-scan-grid {
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    max-width: 100%;
+  }
+
+  /* Basic / Hacker page content padding */
+  .mode-basic .page-content,
+  .mode-hacker .page-content {
+    padding: 12px 16px;
+  }
+
+  .mode-basic .dashboard-header {
+    padding: 12px 16px;
+  }
+}
+
+@media (max-width: 479.98px) {
+  /* Tighter still at <480px — 375px target */
+  .page-scroll {
+    padding: 12px;
+  }
+
+  .device-info .device-model {
+    font-size: 1.4rem;
+  }
+
+  /* Hero KPI strip collapses to single column under 480px */
+  .hero-kpi-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .section {
+    padding: 14px;
+  }
+
+  .section-title {
+    font-size: 0.88rem;
+  }
+
+  /* Buttons gain a touch-friendly min-height */
+  .btn,
+  .icon-btn {
+    min-height: 40px;
+  }
+
+  /* Even tighter log row */
+  .log-row {
+    grid-template-columns: 70px 44px 1fr;
+    font-size: 0.7rem;
+    gap: 8px;
+  }
+
+  /* Modals are essentially fullscreen */
+  .modal-backdrop {
+    padding: 0;
+  }
+
+  .modal {
+    max-height: 100dvh;
+    max-width: 100vw;
+    border-radius: 0;
+    border: none;
+  }
+
+  /* Standard subtab bar scrolls if too many */
+  .standard-subtab-bar {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    flex-wrap: nowrap;
+  }
+
+  .standard-subtab {
+    flex-shrink: 0;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Ultra-narrow guard (≤320px) — emergency micro-screen support
+   Single most important fixes: hero KPI 1-col, smaller body text,
+   tight section padding, single-row Hacker tool-grid, single-row
+   topbar.
+   ───────────────────────────────────────────────────────────── */
+/* D-17: 320 → canonical xs-max 359.98 (--bp-xs). The narrowest-device
+   layout now also covers 320–360 (graceful — those are even narrower). */
+@media (max-width: 359.98px) {
+  /* Canonical: hero KPI strip collapses, section padding tighter */
+  .hero-kpi-strip {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+
+  .section {
+    padding: 12px;
+    border-radius: 10px;
+  }
+
+  body,
+  .input,
+  .nav-item,
+  .device-info .device-meta {
+    font-size: 0.82rem;
+  }
+
+  .device-info .device-model {
+    font-size: 1.2rem;
+  }
+
+  .page-scroll {
+    padding: 10px;
+  }
+
+  /* Topbar: stack contents into a single column row */
+  .topbar {
+    flex-direction: column;
+    align-items: flex-start;
+    padding: 8px 10px;
+    gap: 6px;
+  }
+
+  .topbar-left,
+  .topbar-right {
+    width: 100%;
+    gap: 8px;
+  }
+
+  /* Buttons remain tap-target friendly */
+  .btn,
+  .icon-btn {
+    min-height: 40px;
+  }
+
+  /* Hacker tool-grid collapses to single column */
+  .mode-hacker .hacker-tool-grid {
+    grid-template-columns: 1fr;
+  }
+
+  /* Hacker topbar stacks too */
+  .mode-hacker .hacker-topbar {
+    flex-direction: column;
+    align-items: flex-start;
+    padding: 8px 10px;
+    gap: 6px;
+  }
+
+  /* KPI grid + log-row tighten further */
+  .kpi-grid {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .log-row {
+    grid-template-columns: 60px 36px 1fr;
+    font-size: 0.66rem;
+    gap: 6px;
+    padding: 6px 8px;
+  }
+
+  /* Basic mode bottom nav remains tappable */
+  .mode-basic .page-content {
+    padding: 10px 12px;
+  }
+}
+
+/* Additional 480px Hacker-specific guard — ensure tool-grid is 1-col + topbar single row */
+@media (max-width: 479.98px) {
+  .mode-hacker .hacker-tool-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .mode-hacker .hacker-topbar {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px 12px;
+  }
+
+  .mode-hacker .hacker-status-strip {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Wave 3 — Agent C: Responsive constraints + safe-area +
+   coarse-pointer touch targets (2026-05-15).
+   Additive only; does not alter desktop sizing.
+   Sources: 
+            agent-9-responsive-audit.md
+   ───────────────────────────────────────────────────────────── */
+
+/* H-3 — Sidebar drawer width clamp on mobile so the drawer never
+   takes the whole viewport on small phones. The existing rule at
+   ≤768 px sets the Standard sidebar drawer to 280 px; this clamp
+   guarantees a 48 px gutter on viewports under 328 px. The canonical
+   '.sidebar' (Advanced/Hacker mode) keeps its 240 px width on desktop
+   and gains the same drawer clamp when narrower than the gutter would
+   allow. */
+@media (max-width: 768px) {
+  .mode-standard .sidebar,
+  .mode-standard .sidebar.collapsed,
+  .mode-standard .sidebar.collapsed.open,
+  .mode-standard .sidebar.open {
+    width: min(280px, calc(100vw - 48px));
+    max-width: calc(100vw - 48px);
+  }
+
+  /* Canonical Advanced/Hacker sidebar (.sidebar in canonical.css)
+     never converts to a drawer in current markup, but if it ever
+     does the clamp keeps it phone-safe. */
+  .sidebar {
+    max-width: calc(100vw - 48px);
+  }
+}
+
+/* H-4 — BottomNav max-width cap on tablet and up so it doesn't
+   stretch edge-to-edge on wide screens. Mobile (≤767.98 px) keeps
+   the existing full-width fixed posture from basic.css. */
+@media (min-width: 768px) {
+  .mode-basic .bottom-nav {
+    left: 50%;
+    right: auto;
+    transform: translateX(-50%);
+    max-width: 720px;
+    width: 100%;
+    border-left: 1px solid var(--border);
+    border-right: 1px solid var(--border);
+  }
+}
+
+/* H-5 + L-8 — Safe-area-inset for fixed/sticky bottom surfaces.
+   basic.css already applies env(safe-area-inset-bottom) on the
+   BottomNav (line 1073); this rule extends the same posture to the
+   Standard sticky status footer so iOS home indicator + Android nav
+   bar don't crop chips. */
+.mode-standard .standard-status-footer {
+  padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+}
+
+/* Optional polish #6 — top safe-area-inset for notch-aware topbars. */
+.topbar,
+.mode-standard .topbar,
+.mode-standard .standard-topbar,
+.mode-hacker .hacker-topbar,
+.mode-basic .basic-topbar {
+  padding-top: calc(env(safe-area-inset-top, 0px) + 0px);
+}
+
+/* 44 px touch targets on coarse-pointer devices (phones + tablets +
+   most touchscreens). Desktop mouse/trackpad pointers keep their
+   existing dense sizing. */
+@media (pointer: coarse) {
+  .ds-btn,
+  .bottom-nav-tab,
+  .bottom-nav-item,
+  .tab-button,
+  .icon-btn,
+  .nav-item,
+  .topbar-link {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  /* Full-width settings/toggle rows: enforce vertical tap area only
+     (min-width would force narrow controls to grow). */
+  .toggle-row,
+  .setting-row {
+    min-height: 44px;
+  }
+
+  /* Standard subtab pills + page link pills: bump from 34 px to 44 px
+     on coarse pointers. The ≤479.98 px override at line 268-272 sets
+     34 px on phones, so this rule must win when both apply — same
+     specificity, but coarse-pointer media query is later in source
+     order, so cascade wins. */
+  .mode-standard .standard-subtab,
+  .mode-standard .page-link-pill,
+  .mode-standard .btn,
+  .btn {
+    min-height: 44px;
+  }
+}
+
+/* Phone landscape — short viewport. Reduce vertical padding on hero
+   + topbar surfaces so the first-screen layout still fits. ~30%
+   reduction matches Agent 9's recommendation. */
+@media (orientation: landscape) and (max-height: 500px) {
+  .topbar,
+  .mode-standard .topbar,
+  .mode-hacker .hacker-topbar,
+  .mode-basic .basic-topbar {
+    padding-top: calc(env(safe-area-inset-top, 0px) + 6px);
+    padding-bottom: 6px;
+    min-height: 44px;
+  }
+
+  .mode-standard .top-bar {
+    padding-top: 6px;
+    padding-bottom: 6px;
+  }
+
+  .mode-standard .standard-next-steps-wrap {
+    padding-top: 8px;
+  }
+
+  .page-scroll {
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+
+  .hero-kpi-strip {
+    gap: 6px;
+  }
+
+  .section {
+    padding-top: 12px;
+    padding-bottom: 12px;
+  }
+}

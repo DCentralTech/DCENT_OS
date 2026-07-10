@@ -1,0 +1,260 @@
+/* ───────────────────────────────────────────────────────────────────────────
+ * charts.css —  Phase-3 Agent P6 (2026-05-17)
+ *
+ * Shared telemetry-viz primitive styling for the chart trio:
+ *   • SvgChart.tsx       (multi-series line chart + STALE badge + readout)
+ *   • Sparkline.tsx      (inline smooth-bezier tail)
+ *   • LiveAsicVisual.tsx (the signature animated-ASIC feedback surface)
+ *
+ * Loaded after current-block.css, before responsive.css + motion.css
+ * (see main.tsx). current-block.css is also P6-owned this wave.
+ *
+ * RULES baked into this file:
+ *   - F1 owns the '.dcm-asic-glow' keyframe (motion.css §18). We CONSUME it on
+ *     '.live-asic-stack' — we do NOT redefine the keyframe here.
+ *   - Brand colour ONLY via F1 tokens (--accent / --accent-glow / -border /
+ *     -shadow-* / -tint-* / -deep-10). No 'rgba(250,165,0,…)' literals.
+ *   - TRUTH CONTRACT: the STALE badge is a high-contrast, always-visible
+ *     warning. Nothing here hides or softens it; the tooltip only ADDS an
+ *     honest explanation.
+ *   - Every animation has a 'prefers-reduced-motion' + '@media print' escape
+ *     that still renders the correct static visual.
+ *   - Per-instance scoped <style> blocks were removed from the 3 components
+ *     and consolidated here (one rule set instead of N duplicated copies).
+ *
+ *  P6 token-converge (F6 §3 "converge-to" table):
+ *   - All raw easing literals ('cubic-bezier(0.22,1,0.36,1)', bare
+ *     'ease-in-out'/'ease-out') → F1 '--ease-*' tokens (nearest-tier per F6
+ *     §3c — the draw-in's 0.22/0.36 x-control points map to '--ease-out-soft').
+ *   - Raw 'border-radius' px → F1 '--radius-*' (F6 §3e "stop using raw px").
+ *   - DELIBERATELY KEPT (F6 "never weaken a safety/contrast treatment to
+ *     converge"; documented  exception): the two opaque readout/tip
+ *     backgrounds 'rgba(20,20,30,0.94)' (legibility over a busy chart) AND
+ *     the STALE badge's yellow warning halos 'box-shadow 0 0 Npx
+ *     rgba(234,179,8,…)' — there is no '--glow-yellow' token and a STALE
+ *     warning glow is a safety-contrast treatment, not an accent halo, so it
+ *     is NOT converged to '--glow-orange/-danger/-success'. The neutral
+ *     elevation shadows on the readout/tip are legibility-tuned to match
+ *     their opaque backgrounds and stay paired with them. No accent-halo
+ *     (orange/gold/neon-green) box-shadow exists in this file to converge.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/* ── SvgChart: line draw-in ────────────────────────────────────────────────
+   Paths marked data-draw true draw themselves in ~620ms. Per-segment
+   stagger comes from the inline '--svgchart-line-anim-delay' custom prop. */
+.svgchart-line {
+  stroke-dasharray: none;
+  stroke-dashoffset: 0;
+}
+.svgchart-line[data-draw="true"] {
+  stroke-dasharray: 1 1;
+  stroke-dashoffset: 1;
+  /* F6 §3c: raw cubic-bezier(0.22,1,0.36,1) → nearest-tier --ease-out-soft
+     (cubic-bezier(0.22,0.61,0.36,1) — identical 0.22/0.36 x-control points,
+     a soft ease-out; pixel-equivalent draw-in feel). */
+  animation: svgchartDraw 620ms var(--ease-out-soft, cubic-bezier(0.22, 0.61, 0.36, 1)) forwards;
+  animation-delay: var(--svgchart-line-anim-delay, 0ms);
+}
+@keyframes svgchartDraw {
+  to { stroke-dashoffset: 0; }
+}
+
+/* ── SvgChart: STALE badge ─────────────────────────────────────────────────
+   Truth-contract surface. High-contrast amber pill, top-right. Always
+   visible while telemetry is stale; the [data-tooltip] explainer needs
+   pointer/keyboard reachability, so this is the one chart overlay that is
+   NOT pointer-events:none. Focusable for keyboard tooltip access. */
+.svgchart-stale-badge {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  font: 700 9px/1 var(--font-mono, 'JetBrains Mono', ui-monospace, monospace);
+  letter-spacing: 0.18em;
+  padding: 3px 8px;
+  border-radius: var(--radius-pill, 999px);
+  color: var(--yellow, #EAB308);
+  background: rgba(234, 179, 8, 0.12);
+  border: 1px solid rgba(234, 179, 8, 0.40);
+  box-shadow: 0 0 10px rgba(234, 179, 8, 0.18);
+  text-transform: uppercase;
+  cursor: help;
+  z-index: 4;
+  /* gentle attention pull — opacity-only so it never jitters layout.
+     F6 §3c: bare ease-in-out → --ease-out-soft. */
+  animation: svgchartStaleBreath 2.6s var(--ease-out-soft, ease-in-out) infinite;
+}
+.svgchart-stale-badge::before {
+  /* tiny warning dot so the meaning reads even pre-hover */
+  content: '';
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--yellow, #EAB308);
+  box-shadow: 0 0 5px rgba(234, 179, 8, 0.85);
+  margin-right: 5px;
+  vertical-align: 1px;
+}
+.svgchart-stale-badge:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+@keyframes svgchartStaleBreath {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.72; }
+}
+
+/* ── SvgChart: hover crosshair readout ─────────────────────────────────────
+   Position (left/top) is computed inline; everything else is class-driven. */
+.svgchart-readout {
+  position: absolute;
+  /* Deliberately opaque so the readout stays legible over a busy chart —
+     a translucent token here would hurt readability (truth > prettiness). */
+  background: rgba(20, 20, 30, 0.94);
+  border: 1px solid var(--border-glass, rgba(255, 255, 255, 0.12));
+  /* F6 §3e: raw 6px → nearest small-affordance tier --radius-sm (8). */
+  border-radius: var(--radius-sm, 8px);
+  padding: 6px 10px;
+  font-size: 0.7rem;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  pointer-events: none;
+  z-index: 10;
+  white-space: nowrap;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255,255,255,0.02) inset;
+  backdrop-filter: blur(var(--blur-xs, 6px));
+  -webkit-backdrop-filter: blur(var(--blur-xs, 6px));
+}
+.svgchart-readout-time {
+  color: var(--fg-dim, #6E6E80);
+  margin-bottom: 3px;
+  letter-spacing: 0.04em;
+}
+.svgchart-readout-row {
+  line-height: 1.6;
+  display: flex;
+  gap: 8px;
+}
+.svgchart-readout-label { flex: 0 0 auto; }
+.svgchart-readout-val {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Sparkline ─────────────────────────────────────────────────────────────
+   Inline element; the host KPI owns sizing. NaN-gap honesty + role/aria
+   contract live in the component — this is pure presentation. */
+.dcent-sparkline {
+  display: inline-block;
+  position: relative;
+  vertical-align: middle;
+  line-height: 0;
+}
+.dcent-sparkline-svg {
+  display: block;
+  overflow: visible;
+}
+.dcent-sparkline .sparkline-pulse {
+  transform-origin: center;
+  transform-box: fill-box;
+  /* F6 §3c: bare ease-out → --ease-standard (general transition easing). */
+  animation: sparklinePulse 1.6s var(--ease-standard, ease-out) infinite;
+}
+@keyframes sparklinePulse {
+  0%   { transform: scale(0.6); opacity: 0.95; }
+  70%  { transform: scale(1.9); opacity: 0;    }
+  100% { transform: scale(1.9); opacity: 0;    }
+}
+.dcent-sparkline-tip {
+  position: absolute;
+  pointer-events: none;
+  background: rgba(20, 20, 30, 0.94);
+  color: var(--fg-primary, #F0F0F0);
+  border: 1px solid var(--border-glass, rgba(255, 255, 255, 0.10));
+  /* F6 §3e: raw 4px → --radius-xs (exact match). */
+  border-radius: var(--radius-xs, 4px);
+  padding: 2px 6px;
+  font: 600 10px/1.2 var(--font-mono, 'JetBrains Mono', ui-monospace, monospace);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+  z-index: 10;
+}
+
+/* ── LiveAsicVisual: stack shell ───────────────────────────────────────────
+   'position:relative' is load-bearing — the thermal-tint overlay is
+   absolutely positioned to 'inset:0' inside it. (Was an inline style; the
+   '.dcm-asic-glow.is-mining' glow shell from motion.css §18 is wired on this
+   same element by the component when there is real mining activity.) */
+.live-asic-stack {
+  position: relative;
+}
+
+/* Per-cell pulse — single shared keyframe (was a per-instance useId scoped
+   <style>). Only cells the component flags 'data-pulse="on"' (real activity)
+   animate; zero-hashrate ⇒ zero lit cells stays a component-level guarantee,
+   this CSS never fabricates motion. */
+.live-asic-visual[data-state="live"] .live-asic-chip-grid span[data-pulse="on"] {
+  /* F6 §3c: bare ease-in-out → --ease-out-soft. */
+  animation: liveAsicCellPulse 1400ms var(--ease-out-soft, ease-in-out) infinite;
+  will-change: opacity, filter;
+}
+@keyframes liveAsicCellPulse {
+  0%   { opacity: 0.82; filter: none; }
+  50%  { opacity: 1;    filter: drop-shadow(0 0 4px var(--chain-accent, var(--accent, #FAA500))); }
+  100% { opacity: 0.82; filter: none; }
+}
+
+/* Honest thermal tint — warm/hot/critical wash, screen-blended so it reads
+   as glow not a flat overlay. Driven by the chain temperature severity the
+   component computes; not decoration. */
+.live-asic-thermal-tint {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border-radius: inherit;
+  mix-blend-mode: screen;
+  opacity: 0.55;
+}
+.live-asic-thermal-tint--warm     { background: rgba(234, 179,   8, 0.05); }
+.live-asic-thermal-tint--hot      { background: rgba(239,  68,  68, 0.07); }
+.live-asic-thermal-tint--critical { background: rgba(239,  68,  68, 0.12); }
+
+/* ── Reduced motion ────────────────────────────────────────────────────────
+   Every chart animation collapses to its correct static end-state. The
+   STALE badge stays fully visible (only its breath stops) — the warning is
+   never the thing that gets disabled. */
+@media (prefers-reduced-motion: reduce) {
+  .svgchart-line {
+    animation: none !important;
+    stroke-dasharray: none !important;
+    stroke-dashoffset: 0 !important;
+  }
+  .svgchart-stale-badge { animation: none !important; opacity: 1 !important; }
+  .dcent-sparkline .sparkline-pulse { animation: none !important; opacity: 0 !important; }
+  .live-asic-visual .live-asic-chip-grid span[data-pulse="on"] {
+    animation: none !important;
+    filter: none !important;
+  }
+}
+
+/* ── Print ─────────────────────────────────────────────────────────────────
+   No animation/glow on paper; STALE badge keeps its border so a printed
+   chart still shows it was stale. */
+@media print {
+  .svgchart-line {
+    animation: none !important;
+    stroke-dasharray: none !important;
+    stroke-dashoffset: 0 !important;
+  }
+  .svgchart-stale-badge {
+    animation: none !important;
+    box-shadow: none !important;
+    color: #8a6d00 !important;
+  }
+  .dcent-sparkline .sparkline-pulse { animation: none !important; }
+  .live-asic-visual .live-asic-chip-grid span[data-pulse="on"] {
+    animation: none !important;
+    filter: none !important;
+  }
+  .live-asic-thermal-tint { opacity: 0.35 !important; }
+}

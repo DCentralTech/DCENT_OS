@@ -1,0 +1,36 @@
+[package]
+name = "dcentrald-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+dcentrald-api = { path = "../dcentrald-api", features = ["fuzzing"] }
+dcentrald-stratum = { path = "../dcentrald-stratum" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "ota_sysupgrade_tar"
+path = "fuzz_targets/ota_sysupgrade_tar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sv2_frame_decoder"
+path = "fuzz_targets/sv2_frame_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v1_pool_message_parser"
+path = "fuzz_targets/v1_pool_message_parser.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

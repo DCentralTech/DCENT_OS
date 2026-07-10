@@ -1,0 +1,585 @@
+/* ═════════════════════════════════════════════════════════════════════════
+   DCENT_OS — Claude-Design handoff: SHARED COMPONENT PRIMITIVE skin
+   ═════════════════════════════════════════════════════════════════════════
+
+   Cross-mode chrome-fidelity pass. Sibling of the foundation ('handoff-skin
+   .css', VR1) and the per-mode structural skins ('handoff-skin-standard /
+   -heater / -hacker / -wizard'). This file owns ONE job: make every SHARED
+   widget primitive (buttons, inputs/selects, toggles, chips/pills, modals/
+   overlays, tables, tooltips, badges, empty-state, skeleton, scrollable
+   code/pre, sliders) match the handoff kit's canonical primitive look
+   ('ui_kits/dashboard/styles.css' — the refined spec; the 'preview/
+   components-*.html' cards are simplified specimens).
+
+   ── Rules of engagement ────────────────────────────────────────────────────
+   • CSS-only. No JSX / store / API / contract changes.
+   • Cross-mode shared chrome — NOT scoped to a single '.mode-*'. Values are
+     TOKEN-driven so the Wave-1 accent engine + each mode's per-mode token
+     rebinds (incl. hacker-green, the warm heater palette) still resolve.
+     Where a kit value is a brand literal in the kit itself (e.g. the button
+     gradient text '#1a0f00', the orange press-shadow rgba) it is mapped to
+     the matching production token so accent re-skinning keeps working.
+   • Loaded LAST in main.tsx (after the per-mode skins) so it can refine the
+     SHARED primitives consistently. The per-mode skins legitimately re-skin
+     primitives *within* their own '.mode-*' / '.wizard-shell' scope and at
+     equal-or-higher specificity — those intentionally still win; this file
+     only sets the shared cross-mode baseline they evolve from.
+   • Reduced-motion + print + a11y focus rings preserved (never weakened).
+
+   Production hooks targeted (verified against the live source):
+     .ds-btn (+ .primary/.secondary/.ghost/.danger/.icon/.sm/.lg) + legacy
+     .btn family · .ds-input + legacy .input + bare controls · .ds-toggle ·
+     .ds-chip + legacy .chip + .ds-pill-numeric · .ds-tf-group/.tf-group ·
+     .ds-overlay-backdrop/.ds-overlay-panel + legacy .modal/.modal-backdrop ·
+     table tbody hover + .table-wrap · .dcent-tooltip + [data-tooltip] +
+     .dcent-infodot · .ds-empty-state · .ds-skel · pre/code scroll · range
+     inputs. Selectors paired with the kit's exact primitive values below.
+   ───────────────────────────────────────────────────────────────────────── */
+
+
+/* ═══ 1. BUTTONS ═══════════════════════════════════════════════════════════
+   Kit '.btn' (styles.css:321): radius 8px, 9px/18px pad, .84rem/600,
+   letter-spacing .01em, ripple '::after', translateY(-1px) hover lift.
+   '.btn-primary': 135deg #FAA500→#FA6700, color #1a0f00, layered orange
+   press-shadow. '.btn-secondary': glass + blur(8). '.btn-danger': red
+   gradient. '.btn-ghost': transparent → accent. The production '.ds-btn'
+   already mirrors this; we true-up the legacy '.btn' family + harmonise the
+   shared press feel. Tokens keep accent/hacker re-skin alive. */
+
+.ds-btn,
+.btn {
+  border-radius: var(--radius-sm, 8px);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+.ds-btn:not(.sm):not(.lg):not(.icon),
+.btn:not(.btn-icon):not(.btn-sm):not(.btn-lg) {
+  padding: 9px 18px;
+  font-size: 0.84rem;
+}
+
+/* Kit ripple (styles.css:330): a centered radial that bursts to 300px on
+   :active, 'rgba(255,255,255,.2)' ink, 'width .4s, height .4s' (matches the
+   '--dur-slow' 400ms scale). Additive, chrome-only, reduced-motion
+   neutralised below. */
+.ds-btn::after,
+.btn::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 0;
+  height: 0;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.2);
+  transform: translate(-50%, -50%);
+  transition: width var(--dur-slow, 0.4s), height var(--dur-slow, 0.4s);
+  pointer-events: none;
+}
+.ds-btn,
+.btn { position: relative; overflow: hidden; }
+.ds-btn:active:not(:disabled):not([aria-disabled='true'])::after,
+.btn:active::after { width: 300px; height: 300px; transition: 0s; }
+
+/* Primary — kit gradient + dark-ink label + layered orange glow press. */
+.btn-primary,
+.ds-btn.primary {
+  background: var(--accent-gradient,
+              linear-gradient(135deg, #FAA500 0%, #FA6700 100%));
+  color: #1a0f00;
+  border: 1px solid transparent;
+  box-shadow: var(--shadow-btn, 0 2px 10px rgba(250, 103, 0, 0.30)),
+              inset 0 1px 0 rgba(255, 255, 255, 0.3);
+}
+.btn-primary:hover:not(:disabled):not([aria-disabled='true']),
+.ds-btn.primary:hover:not(:disabled):not([aria-disabled='true']) {
+  box-shadow: 0 6px 20px var(--accent-glow-hi, rgba(250, 103, 0, 0.45)),
+              inset 0 1px 0 rgba(255, 255, 255, 0.3),
+              0 0 26px var(--accent-glow, rgba(250, 165, 0, 0.22));
+  transform: translateY(-1px);
+}
+.btn-primary:active:not(:disabled):not([aria-disabled='true']),
+.ds-btn.primary:active:not(:disabled):not([aria-disabled='true']) {
+  transform: translateY(0);
+}
+
+/* Secondary — kit glass + 8px blur, accent-on-hover. */
+.btn-secondary,
+.ds-btn.secondary {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--fg-primary);
+  border: 1px solid var(--border-glass);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+.btn-secondary:hover:not(:disabled):not([aria-disabled='true']),
+.ds-btn.secondary:hover:not(:disabled):not([aria-disabled='true']) {
+  border-color: var(--accent-border);
+  background: rgba(250, 165, 0, 0.06);
+  color: var(--accent);
+}
+
+/* Danger — kit red gradient. */
+.btn-danger,
+.ds-btn.danger {
+  background: linear-gradient(135deg, var(--red, #ef4444), #dc2626);
+  color: #fff;
+  border: 1px solid transparent;
+  box-shadow: 0 2px 10px rgba(239, 68, 68, 0.30),
+              inset 0 1px 0 rgba(255, 255, 255, 0.18);
+}
+.btn-danger:hover:not(:disabled):not([aria-disabled='true']),
+.ds-btn.danger:hover:not(:disabled):not([aria-disabled='true']) {
+  box-shadow: 0 6px 20px rgba(239, 68, 68, 0.45),
+              inset 0 1px 0 rgba(255, 255, 255, 0.2);
+  transform: translateY(-1px);
+}
+
+/* Ghost — transparent → accent. */
+.btn-ghost,
+.ds-btn.ghost {
+  background: transparent;
+  color: var(--fg-secondary);
+  border-color: transparent;
+}
+.btn-ghost:hover:not(:disabled):not([aria-disabled='true']),
+.ds-btn.ghost:hover:not(:disabled):not([aria-disabled='true']) {
+  color: var(--accent);
+  background: rgba(250, 165, 0, 0.05);
+}
+
+/* Icon button — kit 36×36 square. */
+.btn-icon,
+.ds-btn.icon { width: 36px; height: 36px; padding: 0; justify-content: center; }
+
+
+/* ═══ 2. INPUTS / SELECTS / TEXTAREAS ══════════════════════════════════════
+   Kit '.input' (styles.css:375): full-width, 10px/14px, rgba(10,10,15,.6)
+   fill, 1px border-glass, radius 8px, .85rem; focus → accent border + 3px
+   accent-glow ring + 20px orange wash. Production '.ds-input'/'.input'
+   mirror it; we also reach bare unclassed controls so every shared form
+   field reads the canonical primitive. */
+
+.ds-input,
+.input,
+input[type='text'],
+input[type='search'],
+input[type='number'],
+input[type='password'],
+input[type='url'],
+input[type='email'],
+select,
+textarea {
+  border-radius: var(--radius-sm, 8px);
+  background: rgba(10, 10, 15, 0.6);
+  border: 1px solid var(--border-glass);
+  color: var(--fg-primary);
+  font-family: var(--font-ui);
+  font-size: 0.85rem;
+  transition: border-color 0.18s var(--ease-standard, ease),
+              box-shadow 0.18s var(--ease-standard, ease),
+              background 0.18s var(--ease-standard, ease);
+}
+.ds-input,
+.input,
+input[type='text'],
+input[type='search'],
+input[type='number'],
+input[type='password'],
+input[type='url'],
+input[type='email'],
+textarea { padding: 10px 14px; }
+
+.ds-input:focus,
+.input:focus,
+input[type='text']:focus,
+input[type='search']:focus,
+input[type='number']:focus,
+input[type='password']:focus,
+input[type='url']:focus,
+input[type='email']:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow),
+              0 0 20px rgba(250, 165, 0, 0.1);
+}
+/* Kit '.input-label': .68rem dim uppercase eyebrow. */
+.input-label,
+.ds-input-label {
+  font-size: 0.68rem;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 700;
+}
+
+
+/* ═══ 3. TOGGLE SWITCH ═════════════════════════════════════════════════════
+   Kit '.toggle' (styles.css:504): 40×22, radius 12, rgba(255,255,255,.08)
+   off-track; '.on' → accent gradient + orange glow + inner highlight; 16px
+   knob, +18px travel. Production '.ds-toggle'/'.toggle' already match;
+   restate via tokens so the accent engine recolors the ON state per-mode. */
+
+.ds-toggle,
+.toggle {
+  width: 40px;
+  height: 22px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid transparent;
+  transition: background 0.22s var(--ease-standard, cubic-bezier(.2,0,0,1)),
+              box-shadow 0.22s var(--ease-standard, cubic-bezier(.2,0,0,1));
+}
+.ds-toggle.on,
+.toggle.on,
+.toggle.is-on {
+  background: var(--accent-gradient,
+              linear-gradient(135deg, #FAA500, #FA6700));
+  box-shadow: 0 0 12px var(--accent-glow-hi, rgba(250, 103, 0, 0.35)),
+              inset 0 1px 0 rgba(255, 255, 255, 0.2);
+}
+.ds-toggle .ds-toggle-knob,
+.toggle .knob,
+.toggle .toggle-knob {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+  transition: transform 0.22s var(--ease-standard, cubic-bezier(.2,0,0,1));
+}
+.ds-toggle.on .ds-toggle-knob,
+.toggle.on .knob,
+.toggle.on .toggle-knob,
+.toggle.is-on .knob { transform: translateX(18px); }
+.ds-toggle:focus-visible,
+.toggle:focus-visible { box-shadow: 0 0 0 3px var(--accent-glow); }
+
+
+/* ═══ 4. CHIPS / PILLS / SEGMENTED ═════════════════════════════════════════
+   Kit '.chip' (styles.css:351): inline-flex, 4px/11px, radius 999px,
+   .68rem/700, letter-spacing .08em, uppercase, 1px transparent border;
+   tinted variants; '.dot' 6px glowing; '.live .dot' pulses. Production
+   '.ds-chip'/'.chip' mirror it. Kit '.tf-group' segmented: 8px radius
+   shell + 6px radius active gradient pill. Mode-pill / subtab use 999px
+   pill rails. */
+
+.ds-chip,
+.chip {
+  border-radius: var(--radius-pill, 999px);
+  padding: 4px 11px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  border: 1px solid transparent;
+  font-family: var(--font-ui);
+  white-space: nowrap;
+}
+.ds-chip .ds-dot,
+.chip .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 6px currentColor;
+}
+.ds-chip.ds-live .ds-dot,
+.chip.live .dot { animation: pulse 1.8s ease-in-out infinite; }
+
+/* Numeric pill primitive — kit pill grammar (999px, hairline, accent num). */
+.ds-pill-numeric { border-radius: var(--radius-pill, 999px); }
+
+/* Segmented / true-false — kit '.tf-group': 8px shell, 3px pad,
+   rgba(10,10,15,.5) fill; active = accent gradient + dark ink. */
+.ds-tf-group,
+.tf-group {
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-sm, 8px);
+  background: rgba(10, 10, 15, 0.5);
+  padding: 3px;
+  overflow: hidden;
+}
+.ds-tf-group button,
+.tf-group button {
+  border-radius: 6px;
+  font-weight: 600;
+  font-family: var(--font-ui);
+}
+.ds-tf-group button.active,
+.tf-group button.active,
+.ds-tf-group button[aria-pressed='true'],
+.tf-group button[aria-pressed='true'] {
+  background: var(--accent-gradient,
+              linear-gradient(135deg, #FAA500, #FA6700));
+  color: #1a0f00;
+  box-shadow: 0 2px 8px var(--accent-glow-hi, rgba(250, 103, 0, 0.3));
+}
+
+
+/* ═══ 5. MODALS / OVERLAYS ═════════════════════════════════════════════════
+   Kit '.modal-backdrop' (styles.css:478): rgba(0,0,0,.65) + blur(8px),
+   fadeIn. '.modal': rgba(18,18,30,.95) + blur(24px), 1px orange-tint
+   border, radius 16px, layered 0 24px 80px + accent ring shadow, modalIn
+   pop. Production canonical is '.ds-overlay-backdrop'/'.ds-overlay-panel'
+   (Wave-6 M-01) — already token-glassed (scrim-bg + scrim-blur on the
+   backdrop; diagonal-glass + '--radius-md' + '--elevation-overlay' on the
+   panel). We only true the LEGACY '.modal'/'.modal-backdrop' to the same
+   scrim and to the kit '.modal' look; the canonical panel's own radius is
+   left untouched so the M-01 cross-mode glass stays the single source. */
+
+.ds-overlay-backdrop {
+  background: var(--scrim-bg, rgba(0, 0, 0, 0.6));
+  backdrop-filter: blur(var(--scrim-blur, 8px));
+  -webkit-backdrop-filter: blur(var(--scrim-blur, 8px));
+}
+/* Legacy '.modal' / '.modal-tab' trueing removed 2026-06-25 — dead code (zero
+   consumers); the canonical '.ds-overlay-*' system (scrim above) is the single
+   source. '.ds-overlay-backdrop' falls back to '--scrim-bg' without blur when
+   backdrop-filter is unsupported — no separate @supports rule needed. */
+
+
+/* ═══ 6. TABLES ════════════════════════════════════════════════════════════
+   Kit '.earn-table' (styles.css:2513): th = .62rem dim uppercase 700,
+   letter-spacing .12em, solid border-glass underline; td = dashed
+   border-subtle, tabular-nums; kit '.log-row:hover' = rgba(accent,.04)
+   row wash. Production tables are bespoke per-feature but share the
+   '.table-wrap' scroll wrapper and a cross-mode tbody-hover need. We set a
+   shared, mode-agnostic baseline (the per-mode skins refine within scope). */
+
+table th,
+.table-wrap thead th {
+  font-size: 0.62rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  font-weight: 700;
+  border-bottom: 1px solid var(--border-glass);
+}
+/* Kit '.earn-table td' (styles.css:2520): tabular-nums + a 1px DASHED
+   border-subtle row separator (the kit's signature data-row hairline; the
+   solid underline is reserved for the th). Scoped to the '.table-wrap'
+   scroll surface so it tracks the kit's '.earn-table' scope intent rather
+   than blanket-restyling every nested '<td>' app-wide; the ':last-child'
+   trim mirrors '.earn-table tr:last-child td ( border-bottom: 0 )'. */
+table td,
+.table-wrap tbody td { font-variant-numeric: tabular-nums; }
+.table-wrap tbody td {
+  border-bottom: 1px dashed var(--border-subtle);
+}
+.table-wrap tbody tr:last-child td {
+  border-bottom: 0;
+}
+table tbody tr,
+.table-wrap tbody tr {
+  transition: background var(--dur-fast, 150ms)
+              var(--ease-standard, cubic-bezier(.2,0,0,1));
+}
+table tbody tr:hover,
+.table-wrap tbody tr:hover {
+  background: rgba(250, 165, 0, 0.04);
+}
+/* Kit '.table-wrap' scroll surface = inset glass code-pane look. */
+.table-wrap {
+  border-radius: var(--radius-sm, 8px);
+}
+
+
+/* ═══ 7. TOOLTIPS ══════════════════════════════════════════════════════════
+   Kit '[data-tip]' (styles.css:419): rgba(0,0,0,.92), 1px orange-tint
+   border, radius 6px, .72rem, blur(8px) glass, 0 6px 20px shadow, fade+rise
+   on hover. Production has BOTH the React panel '.dcent-tooltip' and the
+   cheap '[data-tooltip]' path — both already glass+hairline; we true the
+   radius / hairline / glass to the kit primitive (token-driven so hacker
+   keeps its green hairline via the existing .mode-hacker overrides which
+   are more specific and load earlier). */
+
+.dcent-tooltip,
+[data-tooltip]::after {
+  /* Kit '[data-tip]::after' (styles.css:424) radius is 6px — a deliberately
+     tighter primitive than '--radius-sm' (8px). The kit hardcodes 6 (no 6px
+     token exists), so this literal IS the kit's canonical tooltip value;
+     accent-tint hairline + glass + floating-shadow stay token-driven so the
+     per-mode hacker green hairline (more specific, loads earlier) wins. */
+  border-radius: 6px;
+  border: 1px solid var(--accent-border);
+  backdrop-filter: blur(var(--blur-sm, 8px)) saturate(1.15);
+  -webkit-backdrop-filter: blur(var(--blur-sm, 8px)) saturate(1.15);
+  box-shadow: var(--elevation-floating,
+              0 6px 20px rgba(0, 0, 0, 0.5)),
+              var(--glow-orange, 0 0 18px rgba(250, 165, 0, 0.18));
+}
+/* Kit infodot affordance: hairline glass glyph → accent on hover/focus. */
+.dcent-infodot {
+  border: 1px solid var(--border-glass);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+
+/* ═══ 8. BADGES ════════════════════════════════════════════════════════════
+   The kit has no standalone '.badge' primitive distinct from '.chip' — its
+   status badges ARE the chip grammar (999px pill, .68rem/700, uppercase,
+   tinted). Production has TWO chip-grammar surfaces, both already canonical
+   and kit-faithful, so there is nothing to true up here:
+     • '.ds-chip' (design-system.css) — covered by §4.
+     • '.cp-status-pill' + '.cp-dot' (common.css; what 'StatusPill'
+       actually renders — it does NOT emit '.ds-chip'). It already carries
+       the 999px pill + 6px glowing dot + '[data-status=*]' tints +
+       '[data-pulse]' animation, i.e. the kit chip grammar verbatim.
+   No separate production "badge" hook exists (noted, not faked). The small
+   inline severity glyph on AlertBanner/Toast is component-owned chrome,
+   not a shared primitive, so it is intentionally left to its component. */
+
+
+/* ═══ 9. EMPTY-STATE ═══════════════════════════════════════════════════════
+   IMPORTANT — the kit has NO dashed-border "empty card" primitive. In the
+   kit, '1px dashed' is exclusively a ROW / CELL separator ('.earn-table td',
+   '.nest-setting-row', '.hk-table td'), never a boxed placeholder. So we do
+   NOT invent a dashed border-box here (an earlier pass did — removed; it
+   was a fabricated look with no kit specimen behind it).
+
+   What the kit DOES define for an empty surface is the centered stack with
+   a circular accent-glow icon halo + heading-font title. Production
+   '.ds-empty-state .ds-empty-icon' (design-system.css:610) already nails
+   that verbatim — 44×44 circle, '--accent-glow' fill, '--accent-border'
+   hairline, '--accent' glyph — and '.ds-empty-title' already uses
+   '--font-heading'/700. There is no clean kit-vs-production delta left to
+   tighten, so this section asserts NOTHING (noted, not faked). The
+   common.css top-hairline + breathe animation are component chrome the
+   per-file owners keep. */
+
+
+/* ═══ 10. SKELETON ═════════════════════════════════════════════════════════
+   Kit skeletons = a soft white-sheen shimmer sweep on a 6px-radius block.
+   Production '.ds-skel' already uses this exact gradient + ds-shimmer; we
+   restate the radius primitive so it stays consistent if a consumer adds a
+   bespoke skeleton wrapper. */
+
+.ds-skel { border-radius: 6px; }
+
+
+/* ═══ 11. SCROLLABLE CODE / PRE ════════════════════════════════════════════
+   Kit code/log surfaces ('.log-row', console panes) = inset dark glass,
+   mono, hairline rows, subtle row hover. The shared production hook is
+   'pre'/'code' blocks and the '.console-output'/'.table-wrap' scroll
+   container. We give bare 'pre' the kit's inset-glass code-pane primitive
+   (mono, rounded, inset shadow) WITHOUT touching the phosphor terminal
+   ('.mode-hacker .console-output' is more specific + loads earlier, so the
+   hacker CRT identity is preserved). */
+
+pre {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  border-radius: var(--radius-sm, 8px);
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid var(--border-subtle);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.32);
+}
+/* Kit code-pane scrollbar parity (the foundation file sets the global
+   scrollbar; this just keeps overflow code panes scrollable + smooth). */
+pre,
+.code-scroll,
+.table-wrap { -webkit-overflow-scrolling: touch; }
+
+
+/* ═══ 12. SLIDERS / RANGE INPUTS ═══════════════════════════════════════════
+   Kit '.range' (styles.css:615): 6px track, accent→track split fill, 18px
+   gradient thumb with white ring + orange glow, scale(1.15) hover. Shared
+   production sliders are bare 'input[type=range]' (FanControl etc.) — we
+   give them the kit's canonical range primitive. Token-driven so the accent
+   engine recolors the fill/thumb per mode. The track split uses the
+   '--range-fill' custom prop production sliders set inline (falls back to a
+   neutral 50% if a consumer hasn't wired it — no JSX change required). */
+
+input[type='range'] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 6px;
+  border-radius: 3px;
+  outline: none;
+  cursor: pointer;
+  background: linear-gradient(90deg,
+              var(--accent) var(--range-fill, var(--v, 50%)),
+              rgba(255, 255, 255, 0.08) var(--range-fill, var(--v, 50%)));
+}
+input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: linear-gradient(135deg,
+              var(--sphere-hi, #ffc94d), var(--accent-deep, #fa6700));
+  border: 2px solid #fff;
+  box-shadow: 0 0 12px var(--accent-glow-hi, rgba(250, 103, 0, 0.6)),
+              0 2px 4px rgba(0, 0, 0, 0.3);
+  cursor: pointer;
+  transition: transform 0.15s var(--ease-standard, ease);
+}
+input[type='range']::-webkit-slider-thumb:hover { transform: scale(1.15); }
+input[type='range']::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: linear-gradient(135deg,
+              var(--sphere-hi, #ffc94d), var(--accent-deep, #fa6700));
+  cursor: pointer;
+}
+input[type='range']:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px var(--accent-glow),
+              0 0 12px var(--accent-glow-hi, rgba(250, 103, 0, 0.6));
+}
+input[type='range']:focus-visible::-moz-range-thumb {
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+
+/* ═══ A11Y / MOTION / PRINT ════════════════════════════════════════════════
+   Preserve the canonical focus ring (do NOT weaken it — restate parity with
+   design-system.css §F1-FOCUS so this layer can't accidentally suppress it),
+   and neutralise the additive kit ripple/transition decorations under
+   reduced-motion + print. */
+
+.ds-btn:focus-visible,
+.btn:focus-visible,
+.ds-input:focus-visible,
+.input:focus-visible,
+.ds-toggle:focus-visible,
+.toggle:focus-visible,
+input[type='range']:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ds-btn::after,
+  .btn::after {
+    transition: none !important;
+    display: none;
+  }
+  .ds-toggle,
+  .toggle,
+  .ds-toggle .ds-toggle-knob,
+  .toggle .knob,
+  .toggle .toggle-knob,
+  input[type='range']::-webkit-slider-thumb {
+    transition: none;
+  }
+  .ds-chip.ds-live .ds-dot,
+  .chip.live .dot { animation: none; }
+}
+
+@media print {
+  .ds-btn::after,
+  .btn::after { display: none !important; }
+  .dcent-tooltip,
+  [data-tooltip]::after { display: none !important; }
+  .modal,
+  .ds-overlay-panel {
+    box-shadow: none !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+}

@@ -1,0 +1,74 @@
+/* ──────────────────────────────────────────────────────────────────────────
+   core.css — Mining Core Centerpiece (extracted Phase 3.1)
+   ──────────────────────────────────────────────────────────────────────────
+   The "living organism" centerpiece: glassmorphic shell + 7-node molecular
+   sphere with breathing nodes, pulsing links, rotating dashed rings,
+   traveling particles. Ambient backdrop reactivity driven by --core-load
+   (0..1, hashrate-derived) and --core-heat (0..1, max chip temp normalized
+   40-85°C).
+
+   All colors via var(--accent) + currentColor + color-mix() so the user's
+   theme accent flows through every element.
+   ────────────────────────────────────────────────────────────────────────── */
+
+.core{background:radial-gradient(circle at 14% 50%,color-mix(in srgb,var(--accent) 12%,transparent) 0%,transparent 50%),linear-gradient(180deg,rgba(22,24,38,.82) 0%,rgba(10,11,20,.82) 100%);backdrop-filter:blur(18px) saturate(1.2);-webkit-backdrop-filter:blur(18px) saturate(1.2);border:1px solid color-mix(in srgb,var(--accent) 12%,var(--border));border-radius:18px;padding:18px 22px;position:relative;overflow:hidden;box-shadow:0 1px 0 rgba(255,255,255,.05) inset, 0 24px 60px -24px rgba(0,0,0,.7), 0 0 80px -32px color-mix(in oklab, var(--accent), transparent 75%)}
+.core::before{content:'';position:absolute;inset:0;border-radius:inherit;pointer-events:none;background:linear-gradient(135deg,color-mix(in srgb,var(--accent) 35%,transparent),transparent 30%,transparent 70%,color-mix(in srgb,var(--accent) 35%,transparent));opacity:.45;-webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);-webkit-mask-composite:xor;mask-composite:exclude;padding:1px}
+.core-main{display:flex;flex-direction:column;gap:10px;align-items:stretch;position:relative;z-index:1}
+.core-h{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
+.core-eyebrow{font-family:var(--mono);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:2.5px;color:var(--dim)}
+
+/* Slim horizontal layout: [sphere] [hashrate readout] [meta column] */
+.core-row{display:grid;grid-template-columns:auto 1fr auto;gap:22px;align-items:center;min-height:148px}
+.core-c{position:relative;width:140px;height:140px;flex-shrink:0;display:flex;align-items:center;justify-content:center;margin:0}
+.core-c svg{width:100%;height:100%;overflow:visible;display:block}
+
+.core-readout{display:flex;flex-direction:column;gap:2px;text-align:left;min-width:0}
+.core-readout .lbl{font-family:var(--mono);font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:1.8px;color:var(--dim)}
+.core-readout .val{font-family:var(--mono);font-size:60px;font-weight:800;letter-spacing:-2.4px;line-height:1.02;font-variant-numeric:tabular-nums;color:var(--text);text-shadow:0 0 24px color-mix(in oklab, var(--accent), transparent 78%)}
+.core-readout .val .u{font-size:20px;color:var(--accent);margin-left:8px;font-weight:600;letter-spacing:0}
+.core-readout .sub{font-family:var(--mono);font-size:10px;color:var(--accent);letter-spacing:1.5px;text-transform:uppercase;margin-top:2px;opacity:.85}
+
+.core-meta{display:flex;flex-direction:column;gap:6px;align-items:flex-end;text-align:right;min-width:120px;font-family:var(--mono)}
+.core-meta > span{display:flex;align-items:baseline;justify-content:flex-end;gap:4px;font-size:11.5px;color:var(--dim);line-height:1}
+.core-meta .k{color:var(--dim);font-size:9px;letter-spacing:1.2px;text-transform:uppercase;font-weight:700;margin-right:6px}
+.core-meta b{color:var(--text);font-weight:700;font-variant-numeric:tabular-nums}
+.core-meta .u{color:var(--dim);font-size:9px;margin-left:3px}
+
+@media(max-width:900px){
+  .core-row{grid-template-columns:auto 1fr;grid-template-rows:auto auto;gap:14px}
+  .core-c{width:110px;height:110px}
+  .core-readout .val{font-size:42px;letter-spacing:-1.6px}
+  .core-meta{grid-column:1/-1;flex-direction:row;align-items:center;justify-content:center;text-align:center;min-width:0;flex-wrap:wrap;gap:14px}
+  .core-meta > span{justify-content:center}
+}
+
+/* ── Sphere — rings, links, nodes ──────────────────────────────────── */
+.sphere-ring{fill:none;stroke:color-mix(in srgb,var(--accent) 18%,transparent);stroke-width:1;animation:ringRot 40s linear infinite;transform-origin:0 0;transform-box:view-box}
+.sphere-ring-rev{animation:ringRot 60s linear reverse infinite}
+@keyframes ringRot{to{transform:rotate(360deg)}}
+
+.sphere-link{stroke:color-mix(in srgb,var(--accent) 35%,transparent);stroke-width:1.2;fill:none;animation:linkPulse 3s ease-in-out infinite}
+.sphere-link-hot{stroke:color-mix(in srgb,var(--accent) 60%,transparent);animation-duration:1.2s}
+@keyframes linkPulse{0%,100%{stroke-opacity:.25}50%{stroke-opacity:.65}}
+
+.sphere-node{filter:drop-shadow(0 0 8px var(--glow));animation:nodeBreathe 3s ease-in-out infinite;transform-origin:center;transform-box:fill-box;transition:filter .4s ease}
+.sphere-node-center{animation-duration:2.2s;filter:drop-shadow(0 0 10px color-mix(in srgb,var(--accent) 55%,transparent))}
+@keyframes nodeBreathe{0%,100%{opacity:.92}50%{opacity:.72}}
+/* Node-state classes (motion-designer recipe) */
+.sphere-node.cold,.sphere-node.cool{animation-duration:5s}
+.sphere-node.warm{animation-duration:2.2s}
+.sphere-node.hot{animation-duration:1.1s;filter:drop-shadow(0 0 14px color-mix(in srgb,var(--state-error) 70%,var(--accent)))}
+.sphere-node.dim{filter:grayscale(.7) brightness(.55);animation-duration:6s}
+.sphere-node.offline{filter:grayscale(1) brightness(.35);animation:none}
+.sphere-node.active-pulse{animation:nodePing .9s ease-out 1 both}
+@keyframes nodePing{0%{transform:scale(1)}40%{transform:scale(1.18);filter:drop-shadow(0 0 12px var(--accent))}100%{transform:scale(1)}}
+
+/* ── Traveling particles ───────────────────────────────────────────── */
+.sp-particle{pointer-events:none;transform-box:fill-box;transform-origin:center}
+@keyframes pInbound{0%{transform:translate(var(--sx,0),var(--sy,0)) scale(1);opacity:0}15%{opacity:1}80%{transform:translate(calc(var(--sx,0) * .15),calc(var(--sy,0) * .15)) scale(1.2);opacity:1}100%{transform:translate(0,0) scale(.3);opacity:0}}
+@keyframes pHeartbeat{0%{transform:translate(0,0) scale(.6);opacity:.9}100%{transform:translate(var(--sx,0),var(--sy,0)) scale(1.4);opacity:0}}
+@keyframes pReject{0%{transform:translate(var(--sx,0),var(--sy,0)) scale(1);opacity:1}100%{transform:translate(calc(var(--sx,0) * 1.9),calc(var(--sy,0) * 1.9)) scale(.4);opacity:0}}
+
+/* ── Ambient backdrop reactivity ──────────────────────────────────── */
+body::before{transition:opacity .8s ease,filter 1.2s ease}
+body.core-live::before{opacity:calc(.5 + var(--core-load,.3) * .5);filter:hue-rotate(calc(var(--core-heat,0) * 12deg)) saturate(calc(1 + var(--core-load,.3) * .4))}

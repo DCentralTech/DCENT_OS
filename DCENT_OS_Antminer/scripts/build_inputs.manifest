@@ -1,0 +1,79 @@
+# =============================================================================
+# DCENT_OS out-of-band build-inputs manifest
+# =============================================================================
+#
+# These files are REQUIRED to build DCENT_OS firmware from a clean checkout
+# but are deliberately NOT in git (gitignored: extracted/proprietary Bitmain
+# and BraiinsOS boot components plus the Linaro toolchain tarball — they are
+# not redistributable under this repo's licenses).
+#
+# A clean checkout (fresh local clone OR CI/GitHub runner) MUST be populated
+# with these files before running build-dcentrald.sh / build_in_docker.sh.
+# Use the sibling script:
+#
+#     sh DCENT_OS_Antminer/scripts/provision_build_inputs.sh
+#
+# which copies each entry from an out-of-band source directory and verifies
+# it against the SHA256 recorded here (fail-closed supply-chain gate).
+#
+# FORMAT: identical to `sha256sum` output — one entry per line:
+#     <sha256-hex64>  <path relative to repo root>
+# Lines starting with '#' and blank lines are ignored.
+# Verify by hand from the repo root with:  sha256sum -c <this file> --quiet
+# (comment lines make GNU sha256sum warn; provision_build_inputs.sh parses
+#  this file itself and has no such quirk).
+#
+# PROVENANCE of the recorded hashes (2026-07-09, RC rc-beta20260709):
+#   - All six values computed directly from the operator's canonical main
+#     checkout ( Claude Code\DCENT Projects) on
+#     2026-07-09.
+#   - stock_fpga_s9.bin / stock_fpga_extracted.bin additionally match the
+#     2026-04-26 firmware-intake ledger
+#     (
+#      binary-hash-map.md) byte-for-byte — independent historical cross-check.
+#   - The Linaro toolchain hash cee0087b... is the operator-ratified authentic
+#     value, cross-verified against Buildroot's
+#     toolchain-external-linaro-arm.hash at tags 2018.02 AND 2018.05
+#     (upstream releases.linaro.org now 404s; see RC_BUILD_RUNBOOK.md
+#     blocker #3). It matches TOOLCHAIN_SHA256_ARMHF in build_in_docker.sh.
+#
+# CONSUMERS (why each file is required):
+#
+#       s9 target: build_in_docker.sh Phase-0 sanity gate + Phase-4 staging;
+#       package_sysupgrade.sh --board am1-s9 FIT kernel input. 2825904 bytes.
+#
+#       am2-s19jpro target: DCENT_AM2_S19J_KERNEL (build_in_docker.sh Phase 6
+#       -> board post-image.sh probe). 2920448 bytes.
+#
+#       am2-s19jpro target: DCENT_AM2_S19J_BITSTREAM (BraiinsOS s9-io-am2
+#       bitstream, live-proven). 2097152 bytes.
+#   DCENT_OS_Antminer/dcentrald/pic-recovery/firmware/stock_fpga_s9.bin
+#       Embedded at COMPILE TIME via include_bytes! in
+#       pic-recovery/src/main.rs:791 — the whole dcentrald cargo workspace
+#       fails to build without it (this was the first clean-checkout build
+#       failure). Zynq-PCAP byte-swapped stock S9 FPGA image. 2438668 bytes.
+#   DCENT_OS_Antminer/dcentrald/pic-recovery/firmware/stock_fpga_extracted.bin
+#       Companion extracted-FPGA compare target kept alongside
+#       stock_fpga_s9.bin (same gitignored firmware/ dir; recorded in the
+#       2026-04-26 intake ledger). 2559264 bytes.
+#   DCENT_OS_Antminer/buildroot/dl/toolchain-external-custom/gcc-linaro-...
+#       Linaro GCC 7.2.1 armv7 external toolchain tarball (Buildroot
+#       toolchain-external-custom). Upstream URL is DEAD (404) — this file
+#       can ONLY come from the local cache / out-of-band bundle.
+#       108376348 bytes.
+#
+# NOT in this manifest (already tracked in git — listed for completeness):
+#         (tracked)
+#   DCENT_OS_Antminer/dcentrald/dcentrald-api/assets/
+#       stock-bitmain-manifest.json                                  (tracked)
+#       stock-bitmain-manifest.json.sig      (tracked 0-byte placeholder;
+#                                             real sig generated at tag time)
+#
+# =============================================================================
+
+e3d6cb69890118e75b34cf069ee9fd32d0671e192535f6cf83775e69935ea35c  
+b2bf659de0fcb33ec7541bf5a62201d2e95bc52e8e1c497ab9229d7cf350b253  
+f9317611efc031705af33d1b595db20c62802f7aa45a3afc64cedbb62527d005  
+5d12c1b8a6d49084e05ab2275304e126525e5a45c321d036e7ae5aabba31f043  DCENT_OS_Antminer/dcentrald/pic-recovery/firmware/stock_fpga_s9.bin
+4004015bba6ff3d64c7626d3be2e24bf4486fe4bad1261be7b880ca6ef693e1c  DCENT_OS_Antminer/dcentrald/pic-recovery/firmware/stock_fpga_extracted.bin
+cee0087b1f1205b73996651b99acd3a926d136e71047048f1758ffcec69b1ca2  DCENT_OS_Antminer/buildroot/dl/toolchain-external-custom/gcc-linaro-7.2.1-2017.11-x86_64_arm-linux-gnueabihf.tar.xz

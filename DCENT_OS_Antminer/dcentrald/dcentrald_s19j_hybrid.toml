@@ -1,0 +1,41 @@
+# dcentrald S19j Pro Hybrid Mining Configuration
+#
+# Hybrid mode: Serial UART for ASIC init, FPGA /dev/mem for work dispatch.
+# Chain 2 has no UIO devices — uses devmem mmap at 0x43C10000.
+#
+# Usage:
+#   /tmp/dcentrald --s19j-hybrid --config /tmp/dcentrald_s19j_hybrid.toml
+
+[general]
+hostname = "s19j-hybrid"
+log_level = "info"
+
+[pool]
+url = "stratum+tcp://public-pool.io:21496"
+worker = ""
+password = "x"
+
+[mining]
+frequency_mhz = 400
+serial_device = "/dev/ttyS2"
+serial_chip_count = 126
+serial_chip_type = "BM1362"
+fpga_chain_base = "0x43C10000"
+fpga_chain_id = 2
+suggest_difficulty = 8192
+passthrough = true
+
+[thermal]
+target_temp_c = 55
+hot_temp_c = 65
+dangerous_temp_c = 75
+
+[power]
+target_watts = 0
+max_watts = 3500
+
+[watchdog]
+enabled = false
+
+[hash_on_disconnect]
+enabled = true

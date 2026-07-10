@@ -1,0 +1,43 @@
+[package]
+name = "dcentrald-api-grpc"
+version.workspace = true
+edition = "2021"
+license = "GPL-3.0"
+description = "gRPC + protobuf + reflection scaffold for dcentrald (Supremacy S5.1)"
+
+# Supremacy S5.1 (2026-05-15) — scaffold-priority gRPC surface for dcentrald.
+# Real handlers stub `Status::unimplemented`; GetConstraints is the one real
+# handler that returns voltage/fan/freq envelopes from
+# `dcentrald-silicon-profiles`. Default-off in config (`[api.grpc] enabled =
+# false`) until soak-proven.
+
+[dependencies]
+tonic = "0.12"
+prost = "0.13"
+tonic-reflection = "0.12"
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+dcentrald-silicon-profiles = { path = "../dcentrald-silicon-profiles" }
+dcentrald-api-types = { path = "../dcentrald-api-types" }
+
+[build-dependencies]
+# Use tonic-build with the bundled `protoc` provided by `protoc-bin-vendored`
+# so this crate builds without a system `protoc` install (Windows host has
+# no protobuf-compiler by default; Docker / Linux CI doesn't either).
+tonic-build = "0.12"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+prost = "0.13"
+proptest = { workspace = true }
+tokio = { workspace = true }
+
+# Lints follow workspace defaults; per-crate overrides intentionally omitted
+# so the new scaffold inherits warn-level unwrap/expect/panic gates.
+[lints.clippy]
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+indexing_slicing = "allow"
+unwrap_in_result = "allow"

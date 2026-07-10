@@ -1,0 +1,46 @@
+{
+  "source": "",
+  "captured_at": "2026-04-29",
+  "parser": "x21_aes",
+  "boards": [
+    {
+      "i2c_bus": 1,
+      "i2c_addr": "0x50",
+      "preamble": "05 11",
+      "board_name": "BHB56902",
+      "serial_number": "JYZZYR6BCJHCA0JRG",
+      "bom_version": "0x0000",
+      "pcb_version": "0x0003",
+      "chip_type": "BM1366",
+      "voltage_v": 13.9,
+      "frequency_mhz": 670,
+      "hashrate_ghs": 46121.46
+    },
+    {
+      "i2c_bus": 1,
+      "i2c_addr": "0x51",
+      "preamble": "05 11",
+      "board_name": "BHB56902",
+      "serial_number": "JYZZYR6BCJHCA0KRG",
+      "bom_version": "0x0000",
+      "pcb_version": "0x0003",
+      "chip_type": "BM1366",
+      "voltage_v": 13.9,
+      "frequency_mhz": 670,
+      "hashrate_ghs": 46121.46
+    },
+    {
+      "i2c_bus": 1,
+      "i2c_addr": "0x52",
+      "preamble": "05 11",
+      "board_name": "BHB56902",
+      "serial_number": "JYZZYR6BCJHCA0HNX",
+      "bom_version": "0x0000",
+      "pcb_version": "0x0003",
+      "chip_type": "BM1366",
+      "voltage_v": 13.9,
+      "frequency_mhz": 670,
+      "hashrate_ghs": 46121.46
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+# DCENT_OS AM335x/BeagleBone init table.
+
+::sysinit:/etc/dcentos-early-init.sh
+::sysinit:/etc/init.d/rcS
+
+# AM335x debug console. ttyO0 is used by the 3.8-era Bitmain kernel.
+ttyO0::respawn:/bin/login -f root
+
+::shutdown:/etc/init.d/rcK
+::shutdown:/bin/umount -a -r
+::restart:/sbin/init

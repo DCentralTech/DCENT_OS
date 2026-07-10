@@ -1,0 +1,54 @@
+# dcentrald.toml — Passthrough mode test (S9)
+# Rides bosminer's existing ASIC/FPGA state. Proves heartbeat survives mining.
+
+[general]
+hostname = "dcentral-s9"
+log_level = "debug"
+
+[pool]
+url = "stratum+tcp://solo.ckpool.org:3333"
+worker = ""
+password = "d=1"
+
+[mining]
+frequency_mhz = 650
+voltage_mv = 9100
+suggest_difficulty = 8192
+passthrough = true
+version_rolling = false
+
+[power]
+mode = "bypass"
+target_watts = 0
+
+[thermal]
+target_temp_c = 55
+hot_temp_c = 65
+dangerous_temp_c = 75
+fan_min_pwm = 10
+fan_max_pwm = 127
+
+[api]
+cgminer_port = 4029
+http_port = 8080
+websocket = true
+auth_enabled = false
+auth_password = ""
+
+[donation]
+enabled = false
+percent = 0.0
+pool_url = "stratum+tcp://donate.dcentral.pool:3333"
+worker = "dcentrald-donation"
+
+[watchdog]
+enabled = false
+
+[hash_on_disconnect]
+enabled = true
+
+[mode]
+active = "standard"
+
+[autotuner]
+enabled = false

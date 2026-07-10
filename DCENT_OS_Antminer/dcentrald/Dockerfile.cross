@@ -1,0 +1,42 @@
+# Rust cross-compilation environment for dcentrald
+#
+# Builds dcentrald for Antminer S9 (Zynq-7010, Cortex-A9, ARMv7-A hard-float)
+# Uses musl for fully static binary — no glibc dependency on target.
+#
+# Target: armv7-unknown-linux-musleabihf
+#
+# Usage:
+#   docker build -t dcentos-cross-rs -f Dockerfile.cross .
+#   docker run --rm -v $(pwd):/workspace -w /workspace dcentos-cross-rs \
+#       cargo build --release --target armv7-unknown-linux-musleabihf
+#
+# Output: target/armv7-unknown-linux-musleabihf/release/dcentrald
+
+# Rust 1.95 — the committed Cargo.lock pins icu_* 2.2.0 which requires
+# rustc >= 1.86; 1.95 matches the verified host toolchain (2026-04-14).
+FROM rust:1.95-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install ARM cross-compilers (both glibc and musl)
+RUN dpkg --add-architecture armhf && \
+    apt-get update && apt-get install -y \
+    gcc-arm-linux-gnueabihf \
+    libc6-dev-armhf-cross \
+    musl-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download and install musl cross-compiler for ARM hard-float
+RUN mkdir -p /opt/musl-cross && \
+    curl -sSL https://musl.cc/arm-linux-musleabihf-cross.tgz | \
+    tar xz -C /opt/musl-cross --strip-components=1
+
+ENV PATH="/opt/musl-cross/bin:${PATH}"
+
+# Add the musl ARM target to Rust
+RUN rustup target add armv7-unknown-linux-musleabihf
+
+WORKDIR /workspace
+
+# Default: build for musl ARM target (static binary)
+CMD ["cargo", "build", "--release", "--target", "armv7-unknown-linux-musleabihf"]

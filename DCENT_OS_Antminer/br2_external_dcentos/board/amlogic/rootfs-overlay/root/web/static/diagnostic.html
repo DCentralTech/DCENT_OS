@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DCENT_OS Diagnostic</title>
+<style>
+  :root {
+    --bg: #0e0f12;
+    --panel: #16181d;
+    --border: #2a2d36;
+    --text: #e8eaef;
+    --muted: #8a8f9a;
+    --orange: #FAA500;
+    --orange-deep: #FA6700;
+    --red: #ff4d4d;
+    --green: #3fcf5b;
+    --yellow: #ffce4d;
+    --mono: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font-family: system-ui, -apple-system, "Segoe UI", Inter, Roboto, sans-serif;
+         padding: 24px; line-height: 1.45; }
+  h1 { margin: 0 0 4px; font-size: 24px; letter-spacing: 0.3px; }
+  h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 1.2px;
+       color: var(--muted); margin: 0 0 8px; }
+  .top { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
+  .top .ver { color: var(--muted); font-size: 13px; }
+  .banner { padding: 16px 20px; border-radius: 8px; margin-bottom: 20px;
+            font-weight: 600; font-size: 16px; display: flex; align-items: center;
+            gap: 10px; }
+  .banner .pill { font-size: 11px; padding: 3px 8px; border-radius: 999px;
+                  text-transform: uppercase; letter-spacing: 1px; }
+  .banner.dead { background: #2a0e0e; border: 1px solid #5a1e1e; color: var(--red); }
+  .banner.dead .pill { background: var(--red); color: #fff; }
+  .banner.starting { background: #2a200e; border: 1px solid #5a401e; color: var(--yellow); }
+  .banner.starting .pill { background: var(--yellow); color: #000; }
+  .banner.alive { background: #0e2a14; border: 1px solid #1e5a28; color: var(--green); }
+  .banner.alive .pill { background: var(--green); color: #000; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .panel { background: var(--panel); border: 1px solid var(--border);
+           border-radius: 8px; padding: 16px; }
+  .panel.full { grid-column: 1 / -1; }
+  table { width: 100%; border-collapse: collapse; font-family: var(--mono);
+          font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; }
+  td.ok { color: var(--green); }
+  td.bad { color: var(--red); }
+  td.warn { color: var(--yellow); }
+  pre { font-family: var(--mono); font-size: 12px; background: #0a0b0d;
+        padding: 12px; border-radius: 6px; max-height: 320px; overflow: auto;
+        margin: 0; white-space: pre-wrap; word-break: break-all; }
+  .row { display: flex; gap: 8px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
+  button { background: var(--orange); color: #000; border: 0;
+           padding: 8px 14px; border-radius: 6px; font-weight: 600;
+           cursor: pointer; font-size: 13px; }
+  button:hover { background: var(--orange-deep); color: #fff; }
+  button.ghost { background: transparent; color: var(--text);
+                 border: 1px solid var(--border); }
+  button.ghost:hover { background: var(--border); }
+  .key { color: var(--muted); }
+  .val { font-family: var(--mono); }
+  #notif { position: fixed; bottom: 16px; right: 16px; background: var(--panel);
+           padding: 12px 18px; border-radius: 6px; border: 1px solid var(--border);
+           font-size: 13px; opacity: 0; transition: opacity 0.2s; }
+  #notif.show { opacity: 1; }
+  .footer { color: var(--muted); font-size: 12px; margin-top: 24px; }
+  .footer a { color: var(--orange); text-decoration: none; }
+</style>
+</head>
+<body>
+
+<div class="top">
+  <h1>DCENT_OS Diagnostic</h1>
+  <span class="ver" id="version">loading...</span>
+</div>
+
+<div id="banner" class="banner starting">
+  <span class="pill" id="banner-pill">PROBING</span>
+  <span id="banner-msg">Loading dashboard health...</span>
+</div>
+
+<div class="row">
+  <button onclick="restartDaemon()">Restart dcentrald</button>
+  <button class="ghost" onclick="reportIp()">Report IP (broadcast)</button>
+  <button class="ghost" onclick="runDspicProbe()">Run dspic-flash proto-probe</button>
+  <button class="ghost" onclick="refresh()">Refresh now</button>
+  <span class="key" style="margin-left:auto">Auto-refresh: every 5s</span>
+</div>
+
+<div class="grid">
+
+  <div class="panel">
+    <h2>Process</h2>
+    <table>
+      <tr><th>PID</th><td class="val" id="pid">—</td></tr>
+      <tr><th>Status</th><td class="val" id="status">—</td></tr>
+      <tr><th>Uptime</th><td class="val" id="uptime">—</td></tr>
+      <tr><th>API bound :8080</th><td class="val" id="api-bound">—</td></tr>
+      <tr><th>Version (host)</th><td class="val" id="ver-host">—</td></tr>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>Network</h2>
+    <table>
+      <tr><th>Hostname</th><td class="val" id="hostname">—</td></tr>
+      <tr><th>IP</th><td class="val" id="ip">—</td></tr>
+      <tr><th>MAC</th><td class="val" id="mac">—</td></tr>
+      <tr><th>Slot</th><td class="val" id="slot">—</td></tr>
+      <tr><th>upgrade_stage</th><td class="val" id="upgrade-stage">—</td></tr>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>dsPIC probe (single-byte read at I2C bus 0)</h2>
+    <table id="dspic-tbl">
+      <tr><th>Address</th><th>Present</th><th>Raw byte</th><th>Notes</th></tr>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>FPGA UART relay (read-only mirrors per Wave 1-4)</h2>
+    <table id="fpga-tbl">
+      <tr><th>Register</th><th>Value</th></tr>
+    </table>
+  </div>
+
+  <div class="panel full">
+    <h2>Last error</h2>
+    <pre id="last-error">—</pre>
+  </div>
+
+  <div class="panel full">
+    <h2>dcentrald log tail</h2>
+    <pre id="log-tail">—</pre>
+  </div>
+
+  <div class="panel full">
+    <h2>dspic-flash proto-probe (run on demand)</h2>
+    <pre id="dspic-probe">Click "Run dspic-flash proto-probe" to query the dsPIC at 0x21.</pre>
+  </div>
+
+</div>
+
+<div id="notif"></div>
+
+<div class="footer">
+  DCENT_OS by D-Central Technologies — <a href="/recovery">Recovery steps</a> · <a href="/">Main dashboard</a>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+function notify(msg) {
+  const n = $("notif"); n.textContent = msg; n.classList.add("show");
+  setTimeout(() => n.classList.remove("show"), 2500);
+}
+function setBanner(status) {
+  const b = $("banner"); b.className = "banner " + status;
+  const p = $("banner-pill"); const m = $("banner-msg");
+  if (status === "alive") { p.textContent = "ALIVE"; m.textContent = "dcentrald is running and the API is bound."; }
+  else if (status === "starting") { p.textContent = "STARTING"; m.textContent = "Process is up but the API isn't bound yet."; }
+  else { p.textContent = "DEAD"; m.textContent = "dcentrald is not running. Diagnostic data is from server.py only."; }
+}
+function fmtUptime(s) {
+  if (s === null || s === undefined) return "—";
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s/60) + "m " + (s%60) + "s";
+  return Math.floor(s/3600) + "h " + Math.floor((s%3600)/60) + "m";
+}
+function fwHint(raw) {
+  if (!raw) return "";
+  const v = parseInt(raw, 16);
+  if (v === 0x82) return "fw=0x82 (production)";
+  if (v === 0x86) return "fw=0x86 (LOCKED — downgraded)";
+  if (v === 0x89) return "fw=0x89 (production)";
+  if (v === 0x8A) return "fw=0x8A (production)";
+  if (v === 0xff) return "0xFF (silent)";
+  return "unknown";
+}
+async function refresh() {
+  try {
+    const r = await fetch("/api/dashboard/health", { cache: "no-store" });
+    const d = await r.json();
+    setBanner(d.dcentrald_status || (d.alive ? "alive" : "dead"));
+    $("pid").textContent = d.pid || "—";
+    $("status").textContent = d.dcentrald_status || (d.alive ? "alive" : "dead");
+    $("uptime").textContent = fmtUptime(d.uptime_s);
+    $("api-bound").textContent = d.api_bound ? "yes" : "no";
+    $("ver-host").textContent = d.dcentrald_version || "—";
+    $("version").textContent = "v" + (d.version || "dev") + " · " + new Date().toLocaleTimeString();
+
+    if (d.network) {
+      $("hostname").textContent = d.network.hostname || "—";
+      $("ip").textContent = d.network.ip || "—";
+      $("mac").textContent = d.network.mac || "—";
+    }
+    if (d.slot) {
+      $("slot").textContent = d.slot.firmware || "—";
+      $("upgrade-stage").textContent = d.slot.upgrade_stage || "—";
+    }
+    const dspicTbl = $("dspic-tbl");
+    dspicTbl.innerHTML = "<tr><th>Address</th><th>Present</th><th>Raw byte</th><th>Notes</th></tr>";
+    if (d.dspic_probe) {
+      for (const [addr, info] of Object.entries(d.dspic_probe)) {
+        const tr = document.createElement("tr");
+        const presentTd = `<td class="${info.present ? "ok" : "bad"}">${info.present ? "yes" : "no"}</td>`;
+        const rawTd = `<td>${info.raw_byte || info.error || "—"}</td>`;
+        const noteTd = `<td>${info.present ? fwHint(info.raw_byte) : ""}</td>`;
+        tr.innerHTML = `<td>${addr}</td>${presentTd}${rawTd}${noteTd}`;
+        dspicTbl.appendChild(tr);
+      }
+    }
+    const fpgaTbl = $("fpga-tbl");
+    fpgaTbl.innerHTML = "<tr><th>Register</th><th>Value</th></tr>";
+    // W13.B1 (2026-05-10): renamed from `fpga_uart_relay` — Braiins glitch
+    // monitor mirror is diagnostic-only (Braiins-am2 only); on Amlogic this
+    // is always a no-op shape (no FPGA, no mirror).
+    if (d.braiins_glitch_mirror) {
+      for (const [reg, val] of Object.entries(d.braiins_glitch_mirror)) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td>${reg}</td><td>${val || "—"}</td>`;
+        fpgaTbl.appendChild(tr);
+      }
+    }
+    $("last-error").textContent = d.dcentrald_last_error || "(no recent error)";
+    $("log-tail").textContent = (d.dcentrald_log_tail || []).join("\n") || "(log empty or unavailable)";
+  } catch (e) {
+    setBanner("dead");
+    $("banner-msg").textContent = "Dashboard endpoint unreachable: " + e.message;
+  }
+}
+async function restartDaemon() {
+  if (!confirm("Restart dcentrald? Mining will pause for ~5-30s.")) return;
+  try {
+    const r = await fetch("/api/dashboard/restart-dcentrald", { method: "POST" });
+    const d = await r.json();
+    notify("Restart initiated · " + (d.status || "ok"));
+    setTimeout(refresh, 3000);
+  } catch (e) { notify("Error: " + e.message); }
+}
+async function reportIp() {
+  try {
+    const r = await fetch("/api/dashboard/report-ip", { method: "POST" });
+    const d = await r.json();
+    notify("IP report broadcast (" + (d.method || d.status) + ")");
+  } catch (e) { notify("Error: " + e.message); }
+}
+async function runDspicProbe() {
+  $("dspic-probe").textContent = "Probing 0x21...";
+  try {
+    const r = await fetch("/api/dashboard/dspic-flash-probe");
+    const d = await r.json();
+    $("dspic-probe").textContent = JSON.stringify(d, null, 2);
+  } catch (e) { $("dspic-probe").textContent = "Error: " + e.message; }
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

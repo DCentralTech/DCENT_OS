@@ -1,0 +1,72 @@
+#!/bin/sh
+#
+# S37board_setup - AM335x BB safe GPIO/PWM defaults.
+
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+export_gpio() {
+    gpio=$1
+    [ -d "/sys/class/gpio/gpio${gpio}" ] && return 0
+    echo "$gpio" > /sys/class/gpio/export 2>/dev/null || true
+}
+
+gpio_set_out() {
+    gpio=$1
+    value=$2
+    active_low=$3
+    export_gpio "$gpio"
+    dir="/sys/class/gpio/gpio${gpio}"
+    [ -d "$dir" ] || return 0
+    echo "$active_low" > "$dir/active_low" 2>/dev/null || true
+    echo out > "$dir/direction" 2>/dev/null || true
+    echo "$value" > "$dir/value" 2>/dev/null || true
+}
+
+set_pwm_quiet() {
+    chip=$1
+    chan=$2
+    base="/sys/class/pwm/${chip}"
+    pwm="${base}/pwm${chan}"
+    [ -d "$base" ] || return 0
+    [ -d "$pwm" ] || echo "$chan" > "${base}/export" 2>/dev/null || true
+    [ -d "$pwm" ] || return 0
+    echo 100000 > "$pwm/period" 2>/dev/null || true
+    echo 10000 > "$pwm/duty_cycle" 2>/dev/null || true
+    echo 1 > "$pwm/enable" 2>/dev/null || true
+}
+
+am3_bb_safe_defaults() {
+    # S19J_IO_BOARD_V2_0 reset lines are active-low through sysfs
+    # active_low=1; value=1 asserts reset. Board-enable gpio59 is
+    # active-high, so value=0 keeps the hashboard rail off.
+    for gpio in 49 60 27 22; do
+        gpio_set_out "$gpio" 1 1
+    done
+    gpio_set_out 59 0 0
+
+    # Quiet boot default. With hashboards held in reset, 10% PWM avoids a
+    # cold-boot fan blast while dcentrald has not taken ownership yet.
+    set_pwm_quiet pwmchip0 0
+    set_pwm_quiet pwmchip0 1
+    set_pwm_quiet pwmchip2 0
+
+    [ -e /sys/class/pwm/pwm1/duty_ns ] && echo 10000 > /sys/class/pwm/pwm1/duty_ns 2>/dev/null || true
+    [ -e /sys/class/pwm/pwm2/duty_ns ] && echo 10000 > /sys/class/pwm/pwm2/duty_ns 2>/dev/null || true
+}
+
+case "$1" in
+    start|"")
+        echo "  Initializing AM335x BB safe GPIO/PWM defaults..."
+        am3_bb_safe_defaults
+        echo "  [OK] AM335x BB board setup complete"
+        ;;
+    stop)
+        :
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

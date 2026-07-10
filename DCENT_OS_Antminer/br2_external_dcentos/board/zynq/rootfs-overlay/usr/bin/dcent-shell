@@ -1,0 +1,345 @@
+#!/bin/bash
+#
+# dcent-shell — DCENTos Interactive Research Toolkit
+# D-Central Technologies, 2026
+#
+# Interactive menu-driven interface for hardware research on Antminer S9.
+# Wraps our Python tools and system utilities into a guided workflow.
+#
+
+VERSION="0.1"
+TOOLS_DIR="/root/tools"
+LOG_DIR="/tmp/dcentos-logs"
+
+mkdir -p "$LOG_DIR"
+
+# Colors
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[1;34m'
+CYAN='\033[1;36m'
+NC='\033[0m'
+
+banner() {
+    echo -e "${CYAN}"
+    echo "  ╔═══════════════════════════════════════════╗"
+    echo "  ║        DCENT_OS Research Shell             ║"
+    echo "  ║        D-Central Technologies             ║"
+    echo "  ║        v${VERSION} — S9 Target                   ║"
+    echo "  ╚═══════════════════════════════════════════╝"
+    echo -e "${NC}"
+}
+
+show_menu() {
+    echo ""
+    echo -e "${YELLOW}=== Main Menu ===${NC}"
+    echo ""
+    echo -e "  ${GREEN}1)${NC} System Reconnaissance     — I2C scan, FPGA regs, UART ports, MTD info"
+    echo -e "  ${GREEN}2)${NC} ASIC Chain Operations     — Enumerate chips, scan registers, read PLL"
+    echo -e "  ${GREEN}3)${NC} Power & Voltage           — PSU probe, PIC commands, voltage readings"
+    echo -e "  ${GREEN}4)${NC} Temperature Discovery     — Find temp registers, monitor thermal"
+    echo -e "  ${GREEN}5)${NC} Assumption Verifier       — Automated tests against our assumptions"
+    echo -e "  ${GREEN}6)${NC} Full Test Suite            — Run everything, generate report"
+    echo -e "  ${GREEN}7)${NC} Raw Hardware Access        — devmem, i2cget/set, UART send"
+    echo -e "  ${GREEN}8)${NC} View Logs                  — Browse previous test results"
+    echo -e "  ${GREEN}9)${NC} System Info                — Memory, modules, network, uptime"
+    echo -e "  ${GREEN}0)${NC} Bash Shell                 — Drop to regular bash"
+    echo -e "  ${GREEN}q)${NC} Quit"
+    echo ""
+}
+
+log_and_run() {
+    local desc="$1"
+    shift
+    local logfile="$LOG_DIR/$(date +%Y%m%d_%H%M%S)_${desc}.log"
+    echo -e "${BLUE}Running: $@${NC}"
+    echo "=== $desc ===" > "$logfile"
+    echo "Command: $@" >> "$logfile"
+    echo "Time: $(date)" >> "$logfile"
+    echo "---" >> "$logfile"
+    "$@" 2>&1 | tee -a "$logfile"
+    echo ""
+    echo -e "${GREEN}Log saved: $logfile${NC}"
+}
+
+menu_recon() {
+    echo ""
+    echo -e "${YELLOW}=== System Reconnaissance ===${NC}"
+    echo ""
+    echo "1) Scan all I2C buses"
+    echo "2) Read FPGA registers (first 16)"
+    echo "3) List serial ports"
+    echo "4) Show NAND partition table"
+    echo "5) Show UIO devices"
+    echo "6) Full recon (all of the above)"
+    echo "b) Back"
+    echo ""
+    read -p "Choice: " choice
+    case $choice in
+        1) log_and_run "i2c_scan" sh -c 'for b in 0 1 2 3 4 5 6 7; do echo "=== Bus $b ==="; i2cdetect -y $b 2>/dev/null || echo "  (not available)"; done' ;;
+        2) log_and_run "fpga_regs" sh -c 'for off in 0x00 0x04 0x08 0x0C 0x10 0x14 0x18 0x1C 0x20 0x24 0x28 0x2C 0x30 0x34 0x38 0x3C; do printf "0x43C0%04s: " "$off"; devmem $((0x43C00000 + 0x$off)) 32 2>/dev/null || echo "N/A"; done' ;;
+        3) log_and_run "serial_ports" sh -c 'ls -la /dev/ttyPS* /dev/ttyS* /dev/ttyAMA* 2>/dev/null || echo "No serial ports found"' ;;
+        4) log_and_run "mtd_info" cat /proc/mtd ;;
+        5) log_and_run "uio_devices" sh -c 'for u in /sys/class/uio/uio*; do echo "$(basename $u): $(cat $u/name 2>/dev/null) @ $(cat $u/maps/map0/addr 2>/dev/null)"; done' ;;
+        6)
+            log_and_run "full_recon" sh -c '
+                echo "=== I2C Buses ==="
+                for b in 0 1 2 3 4 5 6 7; do
+                    echo "--- Bus $b ---"
+                    i2cdetect -y $b 2>/dev/null || echo "  (not available)"
+                done
+                echo ""
+                echo "=== FPGA Registers ==="
+                for off in 0x00 0x04 0x08 0x0C 0x10 0x14 0x18 0x1C; do
+                    printf "0x43C0%04s: " "$off"
+                    devmem $((0x43C00000 + 0x$off)) 32 2>/dev/null || echo "N/A"
+                done
+                echo ""
+                echo "=== Serial Ports ==="
+                ls -la /dev/ttyPS* /dev/ttyS* /dev/ttyAMA* 2>/dev/null || echo "None found"
+                echo ""
+                echo "=== NAND Partitions ==="
+                cat /proc/mtd
+                echo ""
+                echo "=== UIO Devices ==="
+                for u in /sys/class/uio/uio*; do echo "$(basename $u): $(cat $u/name 2>/dev/null) @ $(cat $u/maps/map0/addr 2>/dev/null)"; done
+                echo ""
+                echo "=== Memory ==="
+                free -h
+                echo ""
+                echo "=== CPU ==="
+                cat /proc/cpuinfo | head -20
+            '
+            ;;
+        b|B) return ;;
+        *) echo "Invalid choice" ;;
+    esac
+}
+
+menu_asic() {
+    echo ""
+    echo -e "${YELLOW}=== ASIC Chain Operations ===${NC}"
+    echo ""
+    echo "1) Enumerate chain (discover all BM1387 chips)"
+    echo "2) Scan registers on chip 0"
+    echo "3) Scan registers on ALL chips"
+    echo "4) Read PLL frequency (all chips)"
+    echo "5) Send raw register read"
+    echo "b) Back"
+    echo ""
+    read -p "Choice: " choice
+    case $choice in
+        1) log_and_run "chain_enum" python3 "$TOOLS_DIR/asic_enumerator.py" --port /dev/ttyPS1 ;;
+        2) log_and_run "reg_scan_0" python3 "$TOOLS_DIR/register_scanner.py" --port /dev/ttyPS1 --chip 0 ;;
+        3) log_and_run "reg_scan_all" python3 "$TOOLS_DIR/register_scanner.py" --port /dev/ttyPS1 --all-chips ;;
+        4) log_and_run "pll_read" python3 "$TOOLS_DIR/register_scanner.py" --port /dev/ttyPS1 --all-chips --register 0x0C ;;
+        5)
+            read -p "Chip address (0-252, step 4): " addr
+            read -p "Register (hex, e.g. 0x00): " reg
+            log_and_run "raw_read" python3 "$TOOLS_DIR/register_scanner.py" --port /dev/ttyPS1 --chip "$addr" --register "$reg"
+            ;;
+        b|B) return ;;
+        *) echo "Invalid choice" ;;
+    esac
+}
+
+menu_power() {
+    echo ""
+    echo -e "${YELLOW}=== Power & Voltage ===${NC}"
+    echo ""
+    echo "1) Probe PSU (I2C scan + PMBus read)"
+    echo "2) Read PSU voltage/current/power"
+    echo "3) Read PIC voltage (all boards)"
+    echo "4) Read TMP75 temperatures (all sensors)"
+    echo "b) Back"
+    echo ""
+    read -p "Choice: " choice
+    case $choice in
+        1) log_and_run "psu_probe" python3 "$TOOLS_DIR/psu_probe.py" --scan ;;
+        2) log_and_run "psu_read" python3 "$TOOLS_DIR/psu_probe.py" --read ;;
+        3) log_and_run "pic_voltage" python3 "$TOOLS_DIR/psu_probe.py" --pic ;;
+        4)
+            log_and_run "tmp75_temp" sh -c '
+                echo "=== TMP75 Temperature Sensors ==="
+                for addr in 0x48 0x49 0x4a 0x4b 0x4c 0x4d 0x4e 0x4f; do
+                    for bus in 0 1 2; do
+                        raw=$(i2cget -y $bus $addr 0x00 w 2>/dev/null)
+                        if [ $? -eq 0 ] && [ -n "$raw" ]; then
+                            # TMP75: 12-bit, big-endian, resolution 0.0625C
+                            printf "Bus %d Addr %s: raw=0x%04X\n" $bus $addr $((raw))
+                        fi
+                    done
+                done
+            '
+            ;;
+        b|B) return ;;
+        *) echo "Invalid choice" ;;
+    esac
+}
+
+menu_temp() {
+    echo ""
+    echo -e "${YELLOW}=== Temperature Discovery ===${NC}"
+    echo ""
+    echo "1) Scan for temperature registers (chip 0)"
+    echo "2) Monitor temperature candidates over time"
+    echo "3) Compare temperatures across chips"
+    echo "b) Back"
+    echo ""
+    read -p "Choice: " choice
+    case $choice in
+        1) log_and_run "temp_find" python3 "$TOOLS_DIR/temp_finder.py" --port /dev/ttyPS1 --chip 0 ;;
+        2) log_and_run "temp_monitor" python3 "$TOOLS_DIR/temp_finder.py" --port /dev/ttyPS1 --chip 0 --monitor --duration 60 ;;
+        3) log_and_run "temp_compare" python3 "$TOOLS_DIR/temp_finder.py" --port /dev/ttyPS1 --compare --chips 0,4,8 ;;
+        b|B) return ;;
+        *) echo "Invalid choice" ;;
+    esac
+}
+
+menu_verify() {
+    echo ""
+    echo -e "${YELLOW}=== Assumption Verifier ===${NC}"
+    echo ""
+    echo "1) Run all verifiable assumptions"
+    echo "2) Run specific category (ASIC protocol)"
+    echo "3) Run specific category (I2C/power)"
+    echo "4) Run specific category (FPGA/registers)"
+    echo "5) Show assumption list"
+    echo "b) Back"
+    echo ""
+    read -p "Choice: " choice
+    case $choice in
+        1) log_and_run "verify_all" python3 "$TOOLS_DIR/assumption_verifier.py" --all ;;
+        2) log_and_run "verify_asic" python3 "$TOOLS_DIR/assumption_verifier.py" --category asic ;;
+        3) log_and_run "verify_power" python3 "$TOOLS_DIR/assumption_verifier.py" --category power ;;
+        4) log_and_run "verify_fpga" python3 "$TOOLS_DIR/assumption_verifier.py" --category fpga ;;
+        5) python3 "$TOOLS_DIR/assumption_verifier.py" --list ;;
+        b|B) return ;;
+        *) echo "Invalid choice" ;;
+    esac
+}
+
+menu_raw() {
+    echo ""
+    echo -e "${YELLOW}=== Raw Hardware Access ===${NC}"
+    echo -e "${RED}WARNING: Direct hardware access. Be careful with writes.${NC}"
+    echo ""
+    echo "1) devmem read (FPGA register)"
+    echo "2) devmem write (FPGA register) [CAREFUL!]"
+    echo "3) i2cget (read I2C register)"
+    echo "4) i2cset (write I2C register) [CAREFUL!]"
+    echo "5) i2cdump (dump I2C device)"
+    echo "6) Configure UART (/dev/ttyPS1)"
+    echo "7) Send raw hex to UART"
+    echo "b) Back"
+    echo ""
+    read -p "Choice: " choice
+    case $choice in
+        1)
+            read -p "Address (hex, e.g. 0x43C00000): " addr
+            devmem "$addr" 32
+            ;;
+        2)
+            read -p "Address (hex): " addr
+            read -p "Value (hex): " val
+            echo -e "${RED}Writing $val to $addr${NC}"
+            read -p "Confirm? (yes/no): " confirm
+            [ "$confirm" = "yes" ] && devmem "$addr" 32 "$val"
+            ;;
+        3)
+            read -p "Bus (0-7): " bus
+            read -p "Device address (hex): " dev
+            read -p "Register (hex): " reg
+            i2cget -y "$bus" "$dev" "$reg"
+            ;;
+        4)
+            read -p "Bus (0-7): " bus
+            read -p "Device address (hex): " dev
+            read -p "Register (hex): " reg
+            read -p "Value (hex): " val
+            echo -e "${RED}Writing $val to bus=$bus dev=$dev reg=$reg${NC}"
+            read -p "Confirm? (yes/no): " confirm
+            [ "$confirm" = "yes" ] && i2cset -y "$bus" "$dev" "$reg" "$val"
+            ;;
+        5)
+            read -p "Bus (0-7): " bus
+            read -p "Device address (hex): " dev
+            i2cdump -y "$bus" "$dev"
+            ;;
+        6)
+            stty -F /dev/ttyPS1 115200 cs8 -cstopb -parenb raw
+            echo "UART configured: 115200 8N1 raw"
+            ;;
+        7)
+            read -p "Hex bytes (space-separated, e.g. 54 00 00 0A): " hexbytes
+            echo "$hexbytes" | xxd -r -p > /dev/ttyPS1
+            echo "Sent. Reading response (2s timeout)..."
+            timeout 2 xxd /dev/ttyPS1 | head -5
+            ;;
+        b|B) return ;;
+        *) echo "Invalid choice" ;;
+    esac
+}
+
+menu_logs() {
+    echo ""
+    echo -e "${YELLOW}=== Logs ===${NC}"
+    echo ""
+    if [ -z "$(ls -A $LOG_DIR 2>/dev/null)" ]; then
+        echo "No logs yet. Run some tests first!"
+        return
+    fi
+    echo "Available logs:"
+    ls -lt "$LOG_DIR" | head -20
+    echo ""
+    read -p "View a log (filename or 'b' to go back): " logfile
+    [ "$logfile" = "b" ] && return
+    if [ -f "$LOG_DIR/$logfile" ]; then
+        less "$LOG_DIR/$logfile"
+    else
+        echo "File not found."
+    fi
+}
+
+menu_sysinfo() {
+    echo ""
+    echo -e "${YELLOW}=== System Info ===${NC}"
+    echo ""
+    echo "Hostname:  $(hostname)"
+    echo "Kernel:    $(uname -r)"
+    echo "Uptime:    $(uptime -p 2>/dev/null || uptime)"
+    echo "Memory:    $(free -h 2>/dev/null | grep Mem | awk '{print $3 "/" $2}')"
+    echo "CPU:       $(grep 'model name' /proc/cpuinfo 2>/dev/null | head -1 | cut -d: -f2 || echo 'N/A')"
+    echo ""
+    echo "Network:"
+    ip addr show eth0 2>/dev/null | grep 'inet '
+    echo ""
+    echo "UIO Devices:"
+    for u in /sys/class/uio/uio*; do [ -d "$u" ] && echo "  $(basename $u): $(cat $u/name 2>/dev/null)"; done 2>/dev/null || echo "  none"
+    echo ""
+    echo "NAND:"
+    cat /proc/mtd 2>/dev/null || echo "  mtd not available"
+    echo ""
+}
+
+# Main loop
+banner
+while true; do
+    show_menu
+    read -p "Choice: " choice
+    case $choice in
+        1) menu_recon ;;
+        2) menu_asic ;;
+        3) menu_power ;;
+        4) menu_temp ;;
+        5) menu_verify ;;
+        6) log_and_run "full_test" /root/tools/test_suite.sh ;;
+        7) menu_raw ;;
+        8) menu_logs ;;
+        9) menu_sysinfo ;;
+        0) echo "Dropping to bash. Type 'dcent-shell' to return."; exec /bin/bash ;;
+        q|Q) echo "Goodbye!"; exit 0 ;;
+        *) echo "Invalid choice." ;;
+    esac
+done

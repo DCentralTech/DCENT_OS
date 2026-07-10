@@ -1,0 +1,41 @@
+# DCENT_OS
+
+> DCENT_OS is D-Central Technologies' free, open-source (GPL-3.0) Bitcoin mining firmware family for
+> industrial Bitmain Antminer hardware (S9 through S21) and ESP32-S3 Bitaxe-class miners (Max through
+> Hex Supra). It turns industrial and desktop Bitcoin ASICs into quiet, efficient home mining space
+> heaters. It has no mandatory developer fee, uses local-first dashboards with no cloud account or
+> telemetry, and keeps the ESP product identity as DCENT_axe under the DCENT_OS umbrella. Built by
+> D-Central Technologies, Canada's leading Bitcoin mining technology company (founded 2016, Laval,
+> Quebec; 2,500+ miners repaired).
+
+## Key facts
+- License: GPL-3.0 (firmware, plus tools and helper scripts unless a file states otherwise). Open-hardware board designs live in the separate DCENT_axe repository under CERN-OHL-S-2.0.
+- Mandatory dev fee: none (optional, transparent, disableable donation; 0% is valid)
+- Language: Rust mining daemon (`dcentrald`) on Buildroot Linux, plus Rust ESP-IDF firmware (`dcentaxe`) as the DCENT_OS-for-ESP member documented in `docs/ESP_DEVICES.md`
+- Mining-proven platforms: Antminer S9, S19 Pro, S19j Pro (Zynq & BeagleBone), S21
+- Install readiness boundary: the S9-to-S21 and Bitaxe-class ranges are family/status coverage, not a blanket production-install-ready claim. S9 and S19j Pro Xilinx remain public-artifact/live-capstone gated; S17, base S19, S19k Pro, and stock AMLCtrl S21 remain evidence/lab gated.
+- ESP tier status: Bitaxe Max/Ultra/Supra/Gamma and Hex Ultra/Supra are the public install targets; drivers are proven and host-tested, Gamma is live-verified, legacy BM1370 lab evidence remains internal context, Hex Supra dispatcher/job-id recovery is live-proven, and LoRa mesh is scaffolded, default-OFF, and not wired into the binary
+- Unique feature: universal Antminer hash-board compatibility via ChipID auto-detection, qualified as validated/lab compatibility until each mixed board route has install evidence, plus shared DCENT_OS design language across ESP Bitaxe-class devices
+- Default pool: DCENT_Pool, a trustless Solo/Guild pool (solo mining with optional guild reward-sharing)
+- Maintainer/direction: D-Central Technologies (sole project direction; open to forks under GPL)
+
+## Documentation
+- [README](README.md): overview, features, quick start, comparison, FAQ
+- [Supported platforms](docs/PLATFORMS.md): per-model status split by mining evidence and public install readiness
+- [How it compares](docs/COMPARISON.md): DCENT_OS vs Braiins OS+, LuxOS, VNish
+- [FAQ](docs/FAQ.md): common questions and answers
+- [Configuration](docs/CONFIGURATION.md): the dcentrald.toml reference
+- [Install guides](docs/INSTALL/): per-platform install procedures
+- [Architecture](docs/DCENTRALD_ARCHITECTURE.md): runtime and system design
+- [DCENT_OS for ESP](docs/ESP_DEVICES.md): Bitaxe-class ESP32-S3 firmware member (`dcentaxe`)
+
+## Project
+- [Governance](GOVERNANCE.md): D-Central sets direction; GPL guarantees the right to fork
+- [Contributing](CONTRIBUTING.md): how to contribute
+- [Security policy](SECURITY.md): responsible disclosure to security@d-central.tech
+
+## About
+- [D-Central Technologies](https://d-central.tech/): the company behind DCENT_OS
+- [DCENT_OS product page](https://d-central.tech/dcent-os/)
+- [DCENT_OS for ESP / DCENT_axe](docs/ESP_DEVICES.md): ESP32-S3 Bitaxe-class firmware member
+- [DCENT Expansion Pack](https://github.com/DCentralTech/DCENT_ExpansionPack): open-hardware Wi-Fi/OLED/temperature bridge

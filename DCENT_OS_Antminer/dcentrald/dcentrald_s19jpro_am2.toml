@@ -1,0 +1,234 @@
+# DCENT_OS dcentrald config — S19j Pro am2 (zynq-bm3-am2, BM1362, PIC FW 0x89)
+#
+# Example config for an S19j Pro am2 (Zynq) unit. Tune the values below for
+# your hardware (board population, PSU rail, baud, frequency/voltage).
+#   - BraiinsOS+ baseline, bosminer crate `bosminer_am2_s17`
+#
+# S19j Pro am2 hardware facts (reference):
+#   - zynq-bm3-am2 platform, BM1362 chip, PIC 0x89 at I2C 0x21
+#   - 2 of 3 boards populated: chain1 @0x43C00000 + chain4 @0x43C30000
+#   - APW121215a PSU (framed I2C 0x10), 15.2 V rail, dsPIC regulates 13.7 V per-chain
+#   - 3.125 Mbaud mining, CTRL=0x00901002, MIDSTATE_CNT=1 (2 midstates)
+#
+# Live-probe reference notes:
+#   - CTRL = 0x00901002 verbatim on both populated chains while mining ~69 TH/s
+#   - WORK_TIME is NOT a dedicated FPGA register on am2 — bosminer embeds it
+#     in the work-tx FIFO payload. Common+0x14 = constant 0x00000001.
+#   - Glitch-monitor is the Braiins-am2 bitstream's diagnostic mirror of
+#     BM1362 reg 0x2C (+0x30/+0x34). Read-only on stock; NEVER load-bearing
+#     (W13.B1 reclassification). Stock CV1835/AM335x/AML/S9 do not populate
+#     this IP at all.
+#
+# Phase 5 changes vs Phase 4 (2026-04-20, investigation/10-psu-watchdog.md +
+# investigation/12-bosminer-startup-timeline.md):
+#   - NEW [psu] section carrying the APW121215a rail parameters that bosminer
+#     configures. Previously these were hard-coded inside the am2 path.
+#   - `mining.voltage_mv` semantics clarified: it is the per-CHAIN target that
+#     the dsPIC regulates to, NOT the PSU rail. The PSU rail is 15.2 V; the
+#     dsPIC steps it down to 13.7 V for the chain.
+#   - PSU heartbeat cadence (1 Hz) + hardware watchdog (opcode 0x81, ~30 s)
+#     are now schema-driven, matching bosminer's startup timeline.
+#
+# NEVER-VIOLATE rules (enforced by the daemon regardless of config):
+#   - MiscCtrl triple-write with 5 ms spacing
+#   - Deferred voltage gate on 5 stable heartbeat ticks
+#   - Board-temp I2C NACK → XADC die-temp fallback
+#   - PIC RESET NEVER sent on S19j Pro
+#   - AXI IIC unbind/SOFTR NEVER on am2
+#   - PSU I2C probe DISABLED entirely on am2 family;
+#     framed heartbeat/watchdog writes on bus 0 @ 0x10 remain legal — the probe
+#     ban is specifically the GPIO bit-bang probe path.
+#
+# Deploy:
+#   bash DCENT_OS_Antminer/scripts/dev_deploy.sh <MINER_IP> \
+#       --config DCENT_OS_Antminer/dcentrald/dcentrald_s19jpro_am2.toml --verify
+#
+# Schema: this file only uses keys that exist in dcentrald/src/config.rs
+# Serde structs. Legacy hand-invented sections ([platform] / [chain] / [pic] /
+# [fan] / [safety] / [voltage] / [frequency]) were silently dropped by
+# the TOML parser and have been removed. Agent δ may reintroduce new sections
+# after landing the matching config.rs struct additions — see TODO markers.
+# Phase 5B Agent D landed [psu]; other sections still pending.
+
+[general]
+hostname = "dcentos-s19jpro-am2"
+log_level = "info"
+
+[pool]
+# Set your own pool and worker before mining. Empty by default so a fresh unit
+# never mines to someone else's account.
+url = ""
+worker = ""
+password = "x"
+protocol = "sv1"
+
+[mining]
+# Bring-up flag — false = idle-first (API only). Phase 4B Stage 3 needs true
+# for own-work dispatch on the FPGA WORK_TX FIFO.
+enabled = true
+
+# Conservative vs bosminer's autotuned 531–556 MHz. Walk up from 525 MHz
+# after the first own-dispatch nonce is confirmed. BM1362 model range is
+# 400-597 MHz (see BM1362_PLL_TABLE in s19j_hybrid_mining.rs:162).
+frequency_mhz = 525
+
+# PER-CHAIN target voltage (mV) — the dsPIC regulates the APW's 15.2 V rail
+# down to this value. SEMANTIC CHANGE vs Phase 4: this is NOT the PSU rail
+# voltage; the PSU rail now lives in [psu].voltage_mv (= 15200 mV). Clamp
+# (5000-20000 mV) still handled by config.rs validate().
+voltage_mv = 13700
+
+# Pool difficulty hint. 8192 keeps share rate calm during bring-up.
+suggest_difficulty = 8192
+
+# Cold-boot init path (NOT passthrough). dcentrald runs the full BM1362 init
+# sequence over /dev/ttyS2, then dispatches work through the am2 FPGA WORK_TX
+# FIFO at 0x43C03000 (chain1). CMD FIFO is DEAD on am2 — never used.
+passthrough = false
+
+# Hybrid BM1362 FPGA dispatch keeps ASIC-side version rolling DISABLED; the
+# FPGA metadata cannot reconstruct rolled version bits truthfully, so we must
+# submit shares at the base version to avoid malformed stratum submits.
+version_rolling = false
+
+# am2 chain1 serial = ttyS2. Chain1 phys-addr-2 populated.
+serial_device = "/dev/ttyS2"
+serial_chip_count = 126
+serial_chip_type = "BM1362"
+
+# am2 chain1 FPGA base (live probe — uio0..uio3).
+# chain4 (second populated board) is at 0x43C30000 — spawn a second
+# S19jHybridMiner instance keyed off that base for dual-chain operation.
+fpga_chain_base = "0x43C00000"
+fpga_chain_id = 1
+
+# Forces MinerProfile selection bypassing chip auto-detection.
+# "s19jpro" normalizes to the BM1362 profile.
+model = "s19jpro"
+
+# Diagnostic toggle for zero-nonce investigations.
+# Only effective with passthrough=true.
+skip_fifo_reset = false
+
+# PIC I2C passthrough board-temp reads corrupt MiscCtrl on some am2 units.
+# When true, thermal controller falls back to XADC die temp only (safe floor).
+skip_board_temp = false
+
+[power]
+# APW121215a shared 15.2 V rail — psu_override is NOT needed because the am2
+# PSU is smart-PMBus-framed. Disabled here; the Loki-bypass path is APW3/APW7.
+psu_bypass = false
+
+# Absolute max wattage safety rail (3-board S19j Pro at 525 MHz ≈ 2600 W;
+# we run 2-board ≈ 1800 W and set the ceiling a bit higher for headroom).
+max_watts = 2200
+
+# Circuit capacity for dashboard headroom display. 20 A × 240 V = 4800 W.
+circuit_capacity_watts = 4800
+circuit_voltage_v = 240
+circuit_amperage_a = 20
+
+[psu]
+# APW121215a rail voltage (PSU level). The dsPIC regulates down to per-chain
+# 13.7 V during mining. Matches bosminer's configured rail.
+voltage_mv = 15200
+
+# Heartbeat cadence (Hz). APW121215a has ~30s hardware watchdog — 1 Hz is the
+# bosminer-verified baseline.
+heartbeat_hz = 1
+
+# Arm the PSU hardware watchdog via opcode 0x81. Production = true.
+watchdog_enabled = true
+
+# I2C address on /dev/i2c-0. APW121215a default.
+i2c_address = 0x10
+
+# Live proof: APW `0x10` is reachable through real bit-bang on
+# gpio895/896 with gpio907 already high, while kernel `/dev/i2c-0` still EIOs.
+transport = "gpio_bitbang"
+
+# Live probe (healthy stock mining state, after a full bosminer restart):
+# gpio-907 is held `out hi` by bosminer; an interim observation caught gpio-907
+# LOW during a transient state and briefly misled this config to gpio-901; that
+# misread was corrected once bosminer reached steady-state mining.
+#
+# gpio-901 is `out hi (|?|)` at FPGA boot (xlnx,dout-default bit 4) but the
+# Xilinx xps-gpio driver cannot sysfs-export it (EBUSY) so DCENT_OS cannot drive
+# it from user-space. `psu_gpio_gate.rs` now tolerates EBUSY and skips the
+# assertion when the kernel already owns the line (2026-04-24).
+#
+# Bottom line: drive gpio-907 HIGH to match bosminer's PWR_CONTROL state.
+pwr_control_gpio = "gpio:907"
+
+[thermal]
+# Home-mining defaults; residential 90 C ceiling enforced by config.rs validate.
+target_temp_c = 60
+hot_temp_c = 70
+dangerous_temp_c = 85
+
+# Home-mining fan ceiling / .
+# NEVER raise above 30 without explicit user mode override.
+fan_min_pwm = 10
+fan_max_pwm = 30
+
+# 2 s cadence is snappier than the 5 s default — safe at our home PWM ceiling.
+pid_interval_s = 2.0
+hysteresis_c = 3
+
+[api]
+# Keep cgminer on 4028 (pyasic / hass-miner expect it). HTTP on 8080 to avoid
+# colliding with BraiinsOS nginx on :80 during hybrid bring-up.
+cgminer_port = 4028
+http_port = 8080
+websocket = true
+# Keep LAN bind disabled until auth lands — cgminer protocol has NO auth.
+cgminer_bind_lan = false
+metrics_require_auth = true
+
+[donation]
+# Bring-up: donation off. Re-enable (2% default) for production deploys.
+enabled = false
+
+[watchdog]
+# Disabled during bring-up — PIC heartbeat covers hardware watchdog, and the
+# Rust daemon watchdog is only useful once mining is stable.
+enabled = false
+
+[hash_on_disconnect]
+enabled = true
+
+[mode]
+# "standard" keeps the dashboard in the classic Mining tone. Use "home" for
+# Space Heater ceilings, "hacker" for raw-register access.
+active = "standard"
+
+[autotuner]
+# Disable until first hash on own work dispatch is verified and the freq-only
+# tuning loop is exercised.
+enabled = false
+
+[led]
+enabled = true
+heartbeat_on_ms = 100
+heartbeat_off_ms = 900
+flash_on_accepted_share = true
+flash_on_rejected_share = true
+
+# --- Agent δ TODO ---
+# The following sections were in the legacy config but are NOT recognized by
+# the current dcentrald_config Serde schema (Phase 5B Agent D landed [psu]):
+#   [platform]   — platform / board_family / board_target / model
+#   [chain]      — chain_count / chips_per_chain / cores_per_chip / init_baud /
+#                  mining_baud / cmd_device_chain1 / cmd_device_chain2
+#   [pic]        — i2c_bus / pic_addrs / pic_fw_byte_expected / framing /
+#                  nack_flush_zeros
+#   [fan]        — fan_count / fan_pwm_cap / fan_min_pwm / min_rpm / min_rpm_grace_ms
+#   [safety]     — miscctrl_triple_write / miscctrl_spacing_ms /
+#                  deferred_voltage_gate_heartbeats / skip_fifo_reset_diagnostic /
+#                  sigkill_passthrough
+#   [voltage]    — min_mv / max_mv
+#   [frequency]  — min_mhz / max_mhz
+#
+# Agent δ owns config.rs — when new Serde structs land, paste the sections
+# back in with matching key names. Until then, keeping them here would silently
+# no-op (worse: gives a false sense of control over values the daemon ignores).

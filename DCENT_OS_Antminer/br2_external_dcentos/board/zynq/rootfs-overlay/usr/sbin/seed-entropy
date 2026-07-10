@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""
+seed-entropy — Credit saved entropy to the kernel random pool.
+
+Writing to /dev/urandom does NOT credit entropy bits to the kernel's
+entropy counter. The kernel still considers the random pool uninitialized
+until enough "real" entropy accumulates (~200 seconds on Zynq ARM).
+
+This script uses the RNDADDENTROPY ioctl to credit saved entropy bits,
+making the random pool immediately available for SSH key exchange.
+
+Usage: seed-entropy [seed-file]
+  Default seed file: /data/keys/random-seed
+
+Safety: Only credit entropy from files saved by US (on previous shutdown).
+Never credit entropy from a predictable source.
+
+D-Central Technologies — DCENTos
+"""
+import sys
+import struct
+import fcntl
+import os
+
+RNDADDENTROPY = 0x40085203  # ioctl number
+DEFAULT_SEED = "/data/keys/random-seed"
+CREDIT_BITS = 256  # Conservative: credit 256 bits from 512 bytes
+
+def main():
+    seed_file = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_SEED
+
+    if not os.path.exists(seed_file):
+        return
+
+    try:
+        with open(seed_file, "rb") as f:
+            seed = f.read()
+
+        if len(seed) < 64:
+            return  # Too small to be useful
+
+        # struct rand_pool_info { int entropy_count; int buf_size; char buf[]; }
+        data = struct.pack("ii", CREDIT_BITS, len(seed)) + seed
+
+        with open("/dev/urandom", "wb") as f:
+            fcntl.ioctl(f.fileno(), RNDADDENTROPY, data)
+
+    except Exception:
+        pass  # Fail silently — worst case, entropy accumulates naturally
+
+if __name__ == "__main__":
+    main()

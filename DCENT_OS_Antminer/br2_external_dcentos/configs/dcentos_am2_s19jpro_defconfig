@@ -1,0 +1,75 @@
+# DCENTos Buildroot defconfig — Antminer S19j Pro (Zynq am2-s17 variant).
+# D-Central Technologies, 2026.
+#
+# Target: Xilinx Zynq-7010/7007 (ARM Cortex-A9, dual core).
+# Chip:   BM1362 (3x126 chips, S19j Pro am2 hashboard family).
+# FPGA:   Braiins s9-io-am2 bitstream (2022-12-08).
+#
+# Per-product OVERRIDE layer. Shared content lives in:
+#   dcentos-common.fragment   (workspace-wide package set + identity)
+#
+# Sibling of dcentos_s9_defconfig — same Cortex-A9 + Linaro 7.2.1 toolchain,
+# different rootfs format (squashfs without ext4 dual-output) and different
+# hashboard family. Arch / toolchain bits stay inline because S9 is the only
+# other Zynq target and its inline copy uses BR2_ARM_FPU_VFPV3D16 with ext4
+# dual-output, which would conflict with a shared armv7 fragment.
+
+# =============================================================================
+# Target Architecture — same as S9 (Zynq Cortex-A9).
+# =============================================================================
+BR2_arm=y
+BR2_cortex_a9=y
+BR2_ARM_ENABLE_NEON=y
+BR2_ARM_ENABLE_VFP=y
+BR2_ARM_FPU_VFPV3D16=y
+
+# =============================================================================
+# Toolchain — Linaro GCC 7.2.1-2017.11 (same as S9, matches BraiinsOS kernel).
+# =============================================================================
+BR2_TOOLCHAIN_EXTERNAL=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM=y
+BR2_TOOLCHAIN_EXTERNAL_DOWNLOAD=y
+BR2_TOOLCHAIN_EXTERNAL_URL="https://releases.linaro.org/components/toolchain/binaries/7.2-2017.11/arm-linux-gnueabihf/gcc-linaro-7.2.1-2017.11-x86_64_arm-linux-gnueabihf.tar.xz"
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_PREFIX="arm-linux-gnueabihf"
+BR2_TOOLCHAIN_EXTERNAL_GCC_7=y
+BR2_TOOLCHAIN_EXTERNAL_HEADERS_4_10=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_GLIBC=y
+BR2_TOOLCHAIN_EXTERNAL_CXX=y
+BR2_TOOLCHAIN_EXTERNAL_FORTRAN=y
+BR2_TOOLCHAIN_EXTERNAL_OPENMP=y
+
+# =============================================================================
+# Filesystem — squashfs primary (sysupgrade), ext4 secondary (research).
+# =============================================================================
+BR2_TARGET_ROOTFS_SQUASHFS=y
+# 1M block + XZ ARM-BCJ filter (EXTREME_COMP) — parity with dcentos_s9_defconfig
+# (shipped since 2026-05-05); ~2.25 MiB smaller squashfs. The 4.4.0-xilinx kernel
+# and BraiinsOS's own am2 image both mount ARM-BCJ squashfs, so no boot risk.
+BR2_TARGET_ROOTFS_SQUASHFS_BS_1024K=y
+BR2_TARGET_ROOTFS_SQUASHFS4_XZ=y
+BR2_TARGET_ROOTFS_SQUASHFS_EXTREME_COMP=y
+# Drop eudev's desktop hardware database (~1.34 MiB) — USB/PCI/input metadata that
+# no miner uses; zero references in overlays/scripts; udevd itself keeps running.
+# BR2_PACKAGE_EUDEV_ENABLE_HWDB is not set
+BR2_TARGET_ROOTFS_EXT2=y
+BR2_TARGET_ROOTFS_EXT2_4=y
+BR2_TARGET_ROOTFS_EXT2_SIZE="128M"
+
+# =============================================================================
+# Per-product identity.
+# =============================================================================
+BR2_TARGET_GENERIC_HOSTNAME="dcentos-s19j"
+BR2_TARGET_GENERIC_ISSUE="DCENTos for S19j Pro (am2-s17) — D-Central Technologies"
+
+# =============================================================================
+# Overlay-on-overlay — shared zynq overlay first, am2-s19jpro identity last.
+# Buildroot applies overlays left-to-right so per-board files win.
+# =============================================================================
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/am2-s19jpro/rootfs-overlay"
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/am2-s19jpro/post-build.sh"
+BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/am2-s19jpro/post-image.sh"
+
+# =============================================================================
+# Zynq-tuned BusyBox config (shared with S9 — same FPGA register applets).
+# =============================================================================
+BR2_PACKAGE_BUSYBOX_CONFIG="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/busybox.config"

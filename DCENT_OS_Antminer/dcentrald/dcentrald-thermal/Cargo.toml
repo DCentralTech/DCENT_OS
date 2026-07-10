@@ -1,0 +1,36 @@
+[package]
+name = "dcentrald-thermal"
+version.workspace = true  # Single source: dcentrald/Cargo.toml [workspace.package]
+edition = "2021"
+description = "Thermal management subsystem for dcentrald - PID control, fan management, curtailment"
+license = "GPL-3.0"
+
+[dependencies]
+dcentrald-hal = { path = "../dcentrald-hal", optional = true }
+dcentrald-api-types = { path = "../dcentrald-api-types" }
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[features]
+# `hal` pulls in the Unix-only dcentrald-hal crate (mmap / ioctl / AsRawFd).
+# Default-ON, so every consumer (dcentrald, dcentrald-api, dcentrald-diagnostics —
+# none of which set default-features=false) is unchanged. Build/test with
+# `--no-default-features` on a non-Unix host (or any CI lane without the HAL) to
+# compile the PURE thermal logic HAL-free: controller PID, fan PWM<=30 cap,
+# supervisor FSM, profiles, battery, curtailment, heater — including the
+# load-bearing tests/safety_pwm_cap.rs fan-never-blast matrix, which previously
+# could not run on the Windows dev host because dcentrald-hal fails to compile
+# there. Only the off-grid battery telemetry module (offgrid.rs, which consumes
+# `dcentrald_hal::adc::AdcReading`) and the `ThermalError::Hal` variant are gated
+# behind this feature.
+default = ["hal"]
+hal = ["dep:dcentrald-hal"]
+
+# W4.7 lint inheritance (DCENT_DevOps + DCENT_QA, 2026-05-07).
+# Near-clean crate: only ~1 unwrap occurrence in src/. Inherit workspace
+# `warn` and let it stay warn — easy to fix to zero, then promote to `deny`.
+# Audit status: .
+[lints]
+workspace = true

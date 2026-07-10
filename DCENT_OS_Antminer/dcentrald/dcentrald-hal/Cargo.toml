@@ -1,0 +1,79 @@
+[package]
+name = "dcentrald-hal"
+version.workspace = true  # Single source: dcentrald/Cargo.toml [workspace.package]
+edition = "2021"
+description = "Hardware Abstraction Layer for dcentrald - UIO, I2C, GPIO, Fan, Watchdog"
+license = "GPL-3.0"
+
+[features]
+# Opt-in escape hatch for recovery binaries (pic-recovery, dspic-flash) and
+# diagnostic examples that legitimately need raw `I2cBus::open` access
+# outside of `dcentrald-hal::platform`. The main `dcentrald` daemon does NOT
+# enable this feature, so the only HAL-public bus constructor stays the
+# `I2cServiceHandle` family. See W2.3 single-I2C-owner lockdown 2026-05-07.
+recovery-tool = []
+
+# Opt-in dev/debug ABI for the bitmain_axi.ko IOCTL surface
+# (`stock_fpga_axi_ioctl.rs`).
+#
+# RE3 (`bitmain_axi_ioctl_report.md`, 2026-05-10) DWARF-confirms zero
+# IOCTL handlers in production `bitmain_axi.ko` and `cv183x_base.ko` —
+# production `bmminer` / `bosminer` always use `open() + mmap() +
+# volatile R/W` (the `stock_fpga_axi_mmap.rs` path is canonical).
+#
+# The W11.1 IOCTL ordinals (`magic='X'`, `REG_READ=0x11`, `REG_WRITE=0x12`,
+# `BURST_READ=0x13`, `BURST_WRITE=0x14`) were inferred from a
+# `fake_axi_fpga.c` QEMU rehosting STUB only — NOT from the production
+# kernel module. The IOCTL adapter is preserved as a Cargo-feature-gated
+# QEMU/lab rehosting helper, and the W10 runtime env-gate
+# `DCENT_BB_TRUST_INFERRED_AXI_IOCTL` is RETIRED in W13.B5.
+#
+# Production `dcentrald` does NOT enable this feature, so the IOCTL
+# module does not compile into shipping firmware. Enable explicitly with
+# `cargo build --features axi-ioctl-debug` for QEMU rehosting tests.
+axi-ioctl-debug = []
+
+[dependencies]
+nix.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Phase B (am3-bb S19J_IO_BOARD_V2_0): the BeagleBone platform loads its
+# board-target config from `/etc/dcentos/board_target/<name>.toml`. Already a
+# `[workspace.dependencies]` entry + present in Cargo.lock — no new lockfile churn.
+toml.workspace = true
+libc = "0.2"
+tokio = { workspace = true, features = ["sync", "time"] }
+tokio-util.workspace = true
+flate2 = "1"
+# W3.3 — the BeagleBone fan-mode refusal gate consumes the canonical
+# `FanMode` enum from the no-HAL API contract crate. The HAL keeps a
+# minimal coupling: pulled in only for the public-API mode-check helper
+# `BeagleBoneFan::check_fan_mode_allowed`, no other usage.
+dcentrald-api-types = { path = "../dcentrald-api-types" }
+
+# The PIC parser flush example uses raw bus access via the recovery escape
+# hatch (`I2cBus::open_for_recovery`) and is only buildable when the
+# `recovery-tool` feature is enabled. This keeps the default `cargo build
+# --examples` from accidentally pulling raw I²C bus calls into shipping
+# images.
+[[example]]
+name = "s19j_pic_parser_flush"
+required-features = ["recovery-tool"]
+
+# W4.7 lint inheritance + grandfather override (DCENT_DevOps + DCENT_QA, 2026-05-07).
+# This crate has ~74 grandfathered unwrap/expect/panic occurrences in src/
+# (HAL touches mmio/uio/devmem paths where panic-on-precondition is sometimes
+# the right semantic — those will be hand-audited as they migrate to typed
+# errors). Lints are downgraded to `allow` here so the existing build stays
+# clean while the audit ladder is climbed. Audit status:
+# .
+# cargo 1.95+: per-crate overrides cannot coexist with `[lints] workspace = true`.
+# Per-crate stance stands alone; workspace inheritance dropped.
+[lints.clippy]
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+indexing_slicing = "allow"
+unwrap_in_result = "allow"

@@ -1,0 +1,52 @@
+[package]
+name = "dcentaxe-hal"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Hardware abstraction layer for DCENT_axe — GPIO, UART, I2C, EMC2101, TPS546"
+
+[features]
+default = []
+# XPSAFE-2 (cross-pollinated from DCENT_OS HAL EEPROM write-denylist): when
+# enabled, the TPS546 OV/OC/OT/UV fault-limit + fault-response registers are
+# write-locked at the HAL after power init so a buggy autotuner/MCP/REST path
+# cannot raise a last-line hardware-protection threshold above safe values.
+# DEFAULT-OFF (not in `default`) — field-proven boards keep their exact prior
+# behavior; reads are never affected; VOUT_COMMAND/OPERATION stay writable. Same
+# default-off opt-in discipline as DCENT_OS's `DCENT_BM139X_OPEN_CORE`.
+tps546-fault-limit-guard = []
+# Pin families (I2C GPIO assignments)
+pins-bitaxe = []       # I2C SDA=47, SCL=48
+pins-nerd = []         # I2C SDA=43, SCL=44
+# LoRa/SX1262 radio pin map (dedicated SPI3/HSPI — NEVER the BAP/J4 UART bus).
+# Additive + orthogonal to the pins-bitaxe/pins-nerd family selector: enabling it
+# only compiles in the `lora_pins` GPIO map + the esp-idf `open_lora_bus` builder.
+# Selected transitively by the `dcentaxe` binary's default-OFF `lora` feature so a
+# non-LoRa SKU pays zero bytes. ⚠️ PROVISIONAL pins — NEEDS-NETLIST-LOCK (doc 05 §1.3).
+pins-lora = []
+# Display hardware
+display-ssd1306 = []   # 128x32 I2C OLED (BitAxe)
+display-none = []      # Headless (NerdNOS, or web-dashboard-only)
+# Power IC
+power-tps546 = []      # TPS546 PMBus DC-DC
+power-ds4432u = []     # DS4432U I2C DAC (BitAxe Max)
+power-fixed = []       # Fixed voltage regulator, no I2C control (NerdNOS)
+# Fan controller
+fan-emc2101 = []       # EMC2101 I2C fan+temp
+fan-emc2103 = []       # EMC2103 I2C fan (BitAxe GT)
+fan-emc2302 = []       # EMC2302 I2C dual fan (Hex boards)
+fan-none = []          # No fan controller (NerdNOS)
+
+[dependencies]
+# Logging
+log = "0.4"
+
+# Serialization for config/telemetry
+serde = { version = "1", features = ["derive"] }
+
+[target.'cfg(target_os = "espidf")'.dependencies]
+# ESP-IDF peripheral access. Host builds (config/OTA unit tests via
+# dcentaxe-core) compile only the pure `board` module and do not pull these.
+# Mirrors dcentaxe-asic's host gate.
+esp-idf-hal = "0.46"
+esp-idf-svc = "0.52"

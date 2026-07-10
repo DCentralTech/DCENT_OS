@@ -1,0 +1,140 @@
+/* ──────────────────────────────────────────────────────────────────────────
+   DCENT_axe Design Tokens
+   ──────────────────────────────────────────────────────────────────────────
+   The single source of truth for surface, accent, semantic, state, temp,
+   glow, typography, spacing, radii, shadow, motion, and layout values.
+   Embedded into the served dashboard via include_str! at firmware build
+   time (see dashboard.rs). Theme accent + glow are mutated at runtime by
+   setAccent() in app.js — every reactive element that uses var(--accent)
+   tracks the user's chosen theme.
+   ────────────────────────────────────────────────────────────────────────── */
+:root{
+  /* ── Surface (4-tier dark — indigo-tinted per bundle reference) ─────
+     Indigo undertone reads warmer next to orange; gives glass real depth. */
+  --s-void:    #070710;
+  --s-base:    #0b0c17;
+  --s-raised:  #12141f;
+  --s-glass:   rgba(18,20,31,0.55);
+  --s-overlay: #1a1c2a;
+  /* Canonical surface-ladder role names (token-contract §3) — deterministic
+     aliases onto axe's existing correct values; NO value change. The 5th
+     --bg-subtle tier and the OS blur scale are [OS-only] — deliberately absent. */
+  --bg-void:    var(--s-void);     /* canonical alias -> #070710 */
+  --bg-base:    var(--s-base);     /* canonical alias -> #0b0c17 */
+  --bg-raised:  var(--s-raised);   /* canonical alias -> #12141f */
+  --bg-overlay: var(--s-overlay);  /* canonical alias -> #1a1c2a */
+
+  /* ── Accent ramp (amber → orange → ember, full DCENT_OS ramp) ───────
+     `--orange` is the DCENT primary (`#FAA500`); legacy Bitcoin-orange
+     `#F7931A` retained as `--orange-bitcoin` for callsites that explicitly
+     want it. setAccent() at runtime overrides --accent + --glow. */
+  --ember:         #FA6700;
+  --orange:        #FAA500;
+  --amber:         #FFC94D;
+  --orange-bitcoin:#F7931A;
+  --accent:        #FAA500;
+  --orange-50:     #FFC94D;
+  --orange-60:     #FAA500;
+  --orange-70:     #FA6700;
+  --grad-core:     linear-gradient(135deg, #FFC94D 0%, #FAA500 50%, #FA6700 100%);
+  --grad-core-r:   radial-gradient(circle, #FFC94D 0%, #FAA500 45%, #FA6700 100%);
+  --glow:          rgba(250,165,0,0.10);
+  --glow-hot:      rgba(250,103,0,0.28);
+  /* Canonical accent role names (token-contract §2) — aliases onto axe's
+     existing values; --accent + --orange-bitcoin already canonical above.
+     Do NOT default any swatch to #F7931A (monolith lane), and do NOT add a
+     --sphere-mid (#F59E0B is the OPEN brand decision, §9 — forbidden here). */
+  --accent-deep:   var(--ember);   /* canonical alias -> #FA6700 */
+  --accent-hover:  var(--amber);   /* canonical alias -> #FFC94D */
+  /* Canonical named-glow vocabulary (token-contract §8) — halo role names.
+     axe's resting orange halo is intentionally softer (0.10); --glow-gold* is
+     [OS-only]. --glow-neon-green states the §8 canonical rgba directly because
+     axe's only green-glow token is the 0.03 terminal inset, not a soft halo. */
+  --glow-orange:        var(--glow);        /* glow-orange-soft (axe-tuned 0.10 resting) */
+  --glow-orange-strong: var(--glow-hot);    /* glow-orange-strong (hover/hero/live) */
+  --glow-neon-green:    rgba(0,255,65,0.22);/* glow-neon-green — terminal/hacker reserved (§8) */
+
+  /* ── Semantic colors (status / log levels) ─────────────────────────── */
+  --green:  #34d399;
+  --red:    #f87171;
+  --yellow: #fbbf24;
+  --cyan:   #22d3ee;
+  --tgreen: #00ff41;
+
+  --glow-green: rgba(52,211,153,0.08);
+  --glow-red:   rgba(248,113,113,0.10);
+
+  /* ── Foreground ────────────────────────────────────────────────────── */
+  --text:    #e8ecf2;
+  --dim:     #6b7a8d;
+  --muted:   #3a4555;
+  --border:  rgba(255,255,255,0.07);
+  --border-hi: rgba(255,255,255,0.12);
+
+  /* ── State system (NEW — explicit idle/active/warn/error) ──────────── */
+  --state-idle:        var(--dim);
+  --state-active:      var(--green);
+  --state-warn:        var(--yellow);
+  --state-error:       var(--red);
+  --state-glow-active: rgba(52,211,153,0.18);
+  --state-glow-warn:   rgba(251,191,36,0.20);
+  --state-glow-error:  rgba(248,113,113,0.22);
+
+  /* ── Thermal ramp (chip + VR temperature) ──────────────────────────── */
+  --temp-cool:   #22d3ee;   /* < 50 °C */
+  --temp-normal: #34d399;   /* 50–75 */
+  --temp-warm:   #fbbf24;   /* 75–90 */
+  --temp-danger: #f87171;   /* > 90  */
+
+  /* ── Typography families ───────────────────────────────────────────── */
+  --font:    -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  --mono:    'SF Mono','Fira Code','Cascadia Code',Consolas,monospace;
+  --blackletter: 'Old English Text MT','UnifrakturCook','Luminari','Apple Chancery','Georgia','Times New Roman',serif;
+
+  /* ── Type scale ─────────────────────────────────────────────────────── */
+  --t-hero:    60px;
+  --t-display: 42px;
+  --t-title:   22px;
+  --t-stat:    22px;
+  --t-h3:      16px;
+  --t-body:    13px;
+  --t-meta:    11px;
+  --t-label:   10px;
+  --t-micro:   9px;
+
+  /* ── Spacing (4-based) ─────────────────────────────────────────────── */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+
+  /* ── Radii ─────────────────────────────────────────────────────────── */
+  --radius:      14px;
+  --radius-sm:   8px;
+  --radius-pill: 999px;
+
+  /* ── Shadows / elevation ───────────────────────────────────────────── */
+  --shadow-card:  0 1px 0 rgba(255,255,255,0.04) inset, 0 2px 8px rgba(0,0,0,0.30), 0 12px 28px -16px rgba(0,0,0,0.55);
+  --shadow-hover: 0 1px 0 rgba(255,255,255,0.06) inset, 0 4px 12px rgba(0,0,0,0.40), 0 18px 40px -18px rgba(0,0,0,0.65), 0 0 0 1px color-mix(in oklab, var(--accent), transparent 80%);
+  --shadow-hero:  0 8px 40px rgba(0,0,0,0.50), inset 0 1px 0 rgba(255,255,255,0.05);
+  --shadow-float: 0 8px 32px rgba(0,0,0,0.50), 0 0 0 1px var(--border);
+
+  /* ── Motion ────────────────────────────────────────────────────────── */
+  --ease-out:  cubic-bezier(.22, 1, .36, 1);
+  --ease-pop:  cubic-bezier(.34, 1.56, .64, 1);
+  --dur-fast:  .15s;
+  --dur-base:  .22s;
+  --dur-slow:  .55s;
+
+  /* ── Layout constants ──────────────────────────────────────────────── */
+  --sidebar-w: 248px;
+  --sidebar-c: 56px;
+  --topbar-h:  48px;
+
+  /* ── Live-state CSS vars (mutated by JS) ───────────────────────────── */
+  --core-load: 0.3;
+  --core-heat: 0;
+}

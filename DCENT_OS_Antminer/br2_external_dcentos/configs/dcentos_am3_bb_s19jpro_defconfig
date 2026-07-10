@@ -1,0 +1,148 @@
+# DCENTos Buildroot defconfig - Antminer S19j Pro AM335x BB carrier
+# (am3-bb-s19jpro variant). D-Central Technologies, 2026.
+#
+# Provenance: cloned from `dcentos_am3_bb_defconfig`. Wave reference:
+# AGENT B3 wave W10.x (2026-05-09). Cross-validated against
+# DCENT_OS_DEVELOPMENT_KIT_FROMRE1/PORTING_PLAN.md sections 2.2 + 4 +
+# the fuller DTS in section 1.5.
+#
+# =============================================================================
+# KERNEL VERSION (W11.11 — RE2 BOOT_CHAIN_ANALYSIS.md evidence):
+# =============================================================================
+# Stock AM335x BB carriers (S19j Pro Bitmain BB control board) ship
+# **Linux 3.14.79+** built by Bitmain on top of the upstream am335x
+# 3.14 LTS tree (per RE2 `BOOT_CHAIN_ANALYSIS.md` lines 17, 189, 192,
+# 368: "Name: Linux-3.14.79+", uImage at 0x80008000, "Kernel: Linux
+# 3.14.79+ (not compressed, loaded directly)").
+#
+# DCENT_OS does NOT compile its own AM335x kernel — Buildroot here
+# builds rootfs + toolchain only. The active kernel at runtime is the
+# stock Bitmain BB kernel that ships on the on-board NAND
+# (mtd `kernel` partition, layout per RE2 BOOT_CHAIN_ANALYSIS.md §
+# "NAND Layout"). DCENT_OS sysupgrade never overwrites the kernel
+# slot until live `/proc/mtd` evidence pins the layout (see
+# ).
+#
+# IMPLICATION (kernel-module ABI ): we don't ship `uart_trans.ko`
+# or any other kernel module against the stock 3.14 ABI. ASIC UART
+# goes through `serial.rs::DevmemUart` userspace mmap (
+# decision #2 + ). This means the
+# kernel version doesn't constrain DCENT_OS userspace runtime, even
+# though stock 3.14 is significantly older than what modern Buildroot
+# would default to.
+#
+# IF AT ANY POINT we need to build a kernel from Buildroot for the
+# AM335x BB carrier (e.g. SD-card-only standalone boot path), the
+# nearest in-tree Buildroot kernel would be the latest 4.x BB-supported
+# version — NOT 3.14, which modern Buildroot has dropped. Userspace
+# stays musl ARMv7-A8 hard-float, fully ABI-stable across that kernel
+# bump. Document the choice in this header at the time of that
+# transition; until then, stock-kernel-reuse is the canonical model.
+# =============================================================================
+#
+# Diffs vs dcentos_am3_bb_defconfig:
+#   1. BR2_TARGET_GENERIC_HOSTNAME    "dcentos-bb"            -> "DCENT-S19jPro"
+#   2. BR2_TARGET_GENERIC_ISSUE       "DCENTos for ... am3-bb"-> "... am3-bb-s19jpro"
+#   3. BR2_ROOTFS_OVERLAY              chains am3-bb base     -> chains am3-bb base PLUS am3-bb-s19jpro variant overlay
+#   4. BR2_ROOTFS_POST_BUILD_SCRIPT   board/beaglebone/am3-bb -> board/beaglebone/am3-bb-s19jpro
+#   5. BR2_ROOTFS_POST_IMAGE_SCRIPT   board/beaglebone/am3-bb -> board/beaglebone/am3-bb-s19jpro
+#
+# Everything else (toolchain, arch, filesystem, USB diagnostics,
+# iptables) is identical to am3-bb base. The variant exists so the
+# Bitmain-stock S19j Pro AM335x BB carrier ships a first-class
+# board_target string ("am3-bb-s19jpro") for runtime routing without
+# polluting the generic am3-bb base for future BB-class control board
+# projects.
+#
+# UART decision (B3): DCENT_OS does NOT port the reconstructed
+# `uart_trans.ko` from PORTING_PLAN.md section 3.2. AM335x ASIC UART
+# traffic is routed through `serial.rs::DevmemUart` in userspace
+# (proven on Zynq am2 + amlogic). decision #2 ("UIO
+# approach, NOT kernel modules"). Documented also in this variant's
+# post-build.sh header.
+#
+# PORTING_PLAN.md section 4 cross-check: the reconstructed AM335x BB
+# U-Boot uses CONFIG_ENV_IS_NOWHERE; there is no validated NAND-backed
+# fw_env partition. fw_env.config in this variant overlay stays empty
+# on purpose. NAND install/revert is gated by
+#  until live /proc/mtd
+# evidence pins the layout.
+
+# Target Architecture - AM335x / Cortex-A8 (mirrors am3-bb base).
+BR2_arm=y
+BR2_cortex_a8=y
+BR2_ARM_ENABLE_NEON=y
+BR2_ARM_ENABLE_VFP=y
+BR2_ARM_FPU_VFPV3=y
+
+# Toolchain - keep arm-linux-gnueabihf userspace compatible with old BB
+# kernels. Mirrors am3-bb base.
+BR2_TOOLCHAIN_EXTERNAL=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM=y
+BR2_TOOLCHAIN_EXTERNAL_DOWNLOAD=y
+BR2_TOOLCHAIN_EXTERNAL_URL="https://releases.linaro.org/components/toolchain/binaries/7.2-2017.11/arm-linux-gnueabihf/gcc-linaro-7.2.1-2017.11-x86_64_arm-linux-gnueabihf.tar.xz"
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_PREFIX="arm-linux-gnueabihf"
+BR2_TOOLCHAIN_EXTERNAL_GCC_7=y
+BR2_TOOLCHAIN_EXTERNAL_HEADERS_4_10=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_GLIBC=y
+BR2_TOOLCHAIN_EXTERNAL_CXX=y
+
+# BB first boot uses a ramdisk-style rootfs plus an ext2 image for
+# inspection. Mirrors am3-bb base.
+BR2_TARGET_ROOTFS_CPIO=y
+BR2_TARGET_ROOTFS_CPIO_GZIP=y
+BR2_TARGET_ROOTFS_EXT2=y
+BR2_TARGET_ROOTFS_EXT2_4=y
+BR2_TARGET_ROOTFS_EXT2_SIZE="128M"
+
+# Per-product identity (DIFF vs am3-bb base).
+BR2_TARGET_GENERIC_HOSTNAME="DCENT-S19jPro"
+BR2_TARGET_GENERIC_ISSUE="DCENTos for S19j Pro AM335x BeagleBone (am3-bb-s19jpro)"
+
+# Overlay chain (DIFF vs am3-bb base):
+#   1. amlogic/rootfs-overlay -- shared serial-platform init/dashboard
+#      layer (cpio.gz + serial-mining init scripts the BB needs).
+#   2. beaglebone/am3-bb/rootfs-overlay -- BB common (S41firewall,
+#      S50dropbear, S70dcentos-discovery, S99upgrade base, dcent-enable-ssh).
+#   3. beaglebone/am3-bb-s19jpro/rootfs-overlay -- variant identity:
+#      board_target=am3-bb-s19jpro, dcentrald.toml override,
+#      hostname/platform stamps, S82dcentrald copy.
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/beaglebone/am3-bb/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/beaglebone/am3-bb-s19jpro/rootfs-overlay"
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/beaglebone/am3-bb-s19jpro/post-build.sh"
+BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/beaglebone/am3-bb-s19jpro/post-image.sh"
+
+# am3-bb-only USB diagnostics (BeagleBone has USB host; Zynq + Amlogic
+# do not expose USB ports on stock control boards). Mirrors am3-bb base.
+BR2_PACKAGE_USBUTILS=y
+
+# am3-bb-only iptables -- defense-in-depth for the daemons:22322
+# privesc on stock Bitmain BB control boards. The post-build.sh hook
+# omits the `daemons` binary, but if a future kernel/initrd or a
+# sideloaded blob ever binds 127.0.0.1:22322 again, S41firewall (from
+# am3-bb base overlay) drops both TCP and UDP traffic. Mirrors am3-bb
+# base. See docs/THREAT_MODEL.md (BB-1) and
+# .
+BR2_PACKAGE_IPTABLES=y
+
+# =============================================================================
+# W13.C4: libgpiod for AM335x BB carriers (am3-bb-s19jpro variant).
+# =============================================================================
+# AM335x kernel 4.6+ ships gpio-cdev (`/dev/gpiochip*` character device
+# interface) so libgpiod consumers — bosminer's `gpiod_get(dev,
+# "PWR_CONTROL")` / `gpiod_get(dev, "HBx_RESET")` calls and any
+# DCENT_OS userspace code that mirrors them — work on this carrier.
+# The DTS-side `gpio-line-names` lookups land in `/dev/gpiochip0`
+# (gpio0 hwmod) and `/dev/gpiochip1` (gpio1 hwmod) at runtime so the
+# `gpiod_get(dev, name)` lookups succeed.
+#
+# Required by the consumers documented in
+#  (R4 §3 + bosminer Phase 13d
+# Ghidra finding).
+#
+# DO NOT enable on am2 — the Zynq am2 kernel (4.4-xilinx, BraiinsOS-
+# derived) ships CONFIG_GPIO_SYSFS only with NO gpio-cdev, so libgpiod
+# is a no-op there. and
+# `dcentos_am2_s19jpro_defconfig` (correctly OMITS these lines).
+# =============================================================================
+BR2_PACKAGE_LIBGPIOD=y
+BR2_PACKAGE_LIBGPIOD_TOOLS=y

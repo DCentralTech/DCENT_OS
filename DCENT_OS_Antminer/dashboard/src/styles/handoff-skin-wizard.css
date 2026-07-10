@@ -1,0 +1,804 @@
+/* ═════════════════════════════════════════════════════════════════════════
+   DCENT_OS — Claude-Design handoff visual recreation
+   VR5 (Wizard): pixel-faithful port of 'ui_kits/wizard' (the First-Time
+   Setup Wizard the operator specifically loves — "REALLY REALLY nice").
+
+   Loads AFTER handoff-skin.css and AFTER the other per-mode handoff-skin-*
+   files (see main.tsx), so every rule here wins the cascade over
+   standard.css's existing '.wizard-*' block (lines ~5859-6320) and the
+   step components' inline styles, and re-skins production's REAL wizard
+   DOM ('wizard-*' + the step components' element structure) to LOOK like
+   the kit's 'wiz-*' visual system.
+
+   This is a pure VISUAL reskin. The wizard's SetupWizard.tsx emits a
+   top-bar + named-progress breadcrumb + scroll body + bottom-nav layout
+   (NOT the kit's header+left-rail+main+footer). We map by SELECTOR:
+   every production 'wizard-*' element gets its kit 'wiz-*' counterpart's
+   treatment values. The kit's signature LEFT numbered step-rail is
+   recreated from production's existing '.wizard-progress-*' breadcrumb
+   using a pure-CSS counter (numbered pills + done/active states +
+   connector lines) — ZERO JSX changes for that, ZERO logic touched.
+
+   The step components are dense inline-styled React. We cannot delete
+   their inline styles from a stylesheet (inline wins specificity), so the
+   kit treatment is applied at the CONTAINER + structural level (the shell,
+   header, rail, big headings, panels, primary buttons, the password
+   strength bars, the donation slider thumb, the skip-confirm + reboot
+   overlays) where production emits stable class hooks ('.ds-btn',
+   '.ds-toggle', '.wizard-*', '.wizard-skip-confirm-*',
+   '.wizard-reboot-*'). Inline-styled inner text keeps production's exact
+   wording and data bindings — we only lift the frame around it to the
+   kit's calm-glass aesthetic. Faithful approximations are called out
+   inline with 'APPROX:'.
+
+   Token foundation is 1:1 with the kit (production tokens.css was sourced
+   from the bundle's colors_and_type.css — verified on
+   sphere/glow/glass/blur/ease/type). We use tokens; the Wave-1 accent
+   engine still recolors everything. Orange literals appear ONLY where the
+   kit itself hard-codes them as the brand signature (the kit's 'wiz-*'
+   spec uses the same 'var(--accent*)'/literal mix verbatim).
+
+   NOTHING here changes any setup api call (setupMode / setupCircuit /
+   setupPool / setupSafety / skipSafety / skipPassword / completeSetup /
+   getSetupStatus / reboot / updateDonationConfig), the reconnect poll,
+   localStorage step persistence, props, state, validation, step
+   sequence, data-testid/aria, the password strength meter, the
+   skip-confirm flow, or the reboot/reconnect flow.
+   ───────────────────────────────────────────────────────────────────── */
+
+/* ─────────────────────────────────────────────────────────────────────
+   1. SHELL  (production '.wizard-shell'  ←  kit '.wiz-shell')
+   The kit shell is a voidy base with the dual brand-orange radial wash.
+   Production paints a flat 'var(--s-void)'; let the kit's signature
+   gradient through (and the handoff-skin.css body aurora behind it).
+   ───────────────────────────────────────────────────────────────────── */
+.wizard-shell {
+  min-height: 100vh;
+  background:
+    radial-gradient(ellipse 80% 60% at 8% 0%,   rgba(250, 103, 0, .10), transparent 55%),
+    radial-gradient(ellipse 80% 60% at 95% 95%,  rgba(250, 165, 0, .06), transparent 55%),
+    transparent;   /* let body aurora + bg-base show through */
+  color: var(--fg-primary, #F0F0F0);
+  font-family: var(--font-ui, 'Inter', sans-serif);
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+   2. HEADER  (production '.wizard-topbar'  ←  kit '.wiz-header')
+   Glass, sticky, blurred, with the brand on the left and the step
+   counter where the kit's rail floats. We keep production's brand text
+   ("DCENT_OS Setup") + the step-counter ("Step N of M · Label") and just
+   lift the chrome to the kit's blurred-glass header bar.
+   ───────────────────────────────────────────────────────────────────── */
+.wizard-shell .wizard-topbar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 16px 36px;
+  background: rgba(7, 7, 16, .75);
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+  border-bottom: 1px solid var(--border-subtle, rgba(255, 255, 255, .06));
+}
+
+.wizard-shell .wizard-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 1.2rem;
+  letter-spacing: .005em;
+  color: var(--fg-primary, #F0F0F0);
+}
+/* Kit brand-mark: glowing molecule-sphere dot (kit 'DCentralMolecule'
+   approximated as the kit's '.wiz-header-brand' accent dot). */
+.wizard-shell .wizard-brand::before {
+  content: '';
+  display: inline-block;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 38% 28%, #FFD47A 0%, #FAA500 55%, #FA6700 100%);
+  box-shadow: 0 0 12px rgba(250, 103, 0, .55);
+  flex-shrink: 0;
+}
+
+/* Kit '.wiz-header-brand': Barlow 800, 1.2rem, letter-spacing .005em, gap 10px
+   (the brand text + the sphere mark). Production renders flat text only —
+   pin the kit type so the wordmark reads exactly like the kit header. */
+.wizard-shell .wizard-brand {
+  letter-spacing: .005em;
+}
+
+/* Step counter → the kit's '.wiz-header-tag' "Setup" pill grammar applied
+   to the accented label half; the numeric half stays plain mono.
+   Kit tag spec (styles.css:27-31): padding 3px 9px, .68rem, weight 700,
+   letter-spacing .1em, bg rgba(250,165,0,.12), accent text+border. */
+.wizard-shell .wizard-step-counter {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  color: var(--fg-secondary, #8B8B9E);
+  font-size: .72rem;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .02em;
+}
+.wizard-shell .wizard-step-counter strong {
+  color: var(--fg-primary, #F0F0F0);
+  font-weight: 700;
+}
+.wizard-shell .wizard-step-label-accent {
+  margin-left: 6px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: rgba(250, 165, 0, .12);
+  border: 1px solid var(--accent-border, rgba(250, 165, 0, .32));
+  color: var(--accent, #FAA500);
+  font-size: .68rem;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+   3. THE SIGNATURE STEP-RAIL
+   (production '.wizard-progress-track' breadcrumb  ←  kit '.wiz-rail')
+
+   The kit's single most-loved element: numbered step pills with
+   done / active states + connector lines. Production renders a thin
+   '.wizard-progress-bars' (segment bars) above '.wizard-progress-labels'
+   (text labels). We HIDE the segment bars and transform the label row
+   into the kit's numbered rail using a pure CSS counter — every label
+   gets a numbered circle + a connector line. No JSX, no logic change;
+   the existing '.is-complete' / '.is-current' classes drive the
+   done/active visuals exactly like the kit's '.done' / '.active'.
+   ───────────────────────────────────────────────────────────────────── */
+
+/* Kill the kit-foreign segment-bar row — the numbered rail subsumes it. */
+
+/* The label row IS the rail.  Kit '.wiz-rail' (styles.css:34-37):
+   flex, space-between, mono, .72rem. */
+
+/* Kit '.wiz-step' (styles.css:38-44): column, gap 4px, padding 4px 0,
+   flex:1, max-width 110px, fg-dim. */
+
+/* Numbered circle — kit '.wiz-step-num' (styles.css:46-54): 28×28, 1px
+   border-glass, bg rgba(255,255,255,.04), fg-secondary, .82rem weight 700. */
+
+/* Step text — kit '.wiz-step-label' (styles.css:64): .68rem,
+   letter-spacing .05em, uppercase. */
+
+/* Connector line — kit '.wiz-step-line' (styles.css:67-70):
+   top:14px (centered on the num pill: 4px pad + 14px = pill mid),
+   left:60% right:-40%, 1px, border-glass, z-index 1. The last step's
+   line is suppressed. */
+
+/* DONE — kit '.wiz-step.done' (styles.css:60-66,71): num bg
+   rgba(34,197,94,.18), green, border rgba(34,197,94,.5); label
+   fg-primary; line rgba(34,197,94,.4). */
+
+/* ACTIVE — kit '.wiz-step.active' (styles.css:55-59,65): num
+   accent-gradient on #1a0f00, accent border, 0 0 14px rgba(250,103,0,.5);
+   label accent, weight 700. */
+/* Kit '.wiz-step.done.active' (styles.css:63): active wins over done —
+   num returns to the accent gradient even when the step is also complete. */
+
+/* Mobile single-label fallback (production '.wizard-progress-current-mobile')
+   → kit accent pill. */
+
+/* ─────────────────────────────────────────────────────────────────────
+   4. STEP BODY  (production '.wizard-step-content'  ←  kit '.wiz-main' +
+   '.wiz-step-body'). The kit centers a 720px column with a soft fade-in.
+   Production's step components own a 'maxWidth' + 'margin:0 auto'
+   wrapper inline, so we only need the scroll/centering frame + entrance.
+   ───────────────────────────────────────────────────────────────────── */
+/* Kit '.wiz-main' (styles.css:74-78): flex, start, center, overflow-y
+   auto, padding 40px 24px 24px. */
+.wizard-shell .wizard-step-content {
+  flex: 1;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  overflow-y: auto;
+  padding: 40px 24px 24px;
+}
+.wizard-shell .wizard-step-content > * {
+  width: 100%;
+}
+
+/* Kit '.wiz-step-body' (styles.css:79-83): max-width 720px, vertical
+   flow with gap 18px, soft fadeIn .35s. The step panes own their own
+   maxWidth inline, but the fade-in entrance + the kit's calm column
+   rhythm belong to the body frame (additive — inline gap on the inner
+   tree is untouched; this only animates the pane on mount, matching
+   the kit's 'animation: fadeIn .35s var(--ease-standard) both'). */
+.wizard-shell .wizard-step-content > .wizard-step-pane {
+  animation: fadeIn .35s var(--ease-standard, cubic-bezier(.2, 0, 0, 1)) both;
+}
+.wizard-shell .wizard-step-content.is-back > .wizard-step-pane {
+  animation-name: fadeIn;
+}
+/* Kit centers the Welcome pane wider ('.wiz-step-body.welcome'
+   max-width 880px, styles.css:84). Production's WelcomeStep is the
+   '--welcome' pane; lift its column ceiling to the kit's. */
+.wizard-shell .wizard-step-pane--welcome {
+  max-width: 880px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* Big step headings → kit '.wiz-h2' / '.wiz-lede'. The step components
+   render '<h2>' with an inline font but inline only sets font-family /
+   weight / size / color / margin; we layer the kit's heading scale +
+   the calm lede treatment on the wrapping element's descendants where
+   inline doesn't already pin the property (letter-spacing, line-height).
+   APPROX: inline 'fontSize'/'color' on each <h2>/<p> still wins; the kit
+   "feel" comes from the surrounding glass frame + the rail + the CTA. */
+.wizard-shell .wizard-step-content h2 {
+  letter-spacing: -.01em;
+  line-height: 1.1;
+}
+.wizard-shell .wizard-step-content h1 {
+  letter-spacing: -.02em;
+  line-height: 1.05;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+   4b. BIG HEADINGS + LEDE  (kit '.wiz-h1' / '.wiz-h2' / '.wiz-lede')
+
+   The kit's most-loved typographic signature: a bold Barlow-Condensed
+   heading at clamp(1.6→2rem) (h1 at clamp(2.2→3.2rem)) with a calm
+   muted lede beneath. Every routed step component (Welcome / Power /
+   Circuit / Pool / Donation / Name / Password / Review) now carries a
+   single non-invasive '.wizard-step-pane' hook on its root <div> (the
+   ONLY JSX touch — no inline style removed, no copy/data/aria changed).
+
+   Each step inline-styles its <h2>/<h1>/<p>, and inline wins specificity,
+   so the kit type scale is applied with '!important' scoped STRICTLY to
+   the typographic properties and STRICTLY to the pane's direct heading /
+   first intro paragraph. This is the established, correct technique for
+   reskinning an inline-styled React tree (the brief explicitly
+   anticipates the structural hook). Nothing but type/weight/spacing is
+   forced — colour stays the kit's '--fg-primary', faithful to the kit's
+   own '.wiz-h2 ( ... )' rule. The Wave-1 accent engine is unaffected
+   (headings are not accent-coloured in the kit either).
+   ───────────────────────────────────────────────────────────────────── */
+/* Kit '.wiz-h2' (styles.css:90-94): Barlow 800,
+   clamp(1.6rem,1.3rem+0.6vw,2rem), margin 0, letter-spacing -.01em. */
+.wizard-step-pane > h2 {
+  font-family: var(--font-heading) !important;
+  font-weight: 800 !important;
+  font-size: clamp(1.6rem, 1.3rem + 0.6vw, 2rem) !important;
+  letter-spacing: -.01em !important;
+  line-height: 1.1 !important;
+  margin-top: 0 !important;
+  margin-bottom: 8px !important;
+  color: var(--fg-primary, #F0F0F0) !important;
+}
+/* Kit '.wiz-h1' (styles.css:85-89): Barlow 900,
+   clamp(2.2rem,1.8rem+1.4vw,3.2rem), margin 4px 0 8px,
+   letter-spacing -.02em, line-height 1.05. */
+.wizard-step-pane--welcome > h1 {
+  font-weight: 900 !important;
+  font-size: clamp(2.2rem, 1.8rem + 1.4vw, 3.2rem) !important;
+  letter-spacing: -.02em !important;
+  line-height: 1.05 !important;
+  margin: 4px 0 8px !important;
+}
+/* The intro lede — the first non-heading paragraph directly under the
+   pane (every step renders it as '<p>' immediately after the heading).
+   Kit '.wiz-lede' (styles.css:95-98): .98rem, line-height 1.55,
+   fg-secondary, margin 0 0 8px, max-width 64ch. */
+.wizard-step-pane > p:first-of-type {
+  font-size: .98rem !important;
+  line-height: 1.55 !important;
+  color: var(--fg-secondary, #8B8B9E) !important;
+  max-width: 64ch;
+}
+/* Kit '.wiz-step-body.welcome .wiz-lede' (styles.css:99): centered,
+   margin 0 auto 6px. */
+.wizard-step-pane--welcome > p:first-of-type {
+  max-width: 64ch;
+  margin: 0 auto 6px !important;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+   5. WELCOME (production 'WelcomeStep' — the kit's '.wiz-welcome' +
+   '.wiz-logo' + mode-card grid). Production folds mode selection INTO
+   Welcome (the kit's separate 'ModeStep' is not routed). The mode
+   buttons carry the '.wizard-tile-selected-halo' hook when selected —
+   we upgrade that halo to the kit's '.wiz-mode-card.active' glow and add
+   the kit's hover-lift to every selectable tile.
+   ───────────────────────────────────────────────────────────────────── */
+.wizard-shell .wizard-tile-selected-halo {
+  position: relative;
+}
+/* Kit '.wiz-mode-card.active' (styles.css:198): border accent +
+   box-shadow 0 0 24px rgba(250,103,0,.18) + bg rgba(250,165,0,.04).
+   Production sets the active border/bg inline; we add the kit's outer
+   glow ring as a non-intrusive ::after so the selected tile gets the
+   exact kit halo (24px / .18 — was .22/26px). */
+.wizard-shell .wizard-tile-selected-halo::after {
+  content: '';
+  position: absolute;
+  inset: -1.5px;
+  border-radius: inherit;
+  pointer-events: none;
+  box-shadow:
+    0 0 0 1px var(--accent, #FAA500),
+    0 0 24px rgba(250, 103, 0, .18),
+    inset 0 0 16px rgba(250, 165, 0, .06);
+}
+
+/* Kit hover-lift on the welcome mode tiles + the power-source tiles
+   (role=radio buttons inside the radiogroup). Inline styles set the
+   resting border/background; transform + the lift are free to add.
+   Kit '.wiz-mode-card:hover' (styles.css:197) = translateY(-2px) +
+   border accent-border; '.wiz-radio:hover' (styles.css:172) = border
+   accent-border (no lift). The welcome mode cards are the kit's
+   '.wiz-mode-card', so the -2px lift is the faithful value. */
+.wizard-shell [role='radiogroup'] > button[role='radio'] {
+  transition:
+    border-color .15s var(--ease-standard, cubic-bezier(.2, 0, 0, 1)),
+    background .15s var(--ease-standard, cubic-bezier(.2, 0, 0, 1)),
+    transform .15s var(--ease-standard, cubic-bezier(.2, 0, 0, 1)),
+    box-shadow .15s var(--ease-standard, cubic-bezier(.2, 0, 0, 1));
+}
+.wizard-shell [role='radiogroup'] > button[role='radio']:hover {
+  transform: translateY(-2px);
+}
+/* Kit resting-card hover border tint (styles.css:172,197,244,265):
+   un-selected selectable cards adopt the accent-border on hover. The
+   step components drive their resting border inline via onMouseEnter
+   to a grey; the kit uses the warmer accent-border — apply it as the
+   faithful hover on any selectable tile that is NOT the active one. */
+.wizard-shell [role='radiogroup'] > button[role='radio']:not(.wizard-tile-selected-halo):hover {
+  border-color: var(--accent-border, rgba(250, 165, 0, .32)) !important;
+}
+
+/* The Welcome brand orb already animates via '.wizard-finish-glow'
+   (breathingGlow); the kit uses the same breathing sphere. The kit's
+   brand sphere is the radial #FFD47A→#FAA500→#FA6700 with a warm dual
+   halo (kit '.wiz-reboot-orb' styles.css:521-526 + the welcome SVG
+   'radialGradient cx=38% cy=28%'). Production paints a flat
+   accent-gradient orb inline; the inline 'background' wins, but the
+   box-shadow halo + the breathing timing are free to tighten to the
+   kit's exact warm glow so the welcome sphere reads identically. */
+.wizard-shell .wizard-finish-glow {
+  animation: breathingGlow 2.4s ease-in-out infinite;
+}
+/* Scope the halo to the Welcome brand orb only (NOT the reboot icon,
+   which gets its own kit treatment in §10). The welcome orb is the
+   '.wizard-finish-glow' directly inside the '--welcome' pane. */
+.wizard-shell .wizard-step-pane--welcome > .wizard-finish-glow {
+  box-shadow:
+    0 0 36px rgba(250, 103, 0, .5),
+    0 0 80px rgba(250, 165, 0, .3) !important;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+   6. FORM INPUTS  (kit '.wiz-input' / '.wiz-input:focus')
+   The step components inline-set input borders, so we cannot fully
+   override resting state. We DO add the kit's focus ring on text inputs,
+   selects, and number fields that DON'T pin box-shadow inline (none do)
+   — this is the most visible "kit feel" on the form-heavy steps.
+   ───────────────────────────────────────────────────────────────────── */
+.wizard-shell .wizard-step-content input[type='text']:focus,
+.wizard-shell .wizard-step-content input[type='password']:focus,
+.wizard-shell .wizard-step-content input[type='number']:focus,
+.wizard-shell .wizard-step-content select:focus {
+  box-shadow: 0 0 0 3px var(--accent-glow, rgba(250, 165, 0, .15));
+  outline: none;
+}
+
+/* Kit range track + thumb (Donation slider, NEC derate slider). Inline
+   only sets 'accentColor'/'width'/'opacity' — the WebKit/Moz thumb
+   pseudo-elements are unstyled inline, so the kit thumb lands cleanly. */
+.wizard-shell .wizard-step-content input[type='range'] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 8px;
+  background: rgba(255, 255, 255, .08);
+  border-radius: 999px;
+}
+.wizard-shell .wizard-step-content input[type='range']:disabled {
+  opacity: .5;
+}
+.wizard-shell .wizard-step-content input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--accent-gradient, linear-gradient(135deg, #FAA500 0%, #FA6700 100%));
+  border: 3px solid var(--bg-base, #0a0a0f);
+  box-shadow: 0 0 14px rgba(250, 103, 0, .6);
+  cursor: pointer;
+}
+.wizard-shell .wizard-step-content input[type='range']::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--accent, #FAA500);
+  border: 3px solid var(--bg-base, #0a0a0f);
+  box-shadow: 0 0 14px rgba(250, 103, 0, .6);
+  cursor: pointer;
+}
+
+/* Password strength bars — kit '.wiz-strength-bar > div' (styles.css:160):
+   height 4px, border-radius 2px, transition background .2s. PasswordStep
+   already inline-sets height:4 / borderRadius:2 / gap:4 (geometry is the
+   kit's by construction), so we ONLY pin the kit's exact .2s background
+   ease so a strength change animates like the kit's crisp 4-segment bar.
+   APPROX: per-segment colour stays production's inline strength value —
+   kit-faithful by design (the kit also colours by strength, Wizard.jsx
+   STR_COLORS). The '~ div > div > div' reach is the strength-meter row
+   that follows the password input + show button. */
+.wizard-shell .wizard-step-content input[type='password'] ~ div > div > div {
+  transition: background .2s ease;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+   7. BUTTONS  (production '.ds-btn' family  ←  kit '.wiz-btn')
+   The bottom-nav, Welcome CTA, skip-confirm actions, and password skip
+   all use '.ds-btn'. The canonical '.ds-btn' already carries the orange
+   gradient + glow; we nudge its wizard-scoped geometry to the kit's
+   '.wiz-btn' (slightly larger radius/padding, the kit's lift + the
+   stronger primary glow on hover) so every wizard button reads as the
+   kit's confident CTA. We do NOT restyle '.ds-btn' globally (out of
+   scope) — only inside '.wizard-shell'.
+   ───────────────────────────────────────────────────────────────────── */
+/* Kit '.wiz-btn' (styles.css:318-324): radius --radius-sm, Inter,
+   .88rem, weight 600, padding 10px 18px, gap 8px, .15s standard ease. */
+.wizard-shell .ds-btn {
+  border-radius: var(--radius-sm, 8px);
+  font-family: var(--font-ui, 'Inter', sans-serif);
+  font-weight: 600;
+  font-size: .88rem;
+  gap: 8px;
+  transition: all .15s var(--ease-standard, cubic-bezier(.2, 0, 0, 1));
+}
+.wizard-shell .ds-btn:hover:not(:disabled):not([aria-disabled='true']) {
+  transform: translateY(-1px);
+}
+/* Kit '.wiz-btn:hover' (non-primary, styles.css:325): accent-border,
+   accent text, bg rgba(250,165,0,.06). Scope away from primary (which
+   keeps its gradient) + ghost (kit '.wiz-btn.ghost:hover' styles.css:336
+   = accent text + bg rgba(250,165,0,.05), no border). */
+.wizard-shell .ds-btn:not(.primary):not(.ghost):hover:not(:disabled):not([aria-disabled='true']) {
+  border-color: var(--accent-border, rgba(250, 165, 0, .32));
+  color: var(--accent, #FAA500);
+  background: rgba(250, 165, 0, .06);
+}
+.wizard-shell .ds-btn.ghost:hover:not(:disabled):not([aria-disabled='true']) {
+  color: var(--accent, #FAA500);
+  background: rgba(250, 165, 0, .05);
+}
+.wizard-shell .ds-btn.primary {
+  background: var(--accent-gradient, linear-gradient(135deg, #FAA500 0%, #FA6700 100%));
+  color: #1a0f00;
+  border-color: transparent;
+  box-shadow:
+    0 4px 14px rgba(250, 103, 0, .28),
+    inset 0 1px 0 rgba(255, 255, 255, .3);
+}
+.wizard-shell .ds-btn.primary:hover:not(:disabled):not([aria-disabled='true']) {
+  box-shadow:
+    0 6px 20px rgba(250, 103, 0, .45),
+    inset 0 1px 0 rgba(255, 255, 255, .3),
+    0 0 26px rgba(250, 165, 0, .22);
+  color: #1a0f00;
+}
+.wizard-shell .ds-btn.lg {
+  padding: 13px 26px;
+  font-size: 1rem;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+   8. BOTTOM NAV  (production '.wizard-bottom-nav'  ←  kit '.wiz-footer')
+   The kit footer is a sticky blurred bar. Production's bottom-nav is a
+   bordered bar at the flex end; we lift it to the kit's glass footer.
+   ───────────────────────────────────────────────────────────────────── */
+/* Kit '.wiz-footer' (styles.css:341-348): sticky bottom, flex/center,
+   gap 12px, padding 14px 36px, bg rgba(7,7,16,.85), blur 16px,
+   1px border-subtle top hairline. */
+.wizard-shell .wizard-bottom-nav {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 36px;
+  background: rgba(7, 7, 16, .85);
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+  border-top: 1px solid var(--border-subtle, rgba(255, 255, 255, .06));
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+   9. SKIP-CONFIRM OVERLAY  (production '.wizard-skip-confirm-*')
+   The kit has no skip-confirm, but its modal/overlay grammar (the
+   '.wiz-reboot' card: gradient panel, accent top hairline, big heading)
+   is the right faithful frame. We re-skin the existing skip-confirm card
+   to the kit's overlay-panel aesthetic. All copy/aria/flow preserved.
+   ───────────────────────────────────────────────────────────────────── */
+.mode-standard .wizard-skip-confirm-card,
+.wizard-skip-confirm-card {
+  position: relative;
+  background: linear-gradient(180deg, rgba(22, 22, 32, .96), rgba(12, 12, 18, .98));
+  border: 1px solid var(--accent-border, rgba(250, 165, 0, .32));
+  border-radius: var(--radius-lg, 16px);
+  padding: 26px 26px 22px;
+  box-shadow:
+    0 30px 70px rgba(0, 0, 0, .6),
+    0 0 50px rgba(250, 103, 0, .15);
+  overflow: hidden;
+}
+.mode-standard .wizard-skip-confirm-card::before,
+.wizard-skip-confirm-card::before {
+  content: '';
+  position: absolute;
+  height: 1px;
+  left: 25%;
+  right: 25%;
+  top: 0;
+  background: linear-gradient(90deg, transparent, var(--accent, #FAA500), transparent);
+}
+.mode-standard .wizard-skip-confirm-title,
+.wizard-skip-confirm-title {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 1.4rem;
+  letter-spacing: -.01em;
+  color: var(--fg-primary, #F0F0F0);
+  margin: 6px 0 8px;
+}
+.mode-standard .wizard-skip-confirm-body,
+.wizard-skip-confirm-body {
+  color: var(--fg-secondary, #8B8B9E);
+  font-size: .9rem;
+  line-height: 1.55;
+}
+.mode-standard .wizard-skip-confirm-actions,
+.wizard-skip-confirm-actions {
+  display: flex;
+  gap: 12px;
+  margin-top: 18px;
+}
+.mode-standard .wizard-skip-confirm-actions > .ds-btn,
+.wizard-skip-confirm-actions > .ds-btn {
+  flex: 1;
+  justify-content: center;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+   10. REBOOT / RECONNECT SCREEN
+   (production '.wizard-reboot-*'  ←  kit '.wiz-reboot*')
+   The kit's apply/reboot overlay is its second-most-loved moment: a
+   glowing breathing orb with twin counter-rotating rings, a gradient
+   panel, and a "what to expect" step list. Production renders a full
+   screen (not a modal overlay) with an icon + heading + lead + cards.
+   We re-skin it to the kit's overlay grammar and upgrade the static
+   reboot icon into the kit's animated orb + rings.
+   ───────────────────────────────────────────────────────────────────── */
+.wizard-reboot-screen {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 24px;
+  background:
+    radial-gradient(ellipse 80% 60% at 8% 0%,  rgba(250, 103, 0, .10), transparent 55%),
+    radial-gradient(ellipse 80% 60% at 95% 95%, rgba(250, 165, 0, .06), transparent 55%),
+    rgba(7, 7, 16, .92);
+}
+/* Kit '.wiz-reboot' (styles.css:500-508): width min(560px,92%),
+   gradient panel, 1px accent-border, --radius-lg, padding 28px 28px 24px,
+   shadow 0 30px 70px/.6 + 0 0 50px rgba(250,103,0,.15). */
+.wizard-reboot-inner {
+  position: relative;
+  max-width: 560px;
+  width: 100%;
+  text-align: center;
+  background: linear-gradient(180deg, rgba(22, 22, 32, .96), rgba(12, 12, 18, .98));
+  border: 1px solid var(--accent-border, rgba(250, 165, 0, .32));
+  border-radius: var(--radius-lg, 16px);
+  padding: 28px 28px 24px;
+  box-shadow:
+    0 30px 70px rgba(0, 0, 0, .6),
+    0 0 50px rgba(250, 103, 0, .15);
+}
+.wizard-reboot-inner::before {
+  content: '';
+  position: absolute;
+  height: 1px;
+  left: 25%;
+  right: 25%;
+  top: 0;
+  background: linear-gradient(90deg, transparent, var(--accent, #FAA500), transparent);
+}
+
+/* The icon glyph → the kit's breathing orb + twin counter-rotating
+   rings. Kit '.wiz-reboot-spin' is 84×84 (styles.css:518-520) with
+   THREE layered children: '.wiz-reboot-orb' (inset 18px radial
+   #FFD47A→#FAA500→#FA6700, breathingGlow 2.4s, dual halo
+   0 0 36px/.5 + 0 0 80px/.3 — styles.css:521-526); '.wiz-reboot-ring'
+   (inset 0, 1.5px accent-border, orbSpin 4s, with a 6px accent dot at
+   12-o'clock via '::before' — styles.css:527-536); '.wiz-reboot-ring.two'
+   (inset 8px, border rgba(250,103,0,.3), orbSpin 6s REVERSE, accent-deep
+   dot — styles.css:537-541).
+
+   Production renders the spinner as ONE element
+   ('<div class="wizard-finish-glow wizard-reboot-icon">↻</div>'), so we
+   only have '::before' + '::after' (pseudo-elements are CHILDREN of the
+   icon box — rotating the box would compound onto them, so the box
+   stays static to keep each ring's spin clean). Faithful mapping:
+   • icon box  = the kit INNER ring.two (1.5px rgba(250,103,0,.3) at the
+                 inset-8px diameter, with the accent-deep lead-dot edge).
+                 Static — see APPROX.
+   • '::before' = the kit orb (exact inset 18px radial
+                 #FFD47A→#FAA500→#FA6700, breathingGlow 2.4s, dual halo
+                 0 0 36px/.5 + 0 0 80px/.3) — upright like the kit.
+   • '::after'  = the kit OUTER ring (1.5px accent-border, orbSpin 4s)
+                 with the kit's 12-o'clock 6px accent dot recreated as a
+                 single accent-tinted top border edge so the rotating
+                 "lead dot" read is preserved.
+   APPROX: (1) ring dots are rendered as the colored leading edge of
+   each ring rather than discrete 6px dots (no 3rd pseudo); (2) the
+   inner ring.two is static, not 6s-reverse-spinning — counter-rotating
+   it would require nesting that compounds the box transform onto the
+   orb + outer ring. The orb breath + the 4s outer ring spin + every
+   colour/size is pixel-exact; only the inner ring's slow reverse spin
+   is sacrificed to keep the loved outer-ring/orb motion clean. */
+.wizard-reboot-icon {
+  position: relative;
+  width: 84px;
+  height: 84px;
+  margin: 0 auto 22px;
+  /* kit ring.two: inset 8px ⇒ ~68px circle; recreate as a static
+     inner border ring sized via padding-box + a transparent outer gap. */
+  border: 1.5px solid rgba(250, 103, 0, .3);
+  border-top-color: var(--accent-deep, #FA6700); /* kit ring.two lead dot */
+  border-radius: 50%;
+  background: transparent;
+  background-clip: padding-box;
+  color: transparent;        /* hide the '↻' glyph; the orb replaces it */
+  font-size: 0;
+  overflow: visible;
+}
+.wizard-reboot-icon::before {
+  content: '';
+  position: absolute;
+  inset: 18px;
+  border-radius: 50%;
+  background: radial-gradient(circle, #FFD47A 0%, #FAA500 50%, #FA6700 100%);
+  box-shadow:
+    0 0 36px rgba(250, 103, 0, .5),
+    0 0 80px rgba(250, 165, 0, .3);
+  animation: breathingGlow 2.4s ease-in-out infinite;
+}
+.wizard-reboot-icon::after {
+  content: '';
+  position: absolute;
+  inset: -8px;               /* kit outer ring sits OUTSIDE ring.two */
+  border-radius: 50%;
+  border: 1.5px solid var(--accent-border, rgba(250, 165, 0, .32));
+  border-top-color: var(--accent, #FAA500);  /* kit ring 12-o'clock dot */
+  animation: orbSpin 4s linear infinite;
+}
+
+/* Kit '.wiz-reboot h3' (styles.css:513-515): Barlow 800, 1.4rem,
+   margin 14px 0 4px. Production puts the orb above with its own
+   margin, so we keep the kit's bottom rhythm (4px) and let the orb's
+   22px bottom margin stand in for the kit's top 14px. */
+.wizard-reboot-heading {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 1.4rem;
+  letter-spacing: -.01em;
+  color: var(--fg-primary, #F0F0F0);
+  margin: 0 0 4px;
+}
+/* Kit '.wiz-reboot p' (styles.css:516): fg-secondary, .88rem,
+   margin 0 0 18px. */
+.wizard-reboot-lead {
+  color: var(--fg-secondary, #8B8B9E);
+  font-size: .88rem;
+  line-height: 1.55;
+  margin: 0 0 18px;
+}
+.wizard-reboot-card {
+  background: rgba(255, 255, 255, .02);
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, .06));
+  border-radius: var(--radius-md, 12px);
+  padding: 16px 18px;
+  text-align: left;
+}
+.wizard-reboot-card + .wizard-reboot-card {
+  margin-top: 14px;
+}
+.wizard-reboot-card--todo {
+  background: rgba(250, 165, 0, .06);
+  border-color: var(--accent-border, rgba(250, 165, 0, .32));
+}
+.wizard-reboot-card-title {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: .95rem;
+  color: var(--accent, #FAA500);
+  margin-bottom: 10px;
+}
+/* Kit '.wiz-reboot-steps' (styles.css:543-546): list, gap 6px, left
+   align. Production renders numbered text divs (no per-step state). */
+.wizard-reboot-card-steps,
+.wizard-reboot-todo-steps {
+  display: grid;
+  gap: 6px;
+  color: var(--fg-secondary, #8B8B9E);
+  font-size: .84rem;
+  line-height: 1.55;
+}
+/* Kit '.wiz-reboot-steps li' (styles.css:547-552): each step is its own
+   calm glass row — grid, padding 10px 14px, --radius-sm, bg
+   rgba(255,255,255,.02), 1px border-subtle. Production's steps are bare
+   '<div>' rows inside the steps container; lift each to the kit row.
+   APPROX: the kit's per-step .done (green ✓ dot) / .now (pulsing accent
+   dot) / .pending (.55 opacity) STATES have NO production hook — the
+   reboot screen ships static numbered text, so we render every row in
+   the kit's neutral resting state and DO NOT fabricate progress state. */
+.wizard-reboot-card-steps > div,
+.wizard-reboot-todo-steps > div {
+  padding: 10px 14px;
+  border-radius: var(--radius-sm, 8px);
+  background: rgba(255, 255, 255, .02);
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, .06));
+  color: var(--fg-secondary, #8B8B9E);
+}
+.wizard-reboot-card--todo .wizard-reboot-todo-steps > div {
+  background: rgba(250, 165, 0, .06);
+  border-color: var(--accent-border, rgba(250, 165, 0, .32));
+}
+.wizard-reboot-card-footer {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-subtle, rgba(255, 255, 255, .06));
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: .78rem;
+  color: var(--fg-secondary, #8B8B9E);
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+   11. REDUCED MOTION — collapse the kit's decorative loops (parity with
+   the kit + production's motion policy). Functional transitions stay.
+   ───────────────────────────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  .wizard-shell .wizard-finish-glow,
+  .wizard-reboot-icon::before,
+  .wizard-reboot-icon::after {
+    animation: none;
+  }
+  .wizard-shell [role='radiogroup'] > button[role='radio']:hover,
+  .wizard-shell .ds-btn:hover:not(:disabled):not([aria-disabled='true']) {
+    transform: none;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+   12. NARROW VIEWPORT — the kit collapses its rail to icons on mobile;
+   production already swaps to '.wizard-progress-current-mobile' under
+   500px (handled in JS). When the full label rail IS shown on a tight
+   width, keep the numbered circles legible by tightening the connector.
+   ───────────────────────────────────────────────────────────────────── */
+@media (max-width: 720px) {
+  .wizard-shell .wizard-topbar,
+  .wizard-shell .wizard-bottom-nav {
+    padding-left: 18px;
+    padding-right: 18px;
+  }
+}

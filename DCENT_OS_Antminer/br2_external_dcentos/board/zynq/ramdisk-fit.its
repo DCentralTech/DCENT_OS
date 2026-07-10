@@ -1,0 +1,26 @@
+/dts-v1/;
+/ {
+    description = "DCENTos Hacker Shell Ramdisk";
+    #address-cells = <1>;
+
+    images {
+        ramdisk {
+            description = "DCENTos rootfs";
+            data = /incbin/("./rootfs.ext2.gz");
+            type = "ramdisk";
+            arch = "arm";
+            os = "linux";
+            compression = "gzip";
+            load = <0>;
+            entry = <0>;
+        };
+    };
+
+    configurations {
+        default = "dcentos";
+        dcentos {
+            description = "DCENTos Hacker Shell v0.1";
+            ramdisk = "ramdisk";
+        };
+    };
+};

@@ -1,0 +1,91 @@
+[package]
+name = "dcentrald"
+version.workspace = true  # Single source: dcentrald/Cargo.toml [workspace.package]
+edition = "2021"
+description = "DCENTos mining daemon - 100% original D-Central codebase"
+license = "GPL-3.0"
+
+[[bin]]
+name = "dcentrald"
+path = "src/main.rs"
+
+[[bin]]
+name = "dcentos-discovery"
+path = "src/bin/dcentos_discovery.rs"
+
+[dependencies]
+dcentrald-hal = { path = "../dcentrald-hal" }
+dcentrald-asic = { path = "../dcentrald-asic" }
+dcentrald-stratum = { path = "../dcentrald-stratum" }
+dcentrald-thermal = { path = "../dcentrald-thermal" }
+dcentrald-diagnostics = { path = "../dcentrald-diagnostics" }
+dcentrald-api = { path = "../dcentrald-api" }
+dcentrald-api-types = { path = "../dcentrald-api-types" }
+# W1.4 wallet-mask: any future daemon-side log line that mentions worker /
+# wallet must use `dcentrald_common::wallet_mask::mask_wallet`. The daemon
+# binary itself doesn't currently emit such fields directly (delegates to
+# stratum + api), but the dep is here so a future regression doesn't have
+# to touch this Cargo.toml.
+dcentrald-common = { path = "../dcentrald-common" }
+dcentrald-autotuner = { path = "../dcentrald-autotuner" }
+# Supremacy S5.1 — gRPC + protobuf + reflection scaffold. Opt-in via
+# `[api.grpc] enabled = true`; the dependency is unconditional because the
+# server-start helper is a trivial one-line spawn and removing the dep would
+# strand the proto contract from the daemon binary.
+dcentrald-api-grpc = { path = "../dcentrald-api-grpc" }
+# Wave K Lane A — load the on-disk silicon-profile registry into the global
+# RwLock at boot so the /api/profiles/silicon/* REST surface reflects real
+# on-device profiles. Read-only catalog crate (no HAL); does NOT drive mining
+# setpoints (the daemon uses MinerProfile::for_chip + autotuner slug presets).
+dcentrald-silicon-profiles = { path = "../dcentrald-silicon-profiles" }
+# DCENT Expansion Pack ("dcent-pack") bridge client. No-HAL leaf crate; the
+# daemon implements its RoomTempSink/MinerStatusProvider ports to feed the
+# bridge's external temperature into the existing room_temp_c10 atomic. Spawned
+# only when [bridge].enabled = true (default off).
+dcentrald-bridge = { path = "../dcentrald-bridge" }
+
+# SW-02 (gRPC write control plane): the daemon implements
+# `dcentrald_api_grpc::GrpcWriteDelegate`, which is a `#[tonic::async_trait]`
+# trait returning `tonic::Status`. Implementing it requires naming `tonic`
+# (the async-trait macro + the Status type) in the daemon crate. Pinned to the
+# same 0.12 line `dcentrald-api-grpc` uses so the desugared trait/impl agree.
+# `default-features = false` drops the tonic transport/router server stack the
+# daemon doesn't use here (the gRPC server itself lives in dcentrald-api-grpc),
+# but we explicitly re-enable `codegen` because `tonic::async_trait` (needed to
+# implement the delegate trait) is gated behind it. `codegen` only pulls the
+# tiny `async-trait` proc-macro — not hyper/tower/axum.
+tonic = { version = "0.12", default-features = false, features = ["codegen"] }
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+sha2.workspace = true
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rumqttc.workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+# W4.7 lint inheritance + grandfather override (DCENT_DevOps + DCENT_QA, 2026-05-07).
+# This crate has ~148 grandfathered unwrap/expect/panic occurrences in src/
+# (counted via `grep -rE '\.unwrap\(\)|\.expect\(|panic!' src/`). Lints are
+# downgraded to `allow` here so the existing build stays clean while the
+# audit ladder is climbed crate-by-crate. Audit status:
+# .
+# cargo 1.95+ rejects `[lints] workspace = true` co-existing with `[lints.clippy]`
+# overrides that shadow the same lint names defined in `[workspace.lints.clippy]`.
+# We drop workspace inheritance here and let the per-crate block stand alone.
+# Audit ladder semantics preserved: each crate explicitly declares its stance
+# in `[lints.clippy]`..
+[lints.clippy]
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+indexing_slicing = "allow"
+unwrap_in_result = "allow"

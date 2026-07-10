@@ -1,0 +1,1139 @@
+#!/bin/sh
+#
+# sysupgrade — DCENTos firmware self-update (A/B slot method)
+# D-Central Technologies — DCENTos Hacker Shell
+#
+# Writes the new rootfs to the INACTIVE firmware slot and switches U-Boot
+# to boot from it. The running system is NEVER modified — no pivot_root,
+# no unmounting, no risk of corrupting the active rootfs.
+#
+# Usage: sysupgrade [-f] <rootfs.squashfs|dcentos-sysupgrade.tar>
+#   1. Upload image/package: scp rootfs.squashfs root@MINER_IP:/tmp/
+#   2. Run: sysupgrade /tmp/rootfs.squashfs
+#
+# Safety:
+#   - Writes go to the unmounted inactive slot (no resource-busy errors)
+#   - The U-Boot env flip is verified before reboot. Power-cycle ONLY reverts
+#     if a serial/SD recovery path is staged and used to flip back manually.
+#   - The old firmware remains intact until overwritten by a future update
+#
+# Firmware slots:
+#   firmware=1 → mtd7 (firmware1 partition)
+#   firmware=2 → mtd8 (firmware2 partition)
+#   Each slot has UBI with: volume 0 = kernel, volume 1 = rootfs
+#
+
+set -e
+
+ROOTFS=""
+FORCE=0
+TEST_ONLY=0
+EXPECTED_BOARD=am1-s9
+EXPECTED_KERNEL_MIN_LEBS=32
+EXPECTED_ROOTFS_LEBS=134
+PACKAGE_DIR=""
+PACKAGE_KERNEL=""
+PACKAGE_MANIFEST=""
+PACKAGE_SIG=""
+PACKAGE_RELEASE_KEY=""
+PACKAGE_STATUS=""
+ALLOW_LAB_UNSIGNED=${DCENT_ALLOW_UNSIGNED_SYSUPGRADE:-0}
+ALLOW_DOWNGRADE=${DCENT_ALLOW_DOWNGRADE:-0}
+RELEASE_PUBKEY="/etc/dcentos/release_ed25519.pub"
+VERSION_PATH="/etc/dcentos-version"
+BOARD_TARGET_PATH="/etc/dcentos/board_target"
+CONF_MINER_TYPE_PATH="/config/CONF_MINER_TYPE"
+CONF_HARDWARE_ID_PATH="/config/CONF_HARDWARE_ID"
+PROC_CMDLINE_PATH="/proc/cmdline"
+if [ "${DCENT_SYSUPGRADE_OFFLINE_HARNESS:-0}" = "1" ]; then
+    SCRIPT_REALPATH=$(readlink -f "$0" 2>/dev/null || printf '%s\n' "$0")
+    if [ "$SCRIPT_REALPATH" = "/usr/sbin/sysupgrade" ]; then
+        echo "Error: offline harness overrides are disabled on deployed /usr/sbin/sysupgrade"
+        exit 1
+    fi
+    if [ -z "${DCENT_SYSUPGRADE_OFFLINE_MARKER:-}" ] || [ ! -f "$DCENT_SYSUPGRADE_OFFLINE_MARKER" ]; then
+        echo "Error: DCENT_SYSUPGRADE_OFFLINE_HARNESS requires DCENT_SYSUPGRADE_OFFLINE_MARKER"
+        exit 1
+    fi
+    MARKER_VALUE=$(cat "$DCENT_SYSUPGRADE_OFFLINE_MARKER" 2>/dev/null || true)
+    if [ "$MARKER_VALUE" != "dcent-sysupgrade-offline-nandsim-harness-v1" ]; then
+        echo "Error: invalid DCENT_SYSUPGRADE_OFFLINE_MARKER"
+        exit 1
+    fi
+    RELEASE_PUBKEY="${DCENT_SYSUPGRADE_RELEASE_PUBKEY:-$RELEASE_PUBKEY}"
+    VERSION_PATH="${DCENT_SYSUPGRADE_VERSION_PATH:-$VERSION_PATH}"
+    BOARD_TARGET_PATH="${DCENT_SYSUPGRADE_BOARD_TARGET_PATH:-$BOARD_TARGET_PATH}"
+    CONF_MINER_TYPE_PATH="${DCENT_SYSUPGRADE_CONF_MINER_TYPE_PATH:-$CONF_MINER_TYPE_PATH}"
+    CONF_HARDWARE_ID_PATH="${DCENT_SYSUPGRADE_CONF_HARDWARE_ID_PATH:-$CONF_HARDWARE_ID_PATH}"
+    PROC_CMDLINE_PATH="${DCENT_SYSUPGRADE_PROC_CMDLINE_PATH:-$PROC_CMDLINE_PATH}"
+fi
+
+cleanup_package() {
+    if [ -n "$PACKAGE_DIR" ] && [ -d "$PACKAGE_DIR" ]; then
+        rm -rf "$PACKAGE_DIR"
+    fi
+}
+
+manifest_field() {
+    # Extract a dotted JSON field. Prefer jsonfilter when available, with a
+    # python3 fallback for the offline harness and fuller host environments.
+    if command -v jsonfilter >/dev/null 2>&1; then
+        jsonfilter -i "$1" -e "@.$2" 2>/dev/null
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 - "$1" "$2" <<'PY'
+import json, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as fh:
+    data = json.load(fh)
+node = data
+for key in sys.argv[2].split('.'):
+    node = node[key]
+if isinstance(node, bool):
+    print('true' if node else 'false')
+else:
+    print(node)
+PY
+    else
+        echo "Error: manifest_field needs jsonfilter or python3" >&2
+        return 1
+    fi
+}
+
+is_release_status() {
+    case "${1:-release}" in
+        release|production|stable) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_truthy() {
+    case "${1:-}" in
+        1|true|TRUE|yes|YES|y|Y) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+if is_truthy "$ALLOW_LAB_UNSIGNED"; then
+    ALLOW_LAB_UNSIGNED=1
+else
+    ALLOW_LAB_UNSIGNED=0
+fi
+if is_truthy "$ALLOW_DOWNGRADE"; then
+    ALLOW_DOWNGRADE=1
+else
+    ALLOW_DOWNGRADE=0
+fi
+
+read_current_version() {
+    sed -n 's/^[[:space:]]*//;s/[[:space:]]*$//;/^$/!{p;q;}' "$VERSION_PATH" 2>/dev/null
+}
+
+compare_versions() {
+    awk -v candidate="$1" -v current="$2" '
+        function trim(s) {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+            return s
+        }
+        function clear_array(a,   k) {
+            for (k in a) {
+                delete a[k]
+            }
+        }
+        function prerelease_value(token,   i, c, chars, split_at, label, tail, score, pos) {
+            if (token ~ /^[0-9]+$/) {
+                return token + 0
+            }
+            split_at = length(token) + 1
+            for (i = 1; i <= length(token); i++) {
+                c = substr(token, i, 1)
+                if (c ~ /[0-9]/) {
+                    split_at = i
+                    break
+                }
+            }
+            label = substr(token, 1, split_at - 1)
+            tail = substr(token, split_at)
+            chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
+            score = 0
+            for (i = 1; i <= length(label); i++) {
+                c = substr(label, i, 1)
+                pos = index(chars, c)
+                score += pos ? pos : 200
+            }
+            if (tail !~ /^[0-9]+$/) {
+                tail = 0
+            }
+            return (score * 1000000) + tail
+        }
+        function parse_version(version, release, prerelease,   text, hyphen, release_part, prerelease_part, parts, preparts, count, pre_count, i, token) {
+            clear_array(release)
+            clear_array(prerelease)
+            text = trim(version)
+            if (substr(text, 1, 1) == "v") {
+                text = substr(text, 2)
+            }
+            hyphen = index(text, "-")
+            if (hyphen > 0) {
+                release_part = substr(text, 1, hyphen - 1)
+                prerelease_part = substr(text, hyphen + 1)
+            } else {
+                release_part = text
+                prerelease_part = ""
+            }
+            sub(/[+].*$/, "", release_part)
+            count = split(release_part, parts, ".")
+            release[0] = 0
+            for (i = 1; i <= count; i++) {
+                if (parts[i] == "" || parts[i] !~ /^[0-9]+$/) {
+                    return 0
+                }
+                release[++release[0]] = parts[i] + 0
+            }
+            if (release[0] == 0) {
+                return 0
+            }
+            prerelease[0] = 0
+            if (prerelease_part != "") {
+                pre_count = split(prerelease_part, preparts, /[.-]/)
+                for (i = 1; i <= pre_count; i++) {
+                    token = preparts[i]
+                    if (token != "") {
+                        prerelease[++prerelease[0]] = prerelease_value(token)
+                    }
+                }
+            }
+            return 1
+        }
+        function cmp_padded(a, b,   max, i, av, bv) {
+            max = (a[0] > b[0]) ? a[0] : b[0]
+            for (i = 1; i <= max; i++) {
+                av = (i in a) ? a[i] : 0
+                bv = (i in b) ? b[i] : 0
+                if (av > bv) {
+                    return 1
+                }
+                if (av < bv) {
+                    return -1
+                }
+            }
+            return 0
+        }
+        BEGIN {
+            if (!parse_version(candidate, cand_release, cand_pre) || !parse_version(current, current_release, current_pre)) {
+                exit 2
+            }
+            release_cmp = cmp_padded(cand_release, current_release)
+            if (release_cmp != 0) {
+                print release_cmp
+                exit 0
+            }
+            if (cand_pre[0] == 0 && current_pre[0] == 0) {
+                print 0
+            } else if (cand_pre[0] == 0) {
+                print 1
+            } else if (current_pre[0] == 0) {
+                print -1
+            } else {
+                print cmp_padded(cand_pre, current_pre)
+            }
+        }
+    '
+}
+
+allow_downgrade_override() {
+    [ "$ALLOW_DOWNGRADE" = "1" ] && ! is_release_status "$PACKAGE_STATUS"
+}
+
+enforce_sysupgrade_version_floor() {
+    candidate_version=$(manifest_field "$PACKAGE_MANIFEST" version 2>/dev/null || true)
+    if [ -z "$candidate_version" ]; then
+        echo "Error: Refusing sysupgrade: signed package MANIFEST.json has no version field; rollback floor cannot be evaluated."
+        return 1
+    fi
+
+    current_version=$(read_current_version || true)
+    if [ -z "$current_version" ]; then
+        echo "Error: Refusing sysupgrade: current $VERSION_PATH is missing or empty; rollback floor cannot be evaluated."
+        return 1
+    fi
+
+    if ! version_cmp=$(compare_versions "$candidate_version" "$current_version"); then
+        echo "Error: Refusing sysupgrade: unparseable firmware version (candidate=$candidate_version current=$current_version)."
+        return 1
+    fi
+
+    case "$version_cmp" in
+        -1)
+            if allow_downgrade_override; then
+                echo "  WARNING: allowing non-release downgrade $current_version -> $candidate_version because DCENT_ALLOW_DOWNGRADE=1"
+                return 0
+            fi
+            echo "Error: Downgrade refused: package version $candidate_version is older than the running firmware version $current_version. DCENT_OS denies firmware downgrades by default."
+            return 1
+            ;;
+        0)
+            echo "  OK: package version $candidate_version matches running firmware version $current_version"
+            ;;
+        1)
+            echo "  OK: package version $candidate_version is newer than running firmware version $current_version"
+            ;;
+        *)
+            echo "Error: Refusing sysupgrade: unparseable firmware version (candidate=$candidate_version current=$current_version)."
+            return 1
+            ;;
+    esac
+}
+
+verify_sha256() {
+    actual=$(sha256sum "$1" | awk '{print $1}')
+    [ "$actual" = "$2" ]
+}
+
+validate_sysupgrade_tar_members() {
+    local tarball=$1
+    tar tf "$tarball" | awk '
+        BEGIN { ok=1 }
+        {
+            name=$0
+            if (name == "" || name ~ /^\// || name ~ /(^|\/)\.\.(\/|$)/) {
+                printf "Error: unsafe tar member path: %s\n", name > "/dev/stderr"
+                ok=0
+            }
+            if (name !~ /^sysupgrade-[^\/]+(\/|$)/) {
+                printf "Error: unexpected tar top-level path: %s\n", name > "/dev/stderr"
+                ok=0
+            }
+        }
+        END { exit ok ? 0 : 1 }
+    ' || return 1
+
+    tar tvf "$tarball" | awk '
+        BEGIN { ok=1 }
+        {
+            type=substr($0, 1, 1)
+            if (type != "-" && type != "d") {
+                printf "Error: unsafe tar member type: %s\n", $0 > "/dev/stderr"
+                ok=0
+            }
+        }
+        END { exit ok ? 0 : 1 }
+    '
+}
+
+ZYNQ_UBI_LEB_SIZE_BYTES=$((124 * 1024))
+AM1_S9_KERNEL_MAX_BYTES=$((32 * ZYNQ_UBI_LEB_SIZE_BYTES))
+AM1_S9_ROOTFS_MAX_BYTES=$((134 * ZYNQ_UBI_LEB_SIZE_BYTES))
+AM2_ZYNQ_KERNEL_MAX_BYTES=$(((23 + 4) * ZYNQ_UBI_LEB_SIZE_BYTES))
+AM2_ZYNQ_ROOTFS_MAX_BYTES=$((179 * ZYNQ_UBI_LEB_SIZE_BYTES))
+SYSUPGRADE_TAR_SLACK_BYTES=$((8 * 1024 * 1024))
+
+sysupgrade_tar_preextract_ceiling() {
+    case "$EXPECTED_BOARD" in
+        am1-s9)
+            echo $((AM1_S9_KERNEL_MAX_BYTES + AM1_S9_ROOTFS_MAX_BYTES + SYSUPGRADE_TAR_SLACK_BYTES))
+            ;;
+        am2-*)
+            echo $((AM2_ZYNQ_KERNEL_MAX_BYTES + AM2_ZYNQ_ROOTFS_MAX_BYTES + SYSUPGRADE_TAR_SLACK_BYTES))
+            ;;
+        *)
+            echo 0
+            ;;
+    esac
+}
+
+validate_sysupgrade_tar_preextract() {
+    local tarball=$1
+    local package_size ceiling tmp_avail_kb tmp_avail_bytes tmp_required
+
+    package_size=$(wc -c < "$tarball" | tr -d '[:space:]')
+    case "$package_size" in ''|*[!0-9]*|0) echo "Error: cannot validate sysupgrade package size (size=$package_size)"; return 1 ;; esac
+    ceiling=$(sysupgrade_tar_preextract_ceiling)
+    case "$ceiling" in ''|*[!0-9]*|0) echo "Error: cannot validate sysupgrade package ceiling for $EXPECTED_BOARD"; return 1 ;; esac
+
+    if [ "$package_size" -gt "$ceiling" ]; then
+        echo "Error: sysupgrade package exceeds pre-extraction ceiling ($package_size bytes > $ceiling bytes)."
+        echo "  Refusing before tar extraction."
+        return 1
+    fi
+
+    tmp_avail_kb=$(df -Pk /tmp 2>/dev/null | awk 'NR==2 {print $4}')
+    case "$tmp_avail_kb" in ''|*[!0-9]*|0) echo "Error: cannot validate /tmp free space before tar extraction"; return 1 ;; esac
+    tmp_avail_bytes=$((tmp_avail_kb * 1024))
+    tmp_required=$((package_size + SYSUPGRADE_TAR_SLACK_BYTES))
+    if [ "$tmp_avail_bytes" -lt "$tmp_required" ]; then
+        echo "Error: /tmp has insufficient free space for sysupgrade package extraction ($tmp_avail_bytes bytes available < $tmp_required bytes required)."
+        echo "  Refusing before tar extraction."
+        return 1
+    fi
+
+    echo "  OK: sysupgrade package pre-extract size $package_size <= $ceiling bytes; /tmp free $tmp_avail_bytes bytes"
+    return 0
+}
+
+ubi_vol_lebs() {
+    cat "/sys/class/ubi/ubi$1_$2/reserved_ebs" 2>/dev/null
+}
+
+ubi_dev_leb_size() {
+    cat "/sys/class/ubi/ubi$1/eraseblock_size" 2>/dev/null
+}
+
+payload_fits_ubi_volume() {
+    _label=$1
+    _size=$2
+    _lebs=$3
+    _leb_size=$4
+
+    case "$_size" in ''|*[!0-9]*|0) echo "Error: cannot validate $_label payload fit (size=$_size)"; return 1 ;; esac
+    case "$_lebs" in ''|*[!0-9]*|0) echo "Error: cannot validate $_label payload fit (lebs=$_lebs)"; return 1 ;; esac
+    case "$_leb_size" in ''|*[!0-9]*|0) echo "Error: cannot validate $_label payload fit (leb_size=$_leb_size)"; return 1 ;; esac
+    _capacity=$((_lebs * _leb_size))
+    if [ "$_size" -gt "$_capacity" ]; then
+        echo "Error: $_label payload exceeds inactive UBI volume ($_size bytes > $_capacity bytes)."
+        echo "  Refusing before ubiupdatevol; wrong payload/window size = brick."
+        return 1
+    fi
+    echo "  OK: $_label payload fits inactive UBI volume ($_size bytes <= $_capacity bytes)"
+    return 0
+}
+
+trap cleanup_package EXIT INT TERM
+
+# Parse arguments
+for arg in "$@"; do
+    case "$arg" in
+        -f|--force) FORCE=1 ;;
+        -T|--test) TEST_ONLY=1 ;;
+        -*) echo "Unknown option: $arg"; exit 1 ;;
+        *) ROOTFS="$arg" ;;
+    esac
+done
+
+# --- Detect current firmware slot ---
+CMDLINE=$(cat "$PROC_CMDLINE_PATH")
+CURRENT_MTD=$(echo "$CMDLINE" | grep -o 'ubi\.mtd=[0-9]*' | cut -d= -f2)
+
+if [ -z "$CURRENT_MTD" ]; then
+    echo "Error: Cannot detect current MTD from /proc/cmdline"
+    echo "cmdline: $CMDLINE"
+    exit 1
+fi
+
+# Map MTD partition to firmware number
+# firmware=1 → mtd7, firmware=2 → mtd8
+if [ "$CURRENT_MTD" = "8" ]; then
+    INACTIVE_MTD=7
+    CURRENT_FW=2
+    INACTIVE_FW=1
+elif [ "$CURRENT_MTD" = "7" ]; then
+    INACTIVE_MTD=8
+    CURRENT_FW=1
+    INACTIVE_FW=2
+else
+    echo "Error: Unexpected MTD partition $CURRENT_MTD (expected 7 or 8)"
+    exit 1
+fi
+# --- Validation ---
+if [ -z "$ROOTFS" ]; then
+    MY_IP=$(ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)
+    echo "Usage: sysupgrade [-f] [-T|--test] <rootfs.squashfs|dcentos-sysupgrade.tar>"
+    echo ""
+    echo "Options:"
+    echo "  -f, --force    Skip confirmation prompt"
+    echo "  -T, --test     Verify package/image only, do not write NAND"
+    echo ""
+    echo "Current: firmware=$CURRENT_FW (mtd$CURRENT_MTD)"
+    echo "Target:  firmware=$INACTIVE_FW (mtd$INACTIVE_MTD)"
+    echo ""
+    echo "Steps:"
+    echo "  1. scp new-rootfs.squashfs root@${MY_IP:-MINER_IP}:/tmp/"
+    echo "  2. sysupgrade /tmp/new-rootfs.squashfs"
+    echo "     or sysupgrade /tmp/dcentos-sysupgrade.tar"
+    exit 1
+fi
+
+if [ ! -f "$ROOTFS" ]; then
+    echo "Error: $ROOTFS not found"
+    exit 1
+fi
+
+# Support verified sysupgrade tar packages in addition to raw squashfs images.
+if tar tf "$ROOTFS" >/dev/null 2>&1; then
+    validate_sysupgrade_tar_members "$ROOTFS" || exit 1
+    validate_sysupgrade_tar_preextract "$ROOTFS" || exit 1
+    echo "Detected sysupgrade package tar — extracting and verifying manifest..."
+    PACKAGE_DIR=$(mktemp -d /tmp/sysupgrade-pkg.XXXXXX 2>/dev/null || mktemp -d)
+    if ! tar xf "$ROOTFS" -C "$PACKAGE_DIR"; then
+        echo "Error: Failed to extract sysupgrade tar package"
+        exit 1
+    fi
+
+    PACKAGE_SUBDIR=$(find "$PACKAGE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'sysupgrade-*' | head -n 1)
+    if [ -z "$PACKAGE_SUBDIR" ]; then
+        echo "Error: Package is missing sysupgrade-* payload directory"
+        exit 1
+    fi
+    PACKAGE_TOP=$(basename "$PACKAGE_SUBDIR")
+    case "$PACKAGE_TOP" in
+        sysupgrade-$EXPECTED_BOARD) ;;
+        sysupgrade-am2-*|sysupgrade-am3-*|sysupgrade-cv*|sysupgrade-bb*)
+            echo "Error: Package prefix '$PACKAGE_TOP' is not for $EXPECTED_BOARD."
+            echo "  This is the shared am1-s9 sysupgrade. Wrong prefix = brick."
+            exit 1
+            ;;
+        sysupgrade-*)
+            echo "Error: Package top-level '$PACKAGE_TOP' does not match sysupgrade-$EXPECTED_BOARD."
+            echo "  Wrong prefix = brick."
+            exit 1
+            ;;
+    esac
+
+    PACKAGE_MANIFEST="$PACKAGE_SUBDIR/MANIFEST.json"
+    PACKAGE_SIG="$PACKAGE_SUBDIR/MANIFEST.sig"
+    PACKAGE_RELEASE_KEY="$PACKAGE_SUBDIR/release_ed25519.pub"
+    PACKAGE_KERNEL="$PACKAGE_SUBDIR/kernel"
+    ROOTFS="$PACKAGE_SUBDIR/root"
+
+    if [ ! -f "$PACKAGE_MANIFEST" ]; then
+        echo "Error: Package is missing MANIFEST.json"
+        exit 1
+    fi
+    PACKAGE_STATUS=$(manifest_field "$PACKAGE_MANIFEST" status 2>/dev/null || true)
+    [ -n "$PACKAGE_STATUS" ] || PACKAGE_STATUS=release
+    if [ ! -f "$PACKAGE_SIG" ] && [ "$ALLOW_LAB_UNSIGNED" != "1" ]; then
+        echo "Error: Package is missing MANIFEST.sig"
+        echo "Set DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 only for controlled lab recovery."
+        exit 1
+    fi
+    if [ ! -f "$PACKAGE_SIG" ] && is_release_status "$PACKAGE_STATUS"; then
+        echo "Error: unsigned release package is not allowed."
+        echo "Set manifest status to a non-release lab value plus DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 only for controlled lab recovery."
+        exit 1
+    fi
+    if [ -f "$PACKAGE_SIG" ] && [ ! -f "$PACKAGE_RELEASE_KEY" ]; then
+        echo "Error: Signed package is missing release_ed25519.pub"
+        exit 1
+    fi
+    if [ ! -f "$PACKAGE_KERNEL" ] || [ ! -f "$ROOTFS" ]; then
+        echo "Error: Package must contain both kernel and root payloads"
+        exit 1
+    fi
+
+    if [ -f "$PACKAGE_SIG" ]; then
+        if ! command -v openssl >/dev/null 2>&1; then
+            echo "Error: openssl is required to verify MANIFEST.sig"
+            exit 1
+        fi
+        if [ ! -f "$RELEASE_PUBKEY" ]; then
+            echo "Error: release public key not found at $RELEASE_PUBKEY"
+            exit 1
+        fi
+        PACKAGE_KEY_SHA=$(sha256sum "$PACKAGE_RELEASE_KEY" | awk '{print $1}')
+        RELEASE_KEY_SHA=$(sha256sum "$RELEASE_PUBKEY" | awk '{print $1}')
+        if [ "$PACKAGE_KEY_SHA" != "$RELEASE_KEY_SHA" ]; then
+            echo "Error: Package release_ed25519.pub does not match embedded release key"
+            exit 1
+        fi
+        if ! openssl pkeyutl -verify -rawin -pubin -inkey "$RELEASE_PUBKEY" -sigfile "$PACKAGE_SIG" -in "$PACKAGE_MANIFEST" >/dev/null 2>&1; then
+            echo "Error: Package signature verification failed"
+            exit 1
+        fi
+        echo "  Verified MANIFEST.sig against embedded release key"
+    else
+        echo "  WARNING: Unsigned package allowed by DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1"
+    fi
+
+    enforce_sysupgrade_version_floor || exit 1
+
+    ROOTFS_SHA=$(manifest_field "$PACKAGE_MANIFEST" payloads.rootfs.sha256 2>/dev/null || true)
+    KERNEL_SHA=$(manifest_field "$PACKAGE_MANIFEST" payloads.kernel.sha256 2>/dev/null || true)
+    RELEASE_KEY_SHA=$(manifest_field "$PACKAGE_MANIFEST" payloads.verification_key.sha256 2>/dev/null || true)
+    PACKAGE_BOARD=$(manifest_field "$PACKAGE_MANIFEST" board 2>/dev/null || true)
+    [ -n "$PACKAGE_BOARD" ] || PACKAGE_BOARD=$(manifest_field "$PACKAGE_MANIFEST" board_target 2>/dev/null || true)
+
+    if [ -f "$BOARD_TARGET_PATH" ]; then
+        DETECTED_BOARD=$(cat "$BOARD_TARGET_PATH" 2>/dev/null || echo unknown)
+    else
+        DETECTED_BOARD="unknown"
+        MODEL=$(cat "$CONF_MINER_TYPE_PATH" 2>/dev/null || echo)
+        HWID=$(cat "$CONF_HARDWARE_ID_PATH" 2>/dev/null || echo)
+        MODEL_LC=$(printf '%s' "$MODEL" | tr 'A-Z' 'a-z')
+        HWID_LC=$(printf '%s' "$HWID" | tr 'A-Z' 'a-z')
+        case "$MODEL_LC:$HWID_LC" in
+            *s9*:*|*:am1*|*:am1-s9*) DETECTED_BOARD="am1-s9" ;;
+        esac
+    fi
+
+    if [ "$DETECTED_BOARD" != "$EXPECTED_BOARD" ]; then
+        echo "Error: am1-s9 sysupgrade running on wrong board (detected='$DETECTED_BOARD', expected '$EXPECTED_BOARD')"
+        echo "  Refusing before any NAND write. Wrong board = brick."
+        exit 1
+    fi
+    if [ -f "$PACKAGE_SIG" ] && [ -z "$RELEASE_KEY_SHA" ]; then
+        echo "Error: Signed package manifest is missing verification key hash"
+        exit 1
+    fi
+    if [ -z "$ROOTFS_SHA" ] || [ -z "$KERNEL_SHA" ]; then
+        echo "Error: Package manifest is missing required payload hashes"
+        exit 1
+    fi
+    if [ -n "$PACKAGE_BOARD" ] && [ "$PACKAGE_BOARD" != "$DETECTED_BOARD" ]; then
+        echo "Error: Package targets '$PACKAGE_BOARD' but detected board is '$DETECTED_BOARD'"
+        exit 1
+    fi
+    if ! verify_sha256 "$ROOTFS" "$ROOTFS_SHA"; then
+        echo "Error: Rootfs hash does not match package manifest"
+        exit 1
+    fi
+    if ! verify_sha256 "$PACKAGE_KERNEL" "$KERNEL_SHA"; then
+        echo "Error: Kernel hash does not match package manifest"
+        exit 1
+    fi
+    if [ -f "$PACKAGE_SIG" ] && ! verify_sha256 "$PACKAGE_RELEASE_KEY" "$RELEASE_KEY_SHA"; then
+        echo "Error: Package release_ed25519.pub does not match signed manifest"
+        exit 1
+    fi
+
+    echo "  Verified package manifest for board: ${PACKAGE_BOARD:-unknown}"
+elif [ "$ALLOW_LAB_UNSIGNED" != "1" ]; then
+    echo "Error: Raw squashfs sysupgrade is blocked by default."
+    echo "Use a packaged sysupgrade tar, or set DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 for controlled lab recovery."
+    exit 1
+elif is_release_status "${DCENT_PACKAGE_STATUS:-release}"; then
+    echo "Error: Raw squashfs lab sysupgrade requires DCENT_PACKAGE_STATUS to be a non-release lab value."
+    echo "DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 alone is not enough."
+    exit 1
+else
+    echo "WARNING: Raw squashfs sysupgrade allowed by DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1"
+fi
+
+if [ -z "${DETECTED_BOARD:-}" ]; then
+    if [ -f "$BOARD_TARGET_PATH" ]; then
+        DETECTED_BOARD=$(cat "$BOARD_TARGET_PATH" 2>/dev/null || echo unknown)
+    else
+        DETECTED_BOARD="unknown"
+        MODEL=$(cat "$CONF_MINER_TYPE_PATH" 2>/dev/null || echo)
+        HWID=$(cat "$CONF_HARDWARE_ID_PATH" 2>/dev/null || echo)
+        MODEL_LC=$(printf '%s' "$MODEL" | tr 'A-Z' 'a-z')
+        HWID_LC=$(printf '%s' "$HWID" | tr 'A-Z' 'a-z')
+        case "$MODEL_LC:$HWID_LC" in
+            *s9*:*|*:am1*|*:am1-s9*) DETECTED_BOARD="am1-s9" ;;
+        esac
+    fi
+fi
+if [ "$DETECTED_BOARD" != "$EXPECTED_BOARD" ]; then
+    echo "Error: am1-s9 sysupgrade running on wrong board (detected='$DETECTED_BOARD', expected '$EXPECTED_BOARD')"
+    echo "  Refusing before any NAND write. Wrong board = brick."
+    exit 1
+fi
+
+# Verify it looks like a squashfs (magic: hsqs = 0x73717368)
+MAGIC=$(hexdump -n 4 -e '4/1 "%02x"' "$ROOTFS" 2>/dev/null)
+if [ "$MAGIC" != "68737173" ]; then
+    echo "Error: $ROOTFS does not appear to be a squashfs image"
+    echo "Expected magic: hsqs, got: $MAGIC"
+    exit 1
+fi
+
+ROOTFS_SIZE=$(wc -c < "$ROOTFS")
+
+echo "============================================"
+echo "  DCENTos Self-Update (A/B Slot)"
+echo "============================================"
+echo ""
+echo "  Current firmware: $CURRENT_FW (mtd$CURRENT_MTD) — running"
+echo "  Target firmware:  $INACTIVE_FW (mtd$INACTIVE_MTD) — will be updated"
+echo ""
+echo "  New rootfs: $ROOTFS ($ROOTFS_SIZE bytes)"
+if [ -n "$PACKAGE_MANIFEST" ]; then
+    echo "  Package manifest: $PACKAGE_MANIFEST"
+fi
+echo ""
+echo "  This will:"
+echo "    - Write rootfs to inactive slot (mtd$INACTIVE_MTD)"
+if [ -n "$PACKAGE_KERNEL" ]; then
+    echo "    - Write verified package kernel to inactive slot"
+else
+    echo "    - Copy kernel from active to inactive slot"
+fi
+echo "    - Switch U-Boot to boot firmware $INACTIVE_FW"
+echo "    - Reboot the miner"
+echo ""
+echo "  The current firmware remains intact on the other slot."
+echo "  Power-cycle ONLY reverts if a serial/SD console recovery path is staged"
+echo "  and used to flip firmware back manually."
+echo ""
+
+if [ "$TEST_ONLY" = "1" ]; then
+    echo "Verification succeeded — test mode, no NAND writes performed."
+    exit 0
+fi
+
+if [ "$FORCE" -eq 0 ]; then
+    echo -n "  Continue? [y/N] "
+    read -r confirm
+    case "$confirm" in
+        y|Y|yes|YES) ;;
+        *) echo "Aborted."; exit 0 ;;
+    esac
+else
+    echo "  Force mode (-f): skipping confirmation"
+fi
+
+echo ""
+
+# --- Step 1: Attach inactive MTD as UBI ---
+echo "[1/5] Attaching inactive slot (mtd$INACTIVE_MTD)..."
+
+# Detach first in case it's already attached from a previous attempt
+ubidetach -m "$INACTIVE_MTD" 2>/dev/null || true
+sleep 1
+
+# Attach as UBI device number 1 (ubi0 is the running slot)
+if ! ubiattach -m "$INACTIVE_MTD" -d 1 2>/dev/null; then
+    echo "Error: Failed to attach mtd$INACTIVE_MTD as UBI device"
+    echo "The inactive slot may not have a valid UBI layout."
+    echo ""
+    echo "To initialize it, run from BraiinsOS:"
+    echo "  ubiformat /dev/mtd$INACTIVE_MTD -y"
+    echo "  ubiattach -m $INACTIVE_MTD"
+    echo "  ubimkvol /dev/ubi1 -N kernel -s 4MiB"
+    echo "  ubimkvol /dev/ubi1 -N rootfs -m"
+    exit 1
+fi
+
+# Create device nodes for the new UBI device (no devtmpfs on this kernel)
+echo "  Creating device nodes..."
+for ubi_path in /sys/class/ubi/ubi1*; do
+    [ -d "$ubi_path" ] || continue
+    name=$(basename "$ubi_path")
+    dev=$(cat "$ubi_path/dev" 2>/dev/null)
+    if [ -n "$dev" ]; then
+        major=${dev%%:*}
+        minor=${dev##*:}
+        mknod -m 660 "/dev/$name" c "$major" "$minor" 2>/dev/null || true
+    fi
+done
+
+# Verify volumes exist
+if [ ! -e /dev/ubi1_0 ] || [ ! -e /dev/ubi1_1 ]; then
+    echo "Error: Expected ubi1_0 (kernel) and ubi1_1 (rootfs) volumes"
+    echo "  ubi1_0: $(ls -la /dev/ubi1_0 2>/dev/null || echo 'NOT FOUND')"
+    echo "  ubi1_1: $(ls -la /dev/ubi1_1 2>/dev/null || echo 'NOT FOUND')"
+    echo ""
+    # A1c-2: unlike the am2 variant, the S9 script does not auto-create volumes on
+    # a factory-blank slot — the S9 on-device sysupgrade is intentionally the
+    # DCENT_OS->DCENT_OS A/B updater (it expects an already-provisioned inactive
+    # slot). First-install from stock/BraiinsOS is handled by the toolbox
+    # (dcent install), NOT here. To bootstrap a factory-blank inactive slot:
+    echo "  (S9 sysupgrade is the DCENT_OS->DCENT_OS A/B updater; first-install is"
+    echo "   handled by the toolbox 'dcent install'. To bootstrap a blank slot:)"
+    echo "    ubiformat /dev/mtd$INACTIVE_MTD -y"
+    echo "    ubiattach -m $INACTIVE_MTD"
+    echo "    ubimkvol /dev/ubi1 -N kernel -s 4MiB"
+    echo "    ubimkvol /dev/ubi1 -N rootfs -m"
+    ubidetach -d 1 2>/dev/null || true
+    exit 1
+fi
+echo "  OK: ubi1_0 (kernel) and ubi1_1 (rootfs) found"
+
+# --- Step 1b: S9 UBI volume layout pre-flight (brick guard) ---
+KERNEL_LEBS=$(ubi_vol_lebs 1 0)
+ROOTFS_LEBS=$(ubi_vol_lebs 1 1)
+ROOTFS_DATA_LEBS=$(ubi_vol_lebs 1 2)
+
+echo "  Inactive slot UBI layout (read-only probe):"
+echo "    ubi1_0 (kernel)      = ${KERNEL_LEBS:-missing} LEBs (expected >= $EXPECTED_KERNEL_MIN_LEBS)"
+echo "    ubi1_1 (rootfs)      = ${ROOTFS_LEBS:-missing} LEBs (expected >= $EXPECTED_ROOTFS_LEBS)"
+echo "    ubi1_2 (rootfs_data) = ${ROOTFS_DATA_LEBS:-missing} LEBs (operator-managed)"
+
+_UBI_LAYOUT_OK=1
+if [ -z "$KERNEL_LEBS" ]; then
+    echo "Error: kernel volume (ubi1_0) has no reserved_ebs -- UBI corruption suspected."
+    _UBI_LAYOUT_OK=0
+elif [ "$KERNEL_LEBS" -lt "$EXPECTED_KERNEL_MIN_LEBS" ]; then
+    echo "Error: kernel volume LEB count $KERNEL_LEBS is smaller than expected minimum $EXPECTED_KERNEL_MIN_LEBS."
+    _UBI_LAYOUT_OK=0
+fi
+if [ -z "$ROOTFS_LEBS" ]; then
+    echo "Error: rootfs volume (ubi1_1) has no reserved_ebs -- UBI corruption suspected."
+    _UBI_LAYOUT_OK=0
+elif [ "$ROOTFS_LEBS" -lt "$EXPECTED_ROOTFS_LEBS" ]; then
+    echo "Error: rootfs volume LEB count $ROOTFS_LEBS is smaller than expected live S9 template $EXPECTED_ROOTFS_LEBS."
+    _UBI_LAYOUT_OK=0
+fi
+if [ -z "$ROOTFS_DATA_LEBS" ]; then
+    echo "  WARN: rootfs_data volume (ubi1_2) missing -- first boot will initialize."
+fi
+if [ "$_UBI_LAYOUT_OK" != "1" ]; then
+    echo "ERROR: inactive slot UBI volumes do not match the expected $EXPECTED_BOARD template."
+    echo "  Refusing before any ubiupdatevol call. Wrong UBI geometry = brick."
+    ubidetach -d 1 2>/dev/null || true
+    rm -f /dev/ubi1 /dev/ubi1_0 /dev/ubi1_1 /dev/ubi1_2 2>/dev/null || true
+    exit 1
+fi
+echo "  OK: inactive UBI layout matches am1-s9 minimum template."
+
+UBI_LEB_SIZE=$(ubi_dev_leb_size 1)
+if ! payload_fits_ubi_volume "rootfs" "$ROOTFS_SIZE" "$ROOTFS_LEBS" "$UBI_LEB_SIZE"; then
+    ubidetach -d 1 2>/dev/null || true
+    rm -f /dev/ubi1 /dev/ubi1_0 /dev/ubi1_1 /dev/ubi1_2 2>/dev/null || true
+    exit 1
+fi
+
+# --- Step 2: Write kernel ---
+if [ -n "$PACKAGE_KERNEL" ]; then
+    echo "[2/5] Writing verified package kernel to inactive slot..."
+    KERNEL_SOURCE="$PACKAGE_KERNEL"
+    KERNEL_SIZE=$(wc -c < "$PACKAGE_KERNEL")
+else
+    echo "[2/5] Copying kernel from active slot..."
+    KERNEL_SIZE=$(cat /sys/class/ubi/ubi0_0/data_bytes 2>/dev/null)
+    if [ -z "$KERNEL_SIZE" ] || [ "$KERNEL_SIZE" -eq 0 ]; then
+        echo "Error: Cannot determine kernel size from ubi0_0"
+        ubidetach -d 1 2>/dev/null || true
+        exit 1
+    fi
+    dd if=/dev/ubi0_0 of=/tmp/kernel.bin bs=1M 2>/dev/null
+    KERNEL_SOURCE=/tmp/kernel.bin
+fi
+echo "  Kernel size: $KERNEL_SIZE bytes"
+
+if ! payload_fits_ubi_volume "kernel" "$KERNEL_SIZE" "$KERNEL_LEBS" "$UBI_LEB_SIZE"; then
+    rm -f /tmp/kernel.bin
+    ubidetach -d 1 2>/dev/null || true
+    exit 1
+fi
+
+if ! ubiupdatevol /dev/ubi1_0 "$KERNEL_SOURCE"; then
+    echo "Error: Failed to write kernel to ubi1_0"
+    rm -f /tmp/kernel.bin
+    ubidetach -d 1 2>/dev/null || true
+    exit 1
+fi
+echo "  Kernel written to ubi1_0"
+
+# --- Step 3: Write rootfs ---
+echo "[3/5] Writing rootfs to inactive slot ($ROOTFS_SIZE bytes)..."
+if ! ubiupdatevol /dev/ubi1_1 "$ROOTFS"; then
+    echo "Error: Failed to write rootfs to ubi1_1"
+    ubidetach -d 1 2>/dev/null || true
+    exit 1
+fi
+echo "  Rootfs written to ubi1_1"
+
+# --- Step 3.25: Read back written payloads before any U-Boot env flip ---
+preflip_fail() {
+    echo "Error: $1"
+    echo "  U-Boot env NOT flipped; firmware still points at active firmware=$CURRENT_FW."
+    rm -f /tmp/kernel.bin /tmp/dcent_preflip_kernel.bin /tmp/dcent_preflip_rootfs.bin
+    ubidetach -d 1 2>/dev/null || true
+    exit 1
+}
+
+preflip_readback_hash() {
+    _dev="$1"
+    _size="$2"
+    _tmp="$3"
+    _blocks=$(( (_size + 1048575) / 1048576 ))
+    [ "$_blocks" -gt 0 ] || _blocks=1
+    rm -f "$_tmp"
+    if ! dd if="$_dev" of="$_tmp" bs=1048576 count="$_blocks" 2>/dev/null; then
+        rm -f "$_tmp"
+        return 1
+    fi
+    _hash=$(head -c "$_size" "$_tmp" | sha256sum | awk '{print $1}')
+    _rc=$?
+    rm -f "$_tmp"
+    [ "$_rc" -eq 0 ] && [ -n "$_hash" ] || return 1
+    printf '%s\n' "$_hash"
+}
+
+preflip_verify_volume() {
+    _label="$1"
+    _dev="$2"
+    _source="$3"
+    _size=$(wc -c < "$_source" | tr -d '[:space:]')
+    [ -n "$_size" ] && [ "$_size" -gt 0 ] || preflip_fail "pre-flip readback cannot determine $_label payload size; env NOT flipped."
+    _expected=$(sha256sum "$_source" | awk '{print $1}')
+    [ -n "$_expected" ] || preflip_fail "pre-flip readback cannot hash $_label source; env NOT flipped."
+    _actual=$(preflip_readback_hash "$_dev" "$_size" "/tmp/dcent_preflip_${_label}.bin") || preflip_fail "pre-flip readback failed for $_label from $_dev; env NOT flipped."
+    if [ "$_actual" != "$_expected" ]; then
+        preflip_fail "pre-flip readback mismatch for $_label on $_dev; env NOT flipped."
+    fi
+    echo "  ${_label}: pre-flip readback SHA256 verified"
+}
+
+echo "[3.25/5] Verifying inactive slot readback before U-Boot env flip..."
+preflip_verify_volume kernel /dev/ubi1_0 "$KERNEL_SOURCE"
+preflip_verify_volume rootfs /dev/ubi1_1 "$ROOTFS"
+rm -f /tmp/kernel.bin
+echo "  Pre-flip readback verified; U-Boot env still points at firmware=$CURRENT_FW"
+
+# --- Step 3.5: Sync persistent data to inactive slot ---
+echo "[3.5/5] Syncing persistent data to inactive slot..."
+
+# Check if rootfs_data volume exists on inactive UBI
+if [ -e /sys/class/ubi/ubi1_2 ]; then
+    # Create device node for ubi1_2 (rootfs_data)
+    dev=$(cat /sys/class/ubi/ubi1_2/dev 2>/dev/null)
+    if [ -n "$dev" ]; then
+        major=${dev%%:*}
+        minor=${dev##*:}
+        mknod -m 660 "/dev/ubi1_2" c "$major" "$minor" 2>/dev/null || true
+    fi
+
+    # Mount inactive rootfs_data
+    mkdir -p /tmp/inactive_data
+    if mount -t ubifs ubi1:rootfs_data /tmp/inactive_data 2>/dev/null; then
+        # Create directory structure
+        mkdir -p /tmp/inactive_data/keys/dropbear
+        mkdir -p /tmp/inactive_data/config
+        mkdir -p /tmp/inactive_data/profiles
+        mkdir -p /tmp/inactive_data/logs
+        mkdir -p /tmp/inactive_data/overlay/etc/upper /tmp/inactive_data/overlay/etc/work
+
+        # Sync SSH keys (|| true: directory may be empty)
+        if [ -d /data/keys ]; then
+            cp -a /data/keys/* /tmp/inactive_data/keys/ 2>/dev/null || true
+            echo "  SSH keys synced"
+        fi
+        # Sync config (|| true: directory may be empty)
+        if [ -d /data/config ]; then
+            cp -a /data/config/* /tmp/inactive_data/config/ 2>/dev/null || true
+        fi
+        # Sync mining profiles (|| true: directory may be empty)
+        if [ -d /data/profiles ]; then
+            cp -a /data/profiles/* /tmp/inactive_data/profiles/ 2>/dev/null || true
+        fi
+        # Sync live runtime config (S82dcentrald prefers /data/dcentrald.toml over /etc)
+        if [ -f /data/dcentrald.toml ]; then
+            cp -a /data/dcentrald.toml /tmp/inactive_data/dcentrald.toml 2>/dev/null || true
+            echo "  Runtime dcentrald.toml synced"
+        fi
+        # Sync dashboard/onboarding/SSH state so an A/B self-update preserves the
+        # operator's dashboard password (auth.json), wizard-complete marker
+        # (onboarding.json), operator SSH keys (authorized_keys), and the
+        # S50dropbear enable flag (.ssh-enabled). cp -a /data/dcent/. captures
+        # the dotfiles a /data/dcent/* glob would miss; the -d guard skips a
+        # fresh unit that has no /data/dcent yet.
+        if [ -d /data/dcent ]; then
+            mkdir -p /tmp/inactive_data/dcent
+            cp -a /data/dcent/. /tmp/inactive_data/dcent/ 2>/dev/null || true
+            # Re-assert perms (cp -a preserves source perms, but harden in case
+            # the source was created loosely or the copy lost mode bits).
+            chmod 0700 /tmp/inactive_data/dcent 2>/dev/null || true
+            if [ -f /tmp/inactive_data/dcent/auth.json ]; then
+                chmod 0600 /tmp/inactive_data/dcent/auth.json 2>/dev/null || true
+            fi
+            echo "  Dashboard/onboarding/SSH state synced"
+        fi
+        # Save current SSH host keys directly
+        if [ -d /etc/dropbear ]; then
+            cp /etc/dropbear/dropbear_*_host_key /tmp/inactive_data/keys/dropbear/ 2>/dev/null || true
+            echo "  SSH host keys saved for new slot"
+        fi
+        # Save entropy seed
+        dd if=/dev/urandom of=/tmp/inactive_data/keys/random-seed bs=512 count=1 2>/dev/null
+        echo "  Entropy seed saved for new slot"
+
+        umount /tmp/inactive_data 2>/dev/null || true
+        rmdir /tmp/inactive_data 2>/dev/null || true
+        echo "  Persistent data synced to inactive slot"
+    else
+        echo "  Warning: Could not mount inactive rootfs_data (first boot will initialize)"
+    fi
+else
+    echo "  Note: No rootfs_data volume on inactive slot (will be created on first boot)"
+fi
+
+# --- Step 4: Detach and switch U-Boot ---
+echo "[4/5] Switching U-Boot to firmware $INACTIVE_FW..."
+
+# Detach the inactive UBI (no longer needed)
+ubidetach -d 1 2>/dev/null || true
+# Clean up device nodes
+rm -f /dev/ubi1 /dev/ubi1_0 /dev/ubi1_1 2>/dev/null || true
+
+# SCOPE: this BASE zynq sysupgrade ships ONLY in the am1-s9 image. Every AM2
+# product (am2-s19jpro / am2-s19pro / am2-s17pro) appends its own
+# board/zynq/<variant>/rootfs-overlay AFTER this base overlay in
+# BR2_ROOTFS_OVERLAY (those overlays may further REPLACE this file). The
+# env-flip below is the am1-s9 healthy-NAND path; the board-detection above
+# resolves only am1-s9 / unknown (no AM2 branch exists) and the package
+# board_target match rejects an AM2 package here regardless.
+#
+# ENV-FLIP MECHANISM — fw_setenv (libubootenv), NOT raw dd/flash_erase/
+# nandwrite. W24-OTA-2 (2026-05-22): the prior `dd /dev/mtd4` capture →
+# switch_firmware CRC-rebuild → `flash_erase /dev/mtd4 0 0` (erases BOTH
+# redundant env copies) → `nandwrite` path has a zero-valid-copy window AND
+# ECC-blind raw reads — the exact erase-both-then-rewrite + identical-flag
+# dual-write pattern that bricked .39/.139. switch_firmware.py wrote BOTH
+# redundant copies byte-identical with the same 1-byte flag, defeating U-Boot's
+# newer-copy disambiguation. This migrates the am1-s9 FLIP to the same atomic
+# `fw_setenv` primitive the am2 overlay already uses (libubootenv implements
+# U-Boot's redundant-env protocol: writes the inactive copy then atomically
+# flips the active/obsolete flag — never a zero-valid-copy window; ECC/bad-block
+# aware; reads exactly as U-Boot does). am1-s9 already uses fw_setenv for the
+# post-boot upgrade_stage CLEAR in S99upgrade and ships /etc/fw_env.config
+# (the same mtd4 redundant pair) — this closes the FLIP asymmetry. The A/B
+# slot metadata (first_boot / upgrade_stage / firmware) is UNCHANGED; only
+# the WRITE MECHANISM changes. Serial/SD recovery remains the reliable backstop.
+#.
+#
+# AUTO-RECOVERY IS NOT A RELIABLE BACKSTOP ON THIS U-BOOT — DO NOT TRUST IT.
+# `upgrade_stage=0` is field-disproven as a power-cycle auto-revert (the .39
+# S9 brick incident: two AC power-cycles did NOT auto-revert; recovery needed
+# an SD card / serial console). So the post-flip fw_printenv verify gate below
+# IS the primary brick defense and MUST fail-closed on every unknown.
+# fw_setenv being redundant-copy-atomic is STRICTLY SAFER than the old
+# erase-both-then-rewrite: a genuinely-failed transaction leaves the prior
+# valid copy intact, so the unit stays bootable on its current/ACTIVE slot.
+#
+# Pre-flight assertions — fail-closed if ANY fails. We do NOT fall back to
+# raw dd/flash_erase/nandwrite: that is the BANNED root cause. A missing/wrong
+# fw_setenv environment is a hard stop with NO env mutation attempted (the
+# inactive slot is already written; leaving the boot-selector untouched keeps
+# the unit on its still-good ACTIVE slot).
+_recovery_hint() {
+    echo "  Recovery: the inactive slot was written but the U-Boot"
+    echo "  boot-selector was NOT changed — this unit still boots its"
+    echo "  current/ACTIVE slot (firmware=$CURRENT_FW). It is SAFE to"
+    echo "  power-cycle (no flip was committed). To retry, restore"
+    echo "  libubootenv-tools + /etc/fw_env.config and re-run sysupgrade."
+}
+if ! command -v fw_setenv >/dev/null 2>&1; then
+    echo "Error: fw_setenv not found — libubootenv-tools missing."
+    echo "  REFUSING to fall back to raw dd/flash_erase/nandwrite (that"
+    echo "  ECC-blind erase-both-then-rewrite path is the .39/.139 brick"
+    echo "  root cause). No U-Boot env change attempted."
+    _recovery_hint
+    exit 1
+fi
+if ! command -v fw_printenv >/dev/null 2>&1; then
+    echo "Error: fw_printenv not found — cannot verify the env flip."
+    echo "  REFUSING to flip blind (no readback oracle). No U-Boot env"
+    echo "  change attempted."
+    _recovery_hint
+    exit 1
+fi
+if [ ! -f /etc/fw_env.config ]; then
+    echo "Error: /etc/fw_env.config missing — fw_setenv has no MTD map."
+    echo "  No U-Boot env change attempted."
+    _recovery_hint
+    exit 1
+fi
+if ! grep -q '/dev/mtd4' /etc/fw_env.config; then
+    echo "Error: /etc/fw_env.config does not resolve to /dev/mtd4 — it"
+    echo "  must point at the same redundant env partition U-Boot reads."
+    echo "  No U-Boot env change attempted."
+    _recovery_hint
+    exit 1
+fi
+# Sanity: fw_printenv must read a CRC-valid env now (no "Bad CRC"/"using
+# default environment") AND its current firmware= must equal the running slot
+# ($CURRENT_FW). If the live env is unreadable or inconsistent with the running
+# system, we do NOT mutate it (a corrupt/foreign env + a write = brick risk).
+_PRECHK=$(fw_printenv 2>&1)
+case "$_PRECHK" in
+    *"Bad CRC"*|*"using default environment"*)
+        echo "Error: fw_printenv reports an INVALID current U-Boot env"
+        echo "  (Bad CRC / default environment). Refusing to fw_setenv"
+        echo "  into an unreadable env. No U-Boot env change attempted."
+        _recovery_hint
+        exit 1
+        ;;
+esac
+_CUR_FW_NOW=$(fw_printenv firmware 2>/dev/null | sed -n 's/^firmware=//p')
+if [ -z "$_CUR_FW_NOW" ]; then
+    echo "Error: fw_printenv could not read the current firmware= value."
+    echo "  Refusing to flip without a confirmed live env. No U-Boot env"
+    echo "  change attempted."
+    _recovery_hint
+    exit 1
+fi
+if [ "$_CUR_FW_NOW" != "$CURRENT_FW" ]; then
+    echo "Error: live U-Boot env firmware=$_CUR_FW_NOW does not match the"
+    echo "  running slot firmware=$CURRENT_FW. The env fw_setenv would"
+    echo "  target is inconsistent with the booted system — refusing to"
+    echo "  mutate it. No U-Boot env change attempted."
+    _recovery_hint
+    exit 1
+fi
+# Forensic-only snapshot of the pre-flip env (harmless text; NOT a raw
+# ECC-blind image — we never restore a raw dd image). The genuine recovery
+# is `fw_setenv firmware $CURRENT_FW`.
+fw_printenv > /tmp/uboot_env_pre.txt 2>/dev/null || true
+
+# THE FLIP — a single atomic libubootenv transaction. fw_setenv writes the
+# inactive redundant copy then atomically flips the active/obsolete flag —
+# there is no zero-valid-copy window, so a failed transaction leaves the prior
+# valid env intact. This preserves the EXISTING DCENT_OS A/B contract
+# (first_boot yes + upgrade_stage 0 + firmware <inactive>) — identical to the
+# old switch_firmware.py --with-stage semantics, only the write mechanism
+# changed. switch_firmware.py is no longer invoked on the write path.
+_FW_SETENV_SCRIPT="/tmp/dcent_fw_setenv_$$.env"
+cat >"$_FW_SETENV_SCRIPT" <<EOF
+first_boot=yes
+upgrade_stage=0
+firmware=${INACTIVE_FW}
+EOF
+if ! fw_setenv --script "$_FW_SETENV_SCRIPT"; then
+    rm -f "$_FW_SETENV_SCRIPT"
+    echo "Error: fw_setenv failed to apply the boot-selector flip."
+    echo "  libubootenv is redundant-copy-atomic: a failed transaction"
+    echo "  leaves the prior VALID env — this unit still boots its"
+    echo "  current/ACTIVE slot (firmware=$CURRENT_FW). SAFE to"
+    echo "  power-cycle. NO slot flip was committed."
+    _recovery_hint
+    exit 1
+fi
+rm -f "$_FW_SETENV_SCRIPT"
+
+# --- Post-flip verify (U-Boot's OWN criterion, read via fw_printenv) ---
+# (1) env CRC-valid, (2) firmware=$INACTIVE_FW, (3) upgrade_stage=0.
+# _VERIFY_OK defaults to 0 (fail), set 1 ONLY on positive triple-confirmation.
+# ANY fail / fw_printenv errored / inconclusive → FAIL-CLOSED exit 1, NO
+# [5/5], NO reboot. A failed atomic transaction leaves the prior valid copy.
+_VERIFY_OK=0
+_FWP=$(fw_printenv 2>&1)
+case "$_FWP" in
+    *"Bad CRC"*|*"using default environment"*)
+        _VERIFY_OK=0 ;;
+    *)
+        _FW_VAL=$(fw_printenv firmware 2>/dev/null | sed -n 's/^firmware=//p')
+        _STG_VAL=$(fw_printenv upgrade_stage 2>/dev/null | sed -n 's/^upgrade_stage=//p')
+        if [ "$_FW_VAL" = "$INACTIVE_FW" ] && [ "$_STG_VAL" = "0" ]; then
+            _VERIFY_OK=1
+        fi
+        ;;
+esac
+
+if [ "$_VERIFY_OK" != "1" ]; then
+    echo "Error: U-Boot env verification FAILED — fw_printenv did NOT"
+    echo "  confirm a CRC-valid env with firmware=$INACTIVE_FW upgrade_stage=0"
+    echo "  after fw_setenv."
+    echo "WARNING: Firmware payload written. Because fw_setenv is"
+    echo "  redundant-copy-atomic, an UNCONFIRMED flip means the prior"
+    echo "  VALID env copy is still in place — this unit still boots its"
+    echo "  current/ACTIVE slot (firmware=$CURRENT_FW). NO slot flip was"
+    echo "  committed. Do NOT power-cycle into an expectation of the new slot."
+    echo "  Recovery (re-flip back via the SAME safe tool — never raw"
+    echo "  nandwrite of a dd image):"
+    echo "    fw_setenv firmware $CURRENT_FW"
+    echo "    fw_printenv firmware   # must report a CRC-valid firmware="
+    exit 1
+fi
+rm -f /tmp/uboot_env_pre.txt 2>/dev/null
+
+echo "  U-Boot env updated: firmware=$INACTIVE_FW"
+
+# --- Step 5: Reboot ---
+echo "[5/5] Update complete! Rebooting..."
+echo ""
+echo "  The miner will boot into firmware $INACTIVE_FW (mtd$INACTIVE_MTD)."
+echo "  Power-cycle ONLY reverts if a serial/SD console recovery path is"
+echo "  staged — U-Boot auto-recovery is field-disproven on this platform."
+echo "  SSH will reconnect in ~90 seconds."
+echo ""
+sleep 2
+reboot

@@ -1,0 +1,30 @@
+/.gitattributes text eol=lf
+*.sh text eol=lf
+/scripts/*.sh text eol=lf
+/br2_external_dcentos/**/etc/init.d/* text eol=lf
+/br2_external_dcentos/**/etc/fw_env.config text eol=lf
+# No-extension shell scripts in the rootfs overlay MUST stay LF — a CRLF
+# shebang (#!/bin/sh\r) makes the script non-executable on the device
+# ("not found" at exec). The shipped usr/sbin/sysupgrade was baked CRLF on a
+# Windows autocrlf checkout because no rule matched it (no .sh, not in init.d).
+/br2_external_dcentos/**/usr/sbin/sysupgrade text eol=lf
+/br2_external_dcentos/**/usr/sbin/revert_to_stock* text eol=lf
+# A2e-1 (S9-vs-S19jPro parity): the rootfs overlays also ship OTHER no-extension
+# shebang scripts (usr/bin/dcent-shell, usr/sbin/autologin, usr/sbin/dcent-enable-ssh,
+# usr/sbin/seed-entropy, ...). They were NOT covered above, so a Windows autocrlf
+# clone could bake CRLF shebangs into the S9 image (the S9 post-build.sh had no
+# CRLF sweep either — now fixed). The overlay usr/sbin + usr/bin dirs contain only
+# text scripts at rest in git (binaries are installed at build time into the target
+# dir, not checked in here), so a blanket eol=lf is safe and comprehensive.
+/br2_external_dcentos/**/usr/sbin/* text eol=lf
+/br2_external_dcentos/**/usr/bin/* text eol=lf
+# hw-acceptance harness: skus.conf is shell-`read` on the miner and the fixtures
+# anchor the accept-parse regexes. A CRLF checkout would leave a trailing \r on
+# the last read field and could shift an EOL-anchored match, so pin the whole
+# harness tree to LF (the *.sh rule above already covers its scripts; this adds
+# skus.conf + fixtures/*).
+/scripts/hw-acceptance/** text eol=lf
+# POOL-3: V1 parser replay corpus fixtures are parsed byte-for-byte by cargo
+# tests and should not change line endings across Windows/WSL checkouts.
+/dcentrald/dcentrald-stratum/tests/v1_parser_corpus.rs text eol=lf
+/dcentrald/dcentrald-stratum/tests/v1_parser_corpus/** text eol=lf

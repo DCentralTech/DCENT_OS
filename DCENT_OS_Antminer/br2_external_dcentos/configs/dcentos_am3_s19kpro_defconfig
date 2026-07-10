@@ -1,0 +1,35 @@
+# DCENTos Buildroot defconfig — Antminer S19K Pro (Amlogic am3-aml NoPic).
+# D-Central Technologies, 2026.
+#
+# Target: Amlogic A113D (ARM Cortex-A53 quad, aarch64).
+# Chip:   BM1366 (3x77 chips, BHB56902 hashboard family — 0x05 0x11 EEPROM).
+# PSU:    APW121215f (fw 0x76).
+# Boot:   BL2 -> FIP -> U-Boot 2015.01 -> kernel 4.9.113 (no FPGA bitstream).
+#
+# This is the per-product OVERRIDE layer only. Shared content lives in:
+#   dcentos-common.fragment           (workspace-wide package set + identity)
+#   dcentos_am3_aml_common.fragment   (aarch64 + Linaro toolchain + cpio.gz)
+#
+# scripts/build_in_docker.sh concatenates those two fragments BEFORE this
+# defconfig and feeds the merged result to `make defconfig`. So when a key
+# is declared both here and upstream, the value HERE wins (later assignment
+# overrides earlier one).
+#
+# Sibling of dcentos_am3_s21_defconfig — same Amlogic SoC, same boot chain,
+# same hashboard family, only product identity differs.
+
+# =============================================================================
+# Per-product identity.
+# =============================================================================
+BR2_TARGET_GENERIC_HOSTNAME="dcentos-s19k"
+BR2_TARGET_GENERIC_ISSUE="DCENTos for S19K Pro (am3-aml NoPic) — D-Central Technologies"
+
+# =============================================================================
+# Overlay-on-overlay — shared amlogic overlay first, am3-s19kpro identity last.
+# Buildroot applies overlays left-to-right; the last write wins, so
+# product-specific files (etc/dcentos-version, dcentrald.toml, board ID files)
+# overwrite anything in the shared amlogic overlay.
+# =============================================================================
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/am3-s19kpro/rootfs-overlay"
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/am3-s19kpro/post-build.sh"
+BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/am3-s19kpro/post-image.sh"

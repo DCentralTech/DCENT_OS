@@ -1,0 +1,74 @@
+# DCENTos am3-aml shared Buildroot fragment — Amlogic A113D (aarch64).
+# D-Central Technologies, 2026.
+#
+# This fragment owns the architecture + toolchain + filesystem decisions
+# that are IDENTICAL across every Amlogic-A113D NoPic DCENT_OS product.
+#: AML S11board is BYTE-IDENTICAL
+# across L9 / S19j Pro Amlogic / S21 / S21 Pro / T21 / S19K Pro Amlogic
+# (all v1.2.6-rc5 board hash bbc25a2137fd...). DCENT_OS am3-aml HAL ports
+# 1:1 across all five product lines, so the Buildroot footprint should
+# also be 1:1 — that is what this fragment encodes.
+#
+# It is concatenated by `scripts/build_in_docker.sh` AFTER
+# `dcentos-common.fragment` and BEFORE the per-product defconfig:
+#
+#   dcentos-common.fragment
+#     + dcentos_am3_aml_common.fragment   <-- THIS FILE
+#     + dcentos_am3_<product>_defconfig   (hostname / issue / overlay path)
+#     ----------------------------------
+#     = generated dcentos_am3_<product>_full_defconfig
+#
+# DO NOT add product-specific Kconfig keys here. Hostname, issue, overlay
+# path, post-build / post-image script paths all live in the per-product
+# defconfig.
+
+# =============================================================================
+# Target Architecture — Amlogic A113D (aarch64, Cortex-A53 quad).
+# Same SoC across L9 / S19j Pro Amlogic / S21 / S21 Pro / T21 / S19K Pro AML.
+# =============================================================================
+BR2_aarch64=y
+BR2_cortex_a53=y
+
+# =============================================================================
+# Toolchain — Linaro GCC 7.2.1-2017.11 aarch64 (matches the vendor 4.9.113
+# kernel ABI shipped with every am3-aml product). Same toolchain version as
+# the Zynq sibling (am2-s17 / am1-s9), just the aarch64 prefix variant.
+# =============================================================================
+BR2_TOOLCHAIN_EXTERNAL=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM=y
+BR2_TOOLCHAIN_EXTERNAL_DOWNLOAD=y
+BR2_TOOLCHAIN_EXTERNAL_URL="https://releases.linaro.org/components/toolchain/binaries/7.2-2017.11/aarch64-linux-gnu/gcc-linaro-7.2.1-2017.11-x86_64_aarch64-linux-gnu.tar.xz"
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_PREFIX="aarch64-linux-gnu"
+BR2_TOOLCHAIN_EXTERNAL_GCC_7=y
+BR2_TOOLCHAIN_EXTERNAL_HEADERS_4_10=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_GLIBC=y
+BR2_TOOLCHAIN_EXTERNAL_CXX=y
+BR2_TOOLCHAIN_EXTERNAL_FORTRAN=y
+BR2_TOOLCHAIN_EXTERNAL_OPENMP=y
+
+# =============================================================================
+# Filesystem — CPIO + gzip wrapped into a uImage ramdisk by post-image.sh.
+#
+# Every am3-aml product boots a uImage-wrapped gzip CPIO out of nandrootfs
+# (S19K Pro: mtd5 LOCAL offset 0x05700000; S21: same nandrootfs partition
+# at 0x05100000; per-product details in board/amlogic/<product>/post-image.sh).
+# squashfs is NOT used on am3-aml. The ext2 image is kept around as a
+# secondary output for SD-card recovery + offline inspection on every product.
+# =============================================================================
+BR2_TARGET_ROOTFS_CPIO=y
+BR2_TARGET_ROOTFS_CPIO_GZIP=y
+BR2_TARGET_ROOTFS_EXT2=y
+BR2_TARGET_ROOTFS_EXT2_4=y
+BR2_TARGET_ROOTFS_EXT2_SIZE="128M"
+
+# =============================================================================
+# BusyBox applet fragment — enable the SNTP client (`ntpd`) the way the Zynq
+# busybox.config does. The amlogic family uses Buildroot's DEFAULT busybox
+# config (it sets no BR2_PACKAGE_BUSYBOX_CONFIG), which ships ntpd OFF. The
+# A113D has a battery-less virtual RTC that boots at 2015, so the ported
+# S41ntp init script needs `ntpd` for a fresh first-boot network time sync.
+# The fragment is merged over the default config and is purely additive (only
+# adds the ntpd applet — `date`/`ip` are already on). See
+# board/amlogic/busybox-ntpd.fragment for the full rationale.
+# =============================================================================
+BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/busybox-ntpd.fragment"

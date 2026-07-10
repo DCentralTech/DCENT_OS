@@ -1,0 +1,18 @@
+#!/bin/sh
+#
+# Stock/LuxOS compatibility wrapper for AM335x BB board setup.
+
+case "$1" in
+    start|"")
+        [ -x /etc/init.d/S37board_setup ] && /etc/init.d/S37board_setup start
+        ;;
+    stop)
+        [ -x /etc/init.d/S37board_setup ] && /etc/init.d/S37board_setup stop
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

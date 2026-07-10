@@ -1,0 +1,222 @@
+#!/bin/sh
+#
+# S15pic_boot — Optional legacy PIC initialization via bosminer compatibility mode
+#
+# This path exists only for older field/lab images that still need a one-shot
+# legacy PIC bring-up helper before native dcentrald takeover.
+#
+# Bosminer handles the fragile PIC RESET+JUMP+voltage sequence with its proven
+# I2C implementation. After 90s (enough for PIC flash + ASIC enum), graceful
+# SIGTERM gives bosminer 10s to release the I2C bus cleanly. Native dcentrald
+# then takes over for mining.
+#
+# This runs ONCE per boot (flag in /tmp clears on reboot).
+# D-Central Technologies — DCENT_OS v0.6.0
+#
+
+BOSMINER="/usr/bin/bosminer"
+FLAG="/tmp/pic_init_done"
+FAIL_FLAG="/tmp/pic_init_failed"
+LOGDIR="/tmp/log/bosminer"
+CONSOLE_LOG="$LOGDIR/pic_init_console.log"
+DEFAULT_COMPAT="/etc/default/dcentos-compat"
+PERSISTENT_COMPAT="/data/dcentos-compat"
+BOSMINER_TOML_CREATED=0
+
+bosminer_pic_bootstrap_enabled() {
+    BOSMINER_PIC_BOOTSTRAP=0
+    [ -f "$DEFAULT_COMPAT" ] && . "$DEFAULT_COMPAT"
+    [ -f "$PERSISTENT_COMPAT" ] && . "$PERSISTENT_COMPAT"
+
+    case "$BOSMINER_PIC_BOOTSTRAP" in
+        1|true|TRUE|yes|YES|on|ON|enabled|ENABLED)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+compat_bootstrap_model_allowed() {
+    BOSMINER_PIC_BOOTSTRAP_ALLOW_MODEL="am1-s9"
+    [ -f "$DEFAULT_COMPAT" ] && . "$DEFAULT_COMPAT"
+    [ -f "$PERSISTENT_COMPAT" ] && . "$PERSISTENT_COMPAT"
+
+    [ "$BOSMINER_PIC_BOOTSTRAP_ALLOW_MODEL" = "am1-s9" ] || return 1
+    [ -d /sys/class/uio ] || return 1
+
+    UIO_COUNT=$(ls -d /sys/class/uio/uio* 2>/dev/null | wc -l)
+    [ "$UIO_COUNT" -gt 0 ] || return 1
+    [ "$UIO_COUNT" -le 14 ] || return 1
+
+    for name_file in /sys/class/uio/*/name; do
+        [ -f "$name_file" ] || continue
+        if grep -q "board-control" "$name_file" 2>/dev/null; then
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+mining_autostart_enabled() {
+    CONFIG="/etc/dcentrald.toml"
+    [ -f /data/dcentrald.toml ] && CONFIG="/data/dcentrald.toml"
+    # FAIL CLOSED: this decides whether to autostart MINING (energize hashboards).
+    # If the config is absent or does not explicitly set [mining].enabled = true,
+    # stay management-only (return 1) rather than energizing on an unknown config —
+    # matching the F5 management-only-boot safety posture. Only an explicit
+    # `[mining] enabled = true` returns 0 (autostart).
+    [ -f "$CONFIG" ] || return 1
+
+    awk '
+        /^\[/ { in_mining = ($0 == "[mining]") }
+        in_mining && $1 == "enabled" {
+            found = 1
+            result = ($3 == "true" ? 0 : 1)
+            exit
+        }
+        END {
+            if (found) {
+                exit result
+            }
+            # Missing [mining].enabled key -> fail closed (management-only).
+            exit 1
+        }
+    ' "$CONFIG"
+}
+
+mark_success() {
+    rm -f "$FAIL_FLAG"
+    touch "$FLAG"
+}
+
+mark_failure() {
+    rm -f "$FLAG"
+    touch "$FAIL_FLAG"
+}
+
+chips_discovered() {
+    grep -q "Discovered" "$LOGDIR/bosminer.log" 2>/dev/null || \
+        grep -q "Discovered" "$CONSOLE_LOG" 2>/dev/null
+}
+
+cleanup_bootstrap_artifacts() {
+    if [ "$BOSMINER_TOML_CREATED" = "1" ]; then
+        rm -f /etc/bosminer.toml
+    fi
+}
+
+case "$1" in
+    start)
+        # Skip if already done this boot
+        [ -f "$FLAG" ] && exit 0
+        rm -f "$FAIL_FLAG"
+
+        if ! bosminer_pic_bootstrap_enabled; then
+            echo "  [SKIP] S15pic_boot: legacy PIC compatibility bootstrap disabled"
+            mark_success
+            exit 0
+        fi
+
+        if ! compat_bootstrap_model_allowed; then
+            echo "  [SKIP] S15pic_boot: legacy PIC bootstrap only allowlisted for am1-s9"
+            mark_success
+            exit 0
+        fi
+
+        if ! mining_autostart_enabled; then
+            echo "  [SKIP] S15pic_boot: mining auto-start disabled"
+            mark_success
+            exit 0
+        fi
+
+        # Skip if bosminer not available
+        [ -x "$BOSMINER" ] || {
+            echo "  [SKIP] S15pic_boot: bosminer not found"
+            mark_success
+            exit 0
+        }
+
+        # Create bosminer config if missing. Bosminer still wants a pool stanza for
+        # startup, but PIC init must never mine to a real destination on fresh images.
+        if [ ! -f /etc/bosminer.toml ]; then
+            BOSMINER_TOML_CREATED=1
+            cat > /etc/bosminer.toml << 'EOF'
+[format]
+version = "1.0+"
+model = "Antminer S9"
+generator = "dcent_pic_init"
+timestamp = 1711300000
+
+[[group]]
+name = "Default"
+
+[[group.pool]]
+url = "stratum+tcp://127.0.0.1:1"
+user = "disabled.picinit"
+password = "x"
+EOF
+        fi
+
+        # Ensure bos_version exists (bosminer panics without it)
+        [ -f /etc/bos_version ] || echo "2022-09-27-0-26ba61b9-22.08.1-plus" > /etc/bos_version
+        [ -f /etc/bos_mode ] || echo "nand" > /etc/bos_mode
+
+        echo "Starting legacy bosminer PIC bootstrap (90s)..."
+        mkdir -p "$LOGDIR"
+        : > "$CONSOLE_LOG"
+        $BOSMINER > "$CONSOLE_LOG" 2>&1 &
+        BOS_PID=$!
+
+        # Wait for PIC init + ASIC enumeration, but abort early if bosminer dies.
+        for i in $(seq 1 90); do
+            if ! kill -0 "$BOS_PID" 2>/dev/null; then
+                echo "  [FAIL] Bosminer exited early after ${i}s — PIC init not confirmed"
+                cleanup_bootstrap_artifacts
+                mark_failure
+                exit 1
+            fi
+            sleep 1
+        done
+
+        # Check if bosminer discovered chips
+        if chips_discovered; then
+            echo "  [OK] Bosminer discovered ASIC chips"
+            PIC_INIT_OK=true
+        else
+            echo "  [FAIL] No chip discovery in bosminer logs — PIC init not confirmed"
+            PIC_INIT_OK=false
+        fi
+
+        # Graceful shutdown — SIGTERM + 10s for clean I2C release
+        echo "  Stopping bosminer (graceful SIGTERM + 10s)..."
+        kill $BOS_PID 2>/dev/null
+        sleep 10
+        kill -9 $BOS_PID 2>/dev/null
+        sleep 2
+        cleanup_bootstrap_artifacts
+
+        if [ "$PIC_INIT_OK" = "true" ]; then
+            mark_success
+            echo "  [OK] Legacy PIC bootstrap complete — dcentrald can start"
+        else
+            mark_failure
+            echo "  [WARN] PIC init not confirmed — dcentrald will fall back to native cold init"
+            exit 1
+        fi
+        ;;
+
+    stop)
+        rm -f "$FLAG"
+        rm -f "$FAIL_FLAG"
+        ;;
+
+    *)
+        echo "Usage: $0 {start|stop}"
+        exit 1
+        ;;
+esac
+
+exit 0

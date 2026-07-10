@@ -1,0 +1,127 @@
+#!/bin/sh
+#
+# S50dropbear - DCENT_OS gated dropbear SSH service with AM3 BB rescue gate.
+#
+# The normal DCENT_OS gate requires the first-boot wizard or authorized_keys.
+# The am3-bb-s19jpro lab image also ships /etc/dcentos/rescue_ssh_enabled so
+# the unit remains reachable over SSH even if dcentrald faults during cold boot.
+
+NAME=dropbear
+DAEMON=/usr/sbin/dropbear
+PIDFILE=/var/run/dropbear.pid
+DROPBEAR_DEFAULTS=/etc/default/dropbear
+
+DCENT_AUTH_FILE=/data/dcent/auth.json
+DCENT_SSH_ENABLED=/data/dcent/.ssh-enabled
+DCENT_AUTHORIZED_KEYS=/data/dcent/authorized_keys
+RESCUE_SSH_MARKER=/etc/dcentos/rescue_ssh_enabled
+BOARD_TARGET_FILE=/etc/dcentos/board_target
+# Phase 4J (2026-05-15): explicit operator opt-out via persistent /data overlay.
+DCENT_SSH_DISABLED=/data/dcent/.ssh-disabled
+
+DROPBEAR_ARGS=""
+[ -r "$DROPBEAR_DEFAULTS" ] && . "$DROPBEAR_DEFAULTS"
+
+mkdir -p /etc/dropbear 2>/dev/null || true
+
+am3_bb_rescue_enabled() {
+    [ -f "$RESCUE_SSH_MARKER" ] || return 1
+    [ -r "$BOARD_TARGET_FILE" ] || return 1
+    [ "$(cat "$BOARD_TARGET_FILE" 2>/dev/null)" = "am3-bb-s19jpro" ] || return 1
+    return 0
+}
+
+ssh_gate_state() {
+    # Phase 4J: explicit operator opt-out beats everything (including
+    # am3-bb-rescue), so a chronically-misbehaving rescue marker can't keep
+    # SSH up against operator wishes.
+    if [ -f "$DCENT_SSH_DISABLED" ]; then
+        echo "disabled-by-opt-out"
+        return
+    fi
+    if am3_bb_rescue_enabled; then
+        echo "enabled-by-am3-bb-rescue"
+        return
+    fi
+    if [ -s "$DCENT_AUTHORIZED_KEYS" ]; then
+        echo "enabled-by-keys"
+        return
+    fi
+    if [ -f "$DCENT_AUTH_FILE" ]; then
+        echo "enabled-by-wizard"
+        return
+    fi
+    # Phase 4J: enable-by-default. Operator creates /data/dcent/.ssh-disabled
+    # to opt out. WARN emitted at start() so the operator knows.
+    echo "enabled-by-default"
+}
+
+start_disabled_msg() {
+    MSG="DCENT_OS: SSH disabled by operator (/data/dcent/.ssh-disabled present)"
+    if command -v logger >/dev/null 2>&1; then
+        logger -t dcent-ssh -p auth.warning "$MSG"
+    fi
+    echo "$MSG"
+}
+
+start_default_warn() {
+    # Phase 4J: one-line WARN on the enable-by-default path.
+    MSG="DCENT_OS: first-boot SSH enabled by default; create /data/dcent/.ssh-disabled to opt out"
+    if command -v logger >/dev/null 2>&1; then
+        logger -t dcent-ssh -p auth.warning "$MSG"
+    fi
+    echo "$MSG"
+}
+
+start() {
+    STATE=$(ssh_gate_state)
+    if [ "$STATE" = "disabled-by-opt-out" ]; then
+        printf 'Starting %s: BLOCKED (gate=%s)\n' "$NAME" "$STATE"
+        start_disabled_msg
+        return 0
+    fi
+    if [ "$STATE" = "enabled-by-default" ]; then
+        start_default_warn
+    fi
+    printf 'Starting %s: ' "$NAME"
+    case " $DROPBEAR_ARGS " in
+        *" -R "*) ;;
+        *) DROPBEAR_ARGS="$DROPBEAR_ARGS -R" ;;
+    esac
+    # shellcheck disable=SC2086
+    start-stop-daemon -S -q -p "$PIDFILE" --exec "$DAEMON" -- $DROPBEAR_ARGS \
+        && echo "OK (gate=$STATE)" || { echo "FAIL"; return 1; }
+}
+
+stop() {
+    printf 'Stopping %s: ' "$NAME"
+    start-stop-daemon -K -q -p "$PIDFILE" 2>/dev/null && echo "OK" || echo "not running"
+}
+
+restart() {
+    stop
+    sleep 1
+    start
+}
+
+status() {
+    STATE=$(ssh_gate_state)
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+        echo "$NAME: running (gate=$STATE)"
+        return 0
+    fi
+    echo "$NAME: stopped (gate=$STATE)"
+    return 3
+}
+
+case "$1" in
+    start) start ;;
+    stop) stop ;;
+    restart|reload) restart ;;
+    status) status ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
+exit $?

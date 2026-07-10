@@ -1,0 +1,147 @@
+# DCENT_OS overlay config — S19j Pro .139, BraiinsOS+ /data/ userspace overlay
+#
+# This config is loaded by dcentrald when running in --stratum-proxy mode
+# from /data/dcentrald/dcentrald.toml on BraiinsOS+. dcentrald in this mode
+# is a PASSIVE OBSERVER:
+#   * Mining stays on bosminer (when working). Bosminer owns the FPGA, PIC,
+#     PSU, /dev/i2c-0, /dev/ttyS*, and /dev/mem.
+#   * dcentrald only opens TCP sockets: dashboard (http_port), CGMiner API
+#     (cgminer_port), Stratum V1 proxy listener (listen_addr).
+#   * Telemetry is scraped from local cgminer @ 127.0.0.1:4028.
+#
+# Hardware-touching code paths are DISABLED below (mining.enabled=false,
+# autotuner off, watchdog off, hash_on_disconnect off, LED off). The
+# --stratum-proxy CLI flag in main.rs already gates hardware init — these
+# settings are belt-and-suspenders.
+#
+# Deploy:
+#   bash DCENT_OS_Antminer/scripts/dcentos_overlay_deploy_139.sh
+# Rollback:
+#   /etc/init.d/dcentrald-overlay disable && stop && rm -rf /data/dcentrald/
+
+[general]
+hostname = "dcentos-overlay-s19jpro"
+log_level = "info"
+
+[pool]
+# Donation pool routing (1.5%) is wired through the Stratum V1 proxy. The user
+# pool flows through bosminer's /etc/bosminer.toml — we do NOT take ownership
+# of the upstream pool URL here. This block exists to satisfy config schema
+# and to seed the dashboard's "primary pool" display only.
+url = "stratum+tcp://127.0.0.1:3333"
+worker = "DCentralTech.s19jpro.overlay"
+password = "x"
+protocol = "sv1"
+
+[stratum_proxy]
+# Local proxy listener (bosminer can be flipped to 127.0.0.1:3333 by a separate
+# step; not part of this overlay deploy). When unused, the listener is idle
+# and harmless.
+listen_addr = "127.0.0.1:3333"
+upstream_url = "stratum+tcp://btc.global.luxor.tech:700"
+# BraiinsOS+ also opens a 64-byte binary devfee session — route those upstream
+# to Braiins Pool unchanged so the proxy never strips devfee shares.
+binary_upstream_url = "stratum2+tcp://a830bcc3.bos.braiins.com:3336"
+
+[mining]
+# CRITICAL: false. dcentrald MUST NOT initialize chains. bosminer owns hardware.
+enabled = false
+
+# These keys exist in the schema but are inert when mining.enabled=false and
+# the daemon runs under --stratum-proxy. Set to safe S19j Pro defaults so that
+# any accidental hardware init path stops at the version-rolling/freq guard
+# instead of inheriting unsafe S9 defaults.
+frequency_mhz = 525
+voltage_mv = 13700
+suggest_difficulty = 8192
+passthrough = false
+version_rolling = false
+serial_device = "/dev/ttyS2"
+serial_chip_count = 126
+serial_chip_type = "BM1362"
+fpga_chain_base = "0x43C00000"
+fpga_chain_id = 1
+model = "s19jpro"
+skip_fifo_reset = false
+# Skip board temp probe — overlay mode never touches I2C, but the parser still
+# validates the key. true = XADC die-temp fallback only.
+skip_board_temp = true
+
+[power]
+# No PSU control. APW121215a is owned by bosminer.
+psu_bypass = false
+max_watts = 2200
+circuit_capacity_watts = 4800
+circuit_voltage_v = 240
+circuit_amperage_a = 20
+
+[psu]
+# Inert in overlay mode (no I2C transactions). Values mirror the production
+# Phase 5 config so the dashboard reads correct PSU metadata.
+voltage_mv = 15200
+heartbeat_hz = 1
+watchdog_enabled = false
+i2c_address = 0x10
+transport = "gpio_bitbang"
+pwr_control_gpio = "gpio:907"
+
+[thermal]
+target_temp_c = 60
+hot_temp_c = 70
+dangerous_temp_c = 85
+fan_min_pwm = 10
+fan_max_pwm = 30
+pid_interval_s = 2.0
+hysteresis_c = 3
+
+[api]
+# CGMiner API: bind only on loopback so we don't collide with bosminer's own
+# :4028. dcentrald scrapes bosminer @ 127.0.0.1:4028 for telemetry; the
+# dashboard surfaces this on /api/status.
+cgminer_port = 4029
+# Dashboard + REST API on :8080 (
+# — never use :80 on platforms with server.py).
+http_port = 8080
+websocket = true
+cgminer_bind_lan = false
+metrics_require_auth = true
+# Upstream cgminer endpoint to scrape for live telemetry. bosminer's CGMiner
+# API listens on 127.0.0.1:4028 by default on BraiinsOS+.
+cgminer_scrape_url = "http://127.0.0.1:4028"
+
+[donation]
+# Voluntary donation routing. Configurable; user can disable in dashboard.
+enabled = true
+percent = 2.0
+pool_url = "stratum+tcp://pool.d-central.tech:3333"
+worker = "DungeonMaster"
+password = "x"
+fallback_enabled = true
+fallback_pool_url = "stratum+tcp://stratum.braiins.com:3333"
+fallback_worker = "DungeonMaster"
+fallback_password = "x"
+cycle_duration_s = 3600
+
+[watchdog]
+# Disabled in overlay mode — bosminer owns the hardware watchdog (PIC + PSU).
+enabled = false
+
+[hash_on_disconnect]
+# Disabled — dcentrald never dispatches work in overlay mode.
+enabled = false
+
+[mode]
+# Default to mining tone; user can flip to home/hacker in the dashboard.
+active = "standard"
+
+[autotuner]
+# CRITICAL: false. Autotuner mutates frequency on chains we don't own.
+enabled = false
+
+[led]
+# Disabled — LED engine writes to GPIO/sysfs that bosminer owns on am2.
+enabled = false
+heartbeat_on_ms = 100
+heartbeat_off_ms = 900
+flash_on_accepted_share = false
+flash_on_rejected_share = false

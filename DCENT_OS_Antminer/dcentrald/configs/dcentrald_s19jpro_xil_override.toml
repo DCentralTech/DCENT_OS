@@ -1,0 +1,236 @@
+# G1 RUNTIME OVERRIDE (XIL S19j Pro production-readiness, 2026-05-16)
+# Generated from dcentrald_s19jpro_xil.toml with ONLY
+# [power.psu_override].enabled flipped false->true. Operator confirmed the
+# Loki board STAYS INSTALLED through the whole campaign (BraiinsOS needs it;
+# removed only at the final real DCENT_OS persistent switch) => the proven
+# 2026-05-15 milestone path (Loki-IN + override skips the APW SMBus probe).
+# fan_max_pwm=30 / hash_on_disconnect=false / autotuner=false preserved
+# verbatim (asserted). Stage to /tmp on .109 ONLY on explicit operator go
+# AFTER an AC-cycle. NOT a NAND/persistent artifact.
+# DCENT_OS dcentrald config — S19j Pro "XIL" unit (zynq-bm3-am2, BM1362, Loki Mod)
+#
+# Target unit: 203.0.113.109  ("XIL" — Xilinx/Zynq am2 control board)
+#   - Home unit with the "Loki Mod": runs an APW3 PSU tweaked to ~12.8 V
+#     output instead of the stock APW12. BraiinsOS refuses to start without a
+#     valid APW12 I²C handshake, so the unit currently uses a "Loki board" that
+#     spoofs APW12 telemetry. DCENT_OS does NOT need the Loki board — it has a
+#     native PSU-override path (see [power.psu_override] below).
+#   - Same control-board *class* as 203.0.113.139 (am2 Zynq, BM1362). The
+#     "Loki Mod" is a POWER configuration, not a separate control-board variant
+#     — routing is still `zynq-bm3-am2` + `model = "s19jpro"`.
+#   - Currently on BraiinsOS — this config is for the overlay-deploy bring-up
+#     (binary in /tmp, reversible: reboot -> BraiinsOS).
+#
+# Bring-up plan (operator decision 2026-05-12):
+#   1. FIRST RUNS: Loki board STAYS in place. [power.psu_override] is DISABLED
+#      below — the rail is already up via the Loki+APW3 under BraiinsOS, and the
+#      [psu] block keeps matching the .139 APW121215a smart path (the Loki board
+#      presents the smart interface, so Phase 0's APW probe is best-effort/
+#      non-fatal either way). Goal of these runs: validate the chain-UART-RX fix
+#      (DevmemUart MCR=0x03 + FCR=0x07 — R4/W13 root cause) live on a Zynq am2
+#      S19j Pro for the first time, then first own-dispatch nonce / accepted share.
+#   2. AFTER first hash is confirmed: pull the Loki board, set
+#      [power.psu_override] enabled = true (model = "APW3", voltage_v = 12.8) —
+#      the am2 hybrid Phase 0 now honours that (it skips the APW121215a I²C
+#      probe / watchdog / set-voltage, still asserts PWR_CONTROL, records the
+#      rail voltage and APW3 efficiency 0.85), then re-run and confirm the
+#      "PSU OVERRIDE (Loki bypass)" branch + PWR_CONTROL asserted + still mining.
+# +
+#      .
+#
+# S19j Pro am2 hardware facts (mirror of dcentrald_s19jpro_am2.toml — the XIL
+# unit is the same control-board class):
+#   - zynq-bm3-am2 platform, BM1362 chip, dsPIC at I2C 0x21 (per-chain voltage
+#     controller — present on the Loki-modded hashboard exactly as on .139;
+#     only the PSU upstream differs)
+#   - Live preflight on 2026-05-14 shows two populated boards. Braiins opens
+#     `/dev/ttyS1` for board #1 and `/dev/ttyS3` for board #3. First DCENT
+#     proof targets board #1 at `0x43C00000`; add board #3 at `0x43C30000`
+#     only after first accepted-share proof.
+#   - 3.125 Mbaud mining, CTRL=0x00901002, MIDSTATE_CNT=1 (2 midstates)
+#   - Reuses the Braiins-am2 FPGA bitstream (stock Bitmain V2.55 incompatible)
+#
+# `mining.voltage_mv` is the per-CHAIN target the hashboard dsPIC regulates to
+# (~13.7 V) — NOT the PSU rail. With the Loki Mod the APW3 delivers ~12.8 V
+# upstream and the dsPIC step-up/regulator brings the chain to 13.7 V (same as
+# .139 from a 15.2 V APW12). `[power.psu_override].voltage_v` (when enabled) is
+# the PSU OUTPUT rail (~12.8 V) — it is deliberately NOT used as the chip rail.
+#
+# NEVER-VIOLATE rules (enforced by the daemon regardless of config):
+#   - MiscCtrl triple-write with 5 ms spacing
+#   - Deferred voltage gate on 5 stable heartbeat ticks
+#   - Board-temp I2C NACK → XADC die-temp fallback
+#   - PIC RESET NEVER sent on S19j Pro
+#   - AXI IIC unbind/SOFTR NEVER on am2
+#   - PSU I2C GPIO bit-bang PROBE disabled on am2;
+#     framed heartbeat/watchdog writes on bus 0 @ 0x10 remain legal.
+#   - Fan ceiling PWM 30 for home mining ( / )
+#
+# Deploy (overlay bring-up —):
+#   dcent install 203.0.113.109 --target braiinsos-am2-s19jpro-zynq-runtime \
+#       --runtime-only --runtime-binary DCENT_OS_Antminer/dcentrald/target/armv7-unknown-linux-musleabihf/release/dcentrald \
+#       --runtime-config DCENT_OS_Antminer/dcentrald/configs/dcentrald_s19jpro_xil.toml --yes
+#   # The toolbox route must stage/run the XIL quiet helpers, then launch:
+#   #   ./dcentrald --s19j-hybrid --config dcentrald_s19jpro_xil.toml
+#
+# Schema: this file only uses keys that exist in dcentrald/src/config.rs Serde
+# structs. (Same constraint + Agent δ TODO list as dcentrald_s19jpro_am2.toml.)
+
+[general]
+hostname = "dcentos-s19jpro-xil"
+log_level = "info"
+
+[pool]
+# Home bring-up pool. BB `a lab unit` proved Public Pool with suggested difficulty
+# 256 gives fast accepted-share feedback during short quiet proof windows.
+# `worker` must still be a valid BTC address plus worker suffix.
+url = "stratum+tcp://public-pool.io:21496"
+worker = ""
+password = "x"
+protocol = "sv1"
+
+[mining]
+enabled = true
+
+# First-hash proof profile: use the RE-traced BM1362 AM2 PLL condition before
+# FastUART. The earlier 400 MHz ramp profile kept 115200 enumeration alive but
+# failed the immediate fast-baud GetAddress gate (`0x3011@3.125M` and
+# `0x3011@3.0M` both returned 0). After accepted shares are proven, walk this
+# down again for quiet/night space-heater tuning.
+frequency_mhz = 525
+am2_pll_ramp = false
+
+# Home/lab safety guard: after the first work dispatch, force PWR_CONTROL low
+# if the FPGA never returns a nonce. This prevents overnight PWR-high stalls.
+am2_no_nonce_timeout_s = 90
+
+# PER-CHAIN target (mV) the hashboard dsPIC regulates to — NOT the PSU rail.
+voltage_mv = 13700
+
+# Low-difficulty accepted-share proof target, carried over from the BB unit.
+suggest_difficulty = 256
+
+# Cold-boot init path (NOT passthrough — passthrough on am2 post-bosminer
+# produces zero RX; proven on .139 Phase 13/14). dcentrald runs the full
+# BM1362 init over /dev/ttyS1 then dispatches via the FPGA WORK_TX FIFO at
+# 0x43C03000 (chain1). CMD FIFO is DEAD on am2.
+passthrough = false
+
+# ASIC-side version rolling stays DISABLED on the hybrid FPGA dispatch path.
+version_rolling = false
+
+serial_device = "/dev/ttyS1"
+serial_chip_count = 126
+serial_chip_type = "BM1362"
+
+fpga_chain_base = "0x43C00000"
+fpga_chain_id = 1
+
+# Force the BM1362 MinerProfile, bypassing chip auto-detect.
+model = "s19jpro"
+
+# Only effective with passthrough=true.
+skip_fifo_reset = false
+
+# When true, thermal controller falls back to XADC die temp only.
+skip_board_temp = false
+
+[power]
+# psu_bypass (the daemon-path PSU bypass) stays off; the am2 hybrid path uses
+# [power.psu_override] (below) for the Loki bypass instead.
+psu_bypass = false
+
+# Home-quiet first-hash ceiling for the single-chain XIL bring-up profile.
+max_watts = 1200
+
+circuit_capacity_watts = 4800
+circuit_voltage_v = 240
+circuit_amperage_a = 20
+
+# --- PSU OVERRIDE ("Loki bypass") -------------------------------------------
+# DISABLED for the first bring-up runs (Loki board still in place; the rail is
+# already up via Loki+APW3 under BraiinsOS, and the [psu] block below keeps
+# matching the .139 smart path which the Loki board satisfies).
+#
+# AFTER first-hash is confirmed and the Loki board is physically removed, set:
+#     [power.psu_override]
+#     enabled   = true
+#     model     = "APW3"     # APW3 efficiency = 0.85 (model-specific)
+#     voltage_v = 12.8       # the APW3 OUTPUT rail (NOT the ~13.7 V chip rail)
+# The am2 hybrid Phase 0 then skips the APW121215a I²C probe / disable-watchdog
+# / set-DAC / arm sequence and the 1 Hz PSU heartbeat thread, still asserts
+# PWR_CONTROL (the APW3 output enable is wired through it on a Loki-modded
+# chassis), records the declared rail voltage, and proceeds to the dsPIC + BM1362
+# init unchanged..
+[power.psu_override]
+enabled = true
+model = "APW3"
+voltage_v = 12.8
+
+[psu]
+# APW121215a rail params — kept matching .139 for the Loki-board-present bring-up
+# runs. When [power.psu_override] is enabled (Loki board removed), this whole
+# block is bypassed (no APW121215a opened).
+voltage_mv = 15200
+heartbeat_hz = 1
+watchdog_enabled = true
+i2c_address = 0x10
+transport = "gpio_bitbang"
+# Match bosminer's PWR_CONTROL state — drive gpio-907 HIGH. (gpio-901 is held by
+# the kernel and not sysfs-exportable; psu_gpio_gate.rs tolerates EBUSY.) The
+# bypass branch routes this same spec into PsuBypassGate. VERIFY gpio907 is
+# exportable on the XIL kernel before the bring-up.
+pwr_control_gpio = "gpio:907"
+
+[thermal]
+target_temp_c = 60
+hot_temp_c = 70
+dangerous_temp_c = 80
+
+# Home-mining fan ceiling — NEVER raise above 30 without an explicit user mode
+# override ( / ). The hybrid
+# path honours this cap during cold boot too: no transient fan burst.
+fan_min_pwm = 10
+fan_max_pwm = 30
+# idle/non-mining fan duty; uio16-mmap true low PWM; <= fan_max_pwm
+fan_idle_pwm = 10
+
+pid_interval_s = 2.0
+hysteresis_c = 3
+
+[api]
+# BraiinsOS BOSer keeps :4028 open even after `bosminer` is stopped. Use 4027
+# for reversible overlay proof; flashed DCENT_OS can return to 4028 when BOSer
+# is not present.
+cgminer_port = 4027
+# HTTP on 8080 — avoids colliding with BraiinsOS nginx on :80 during bring-up.
+http_port = 8080
+websocket = true
+cgminer_bind_lan = false
+metrics_require_auth = true
+
+[donation]
+# Bring-up: off. Re-enable (2% default) for production deploys.
+enabled = false
+
+[watchdog]
+# Bring-up: off — PIC heartbeat covers the hardware watchdog.
+enabled = false
+
+[hash_on_disconnect]
+# Bring-up: never continue hashing stale work during a pool/control failure.
+enabled = false
+
+[mode]
+active = "standard"
+
+[autotuner]
+# Until first own-dispatch nonce is confirmed.
+enabled = false
+
+[led]
+enabled = true
+heartbeat_on_ms = 100
+heartbeat_off_ms = 900
+flash_on_accepted_share = true
+flash_on_rejected_share = true

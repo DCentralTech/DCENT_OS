@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "dcentaxe",
+    "dcentaxe-asic",
+    "dcentaxe-core",
+    "dcentaxe-bap",
+    "dcentaxe-lora",
+    "dcentaxe-hal",
+    "dcentaxe-stratum",
+    "dcentaxe-mining",
+    "dcentaxe-stratum-v2",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.3.0"
+license = "GPL-3.0"
+
+# COMP-1 / XPSAFE-1: pin panic=abort for firmware release builds.
+#
+# The xtensa-esp32s3-espidf target SPEC already defaults to
+# `panic-strategy = "abort"`, and `.cargo/config.toml` builds only the abort std
+# runtime (`build-std = ["std", "panic_abort"]`) — so this is idempotent for the
+# firmware image. Stating it explicitly guarantees a future target or profile
+# change cannot silently re-enable unwinding, which would reintroduce the
+# Mutex-poisoning risk COMP-1 describes (a panic while holding one of
+# SharedState's 12 Arc<Mutex> locks). It also keeps the coredump path coherent:
+# Rust panic -> abort -> esp_panic_handler -> coredump -> ESP_RST_PANIC reset.
+# Host `cargo test` uses the dev profile (and forces unwind for the harness), so
+# this does not affect the host test suite.
+[profile.release]
+panic = "abort"
+# Size-optimize the firmware app so it fits the 3 MB ota_0 slot in partitions.csv
+# (the app crept past 3 MB; the load-bearing package-firmware OTA-fit gate correctly
+# rejected it). opt-level="s" is size-first with identical logic — ASIC/UART timing is
+# FreeRTOS delay-driven, not codegen-timed — and keeps OTA updates flashable. Do not
+# remove panic="abort" (COMP-1/XPSAFE-1).
+opt-level = "s"

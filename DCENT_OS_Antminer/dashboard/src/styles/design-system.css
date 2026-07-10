@@ -1,0 +1,2463 @@
+/* DCENT_OS Design System — design-handoff refinements
+ * Layered on top of global.css + mode stylesheets.
+ * Source: design-handoff/dcent-os-design-system/project/ui_kits/dashboard/styles.css
+ *
+ * Goal: ship the visual details from the handoff that aren't already in the existing CSS
+ * without breaking any of the existing component selectors.
+ */
+
+/* ─── Hero KPI: orange gradient text on the hashrate hero ───────────────────── */
+/* Subtle top-orange gradient line on cards & sections (appears on hover) */
+.mode-standard .kpi-card,
+.mode-standard .chart-container,
+.mode-standard .section .card {
+  position: relative;
+  overflow: hidden;
+}
+
+.mode-standard .kpi-card::before,
+.mode-standard .chart-container::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(250, 165, 0, 0.4), transparent);
+  opacity: 0;
+  transition: opacity var(--dur-med) var(--ease-standard);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.mode-standard .kpi-card:hover::before,
+.mode-standard .chart-container:hover::before {
+  opacity: 1;
+}
+
+/* Gradient rail on section title (replaces solid bar) */
+.mode-standard .section-title::before {
+  background: linear-gradient(180deg, var(--accent), var(--accent-deep));
+  box-shadow: 0 0 10px var(--accent-glow-hi);
+  border-radius: 2px;
+}
+
+/* Staggered page entrance — applies to any .page-content / .page-scroll children */
+.mode-standard .page-content > *,
+.mode-standard .page-scroll > * {
+  animation: slideUp 0.45s var(--ease-standard) both;
+}
+.mode-standard .page-content > *:nth-child(1),
+.mode-standard .page-scroll > *:nth-child(1)  { animation-delay:   0ms; }
+.mode-standard .page-content > *:nth-child(2),
+.mode-standard .page-scroll > *:nth-child(2)  { animation-delay:  40ms; }
+.mode-standard .page-content > *:nth-child(3),
+.mode-standard .page-scroll > *:nth-child(3)  { animation-delay:  80ms; }
+.mode-standard .page-content > *:nth-child(4),
+.mode-standard .page-scroll > *:nth-child(4)  { animation-delay: 120ms; }
+.mode-standard .page-content > *:nth-child(5),
+.mode-standard .page-scroll > *:nth-child(5)  { animation-delay: 160ms; }
+.mode-standard .page-content > *:nth-child(n+6),
+.mode-standard .page-scroll > *:nth-child(n+6) { animation-delay: 200ms; }
+
+/* ─── Design-handoff primitives (generic, mode-agnostic) ────────────────────── */
+
+/* .ds-chip — pill badge (status, SV2, fan state, etc.) */
+.ds-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 11px;
+  border-radius: var(--radius-pill);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  border: 1px solid transparent;
+  white-space: nowrap;
+  font-family: var(--font-ui);
+}
+.ds-chip .ds-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 6px currentColor;
+}
+.ds-chip.ds-live .ds-dot { animation: pulse 1.8s ease-in-out infinite; }
+.ds-chip.ds-success { color: var(--green);  background: rgba(34,197,94,.12);  border-color: rgba(34,197,94,.28); }
+.ds-chip.ds-warning { color: var(--yellow); background: rgba(234,179,8,.12); border-color: rgba(234,179,8,.28); }
+.ds-chip.ds-danger  { color: var(--red);    background: rgba(239,68,68,.12); border-color: rgba(239,68,68,.28); }
+.ds-chip.ds-info    { color: var(--blue);   background: var(--blue-dim);     border-color: rgba(59,130,246,.28); }
+.ds-chip.ds-accent  { color: var(--accent); background: var(--accent-glow);  border-color: var(--accent-border); box-shadow: 0 0 12px rgba(250,165,0,.1); }
+/* ds-neutral — muted/unknown chip tone. Used for legacy or unrecognized pool
+   states and for the FWT-1 "estimate" provenance marker, where we want a
+   visible-but-quiet badge that does NOT imply success/warning/error. */
+.ds-chip.ds-neutral {
+  color: var(--text-dim);
+  background: rgba(110,110,128,.10);
+  border-color: rgba(110,110,128,.26);
+  text-transform: none;
+  letter-spacing: 0.02em;
+  font-weight: 600;
+  padding: 2px 8px;
+}
+
+/* .ds-toggle — clean iOS-style toggle */
+.ds-toggle {
+  position: relative;
+  width: 40px; height: 22px;
+  border-radius: 12px;
+  background: rgba(255,255,255,.08);
+  cursor: pointer;
+  transition: all .22s var(--ease-standard);
+  flex-shrink: 0;
+  border: 1px solid transparent;
+  outline: none;
+}
+.ds-toggle:focus-visible {
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+.ds-toggle.on {
+  background: var(--accent-gradient);
+  box-shadow: 0 0 12px rgba(250,103,0,.35), inset 0 1px 0 rgba(255,255,255,.2);
+}
+.ds-toggle .ds-toggle-knob {
+  position: absolute;
+  top: 2px; left: 2px;
+  width: 16px; height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 2px 4px rgba(0,0,0,.3);
+  transition: transform .22s var(--ease-standard);
+}
+.ds-toggle.on .ds-toggle-knob { transform: translateX(18px); }
+
+/* .ds-btn — canonical button system
+ *
+ * Variants (additive; default = secondary glass)
+ *   .ds-btn               — secondary glass (subtle)
+ *   .ds-btn.primary       — D-Central orange gradient (hero CTA)
+ *   .ds-btn.secondary     — explicit secondary alias
+ *   .ds-btn.ghost         — transparent / link-like
+ *   .ds-btn.danger        — destructive (red gradient)
+ *   .ds-btn.icon          — square 36×36, no text padding
+ *
+ * Modifiers
+ *   .ds-btn.is-loading    — shows shimmer overlay
+ *   .ds-btn.is-active     — pinned active (e.g. toggle button)
+ *   [aria-pressed="true"] — same effect as .is-active
+ *
+ * Sizes
+ *   .ds-btn.sm — 7px / 14px / 0.78rem
+ *   .ds-btn.lg — 12px / 22px / 0.92rem
+ */
+.ds-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 9px 18px;
+  border-radius: var(--radius-sm);
+  font-weight: 600;
+  font-size: 0.84rem;
+  border: 1px solid var(--border-glass);
+  font-family: var(--font-ui);
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease-standard),
+    border-color var(--dur-fast) var(--ease-standard),
+    color var(--dur-fast) var(--ease-standard),
+    box-shadow var(--dur-fast) var(--ease-standard),
+    transform 90ms var(--ease-out-soft, var(--ease-standard));
+  white-space: nowrap;
+  position: relative;
+  overflow: hidden;
+  letter-spacing: .01em;
+  color: var(--fg-primary);
+  background: rgba(255,255,255,.05);
+  box-shadow: var(--elevation-flat, 0 0 0 1px rgba(255,255,255,.025));
+}
+.ds-btn:hover:not(:disabled):not([aria-disabled="true"]) {
+  border-color: var(--accent-border);
+  background: rgba(250,165,0,.06);
+  color: var(--accent);
+  transform: translateY(-1px);
+  box-shadow: var(--elevation-base, 0 1px 2px rgba(0,0,0,.35), 0 2px 6px rgba(0,0,0,.22));
+}
+.ds-btn:active:not(:disabled):not([aria-disabled="true"]) {
+  transform: translateY(0) scale(.985);
+  box-shadow: var(--elevation-flat, 0 0 0 1px rgba(255,255,255,.025));
+  transition-duration: 60ms;
+}
+.ds-btn:disabled,
+.ds-btn[aria-disabled="true"] {
+  opacity: .5;
+  cursor: not-allowed;
+  transform: none !important;
+}
+
+.ds-btn.secondary {
+  background: rgba(255,255,255,.04);
+  color: var(--fg-primary);
+  border-color: var(--border-glass);
+}
+
+.ds-btn.primary {
+  background: var(--accent-gradient);
+  /* ZONE C accent.ts emits --accent-ink (the readable ink for the chosen
+     accent); we only consume it with the legacy default as fallback so a
+     custom accent keeps a legible label. */
+  color: var(--accent-ink, #1a0f00);
+  box-shadow: var(--shadow-btn), inset 0 1px 0 rgba(255,255,255,.3);
+  border-color: transparent;
+}
+.ds-btn.primary:hover:not(:disabled):not([aria-disabled="true"]) {
+  box-shadow:
+    0 6px 20px rgba(250,103,0,.45),
+    inset 0 1px 0 rgba(255,255,255,.3),
+    0 0 26px rgba(250,165,0,.22);
+  transform: translateY(-1px);
+  color: var(--accent-ink, #1a0f00);
+  background: var(--accent-gradient);
+}
+.ds-btn.primary:active:not(:disabled):not([aria-disabled="true"]) {
+  box-shadow: 0 2px 8px rgba(250,103,0,.32), inset 0 1px 0 rgba(255,255,255,.18);
+}
+
+.ds-btn.danger {
+  background: linear-gradient(135deg, var(--red), #dc2626);
+  color: #fff;
+  box-shadow: 0 2px 10px rgba(239,68,68,.3), inset 0 1px 0 rgba(255,255,255,.18);
+  border-color: transparent;
+}
+.ds-btn.danger:hover:not(:disabled):not([aria-disabled="true"]) {
+  box-shadow: 0 6px 20px rgba(239,68,68,.45), inset 0 1px 0 rgba(255,255,255,.2);
+  color: #fff;
+  transform: translateY(-1px);
+}
+
+.ds-btn.ghost {
+  background: transparent;
+  color: var(--fg-secondary);
+  border-color: transparent;
+  box-shadow: none;
+}
+.ds-btn.ghost:hover:not(:disabled):not([aria-disabled="true"]) {
+  color: var(--accent);
+  border-color: transparent;
+  background: rgba(250,165,0,.05);
+  box-shadow: none;
+  transform: none;
+}
+
+.ds-btn.icon { width: 36px; height: 36px; padding: 0; flex-shrink: 0; }
+.ds-btn.icon.sm { width: 30px; height: 30px; }
+.ds-btn.icon.lg { width: 42px; height: 42px; }
+
+.ds-btn.sm { padding: 7px 14px; font-size: .78rem; gap: 6px; }
+.ds-btn.lg { padding: 12px 22px; font-size: .92rem; gap: 10px; }
+
+/* Pinned-active state (toggle, segmented control, etc.) */
+.ds-btn.is-active,
+.ds-btn[aria-pressed="true"]:not(.primary):not(.danger) {
+  background: var(--accent-glow);
+  color: var(--accent);
+  border-color: var(--accent-border);
+  box-shadow: inset 0 0 0 1px var(--accent-border), 0 0 14px rgba(250,165,0,.10);
+}
+
+/* Loading shimmer overlay */
+.ds-btn.is-loading { pointer-events: none; color: transparent !important; }
+.ds-btn.is-loading::after {
+  content: '';
+  position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,.16), transparent);
+  background-size: 200% 100%;
+  animation: ds-shimmer 1.2s linear infinite;
+}
+
+/* .ds-input — canonical input */
+.ds-input {
+  width: 100%;
+  padding: 10px 14px;
+  background: rgba(10,10,15,.6);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-sm);
+  color: var(--fg-primary);
+  font-size: .85rem;
+  font-family: var(--font-ui);
+  outline: none;
+  transition: all .18s;
+}
+.ds-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow), 0 0 20px rgba(250,165,0,.1);
+}
+
+/* .ds-tf-group — true/false segmented control */
+.ds-tf-group {
+  display: inline-flex;
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: rgba(10,10,15,.5);
+  padding: 3px;
+}
+.ds-tf-group button {
+  padding: 7px 18px;
+  background: transparent;
+  border: none;
+  color: var(--fg-secondary);
+  font-weight: 600;
+  font-size: .8rem;
+  cursor: pointer;
+  font-family: var(--font-ui);
+  border-radius: 6px;
+  transition: all .18s;
+}
+.ds-tf-group button:hover { color: var(--fg-primary); }
+.ds-tf-group button.active {
+  background: var(--accent-gradient);
+  color: var(--accent-ink, #1a0f00);
+  box-shadow: 0 2px 8px rgba(250,103,0,.3);
+}
+
+/* ─── Logo cursor blink (for DcentOsLogo component) ─────────────────────────── */
+.ds-logo-cursor {
+  display: inline-block;
+  width: 4px;
+  height: 22px;
+  background: var(--accent);
+  vertical-align: middle;
+  margin-left: 2px;
+  animation: logoBlink 1.2s step-end infinite;
+  box-shadow: 0 0 8px var(--accent-glow);
+}
+
+/* ─── Sidebar edge-rail (vertical orange gradient on right edge) ────────────── */
+.mode-standard .sidebar::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  top: 10%;
+  bottom: 10%;
+  width: 1px;
+  background: linear-gradient(180deg, transparent, rgba(250,165,0,.3), transparent);
+  pointer-events: none;
+}
+
+/* ─── Topbar bottom orange gradient line ───────────────────────────────────── */
+.mode-standard .topbar,
+.mode-standard .standard-topbar {
+  position: relative;
+}
+.mode-standard .topbar::after,
+.mode-standard .standard-topbar::after {
+  content: '';
+  position: absolute;
+  left: 0; right: 0;
+  bottom: -1px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(250,165,0,.25) 50%, transparent);
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Canonical DCENT_OS token and primitive pass.
+ * Kept at the end so it can tune inherited mode tokens without component churn.
+ */
+.mode-standard {
+  --bg: var(--bg-void);
+  --bg-subtle: #11111a;
+  --card-bg: rgba(18, 18, 27, 0.9);
+  --card-bg-solid: #14141f;
+  --card-hover: rgba(29, 29, 43, 0.96);
+  --card-shadow: var(--shadow-surface);
+  --border: rgba(255, 255, 255, 0.1);
+  --border-glass: rgba(255, 255, 255, 0.13);
+  --text: #f5f5f7;
+  --text-secondary: #b7b7c6;
+  --text-dim: #78788a;
+  --fg-primary: var(--text);
+  --fg-secondary: var(--text-secondary);
+  --fg-muted: var(--text-dim);
+  --accent: var(--brand-orange);
+  --accent-deep: var(--brand-orange-deep);
+  --accent-light: var(--brand-amber);
+  --accent-hover: var(--brand-amber);
+  --sphere-hi: var(--brand-amber);
+  --accent-glow: rgba(250, 165, 0, 0.16);
+  --accent-glow-hi: rgba(250, 165, 0, 0.34);
+  --accent-border: rgba(255, 201, 77, 0.36);
+  --accent-gradient: linear-gradient(135deg, var(--sphere-hi) 0%, var(--accent) 50%, var(--accent-deep) 100%);
+}
+
+.mode-standard .top-bar,
+.mode-standard .topbar,
+.mode-standard .standard-topbar {
+  background: var(--surface-glass-topbar);
+  border-bottom-color: var(--border);
+}
+
+.mode-standard .top-bar::after,
+.mode-standard .topbar::after,
+.mode-standard .standard-topbar::after {
+  background: linear-gradient(90deg, transparent, rgba(250, 165, 0, 0.32) 50%, transparent);
+}
+
+.mode-standard .sidebar,
+.mode-standard .glass-sidebar {
+  background: var(--surface-glass-sidebar);
+  border-right-color: var(--border);
+}
+
+.mode-standard .kpi-card,
+.mode-standard .chart-container,
+.mode-standard .page-surface,
+.mode-standard .metric-card {
+  background: var(--surface-operational);
+  border-color: var(--border-glass);
+  box-shadow: var(--shadow-surface);
+}
+
+.mode-standard .thermal-summary-card {
+  background: rgba(255, 255, 255, 0.035);
+  border-color: var(--border);
+}
+
+.mode-standard .ops-action-btn:hover,
+.mode-standard .control-option:hover,
+.mode-standard .chart-legend-toggle:hover {
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.ds-surface,
+.ds-panel {
+  background: var(--surface-operational);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-surface);
+  color: var(--fg-primary);
+}
+
+.ds-surface {
+  padding: 16px;
+}
+
+.ds-panel {
+  padding: 14px;
+}
+
+.ds-toolbar,
+.ds-operational-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.ds-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+}
+
+.ds-stat {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.ds-stat-label {
+  color: var(--fg-muted);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.ds-stat-value {
+  color: var(--fg-primary);
+  font-family: var(--font-mono);
+  font-size: 0.95rem;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.ds-divider {
+  height: 1px;
+  background: var(--border);
+}
+
+.ds-btn:focus-visible,
+.ds-toggle:focus-visible,
+.ds-input:focus-visible,
+.ds-tf-group button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px var(--focus-ring-soft);
+}
+
+@keyframes logoBlink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Polish layer (2026-05-14) — bringing the dashboard up to handoff fidelity
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+/* ─── Keyframes (additive, namespaced ds-* to avoid collision) ──────────────── */
+@keyframes ds-pulse        { 0%,100% { opacity: 1; } 50% { opacity: .5; } }
+@keyframes ds-fadeIn       { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@keyframes ds-slideUp      { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+@keyframes ds-spin         { to { transform: rotate(360deg); } }
+@keyframes ds-shimmer      { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
+@keyframes ds-valueFlash {
+  0%   { color: var(--accent); filter: brightness(1.25) drop-shadow(0 0 8px var(--accent-glow-hi)); }
+  60%  { color: var(--accent); filter: brightness(1.05); }
+  100% { filter: brightness(1); }
+}
+@keyframes ds-glowPulse {
+  0%, 100% { box-shadow: 0 0 12px rgba(250,165,0,.10); }
+  50%      { box-shadow: 0 0 22px rgba(250,165,0,.24); }
+}
+@keyframes ds-breathingGlow {
+  0%, 100% { opacity: .65; transform: scale(1); }
+  50%      { opacity: 1;   transform: scale(1.04); }
+}
+@keyframes ds-heatPulse {
+  0%, 100% { filter: drop-shadow(0 0 12px rgba(250,103,0,.45)); }
+  50%      { filter: drop-shadow(0 0 26px rgba(250,103,0,.80)) drop-shadow(0 0 56px rgba(250,165,0,.28)); }
+}
+@keyframes ds-emberFloat {
+  0%   { transform: translateY(0) translateX(0) scale(1); opacity: 0; }
+  10%  { opacity: .8; }
+  100% { transform: translateY(-220px) translateX(var(--ds-drift, 0px)) scale(.25); opacity: 0; }
+}
+@keyframes ds-scanLine {
+  0%   { transform: translateY(-100%); }
+  100% { transform: translateY(100%);  }
+}
+@keyframes ds-flicker {
+  0%, 92%, 100% { opacity: 1; }
+  93%           { opacity: .65; }
+  95%           { opacity: 1; }
+  97%           { opacity: .85; }
+}
+@keyframes ds-flameFlicker {
+  0%, 100% { opacity: .85; transform: scale(1); }
+  25%      { opacity: 1;   transform: scale(1.06) rotate(-2deg); }
+  50%      { opacity: .9;  transform: scale(1.02) rotate(1deg); }
+  75%      { opacity: 1;   transform: scale(1.05) rotate(-1deg); }
+}
+@keyframes ds-cursorBlink {
+  0%, 49%  { opacity: 1; }
+  50%,100% { opacity: 0; }
+}
+@keyframes ds-modalIn  { from { opacity: 0; transform: translateY(8px) scale(.99); } to { opacity: 1; transform: none; } }
+
+/* ─── Live value flash — apply via key change in React (key=(value)) ────────── */
+.ds-value-flash      { animation: ds-valueFlash 700ms var(--ease-standard, cubic-bezier(.2,0,0,1)) both; }
+.ds-breathing-glow   { animation: ds-breathingGlow 3.2s ease-in-out infinite; }
+.ds-cursor-blink     { animation: ds-cursorBlink 1.05s step-end infinite; }
+.ds-flame-flicker    { animation: ds-flameFlicker 1.5s ease-in-out infinite; transform-origin: center bottom; }
+
+/* ─── Live "fresh data" indicator ───────────────────────────────────────────── */
+.ds-live-dot {
+  display: inline-block;
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--green, #22C55E);
+  box-shadow: 0 0 8px var(--green, #22C55E);
+  animation: ds-pulse 1.8s ease-in-out infinite;
+  vertical-align: middle;
+}
+
+/* ─── Universal hover-lift utility on cards (opt-in) ────────────────────────── */
+.ds-hoverable {
+  transition: transform var(--dur-fast, 150ms) var(--ease-standard, cubic-bezier(.2,0,0,1)),
+              box-shadow var(--dur-fast, 150ms) var(--ease-standard, cubic-bezier(.2,0,0,1)),
+              border-color var(--dur-fast, 150ms) var(--ease-standard, cubic-bezier(.2,0,0,1));
+}
+.ds-hoverable:hover { transform: translateY(-2px); box-shadow: var(--shadow-elevated, 0 8px 32px rgba(0,0,0,.4)); border-color: var(--accent-border, rgba(250,165,0,.32)); }
+
+/* ─── Skeleton / shimmer loader ─────────────────────────────────────────────── */
+.ds-skel {
+  background: linear-gradient(90deg, rgba(255,255,255,.04), rgba(255,255,255,.10), rgba(255,255,255,.04));
+  background-size: 200% 100%;
+  animation: ds-shimmer 1.4s linear infinite;
+  border-radius: 6px;
+  display: block;
+}
+.ds-skel.line { height: 12px; margin: 6px 0; }
+.ds-skel.box  { height: 56px; }
+
+/* ─── Branded empty state ───────────────────────────────────────────────────── */
+.ds-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 48px 24px;
+  border: 1px dashed var(--border-glass, rgba(255,255,255,.08));
+  border-radius: var(--radius-md, 12px);
+  background: rgba(255,255,255,.012);
+  color: var(--fg-secondary, #8b8b9e);
+  text-align: center;
+}
+.ds-empty-state .ds-empty-icon {
+  width: 44px; height: 44px;
+  border-radius: 50%;
+  background: var(--accent-glow, rgba(250,165,0,.15));
+  border: 1px solid var(--accent-border, rgba(250,165,0,.32));
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--accent, #FAA500);
+  flex-shrink: 0;
+}
+.ds-empty-state .ds-empty-title {
+  font-family: var(--font-heading);
+  font-weight: 700; font-size: 1.05rem;
+  color: var(--fg-primary, #f0f0f0);
+  letter-spacing: .01em;
+}
+.ds-empty-state .ds-empty-hint {
+  font-size: .78rem; color: var(--fg-secondary, #8b8b9e);
+  max-width: 42ch;
+}
+
+/* ─── Section eyebrow (above section-title) ─────────────────────────────────── */
+.ds-section-eyebrow {
+  display: block;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: .62rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .14em;
+  color: var(--fg-dim, #6a6a7e);
+  margin-bottom: 4px;
+  line-height: 1;
+}
+
+/* ─── Status footer chip spacing (Standard mode footer breathing room) ──────── */
+.mode-standard .standard-status-footer {
+  gap: 12px;
+}
+.mode-standard .standard-status-footer-items {
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.mode-standard .standard-status-footer-chip {
+  border-radius: 999px;
+  letter-spacing: .015em;
+  text-transform: none;
+  padding: 4px 11px;
+  font-size: .72rem;
+}
+
+/* ─── Tabular nums everywhere telemetry lives ───────────────────────────────── */
+.mode-standard .kpi-value,
+.mode-standard .metric-card-value,
+.mode-standard .top-kpi-value,
+.mode-standard .standard-status-footer-chip strong,
+.mode-standard table td,
+.mode-standard .shares-table td,
+.mode-standard .logs-table td {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum';
+}
+
+/* ─── Standard mode table hover ─────────────────────────────────────────────── */
+.mode-standard table tbody tr,
+.mode-standard .data-table tbody tr,
+.mode-standard .shares-table tbody tr,
+.mode-standard .logs-table tbody tr {
+  transition: background var(--dur-fast, 150ms) var(--ease-standard, cubic-bezier(.2,0,0,1));
+}
+.mode-standard table tbody tr:hover,
+.mode-standard .data-table tbody tr:hover,
+.mode-standard .shares-table tbody tr:hover,
+.mode-standard .logs-table tbody tr:hover {
+  background: rgba(250, 165, 0, 0.045);
+}
+
+/* ─── Standard mode: KPI hero hover lift, gradient top-line (already in earlier block) ─ */
+.mode-standard .kpi-card,
+.mode-standard .metric-card {
+  transition: transform var(--dur-fast, 150ms) var(--ease-standard, cubic-bezier(.2,0,0,1)),
+              border-color var(--dur-fast, 150ms) var(--ease-standard, cubic-bezier(.2,0,0,1)),
+              box-shadow var(--dur-fast, 150ms) var(--ease-standard, cubic-bezier(.2,0,0,1)),
+              background var(--dur-fast, 150ms) var(--ease-standard, cubic-bezier(.2,0,0,1));
+}
+.mode-standard .kpi-card:hover,
+.mode-standard .metric-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--accent-border, rgba(250,165,0,.32));
+  box-shadow: var(--shadow-elevated, 0 8px 32px rgba(0,0,0,.4));
+}
+
+/* ─── Sidebar active-item ambient glow (Standard) ───────────────────────────── */
+.mode-standard .sidebar .nav-item.active {
+  box-shadow: inset 0 0 0 1px var(--accent-border, rgba(250,165,0,.32)),
+              inset 0 0 20px rgba(250,165,0,.06);
+}
+.mode-standard .sidebar .nav-item.active::before {
+  box-shadow: 0 0 10px var(--accent-glow-hi, rgba(250,165,0,.35));
+}
+.mode-standard .sidebar .nav-item.active svg {
+  filter: drop-shadow(0 0 6px var(--accent-glow-hi, rgba(250,165,0,.35)));
+}
+
+/* ─── Top bar (Standard) — true glass + bottom hairline ─────────────────────── */
+.mode-standard .top-bar,
+.mode-standard .topbar,
+.mode-standard .standard-topbar {
+  background: rgba(11, 12, 18, 0.62);
+  backdrop-filter: blur(18px) saturate(1.15);
+  -webkit-backdrop-filter: blur(18px) saturate(1.15);
+}
+
+/* ─── Hacker mode: CRT scanline overlay ─────────────────────────────────────── */
+.mode-hacker {
+  position: relative;
+}
+.mode-hacker::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(0, 255, 65, 0.025) 0px,
+    rgba(0, 255, 65, 0.025) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+  mix-blend-mode: screen;
+  opacity: .55;
+}
+.mode-hacker::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  background: linear-gradient(180deg, rgba(0, 255, 65, 0.04) 0%, transparent 6%, transparent 94%, rgba(0,255,65,0.04) 100%);
+  animation: ds-scanLine 9s linear infinite;
+  height: 200%;
+}
+
+/* ─── Hacker mode: blanket monospace + tighter density ──────────────────────── */
+.mode-hacker {
+  font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+.mode-hacker input,
+.mode-hacker textarea,
+.mode-hacker button,
+.mode-hacker select,
+.mode-hacker .page-header,
+.mode-hacker .nav-item,
+.mode-hacker .card,
+.mode-hacker .section,
+.mode-hacker .advanced-page {
+  font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+}
+.mode-hacker .advanced-page,
+.mode-hacker .page-content {
+  padding: 14px 16px;
+}
+.mode-hacker .section {
+  padding: 14px 16px;
+}
+.mode-hacker .card {
+  padding: 10px 12px;
+}
+.mode-hacker .status-strip,
+.mode-hacker .advanced-status-strip {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: .74rem;
+  letter-spacing: .02em;
+}
+.mode-hacker .status-strip-item strong,
+.mode-hacker .advanced-status-strip-item strong {
+  color: var(--accent, #00FF41);
+  font-weight: 700;
+}
+
+/* Hacker terminal "blinking cursor" hint for empty states */
+.mode-hacker .ds-empty-state::after {
+  content: '_';
+  display: inline-block;
+  margin-left: 4px;
+  animation: ds-cursorBlink 1.05s step-end infinite;
+  color: var(--accent, #00FF41);
+  font-family: inherit;
+}
+.mode-hacker .ds-empty-icon {
+  background: rgba(0, 255, 65, 0.12);
+  border-color: rgba(0, 255, 65, 0.32);
+  color: var(--accent, #00FF41);
+}
+.mode-hacker .ds-section-eyebrow,
+.mode-hacker .ds-empty-hint {
+  color: rgba(0, 255, 65, 0.55);
+}
+
+/* ─── Basic (Heater) mode — WARM PALETTE OVERRIDE ───────────────────────────── */
+/* Audit gap #6: current basic.css uses cool blues. Override to warm browns from handoff. */
+.mode-basic {
+  --bg:                #1A1410;
+  --bg-subtle:         #221C16;
+  --card-bg:           #2A2218;
+  --card-bg-solid:     #2A2218;
+  --card-hover:        #34291D;
+  --card-shadow:       0 10px 28px rgba(0, 0, 0, 0.45);
+  --border:            #3D3228;
+  --border-glass:      rgba(255, 220, 180, 0.10);
+  --text:              #E8E0D6;
+  --text-secondary:    #A09888;
+  --text-dim:          #6B5F52;
+  --fg-warm-primary:   #E8E0D6;
+  --fg-warm-secondary: #A09888;
+  --fg-warm-dim:       #6B5F52;
+}
+/* When night-mode is active, slightly dim accents */
+.mode-basic[data-night-mode='on'],
+.mode-basic .night-mode-active {
+  --accent-glow:    rgba(250, 165, 0, 0.08);
+  --accent-glow-hi: rgba(250, 165, 0, 0.18);
+}
+
+.mode-basic .btu-hero-value,
+.mode-basic .sats-counter-main {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum';
+}
+
+/* BTU hero — gradient text + halo */
+.mode-basic .btu-hero-value {
+  background: linear-gradient(135deg, #FFC94D 0%, #FAA500 50%, #FA6700 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  filter: drop-shadow(0 0 14px rgba(250, 103, 0, 0.32));
+}
+
+/* Thermostat ring breathing halo (mining-glow only) */
+.mode-basic .thermostat.mining-glow,
+.mode-basic .thermostat[data-mining='true'] {
+  animation: ds-heatPulse 3.2s ease-in-out infinite;
+}
+
+/* DCENT_OS molecule logo follows the active theme accent ───────────────────
+   The spinning brand mark (DcentOsLogo / DcentOsIcon) hardcodes orange gradient
+   stops as SVG attributes; SVG presentation attributes can't read var(), but a
+   CSS 'stop-color' rule can — and CSS wins over the attribute. So the molecule,
+   its glow, and the wordmark underscore all track the Theme Studio / per-mode
+   --accent family. Default --accent (#FAA500) keeps the shipped orange; picking
+   a theme (Matrix-green, Violet, …) or a custom accent recolors the brand mark
+   to match the rest of the terminal — including Advanced/Hacker mode. */
+#logo-sphere stop:nth-child(1),
+#icon-sphere stop:nth-child(1) { stop-color: var(--accent-light, #FFD47A); }
+#logo-sphere stop:nth-child(2),
+#icon-sphere stop:nth-child(2) { stop-color: var(--accent, #FAA500); }
+#logo-sphere stop:nth-child(3),
+#icon-sphere stop:nth-child(3) { stop-color: var(--accent-deep, #FA6700); }
+#logo-glow feFlood,
+#icon-glow feFlood { flood-color: var(--accent, #FAA500); }
+.dcent-logo-underscore { fill: var(--accent, #FAA500); }
+
+/* Companion dock — compact sidebar-footer trigger + click-to-open popover.
+   Present at the bottom of every mode's menu bar; theme-accent aware. The full
+   CompanionCard (mood / stats / quests) opens in a centered popover so the
+   companion no longer takes a slab on the page bodies. */
+.companion-dock { width: 100%; margin: 6px 0; }
+.companion-dock-trigger {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 8px 10px; border-radius: 10px; cursor: pointer;
+  background: color-mix(in srgb, var(--accent, #FAA500) 8%, transparent);
+  border: 1px solid var(--accent-border, rgba(250, 165, 0, 0.28));
+  color: var(--text, #e8e8ee); text-align: left;
+  transition: background 0.2s ease, border-color 0.2s ease, transform 0.15s ease;
+}
+.companion-dock-trigger:hover {
+  background: color-mix(in srgb, var(--accent, #FAA500) 15%, transparent);
+  transform: translateY(-1px);
+}
+.companion-dock-trigger:focus-visible { outline: 2px solid var(--accent, #FAA500); outline-offset: 2px; }
+.companion-dock-face {
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, monospace; font-size: 1rem; line-height: 1;
+  color: var(--accent, #FAA500);
+  filter: drop-shadow(0 0 6px color-mix(in srgb, var(--accent, #FAA500) 50%, transparent));
+}
+.companion-dock-text { display: flex; flex-direction: column; min-width: 0; }
+.companion-dock-text strong { font-size: 0.82rem; font-weight: 700; }
+.companion-dock-text small { font-size: 0.62rem; opacity: 0.7; text-transform: uppercase; letter-spacing: 0.04em; }
+.companion-dock-backdrop {
+  position: fixed; inset: 0; z-index: 10050; background: rgba(0, 0, 0, 0.55); backdrop-filter: blur(2px);
+  display: flex; align-items: center; justify-content: center; padding: 16px;
+}
+.companion-dock-popover {
+  position: relative; z-index: 10051;
+  width: min(420px, 100%); max-height: min(82vh, 760px); overflow: auto;
+  border-radius: 14px; background: var(--card-bg-solid, #14141c);
+  border: 1px solid var(--accent-border, rgba(250, 165, 0, 0.3));
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55); padding: 6px;
+}
+.companion-dock-close {
+  position: absolute; top: 8px; right: 12px; z-index: 1; background: transparent; border: none;
+  color: var(--text-secondary, #9aa); font-size: 1.5rem; line-height: 1; cursor: pointer;
+  padding: 0 6px; border-radius: 8px;
+}
+.companion-dock-close:hover { color: var(--text, #fff); background: rgba(255, 255, 255, 0.08); }
+.companion-dock-card { box-shadow: none; border: none; background: transparent; }
+
+/* Mobile touch targets for power presets + bottom nav */
+.mode-basic .preset-btn,
+.mode-basic .power-preset {
+  min-height: 52px;
+  padding: 14px 12px;
+}
+.mode-basic .bottom-nav-tab {
+  min-height: 60px;
+}
+/* D-17: 480 → canonical sm-max 479.98 (--bp-sm). */
+@media (max-width: 479.98px) {
+  .mode-basic .preset-btn,
+  .mode-basic .power-preset { min-height: 56px; padding: 16px 12px; }
+  .mode-basic .bottom-nav-tab { min-height: 64px; }
+}
+
+/* Bottom-nav focus ring */
+.mode-basic .bottom-nav-tab:focus-visible {
+  outline: 2px solid var(--accent-light, #FFC94D);
+  outline-offset: 2px;
+}
+
+/* ─── Ember field — subtle floating particles for Basic/Heater mode ─────────── */
+.ds-ember-field {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+.ds-ember-field .ds-ember {
+  position: absolute;
+  bottom: -12px;
+  width: 4px; height: 4px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(255, 201, 77, .85), rgba(250, 103, 0, .35) 60%, transparent 70%);
+  filter: blur(.3px);
+  animation: ds-emberFloat var(--ds-dur, 7s) linear infinite;
+  opacity: 0;
+}
+.ds-ember-field .ds-ember:nth-child(1)  { left:  6%; --ds-drift:  18px; --ds-dur: 7.4s; animation-delay: 0s;   }
+.ds-ember-field .ds-ember:nth-child(2)  { left: 14%; --ds-drift: -22px; --ds-dur: 8.2s; animation-delay: 1.3s; }
+.ds-ember-field .ds-ember:nth-child(3)  { left: 24%; --ds-drift:  12px; --ds-dur: 6.5s; animation-delay: 2.5s; }
+.ds-ember-field .ds-ember:nth-child(4)  { left: 34%; --ds-drift: -14px; --ds-dur: 7.8s; animation-delay: 0.7s; }
+.ds-ember-field .ds-ember:nth-child(5)  { left: 46%; --ds-drift:  24px; --ds-dur: 8.7s; animation-delay: 3.2s; }
+.ds-ember-field .ds-ember:nth-child(6)  { left: 58%; --ds-drift: -18px; --ds-dur: 7.1s; animation-delay: 1.9s; }
+.ds-ember-field .ds-ember:nth-child(7)  { left: 68%; --ds-drift:  16px; --ds-dur: 6.9s; animation-delay: 0.4s; }
+.ds-ember-field .ds-ember:nth-child(8)  { left: 78%; --ds-drift: -20px; --ds-dur: 8.0s; animation-delay: 2.1s; }
+.ds-ember-field .ds-ember:nth-child(9)  { left: 86%; --ds-drift:  14px; --ds-dur: 7.6s; animation-delay: 4.0s; }
+.ds-ember-field .ds-ember:nth-child(10) { left: 94%; --ds-drift: -10px; --ds-dur: 6.7s; animation-delay: 1.1s; }
+.ds-ember-field .ds-ember.lg { width: 6px; height: 6px; }
+
+/* ─── Universal focus ring (low-specificity baseline) ───────────────────────────
+   D-16 RECONCILED (F1, Wave 5): this baseline is kept (it catches elements the
+   canonical ':where()' enumeration doesn't list) but its visual output is now
+   reconciled to the single canonical ring in §F1-FOCUS (accent outline + soft
+   halo + ambient glow + radius) so no divergent ring renders. The canonical
+   rule appears later in this file and wins where both match. */
+:focus-visible {
+  outline: 2px solid var(--accent, #FAA500);
+  outline-offset: 2px;
+  box-shadow:
+    0 0 0 4px var(--focus-ring-soft, rgba(250, 165, 0, 0.28)),
+    0 0 14px var(--accent-glow-hi, rgba(250, 165, 0, 0.35));
+  border-radius: var(--radius-sm);
+}
+button:focus:not(:focus-visible),
+a:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* ─── Reduced-motion guard — disable all decorative animations ──────────────── */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .08s !important;
+  }
+  .ds-ember-field,
+  .mode-hacker::before,
+  .mode-hacker::after {
+    display: none !important;
+  }
+}
+
+/* 2026-05-15 multi-mode polish: live ASIC visual and shared operator affordances. */
+.section-title .section-link-btn {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  font: inherit;
+}
+
+.mode-standard .operator-focus-panel {
+  background:
+    linear-gradient(135deg, rgba(250, 165, 0, 0.08), rgba(255, 255, 255, 0.025) 42%, rgba(250, 103, 0, 0.045)),
+    var(--surface-operational, rgba(19, 19, 29, 0.92));
+  box-shadow: var(--shadow-surface, 0 10px 30px rgba(0, 0, 0, 0.34));
+}
+
+.mode-standard .standard-top-intelligence-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.55fr) minmax(340px, 0.75fr);
+  gap: 18px;
+  align-items: stretch;
+  margin: 18px 0;
+}
+
+.mode-standard .standard-top-intelligence-grid > .live-asic-visual,
+.mode-standard .standard-top-intelligence-grid > .current-block-card {
+  min-height: 292px;
+}
+
+.mode-standard .standard-top-intelligence-grid > .current-block-card {
+  height: 100%;
+}
+
+.mode-standard .ds-hashrate-chart-compact {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 220px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.mode-standard .ds-hashrate-chart-compact .hashrate-chart-controls {
+  margin-bottom: 6px;
+}
+
+.mode-standard .ds-hashrate-chart-compact .time-range-tabs {
+  justify-content: flex-end;
+}
+
+.mode-standard .ds-hashrate-chart-compact .ds-hashrate-chart-body {
+  min-height: 148px;
+}
+
+.mode-standard .ds-hashrate-chart-compact .chart-legend {
+  display: none;
+}
+
+/* D-17: 1180 (laptop band) → canonical xl-max 1279.98 (--bp-xl). Snapped UP
+   so the narrower-layout rule still applies on 1024–1180 (graceful), never
+   hiding content that 1180 used to cover. */
+
+/* D-17: 720 → canonical md-max 767.98 (--bp-md). */
+
+.live-asic-visual {
+  position: relative;
+  overflow: hidden;
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid var(--border-glass, rgba(255, 255, 255, 0.12));
+  border-radius: var(--radius, 12px);
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.015)),
+    var(--surface-operational, rgba(19, 19, 29, 0.92));
+  box-shadow: var(--shadow-surface, 0 10px 30px rgba(0, 0, 0, 0.34));
+  color: var(--text, #f5f5f7);
+}
+
+.live-asic-visual::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(90deg, transparent, rgba(250, 165, 0, 0.10), transparent),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.035), transparent 24%);
+  opacity: 0.65;
+}
+
+.live-asic-visual > * {
+  position: relative;
+  z-index: 1;
+}
+
+.live-asic-visual--compact {
+  padding: 12px;
+  gap: 10px;
+}
+
+.live-asic-header,
+.live-asic-actions,
+.live-asic-footer,
+.live-asic-chain-meta,
+.live-asic-chain-readout {
+  display: flex;
+  align-items: center;
+}
+
+.live-asic-header {
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.live-asic-heading {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.live-asic-eyebrow {
+  color: var(--text-dim, #78788a);
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.62rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.live-asic-heading h3 {
+  margin: 0;
+  color: var(--text, #f5f5f7);
+  font-family: var(--font-heading);
+  font-size: 1.15rem;
+  line-height: 1.05;
+}
+
+.live-asic-heading p {
+  margin: 0;
+  color: var(--text-secondary, #b7b7c6);
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.live-asic-actions {
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.live-asic-status,
+.live-asic-action {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.live-asic-status {
+  gap: 7px;
+  padding: 0 10px;
+  border: 1px solid var(--border-glass, rgba(255, 255, 255, 0.12));
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-secondary, #b7b7c6);
+}
+
+.live-asic-status.success { color: var(--green, #22C55E); }
+.live-asic-status.warning { color: var(--yellow, #EAB308); }
+.live-asic-status.danger { color: var(--red, #EF4444); }
+.live-asic-status.info { color: var(--accent, #FAA500); }
+
+.live-asic-pulse {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 8px currentColor;
+  opacity: 0.55;
+}
+
+.live-asic-pulse.is-live {
+  animation: asic-live-pulse 1.6s ease-in-out infinite;
+}
+
+.live-asic-action {
+  padding: 0 12px;
+  border: 1px solid var(--accent-border, rgba(250, 165, 0, 0.32));
+  background: rgba(250, 165, 0, 0.07);
+  color: var(--accent, #FAA500);
+  cursor: pointer;
+}
+
+.live-asic-action:hover {
+  background: rgba(250, 165, 0, 0.12);
+  color: var(--accent-light, #FFC94D);
+}
+
+.live-asic-stack {
+  display: grid;
+  gap: 8px;
+}
+
+.live-asic-chain {
+  display: grid;
+  /* : minimums relaxed (120->80, 220->100) so the three columns stop
+     overflowing narrow cards (~375px). The fr units keep the desktop layout
+     identical; only the floor shrinks. */
+  grid-template-columns: minmax(82px, 0.45fr) minmax(80px, 1fr) minmax(100px, 1.25fr);
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.075);
+  border-radius: var(--radius-sm, 8px);
+  background: rgba(0, 0, 0, 0.18);
+  transition: border-color 160ms var(--ease-standard, ease), transform 160ms var(--ease-standard, ease), background 160ms var(--ease-standard, ease);
+}
+
+.live-asic-chain:hover {
+  transform: translateY(-1px);
+  border-color: var(--chain-accent);
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.live-asic-chain.live {
+  box-shadow: inset 3px 0 0 var(--green, #22C55E);
+}
+
+.live-asic-chain.danger {
+  box-shadow: inset 3px 0 0 var(--red, #EF4444);
+}
+
+.live-asic-chain.standby,
+.live-asic-chain.muted {
+  opacity: 0.72;
+}
+
+.live-asic-chain-meta {
+  gap: 7px;
+  min-width: 0;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.68rem;
+  color: var(--text-dim, #78788a);
+}
+
+.live-asic-chain-meta strong {
+  color: var(--accent, #FAA500);
+  font-size: 0.78rem;
+}
+
+.live-asic-chip-grid {
+  display: grid;
+  grid-template-columns: repeat(16, minmax(4px, 1fr));
+  gap: 4px;
+  min-width: 0;
+}
+
+.live-asic-chip-grid span {
+  aspect-ratio: 1;
+  min-width: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.08);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.025);
+}
+
+.live-asic-chip-grid span.is-active {
+  background: linear-gradient(180deg, var(--accent-light, #FFC94D), var(--accent-deep, #FA6700));
+  box-shadow: 0 0 7px rgba(250, 165, 0, 0.28);
+}
+
+.live-asic-chain-readout {
+  justify-content: flex-end;
+  gap: 10px;
+  min-width: 0;
+  color: var(--text-secondary, #b7b7c6);
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.68rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.live-asic-chain-readout span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.live-asic-chain-rail {
+  grid-column: 1 / -1;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.live-asic-chain-rail span {
+  display: block;
+  width: var(--chain-load);
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--chain-accent), var(--accent, #FAA500));
+  box-shadow: 0 0 10px var(--chain-accent);
+  transition: width 300ms var(--ease-standard, ease);
+}
+
+.live-asic-footer {
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: var(--text-dim, #78788a);
+  font-size: 0.68rem;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+}
+
+.live-asic-footer strong {
+  color: var(--text, #f5f5f7);
+  font-weight: 800;
+}
+
+.live-asic-visual--hacker {
+  border-color: rgba(0, 255, 65, 0.18);
+  background:
+    linear-gradient(145deg, rgba(0, 255, 65, 0.055), rgba(250, 165, 0, 0.025)),
+    rgba(5, 7, 8, 0.92);
+}
+
+.live-asic-visual--hacker .live-asic-eyebrow,
+.live-asic-visual--hacker .live-asic-chain-meta strong,
+.live-asic-visual--hacker .live-asic-action {
+  color: var(--accent, #00FF41);
+}
+
+.live-asic-visual--hacker .live-asic-action {
+  border-color: rgba(0, 255, 65, 0.28);
+  background: rgba(0, 255, 65, 0.055);
+}
+
+.live-asic-visual--heater {
+  margin: 0 20px 8px;
+  background:
+    linear-gradient(145deg, rgba(250, 103, 0, 0.12), rgba(255, 201, 77, 0.035)),
+    var(--card-bg, #2A2218);
+}
+
+.live-asic-visual--heater .live-asic-heading h3 {
+  font-size: 1rem;
+}
+
+.live-asic-visual--heater .live-asic-stack {
+  gap: 6px;
+}
+
+.live-asic-visual--heater .live-asic-chain {
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+
+.live-asic-visual--heater .live-asic-chain-readout {
+  justify-content: space-between;
+}
+
+@keyframes asic-live-pulse {
+  0%, 100% { opacity: 0.5; transform: scale(0.9); }
+  50% { opacity: 1; transform: scale(1.15); }
+}
+
+/* D-17: 900 → canonical lg-max 1023.98 (--bp-lg). Snapped UP so the rule
+   still fires across the 768–900 range it used to cover. */
+@media (max-width: 1023.98px) {
+  .mode-standard .standard-top-intelligence-grid {
+    grid-template-columns: 1fr;
+  }
+  .live-asic-chain {
+    grid-template-columns: minmax(78px, auto) minmax(140px, 1fr);
+  }
+  .live-asic-chain-readout {
+    grid-column: 1 / -1;
+    justify-content: space-between;
+  }
+}
+
+/* D-17: 560 → canonical md-max 767.98 (--bp-md). Snapped UP — the spacing
+   tweak is benign/graceful on the extra 560–768 tablet band. */
+@media (max-width: 767.98px) {
+  .mode-standard .standard-top-intelligence-grid {
+    gap: 14px;
+    margin: 14px 0;
+  }
+  .mode-standard .standard-top-intelligence-grid > .live-asic-visual,
+  .mode-standard .standard-top-intelligence-grid > .current-block-card {
+    min-height: 0;
+  }
+  .live-asic-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .live-asic-actions {
+    justify-content: flex-start;
+  }
+  .live-asic-chain {
+    grid-template-columns: 1fr;
+  }
+  .live-asic-chain-readout {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+  .live-asic-footer {
+    justify-content: flex-start;
+  }
+  .live-asic-visual--heater {
+    margin-inline: 14px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-asic-pulse.is-live {
+    animation: none !important;
+  }
+  .live-asic-chain,
+  .live-asic-chain-rail span,
+  .live-asic-chip-grid span {
+    transition: none !important;
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Foundation polish (Agent 1 — 2026-05-15 deep redesign wave)
+ *
+ * Appends to design-system.css without rewriting any existing selector. Adds:
+ *   - Universal :focus-visible polish (lower specificity than global.css)
+ *   - Graceful backdrop-filter fallback for older browsers / WebViews
+ *   - Elevation utility classes (.ds-elev-*)
+ *   - Refined glass surface primitives (.ds-glass-card / .ds-glass-panel)
+ *   - Status indicators (.ds-dot-live, .ds-signal-bars, .ds-pill-numeric)
+ *   - Reduced-motion guards for new indicators
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+/* ─── Universal :focus-visible polish ───
+   D-16 RECONCILED (F1, Wave 5): superseded by the single canonical ring in
+   §F1-FOCUS at the end of this file (it adds the ambient accent glow + the
+   hacker-mode phosphor variant + role=option/switch coverage). This earlier
+   Agent-1 block is kept but its visual output is reconciled to the canonical
+   one so the two ':where()' copies render byte-identically — no divergence,
+   no regression for Waves 1-4 consumers. */
+:where(
+  button, a, summary, [role="button"], [role="tab"], [role="menuitem"],
+  [tabindex]:not([tabindex="-1"]), input, select, textarea,
+  .ds-btn, .ds-toggle, .ds-input, .ds-chip, .ds-tf-group button,
+  .nav-item, .chip
+):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  box-shadow:
+    0 0 0 4px var(--focus-ring-soft, rgba(250, 165, 0, 0.28)),
+    0 0 14px var(--accent-glow-hi, rgba(250, 165, 0, 0.35));
+  border-radius: var(--radius-sm);
+}
+
+/* ─── Graceful backdrop-filter fallback ───
+   Browsers without backdrop-filter get solid-but-similarly-tinted surfaces
+   so the dashboard reads correctly even on older WebViews. Mirrors and
+   extends the fallback already in global.css. */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .topbar, .sidebar, .modal, .glass-panel, .glass-card,
+  .standard-topbar, .modal-backdrop {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+  .topbar, .standard-topbar { background: #0f0f1a !important; }
+  .sidebar { background: #0a0a14 !important; }
+  .modal, .glass-panel { background: #14141f !important; }
+  .glass-card, .hero-kpi, .section, .kpi-card { background: #161623 !important; }
+  .modal-backdrop { background: rgba(0,0,0,0.82) !important; }
+}
+
+/* ─── Elevation utility classes (opt-in) ───
+   Apply to any card/panel/modal to get the layered shadow scale.
+   Existing .glass-card / .section / .kpi-card visuals stay untouched. */
+.ds-elev-flat       { box-shadow: var(--elevation-flat); }
+.ds-elev-base       { box-shadow: var(--elevation-base); }
+.ds-elev-raised     { box-shadow: var(--elevation-raised); }
+.ds-elev-floating   { box-shadow: var(--elevation-floating); }
+.ds-elev-overlay    { box-shadow: var(--elevation-overlay); }
+.ds-elev-glow       { box-shadow: var(--elevation-glow); }
+.ds-elev-glow-strong { box-shadow: var(--elevation-glow-strong); }
+
+/* ─── Refined glass surface primitive ───
+   .ds-glass-card / .ds-glass-panel ship a premium glass surface that
+   (a) adds a subtle inner top-edge highlight, (b) layers ambient + key
+   shadows for depth, (c) softens with a 145° diagonal gradient overlay,
+   and (d) falls back gracefully on browsers without backdrop-filter. */
+.ds-glass-card,
+.ds-glass-panel {
+  position: relative;
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-md);
+  background:
+    var(--grad-glass-diagonal),
+    var(--surface-glass-card);
+  backdrop-filter: blur(var(--blur-sm)) saturate(1.1);
+  -webkit-backdrop-filter: blur(var(--blur-sm)) saturate(1.1);
+  box-shadow: var(--elevation-raised), var(--inner-highlight);
+  color: var(--fg-primary);
+}
+.ds-glass-panel {
+  border-radius: var(--radius-lg);
+  background:
+    var(--grad-glass-diagonal),
+    var(--surface-glass-panel);
+  backdrop-filter: blur(var(--blur-md)) saturate(1.15);
+  -webkit-backdrop-filter: blur(var(--blur-md)) saturate(1.15);
+  box-shadow: var(--elevation-floating), var(--inner-highlight);
+}
+.ds-glass-card.ds-glow,
+.ds-glass-panel.ds-glow {
+  border-color: var(--accent-border);
+  box-shadow: var(--elevation-glow), var(--inner-highlight);
+}
+.ds-glass-card.ds-glow::before,
+.ds-glass-panel.ds-glow::before {
+  content: '';
+  position: absolute; left: 12px; right: 12px; top: 0; height: 1px;
+  background: var(--grad-hairline);
+  pointer-events: none;
+}
+
+/* ─── Status indicators ──
+ * .ds-dot-live    — pulsing dot + soft ring (live data affordance)
+ * .ds-signal-bars — 3-bar signal strength (data-strength="0|1|2|3")
+ * .ds-pill-numeric — large mono number stacked over unit label
+ */
+
+.ds-dot-live {
+  display: inline-block;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 8px var(--green);
+  position: relative;
+  vertical-align: middle;
+}
+.ds-dot-live::after {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  border: 1px solid var(--green);
+  opacity: 0;
+  animation: ds-dot-live-ring 1.8s ease-out infinite;
+}
+.ds-dot-live.warn { background: var(--yellow); box-shadow: 0 0 8px var(--yellow); }
+.ds-dot-live.warn::after { border-color: var(--yellow); }
+.ds-dot-live.danger { background: var(--red); box-shadow: 0 0 8px var(--red); }
+.ds-dot-live.danger::after { border-color: var(--red); }
+.ds-dot-live.accent { background: var(--accent); box-shadow: 0 0 8px var(--accent-glow-hi); }
+.ds-dot-live.accent::after { border-color: var(--accent); }
+
+@keyframes ds-dot-live-ring {
+  0%   { transform: scale(0.6); opacity: 0.55; }
+  80%  { transform: scale(1.6); opacity: 0;    }
+  100% { transform: scale(1.6); opacity: 0;    }
+}
+
+.ds-signal-bars {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 14px;
+  vertical-align: middle;
+}
+.ds-signal-bars > span {
+  display: block;
+  width: 3px;
+  border-radius: 1px;
+  background: rgba(255,255,255,.16);
+  transition: background var(--dur-fast) var(--ease-standard);
+}
+.ds-signal-bars > span:nth-child(1) { height: 38%; }
+.ds-signal-bars > span:nth-child(2) { height: 68%; }
+.ds-signal-bars > span:nth-child(3) { height: 100%; }
+.ds-signal-bars[data-strength="0"] > span { background: rgba(255,255,255,.10); }
+.ds-signal-bars[data-strength="1"] > span:nth-child(1) {
+  background: var(--yellow);
+  box-shadow: 0 0 6px rgba(234,179,8,.35);
+}
+.ds-signal-bars[data-strength="2"] > span:nth-child(-n+2) {
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent-glow);
+}
+.ds-signal-bars[data-strength="3"] > span {
+  background: var(--green);
+  box-shadow: 0 0 6px rgba(34,197,94,.4);
+}
+.ds-signal-bars.is-danger > span:nth-child(-n+3) {
+  background: var(--red);
+  box-shadow: 0 0 6px rgba(239,68,68,.4);
+}
+
+.ds-pill-numeric {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: baseline;
+  justify-content: center;
+  gap: 2px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-glass);
+  background: rgba(255,255,255,.025);
+  min-width: 76px;
+  line-height: 1;
+}
+.ds-pill-numeric > .ds-pill-num {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 1.55rem;
+  color: var(--fg-primary);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -.015em;
+  line-height: 1;
+}
+.ds-pill-numeric > .ds-pill-label {
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+.ds-pill-numeric.accent  { border-color: var(--accent-border); background: var(--accent-glow); }
+.ds-pill-numeric.accent  > .ds-pill-num { color: var(--accent); }
+.ds-pill-numeric.success > .ds-pill-num { color: var(--green); }
+.ds-pill-numeric.warning > .ds-pill-num { color: var(--yellow); }
+.ds-pill-numeric.danger  > .ds-pill-num { color: var(--red); }
+
+/* Honor reduced-motion for the new animated indicators. */
+@media (prefers-reduced-motion: reduce) {
+  .ds-dot-live::after,
+  .ds-btn.is-loading::after { animation: none !important; }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * WAVE-5 FOUNDATION (Phase-2 / Agent F1 — 2026-05-17)
+ *
+ * Strictly ADDITIVE. No existing selector/token/class renamed or removed.
+ * Establishes the coherent glass / blur / glow / terminal system the 6
+ * Phase-3 polish agents apply. F1 provides the utilities — it does NOT
+ * restyle components.
+ *
+ * Catalog (class name → intent):
+ *   .ds-glass            — standard glass surface (cards / panels)
+ *   .ds-glass-strong     — heavier blur+opacity (modals / overlays / palette)
+ *   .ds-glass-rail       — low-opacity vertical rail (sidebars / sub-nav)
+ *   .ds-glass-inset      — recessed glass (wells / code blocks / readouts)
+ *   .ds-glow / .ds-glow-strong         — warm orange accent halo
+ *   .ds-glow-gold / .ds-glow-gold-strong — gold halo (hero numerics)
+ *   .ds-glow-neon / .ds-glow-neon-strong — phosphor-green halo (hacker)
+ *   .ds-glow-hover       — halo only on hover (opt-in interactive glow)
+ *   .ds-accent-edge      — 1px top accent-gradient hairline (::before)
+ *   .ds-neon-text        — phosphor-green glow text (Advanced)
+ *   .ds-accent-text      — warm accent-gradient clip text
+ *   .ds-terminal-panel   — Advanced terminal-inspired panel surface
+ *   .ds-focus-ring       — explicit canonical focus ring (manual opt-in)
+ * Single-rule canonical :focus-visible lives in §F1-FOCUS below.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+/* ─── §F1-GLASS: layered glassmorphism tiers ───
+   Evolves (does NOT duplicate) the existing .ds-glass-card / .ds-glass-panel.
+   These are lighter-weight standalone utilities Phase-3 agents apply to
+   surfaces that aren't full cards. Each ships a graceful no-backdrop
+   fallback so constrained WebViews still read correctly. */
+.ds-glass {
+  position: relative;
+  background: var(--grad-glass-diagonal), var(--surface-glass-card);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-md);
+  backdrop-filter: blur(var(--blur-sm)) saturate(1.08);
+  -webkit-backdrop-filter: blur(var(--blur-sm)) saturate(1.08);
+  box-shadow: var(--elevation-base), var(--inner-highlight);
+}
+.ds-glass-strong {
+  position: relative;
+  background: var(--grad-glass-diagonal), var(--surface-glass-panel);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-lg);
+  backdrop-filter: blur(var(--blur-lg)) saturate(1.16);
+  -webkit-backdrop-filter: blur(var(--blur-lg)) saturate(1.16);
+  box-shadow: var(--elevation-overlay), var(--inner-highlight-strong);
+}
+.ds-glass-rail {
+  background: var(--grad-glass-rail), var(--surface-glass-sidebar);
+  border-right: 1px solid var(--border-subtle);
+  backdrop-filter: blur(var(--blur-md)) saturate(1.05);
+  -webkit-backdrop-filter: blur(var(--blur-md)) saturate(1.05);
+}
+.ds-glass-inset {
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.32);
+}
+/* No-backdrop-filter fallback — extends global.css's @supports block. */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .ds-glass        { background: #15151f; }
+  .ds-glass-strong { background: #1a1a26; }
+  .ds-glass-rail   { background: #0b0b14; }
+}
+
+/* ─── §F6-OVERLAY: canonical modal scrim + panel (anchors M-01) ───
+   The canonical OverlayDialog primitive (common/OverlayDialog.tsx) and the
+   Standard mobile-menu scrim (M-02) both inline 'rgba(0,0,0,0.6)' +
+   'blur(8px)'. These two opt-in classes formalise that exact scrim so P5
+   can migrate OverlayDialog's inline styles onto a class, and P2/P3 can
+   reuse the SAME scrim for the mobile menu (M-02) and the bespoke
+   I2cScanner/RegisterInspector dialogs (M-04) — one glass for every modal.
+   Byte-faithful to OverlayDialog's current inline values; chrome only,
+   no behaviour/a11y change (the TSX keeps its role/aria/focus wiring).
+   '.ds-overlay-panel' layers the canonical '.ds-glass-strong' glass +
+   '--elevation-overlay' so modals stop inheriting the non-canonical
+   '--shadow-elevated'-only look. */
+.ds-overlay-backdrop {
+  position: fixed;
+  inset: 0;
+  background: var(--scrim-bg, rgba(0, 0, 0, 0.6));
+  backdrop-filter: blur(var(--scrim-blur, 8px));
+  -webkit-backdrop-filter: blur(var(--scrim-blur, 8px));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10002;
+  animation: ds-fadeIn 0.18s var(--ease-standard, cubic-bezier(.2,0,0,1)) both;
+}
+.ds-overlay-backdrop.is-sheet {
+  align-items: stretch;
+  justify-content: flex-start;
+}
+.ds-overlay-panel {
+  position: relative;
+  background: var(--grad-glass-diagonal), var(--surface-glass-panel);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-md);
+  backdrop-filter: blur(var(--blur-lg)) saturate(1.16);
+  -webkit-backdrop-filter: blur(var(--blur-lg)) saturate(1.16);
+  box-shadow: var(--elevation-overlay), var(--inner-highlight-strong);
+  outline: none;
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+  animation: ds-modalIn 0.22s var(--ease-standard, cubic-bezier(.2,0,0,1)) both;
+}
+.ds-overlay-panel.is-sheet {
+  border-radius: 0;
+  border: none;
+  border-right: 1px solid var(--border-glass);
+  min-height: 100%;
+  max-height: none;
+  animation: ds-slideUp 0.22s var(--ease-standard, cubic-bezier(.2,0,0,1)) both;
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .ds-overlay-backdrop { background: rgba(0, 0, 0, 0.82); }
+  .ds-overlay-panel    { background: #1a1a26; }
+}
+
+/* ─── §F6-CARDHOVER: canonical card hover-lift (anchors C-04) ───
+   '.ds-hoverable' (above) is the canonical card hover. This is a named
+   alias so zone agents converging the drifted per-mode hover-lift
+   literals (basic -1/-2px, standard -1/-2/-10px outlier, advanced NONE)
+   have ONE explicit utility to point at. Same -2px / '--dur-fast' /
+   '--ease-standard' contract as '.ds-hoverable' — do not diverge. Advanced
+   cards (which currently never lift) opt in by adding '.ds-card-hover'. */
+.ds-card-hover {
+  transition: transform var(--dur-fast, 150ms) var(--ease-standard, cubic-bezier(.2,0,0,1)),
+              box-shadow var(--dur-fast, 150ms) var(--ease-standard, cubic-bezier(.2,0,0,1)),
+              border-color var(--dur-fast, 150ms) var(--ease-standard, cubic-bezier(.2,0,0,1));
+}
+.ds-card-hover:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--elevation-raised, 0 6px 18px rgba(0,0,0,.3));
+  border-color: var(--accent-border, rgba(250,165,0,.3));
+}
+@media (prefers-reduced-motion: reduce) {
+  .ds-card-hover:hover { transform: none; }
+}
+
+/* ─── §F1-GLOW: accent/gold/neon halo utilities ───
+   Resting halo ('.ds-glow'), active/hover halo ('*-strong'), and an opt-in
+   hover-only variant. Compose with any glass tier or card. */
+.ds-glow            { box-shadow: var(--elevation-base), var(--glow-orange); }
+.ds-glow-strong     { box-shadow: var(--elevation-raised), var(--glow-orange-strong); }
+.ds-glow-gold       { box-shadow: var(--elevation-base), var(--glow-gold); }
+.ds-glow-gold-strong { box-shadow: var(--elevation-raised), var(--glow-gold-strong); }
+.ds-glow-neon       { box-shadow: var(--elevation-base), var(--glow-neon-green); }
+.ds-glow-neon-strong { box-shadow: var(--elevation-raised), var(--glow-neon-green-strong); }
+.ds-glow-hover {
+  transition: box-shadow var(--dur-med) var(--ease-standard),
+              border-color var(--dur-med) var(--ease-standard);
+}
+.ds-glow-hover:hover {
+  box-shadow: var(--elevation-raised), var(--glow-orange-strong);
+  border-color: var(--accent-border);
+}
+.mode-hacker .ds-glow-hover:hover {
+  box-shadow: var(--elevation-raised), var(--glow-neon-green-strong);
+  border-color: rgba(0, 255, 65, 0.32);
+}
+
+/* 1px top accent-gradient hairline — premium framing for hero/section heads. */
+.ds-accent-edge { position: relative; }
+.ds-accent-edge::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: var(--grad-hairline);
+  opacity: 0.6;
+  pointer-events: none;
+}
+.mode-hacker .ds-accent-edge::before { background: var(--grad-hairline-green); }
+
+/* ─── §F1-TEXT: accent / neon clip+glow text ─── */
+.ds-accent-text {
+  background: var(--accent-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  font-variant-numeric: tabular-nums;
+}
+.ds-neon-text {
+  color: var(--fg-hacker-green);
+  text-shadow: 0 0 8px rgba(0, 255, 65, 0.55);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ─── §F1-TERMINAL: Advanced terminal-inspired panel ───
+   A reusable Advanced/hacker surface — voidy floor, phosphor edge, faint
+   scanline-free terminal tint. Phase-3 P3 applies it to inspector/console
+   chrome (the CRT scanline overlay stays scoped to .console-output). */
+.ds-terminal-panel {
+  position: relative;
+  background:
+    var(--grad-terminal),
+    var(--grad-terminal-floor),
+    var(--bg-hacker, #0a0a0a);
+  border: 1px solid rgba(0, 255, 65, 0.16);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--glow-inset-orange), 0 0 0 1px rgba(0, 255, 65, 0.05);
+  color: var(--fg-hacker-green);
+  font-family: var(--font-mono);
+}
+.ds-terminal-panel::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: var(--grad-hairline-green);
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * §F1-FOCUS: SINGLE canonical accessible focus ring (D-16 close)
+ *
+ * D-16: ':focus-visible' was declared in ~8 CSS files with non-identical
+ * outline/box-shadow/radius. This is the ONE canonical rule. It is the
+ * LAST ':focus-visible' declaration in the global cascade load order
+ * (tokens → global → basic → standard → advanced → features →
+ * design-system → canonical → current-block → responsive → motion), and
+ * uses ':where()' for zero specificity so per-element rules can still
+ * intentionally override, while every divergent UNINTENTIONAL universal
+ * copy in F1-owned files (global.css:100, design-system.css:908/1648,
+ * canonical.css:716) is reconciled to THIS definition's visual output.
+ *
+ * Ring: 2px solid accent + 4px soft accent halo + 14px ambient accent
+ * glow + 8px radius. Hacker mode swaps to phosphor-green. Matches the
+ * motion.css interactive ring (kept — it's the same visual, scoped to
+ * named interactives) so there is no visual jump between layers.
+ * ════════════════════════════════════════════════════════════════════════════ */
+:where(
+  a, button, summary, [role="button"], [role="tab"], [role="switch"],
+  [role="menuitem"], [role="option"], [tabindex]:not([tabindex="-1"]),
+  input, select, textarea,
+  .ds-btn, .ds-toggle, .ds-input, .ds-chip, .ds-tf-group button,
+  .nav-item, .chip
+):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  box-shadow:
+    0 0 0 4px var(--focus-ring-soft, rgba(250, 165, 0, 0.28)),
+    0 0 14px var(--accent-glow-hi, rgba(250, 165, 0, 0.35));
+  border-radius: var(--radius-sm);
+}
+.mode-hacker :where(
+  a, button, summary, [role="button"], [role="tab"], [role="switch"],
+  [role="menuitem"], [role="option"], [tabindex]:not([tabindex="-1"]),
+  input, select, textarea, .ds-btn, .ds-toggle, .ds-input, .ds-chip
+):focus-visible {
+  outline-color: var(--fg-hacker-green, #00FF41);
+  box-shadow:
+    0 0 0 4px rgba(0, 255, 65, 0.18),
+    0 0 14px rgba(0, 255, 65, 0.32);
+}
+:where(button, a):focus:not(:focus-visible) { outline: none; }
+
+/* Manual opt-in focus ring (e.g. roving-tabindex custom widgets that manage
+   their own focus and want the canonical look without :focus-visible). */
+.ds-focus-ring {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  box-shadow:
+    0 0 0 4px var(--focus-ring-soft, rgba(250, 165, 0, 0.28)),
+    0 0 14px var(--accent-glow-hi, rgba(250, 165, 0, 0.35));
+  border-radius: var(--radius-sm);
+}
+
+/* Reduced-motion: glow utilities are static box-shadows (no animation) so
+   they are safe; the canonical ring stays (state feedback, not decoration). */
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * §F1-TOOLTIP: the  tooltip primitive (D-01 close)
+ *
+ * Two surfaces, ONE visual language:
+ *   - '.dcent-tooltip'     : the portaled React panel (Tooltip.tsx)
+ *   - '[data-tooltip]'     : the cheap CSS-only path (zero JS per use)
+ * Glassmorphism panel, warm-orange edge glow, fast premium fade/scale-in
+ * (dcm-tooltip-in from motion.css), phosphor-green variant under mode-hacker.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+/* ── React panel ── */
+.dcent-tooltip {
+  position: fixed;
+  z-index: 10050;
+  max-width: 280px;
+  padding: 9px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--grad-glass-diagonal), var(--surface-glass-panel, rgba(26,26,46,0.92));
+  border: 1px solid var(--accent-border);
+  backdrop-filter: blur(var(--blur-md)) saturate(1.15);
+  -webkit-backdrop-filter: blur(var(--blur-md)) saturate(1.15);
+  box-shadow: var(--elevation-overlay), var(--glow-orange);
+  color: var(--fg-primary);
+  font-family: var(--font-ui);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  pointer-events: none;          /* never steals hover from the trigger */
+  text-align: left;
+}
+.dcent-tooltip__title {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 0.74rem;
+  letter-spacing: 0.01em;
+  color: var(--accent);
+  margin-bottom: 3px;
+}
+.dcent-tooltip__body { color: var(--fg-secondary); }
+.mode-hacker .dcent-tooltip {
+  border-color: rgba(0, 255, 65, 0.34);
+  box-shadow: var(--elevation-overlay), var(--glow-neon-green);
+  font-family: var(--font-mono);
+}
+.mode-hacker .dcent-tooltip__title { color: var(--fg-hacker-green); }
+
+/* Standalone info glyph (InfoDot). Inherits the canonical focus ring. */
+.dcent-infodot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: middle;
+  margin-left: 5px;
+  border-radius: 50%;
+  border: 1px solid var(--border-glass);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--fg-dim);
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-style: italic;
+  line-height: 1;
+  cursor: help;
+  flex-shrink: 0;
+  transition: color var(--dur-fast) var(--ease-standard),
+              border-color var(--dur-fast) var(--ease-standard),
+              box-shadow var(--dur-fast) var(--ease-standard);
+}
+.dcent-infodot:hover,
+.dcent-infodot:focus-visible {
+  color: var(--accent);
+  border-color: var(--accent-border);
+  box-shadow: var(--glow-orange);
+}
+.mode-hacker .dcent-infodot:hover,
+.mode-hacker .dcent-infodot:focus-visible {
+  color: var(--fg-hacker-green);
+  border-color: rgba(0, 255, 65, 0.34);
+  box-shadow: var(--glow-neon-green);
+}
+
+/* ── Cheap CSS-only path: [data-tooltip] ──
+   Any element with data-tooltip="..." gets a styled hover/focus bubble with
+   ZERO JS. Shows on :hover and :focus-within (keyboard-reachable). Default
+   placement top; data-tooltip-pos overrides. Pure CSS can't auto-flip — keep
+   these strings short and use <Tooltip> near viewport edges. */
+[data-tooltip] {
+  position: relative;
+}
+[data-tooltip]::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 8px);
+  transform: translateX(-50%) translateY(3px) scale(0.96);
+  z-index: 10050;
+  width: max-content;
+  max-width: 240px;
+  padding: 8px 11px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-glass-panel, rgba(26,26,46,0.94));
+  border: 1px solid var(--accent-border);
+  backdrop-filter: blur(var(--blur-sm));
+  -webkit-backdrop-filter: blur(var(--blur-sm));
+  box-shadow: var(--elevation-floating), var(--glow-orange);
+  color: var(--fg-secondary);
+  font-family: var(--font-ui);
+  font-size: 0.74rem;
+  font-weight: 500;
+  line-height: 1.45;
+  letter-spacing: normal;
+  text-transform: none;
+  text-align: left;
+  white-space: normal;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms var(--ease-out-soft, ease),
+              transform 120ms var(--ease-out-soft, ease);
+}
+[data-tooltip]:hover::after,
+[data-tooltip]:focus-visible::after,
+[data-tooltip]:focus-within::after {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0) scale(1);
+}
+[data-tooltip][data-tooltip-pos="bottom"]::after {
+  bottom: auto;
+  top: calc(100% + 8px);
+}
+[data-tooltip][data-tooltip-pos="left"]::after {
+  left: auto; right: calc(100% + 8px); bottom: auto; top: 50%;
+  transform: translateY(-50%) translateX(3px) scale(0.96);
+}
+[data-tooltip][data-tooltip-pos="right"]::after {
+  left: calc(100% + 8px); right: auto; bottom: auto; top: 50%;
+  transform: translateY(-50%) translateX(-3px) scale(0.96);
+}
+[data-tooltip][data-tooltip-pos="left"]:hover::after,
+[data-tooltip][data-tooltip-pos="left"]:focus-visible::after,
+[data-tooltip][data-tooltip-pos="left"]:focus-within::after,
+[data-tooltip][data-tooltip-pos="right"]:hover::after,
+[data-tooltip][data-tooltip-pos="right"]:focus-visible::after,
+[data-tooltip][data-tooltip-pos="right"]:focus-within::after {
+  transform: translateY(-50%) translateX(0) scale(1);
+}
+.mode-hacker [data-tooltip]::after {
+  border-color: rgba(0, 255, 65, 0.34);
+  box-shadow: var(--elevation-floating), var(--glow-neon-green);
+  font-family: var(--font-mono);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dcent-tooltip,
+  [data-tooltip]::after {
+    transition: none;
+    animation: none;
+  }
+}
+@media print {
+  .dcent-tooltip,
+  [data-tooltip]::after { display: none !important; }
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * §F1-INFOBANNER: shared decoupled banner primitive (D-02 close)
+ * Design-system styled — Phase-3 replaces ≥6 inline-styled banner dupes.
+ * Tone gradient + accent border + glass; the copy is the caller's (verbatim
+ * for truth-contract banners).
+ * ════════════════════════════════════════════════════════════════════════════ */
+.ds-infobanner {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 13px 16px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-glass);
+  background: var(--surface-glass-card);
+  box-shadow: var(--elevation-base), var(--inner-highlight);
+  color: var(--fg-primary);
+  font-family: var(--font-ui);
+  font-size: 0.84rem;
+  line-height: 1.5;
+}
+.ds-infobanner--dense { padding: 9px 13px; gap: 9px; font-size: 0.8rem; }
+
+.ds-infobanner__icon {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 0.82rem;
+  line-height: 1;
+}
+.ds-infobanner__content { flex: 1 1 auto; min-width: 0; }
+.ds-infobanner__title {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 0.9rem;
+  margin-bottom: 2px;
+}
+.ds-infobanner__body { color: var(--fg-secondary); }
+.ds-infobanner__action { flex-shrink: 0; align-self: center; }
+.ds-infobanner__dismiss {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-xs);
+  color: var(--fg-dim);
+  font-size: 1.05rem;
+  line-height: 1;
+  transition: color var(--dur-fast) var(--ease-standard),
+              background var(--dur-fast) var(--ease-standard);
+}
+.ds-infobanner__dismiss:hover { color: var(--fg-primary); background: rgba(255,255,255,.06); }
+
+/* Tone treatments — gradient wash + accent border + tinted glyph. */
+.ds-infobanner--info {
+  border-color: rgba(59,130,246,.32);
+  background: var(--grad-status-info), var(--surface-glass-card);
+}
+.ds-infobanner--info .ds-infobanner__icon { background: var(--blue-dim); color: var(--blue); }
+
+.ds-infobanner--success {
+  border-color: rgba(34,197,94,.34);
+  background: var(--grad-status-success), var(--surface-glass-card);
+}
+.ds-infobanner--success .ds-infobanner__icon { background: var(--green-dim); color: var(--green); }
+
+.ds-infobanner--warn {
+  border-color: rgba(234,179,8,.38);
+  background: var(--grad-status-warning), var(--surface-glass-card);
+}
+.ds-infobanner--warn .ds-infobanner__icon { background: var(--yellow-dim); color: var(--yellow); }
+
+.ds-infobanner--danger {
+  border-color: rgba(239,68,68,.42);
+  background: var(--grad-status-danger), var(--surface-glass-card);
+  box-shadow: var(--elevation-raised), var(--glow-danger);
+}
+.ds-infobanner--danger .ds-infobanner__icon { background: var(--red-dim); color: var(--red); }
+
+.ds-infobanner--neutral {
+  border-color: var(--border-glass);
+  background: var(--surface-glass-card);
+}
+.ds-infobanner--neutral .ds-infobanner__icon {
+  background: rgba(255,255,255,.06);
+  color: var(--fg-secondary);
+}
+
+/* Hacker mode: warm accent reads as "info" against phosphor; keep tones but
+   shift the neutral/info glyph to the orange "cursor-is-here" identity. */
+.mode-hacker .ds-infobanner {
+  background: rgba(10,10,10,.7);
+  font-family: var(--font-mono);
+}
+.mode-hacker .ds-infobanner--info,
+.mode-hacker .ds-infobanner--neutral {
+  border-color: var(--accent-border);
+}
+.mode-hacker .ds-infobanner--info .ds-infobanner__icon,
+.mode-hacker .ds-infobanner--neutral .ds-infobanner__icon {
+  background: var(--accent-glow);
+  color: var(--accent);
+}
+
+@media print {
+  .ds-infobanner {
+    box-shadow: none;
+    background: #fff;
+    border-color: #ccc;
+    color: #15151b;
+  }
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * §F1-SPLASH: first-paint loading splash (D-27 close)
+ * The first thing every user sees — elevated to the premium identity:
+ * voidy radial-glow backdrop, glass logo plinth, warm halo, refined
+ * dual-ring spinner, the existing DcentOsLogo + rotating quote.
+ * App.tsx renders this inside its demarcated F1 wave5 splash block.
+ * ════════════════════════════════════════════════════════════════════════════ */
+.ds-splash {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 22px;
+  padding: 24px;
+  background:
+    radial-gradient(120% 90% at 50% 8%, rgba(250,165,0,0.07), transparent 55%),
+    radial-gradient(90% 70% at 50% 100%, rgba(250,103,0,0.05), transparent 60%),
+    var(--bg-void, #070710);
+  z-index: 100000;
+  animation: ds-fadeIn 280ms var(--ease-out-soft, ease) both;
+}
+.ds-splash__logo {
+  position: relative;
+  padding: 26px 34px;
+  border-radius: var(--radius-lg);
+  background: var(--grad-glass-diagonal), var(--surface-glass-card);
+  border: 1px solid var(--accent-border);
+  backdrop-filter: blur(var(--blur-md)) saturate(1.12);
+  -webkit-backdrop-filter: blur(var(--blur-md)) saturate(1.12);
+  box-shadow: var(--elevation-floating), var(--glow-orange);
+  animation: dcm-glow-breathe 4.6s ease-in-out infinite;
+}
+.ds-splash__quote {
+  max-width: 420px;
+  text-align: center;
+  color: var(--fg-secondary);
+  font-family: var(--font-ui);
+  font-size: 0.82rem;
+  font-style: italic;
+  line-height: 1.5;
+}
+.ds-splash__spinner {
+  position: relative;
+  width: 32px;
+  height: 32px;
+}
+.ds-splash__spinner::before,
+.ds-splash__spinner::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 3px solid transparent;
+}
+.ds-splash__spinner::before {
+  border-top-color: var(--accent);
+  border-right-color: var(--accent-deep);
+  animation: ds-spin 0.9s linear infinite;
+}
+.ds-splash__spinner::after {
+  inset: 6px;
+  border-bottom-color: var(--sphere-hi, #FFC94D);
+  opacity: 0.55;
+  animation: ds-spin 1.4s linear infinite reverse;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ds-splash { animation: none; }
+  .ds-splash__logo { animation: none; }
+  .ds-splash__spinner::before,
+  .ds-splash__spinner::after {
+    animation-duration: 0.01ms;
+    animation-iteration-count: 1;
+    border-top-color: var(--accent);
+  }
+}
+@media print { .ds-splash { display: none !important; } }
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * WAVE-9 ZONE A — DS + COMMON primitives + Standard-hero polish (2026-06-02)
+ *
+ * Strictly ADDITIVE. No existing selector/token/class renamed or removed.
+ * Adds: the canonical '.ds-toast' family (Toast.tsx drops ~20 inline styles
+ * onto these), the mode-agnostic '.fan-mode-btn' base (so the FanControl mode
+ * buttons render correctly in Basic/Hacker, not just Standard), and the
+ * Standard command-core "is mining" affordances (glow aura + hashrate breathe
+ * + fact hover). All animation is covered by the reduced-motion + print guards
+ * at the end of this block.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+/* ─── §A1-TOAST: canonical toast surface ───
+   Toast.tsx is a positioning shell + per-item live region (role=alert for
+   errors / role=status otherwise). These classes carry the visual so the
+   component holds ZERO inline chrome. Type tints come from the status tokens.
+   The clickable inner element gets the canonical hover-lift + focus ring
+   (it's role="button" tabIndex=0 — the F1-FOCUS ':where()' ring already
+   covers [role="button"], so no extra focus CSS is needed here). */
+.ds-toast {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-radius: var(--radius-sm, 8px);
+  border: 1px solid var(--border-glass, rgba(255, 255, 255, 0.08));
+  border-left: 3px solid var(--ds-toast-accent, var(--blue, #3B82F6));
+  background: rgba(20, 20, 31, 0.82);
+  backdrop-filter: blur(14px) saturate(1.15);
+  -webkit-backdrop-filter: blur(14px) saturate(1.15);
+  box-shadow: var(--elevation-overlay, 0 8px 32px rgba(0, 0, 0, 0.4));
+  color: var(--fg-primary, #f0f0f0);
+  font-family: var(--font-ui);
+  font-size: 0.85rem;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  pointer-events: auto;
+  cursor: pointer;
+  text-align: left;
+  animation: ds-slideUp 0.22s var(--ease-standard, cubic-bezier(.2,0,0,1)) both;
+  transition: transform var(--dur-fast, 150ms) var(--ease-standard, cubic-bezier(.2,0,0,1)),
+              box-shadow var(--dur-fast, 150ms) var(--ease-standard, cubic-bezier(.2,0,0,1)),
+              border-color var(--dur-fast, 150ms) var(--ease-standard, cubic-bezier(.2,0,0,1));
+}
+.ds-toast:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--elevation-floating, 0 12px 40px rgba(0, 0, 0, 0.46));
+}
+.ds-toast__glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--ds-toast-glyph-bg, rgba(59, 130, 246, 0.12));
+  color: var(--ds-toast-accent, var(--blue, #3B82F6));
+  font-size: 0.78rem;
+  font-weight: 800;
+  box-shadow: 0 0 8px var(--ds-toast-glyph-glow, rgba(59, 130, 246, 0.2));
+}
+.ds-toast__msg { flex: 1; min-width: 0; }
+
+.ds-toast--success {
+  --ds-toast-accent: var(--green, #22C55E);
+  --ds-toast-glyph-bg: rgba(34, 197, 94, 0.12);
+  --ds-toast-glyph-glow: rgba(34, 197, 94, 0.2);
+}
+.ds-toast--error {
+  --ds-toast-accent: var(--red, #EF4444);
+  --ds-toast-glyph-bg: rgba(239, 68, 68, 0.12);
+  --ds-toast-glyph-glow: rgba(239, 68, 68, 0.2);
+}
+.ds-toast--warning {
+  --ds-toast-accent: var(--yellow, #EAB308);
+  --ds-toast-glyph-bg: rgba(234, 179, 8, 0.12);
+  --ds-toast-glyph-glow: rgba(234, 179, 8, 0.2);
+}
+.ds-toast--info {
+  --ds-toast-accent: var(--blue, #3B82F6);
+  --ds-toast-glyph-bg: rgba(59, 130, 246, 0.12);
+  --ds-toast-glyph-glow: rgba(59, 130, 246, 0.2);
+}
+@media (prefers-reduced-motion: reduce) {
+  .ds-toast { animation: none; transition: none; }
+  .ds-toast:hover { transform: none; }
+}
+
+/* ─── §A2-FANMODE: mode-agnostic fan mode button base ───
+   '.mode-standard .fan-mode-btn' (standard.css, higher specificity) still
+   wins in Standard mode and is unchanged. This base makes the SAME buttons
+   render correctly in Basic/Hacker, where they previously had no styling at
+   all (FanControl is a shared common/ component used in every mode). */
+.fan-mode-btn {
+  flex: 1;
+  padding: 10px;
+  border-radius: var(--radius-sm, 8px);
+  border: 1px solid var(--border-glass, rgba(255, 255, 255, 0.13));
+  background: var(--card-bg, rgba(18, 18, 27, 0.9));
+  color: var(--fg-secondary, var(--text-secondary, #b7b7c6));
+  font-family: var(--font-ui);
+  font-size: 0.8rem;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color var(--dur-fast, 150ms) var(--ease-standard, cubic-bezier(.2,0,0,1)),
+              background var(--dur-fast, 150ms) var(--ease-standard, cubic-bezier(.2,0,0,1)),
+              color var(--dur-fast, 150ms) var(--ease-standard, cubic-bezier(.2,0,0,1)),
+              box-shadow var(--dur-fast, 150ms) var(--ease-standard, cubic-bezier(.2,0,0,1));
+}
+.fan-mode-btn:hover:not(:disabled) {
+  border-color: var(--accent-border, rgba(250, 165, 0, 0.32));
+  color: var(--fg-primary, var(--text, #f5f5f7));
+}
+.fan-mode-btn.active {
+  border-color: var(--accent-border, rgba(250, 165, 0, 0.32));
+  background: var(--accent-glow, rgba(250, 165, 0, 0.16));
+  color: var(--accent, #FAA500);
+  box-shadow: 0 0 12px var(--accent-glow, rgba(250, 165, 0, 0.16));
+}
+.fan-mode-btn:disabled { opacity: 0.6; cursor: wait; }
+.fan-mode-btn .mode-name { display: block; font-weight: 600; margin-bottom: 2px; }
+.fan-mode-btn .mode-desc { font-size: 0.7rem; color: var(--fg-muted, var(--text-dim, #78788a)); }
+
+/* ─── §A3-COMMANDCORE: Standard "is mining" hero affordances ───
+   When the operator-focus command core is actively mining, the surface gets
+   a slow ambient glow aura, the hero hashrate value breathes (a subtle live
+   pulse), and the fact tiles light their border on hover. The '.is-mining'
+   class is set by StandardDashboard on '.standard-command-core' when telemetry
+   is fresh AND mining. Uses the existing ds-glowPulse / ds-breathingGlow
+   keyframes — no new animation introduced. */
+.mode-standard .standard-top-intelligence-grid.is-mining {
+  animation: ds-glowPulse 3.6s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .mode-standard .standard-top-intelligence-grid.is-mining {
+    animation: none;
+  }
+}
+@media print {
+  .ds-toast { display: none !important; }
+}
+
+/* ─── §A4-INFODOT-HIT: ≥24px touch/click target on the info glyph ───
+   InfoDot renders a small visual glyph (default 14px) but interactive targets
+   should be ≥24px (WCAG 2.2 Target Size minimum). A centered transparent
+   pseudo-element extends the clickable/tappable area to 24px WITHOUT changing
+   the visual glyph size or the surrounding layout (the dot keeps its inline
+   width/height; only the pointer hit-box grows). */
+.dcent-infodot {
+  position: relative;
+}
+.dcent-infodot::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 24px;
+  height: 24px;
+  min-width: 24px;
+  min-height: 24px;
+  transform: translate(-50%, -50%);
+  /* transparent — pure hit-area expansion, no visual change */
+}
+
+/* ─── §A5-OVERLAY-SCRIM: converge any stray local scrim onto the canonical
+   --scrim-bg / --scrim-blur tokens. The canonical .ds-overlay-backdrop above
+   already consumes them; this is a low-specificity safety so any element that
+   opts into '.ds-scrim' gets the exact converged scrim. */
+.ds-scrim {
+  background: var(--scrim-bg, rgba(0, 0, 0, 0.6));
+  backdrop-filter: blur(var(--scrim-blur, 8px));
+  -webkit-backdrop-filter: blur(var(--scrim-blur, 8px));
+}

@@ -1,0 +1,77 @@
+# DCENT_OS dcentrald config for Antminer S19 XP (BM1366 family)
+# Initial warm-init validation template for Amlogic-style serial mining.
+# Adjust serial_device and pool settings before use.
+
+[general]
+hostname = "dcent-s19xp"
+log_level = "info"
+
+[pool]
+url = ""
+worker = ""
+password = "x"
+protocol = "sv1"
+
+[mining]
+enabled = false
+model = "s19xp"
+frequency_mhz = 400
+voltage_mv = 12800
+version_rolling = true
+passthrough = false
+suggest_difficulty = 8192
+
+# Pick the ttyS device for the populated board on the target unit.
+serial_device = "/dev/ttyS2"
+serial_chip_count = 110
+serial_chip_type = "BM1366"
+
+[power]
+mode = "bypass"
+target_watts = 1600
+
+[power.psu_override]
+enabled = true
+model = "APW12"
+voltage_v = 14.0
+
+[thermal]
+target_temp_c = 60
+hot_temp_c = 70
+dangerous_temp_c = 80
+fan_min_pwm = 10
+fan_max_pwm = 40
+
+[api]
+cgminer_port = 4028
+http_port = 80
+websocket = true
+auth_enabled = false
+auth_password = ""
+
+[donation]
+enabled = false
+percent = 2.0
+pool_url = ""
+worker = ""
+password = "x"
+cycle_duration_s = 3600
+
+[watchdog]
+enabled = false
+
+[hash_on_disconnect]
+enabled = true
+
+[mode]
+active = "standard"
+
+[autotuner]
+enabled = false
+min_freq_mhz = 250
+max_freq_mhz = 650
+
+[led]
+enabled = true
+heartbeat_on_ms = 100
+heartbeat_off_ms = 900

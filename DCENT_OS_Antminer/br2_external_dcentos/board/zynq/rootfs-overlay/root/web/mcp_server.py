@@ -1,0 +1,2245 @@
+#!/usr/bin/env python3
+"""
+DCENTos MCP Server — Model Context Protocol for AI-Assisted Mining
+D-Central Technologies, 2026
+
+MCP (Model Context Protocol) is an open standard by Anthropic that allows
+AI assistants (Claude, ChatGPT, etc.) to connect to external tools and data.
+
+This server exposes the miner's hardware as MCP "tools" and "resources",
+enabling any MCP-compatible AI to:
+  - Read real-time sensor data (temperatures, voltages, hash rates)
+  - Run hardware diagnostics
+  - Control fan speed and mining parameters
+  - Troubleshoot issues conversationally
+  - Monitor fleet status
+
+Protocol: JSON-RPC 2.0 over HTTP (Streamable HTTP transport)
+Port: 3000 (configurable)
+Spec: https://modelcontextprotocol.io/
+
+~28 tools exposed — see TOOLS dict for full list.
+
+Resources exposed:
+  miner://status       — Live system status (subscribable)
+  miner://temperatures — Temperature readings
+  miner://chains       — Chain status
+  miner://hashrate     — Live hashrate from dcentrald
+  miner://config       — Current dcentrald config
+"""
+
+import http.server
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import socket
+import argparse
+
+VERSION = "0.3.0"
+PROTOCOL_VERSION = "2024-11-05"
+SERVER_NAME = "dcentos-mcp"
+PROFILE_ID = "dcent.cross-firmware.minimal.v1"
+
+# MCP-3 (P3 hardening): hard cap on the JSON-RPC request body size. do_POST
+# reads exactly Content-Length bytes; without a ceiling a single oversized POST
+# is a trivial memory-exhaustion vector (especially under --bind 0.0.0.0). MCP
+# requests are tiny (the largest legitimate one is a tool call with a few hex
+# args), so 1 MiB is generous headroom while closing the DoS surface.
+MAX_REQUEST_BODY_BYTES = 1 << 20  # 1 MiB
+
+
+# =============================================================================
+# MCP-2 ( privacy): wallet + pool-credential sanitizer for READ tools.
+#
+# The READ tools (get_config / tail_log / grep_log / live_stats) are NEVER
+# behind the release bearer-token gate (reads stay open on dev AND release), so
+# any operator BTC payout address (the Stratum V1 `worker`) or pool URL
+# `user:pass@` credential they return would leak unauthenticated to anyone who
+# can reach :3000. This mirrors the load-bearing Rust sanitizers
+# `dcentrald_common::wallet_mask::{mask_wallet, mask_in_string}` and
+# `dcentrald_stratum::pool_api::sanitize_pool_url` so this parallel Python read
+# path masks the same surfaces. Detection rules are byte-aligned with
+# wallet_mask.rs (bech32/bech32m HRPs, base58 P2PKH/P2SH first-bytes, 32/40/64
+# hex runs) and the mask form is `<first6>…<last4>` (U+2026) for inputs >= 12.
+# =============================================================================
+
+# bech32 / bech32m HRP set + data charset (wallet_mask.rs BECH32_HRPS /
+# BECH32_CHARSET). Word-bounded both sides; length re-validated in _mask_bech32.
+_BECH32_RE = re.compile(
+    r'(?<![A-Za-z0-9])'
+    r'(?:bc|tb|bcrt|bsv|ltc|tltc)1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{6,87}'
+    r'(?![A-Za-z0-9])'
+)
+# base58 P2PKH / P2SH (wallet_mask.rs BASE58_FIRST_BYTES + BASE58_CHARSET,
+# total length 25..35 = first byte + 24..34 trailing).
+_BASE58_RE = re.compile(
+    r'(?<![A-Za-z0-9])'
+    r'[123mn][123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]{24,34}'
+    r'(?![A-Za-z0-9])'
+)
+# long hex runs (wallet_mask.rs matches_hex_address: exactly 32/40/64 hex chars).
+_HEX_RE = re.compile(
+    r'(?<![A-Za-z0-9])'
+    r'(?:[0-9a-fA-F]{64}|[0-9a-fA-F]{40}|[0-9a-fA-F]{32})'
+    r'(?![A-Za-z0-9])'
+)
+# scheme://[user[:pass]@]authority — strip the userinfo (sanitize_pool_url). The
+# userinfo char class excludes `/ @ whitespace " '` so it never crosses into the
+# path/query (mirrors the authority-only stripping in pool_api::sanitize_pool_url).
+_URL_CRED_RE = re.compile(r'(://)[^/@\s"\']+@')
+
+
+def _mask_wallet(addr):
+    """Mirror dcentrald_common::wallet_mask::mask_wallet — `<first6>…<last4>`
+    for inputs >= 12 chars, otherwise unchanged."""
+    if len(addr) < 12:
+        return addr
+    return addr[:6] + "…" + addr[-4:]
+
+
+def _mask_bech32(match):
+    s = match.group(0)
+    # Enforce BIP-173 total length 14..90 (the regex floor is shorter for the
+    # short `bc1` HRP); leave anything outside that window untouched.
+    return _mask_wallet(s) if 14 <= len(s) <= 90 else s
+
+
+def sanitize_secrets(text):
+    """Strip pool-URL credentials and mask wallet addresses in arbitrary text.
+
+    Mirrors the Rust pair sanitize_pool_url (strip `user:pass@`) +
+    wallet_mask::mask_in_string (mask bech32 / base58 / long-hex). Applied to
+    every READ tool that can surface the operator's payout address or pool
+    credentials. Non-strings pass through unchanged.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    text = _URL_CRED_RE.sub(r"\1", text)
+    text = _BECH32_RE.sub(_mask_bech32, text)
+    text = _BASE58_RE.sub(lambda m: _mask_wallet(m.group(0)), text)
+    text = _HEX_RE.sub(lambda m: _mask_wallet(m.group(0)), text)
+    return text
+
+
+def sanitize_obj(obj):
+    """Recursively apply sanitize_secrets() to every string in a JSON-ish
+    structure (dict / list / str). Used for proxied JSON responses such as
+    live_stats so a pool URL or worker nested anywhere is masked."""
+    if isinstance(obj, str):
+        return sanitize_secrets(obj)
+    if isinstance(obj, dict):
+        return {k: sanitize_obj(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize_obj(v) for v in obj]
+    return obj
+
+
+def minimal_profile():
+    return {
+        "id": PROFILE_ID,
+        "protocolVersion": PROTOCOL_VERSION,
+        "transport": "streamable-http",
+        "tools": [
+            {
+                "name": "get_status",
+                "description": "Read the current miner status summary",
+                "legacyAliases": ["get_system_status", "live_stats", "get_hashrate"],
+                "write": False,
+            },
+            {
+                "name": "get_device_info",
+                "description": "Read the current device identity and ASIC metadata",
+                # Aliases MUST stay byte-aligned with the Rust source of truth in
+                # projects/dcent-schema/src/mcp.rs::minimal_profile() (the cross-
+                # firmware canonical registry, mcp-auth-contract.md §5.1). Both
+                # get_asic_info and get_config are accepted inbound, mapped to the
+                # canonical get_device_info handler — never emitted as standalone tools.
+                "legacyAliases": ["get_asic_info", "get_config"],
+                "write": False,
+            },
+            {
+                "name": "get_swarm_status",
+                "description": "Read the shared swarm and discovery status",
+                # get_swarm is the canonical-as-alias accepted inbound (Rust source
+                # of truth: dcent-schema minimal_profile()); never emitted standalone.
+                "legacyAliases": ["get_swarm"],
+                "write": False,
+            },
+            {
+                "name": "identify_device",
+                "description": "Toggle the physical identify signal for the device",
+                "legacyAliases": [],
+                "write": True,
+            },
+            {
+                "name": "restart_mining",
+                "description": "Restart mining without redefining the pool configuration",
+                "legacyAliases": ["service_control"],
+                "write": True,
+            },
+            {
+                "name": "set_pool",
+                "description": "Update the active mining pool target",
+                "legacyAliases": ["pool_switch"],
+                "write": True,
+            },
+        ],
+    }
+
+
+def run_cmd(cmd, timeout=5):
+    """Run a command and return stdout (stripped), or "" on failure.
+
+    FO-1 (SEC-W24-3, 2026-05-22): `shell=True` is dropped UNCONDITIONALLY. The
+    previous implementation passed the whole command string to a shell, which
+    was a latent injection footgun (one careless future tool addition = RCE).
+    This shell-free runner parses the limited shell features the tools actually
+    use — `2>/dev/null` stderr suppression and single `|` pipelines — and runs
+    each segment as an argv list via `shell=False`. Pure-argv callers can pass
+    a list directly and skip parsing entirely.
+
+    Supported (no shell): plain argv, trailing `2>/dev/null` / `2>&1`, and
+    `a | b | c` pipelines (each stage tokenized with shlex). Anything else that
+    would need a real shell (`&&`, `;`, `$()`, backticks, globbing) is NOT
+    supported by design — no tool uses them, and refusing them keeps the
+    injection surface closed.
+    """
+    try:
+        if isinstance(cmd, (list, tuple)):
+            result = subprocess.run(
+                list(cmd), shell=False, capture_output=True, text=True, timeout=timeout
+            )
+            return result.stdout.strip()
+        out, _ = _run_pipeline(cmd, timeout=timeout)
+        return out.strip()
+    except Exception:
+        return ""
+
+
+def _parse_redirections(segment):
+    """Strip trailing `2>/dev/null` / `2>&1` from one pipeline segment.
+
+    Returns (argv_list, stderr_target) where stderr_target is one of
+    subprocess.DEVNULL, subprocess.STDOUT, or None.
+    """
+    import shlex
+
+    tokens = shlex.split(segment)
+    stderr = None
+    cleaned = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "2>/dev/null":
+            stderr = subprocess.DEVNULL
+        elif tok == "2>&1":
+            stderr = subprocess.STDOUT
+        elif tok == "2>" and i + 1 < len(tokens) and tokens[i + 1] == "/dev/null":
+            stderr = subprocess.DEVNULL
+            i += 1
+        else:
+            cleaned.append(tok)
+        i += 1
+    return cleaned, stderr
+
+
+def _run_pipeline(cmd, timeout=5):
+    """Run a `a | b | c` pipeline with shell=False. Returns (stdout, rc)."""
+    segments = [s.strip() for s in cmd.split("|")]
+    prev_stdout = None
+    procs = []
+    for idx, segment in enumerate(segments):
+        argv, stderr_target = _parse_redirections(segment)
+        if not argv:
+            continue
+        is_last = idx == len(segments) - 1
+        proc = subprocess.Popen(
+            argv,
+            stdin=prev_stdout,
+            stdout=subprocess.PIPE,
+            stderr=(stderr_target if stderr_target is not None else None),
+            text=True,
+        )
+        if prev_stdout is not None:
+            prev_stdout.close()  # allow upstream to receive SIGPIPE
+        prev_stdout = proc.stdout
+        procs.append(proc)
+    if not procs:
+        return "", 0
+    try:
+        out, _ = procs[-1].communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        for p in procs:
+            p.kill()
+        return "", 124
+    for p in procs[:-1]:
+        try:
+            p.wait(timeout=1)
+        except Exception:
+            p.kill()
+    return out or "", procs[-1].returncode
+
+
+def _release_image():
+    """FO-1: True when this firmware was built as a PRODUCTION/release image.
+
+    Mirrors the Rust daemon's `auth::is_release_image()` — the marker file
+    `/etc/dcentos/release-image` is stamped only for release builds. On a
+    DEV/LAB image the file is absent and the MCP server stays open (no token),
+    byte-identical to today. On a release image a Bearer token is required for
+    write tools.
+    """
+    return os.path.exists("/etc/dcentos/release-image")
+
+
+# FO-1: MCP auth token for release images. Read once from a root-only file
+# (preferred: the daemon's auth surface; fallback: a dedicated MCP token file).
+# DEV images leave this None → no token required (open, as today).
+_MCP_TOKEN_CACHE = {"loaded": False, "token": None}
+
+
+def _mcp_required_token():
+    """Return the Bearer token required for write tools on a release image,
+    or None if none is provisioned / this is a DEV image."""
+    if not _release_image():
+        return None
+    if _MCP_TOKEN_CACHE["loaded"]:
+        return _MCP_TOKEN_CACHE["token"]
+    token = None
+    for path in ("/run/dcentos/mcp_token", "/data/dcent/mcp_token"):
+        try:
+            with open(path, "r") as fh:
+                candidate = fh.read().strip()
+            if candidate:
+                token = candidate
+                break
+        except OSError:
+            pass
+    _MCP_TOKEN_CACHE["loaded"] = True
+    _MCP_TOKEN_CACHE["token"] = token
+    return token
+
+
+def _extract_bearer(headers):
+    """Pull the bearer token from an Authorization header, or None."""
+    auth = headers.get("Authorization") or headers.get("authorization")
+    if not auth:
+        return None
+    if auth.startswith("Bearer "):
+        return auth[len("Bearer "):].strip()
+    return None
+
+
+def _tokens_equal(a, b):
+    """Constant-time token comparison (avoids a timing oracle on a release
+    image). Both args are strings; returns True only on exact match."""
+    if a is None or b is None:
+        return False
+    try:
+        import hmac
+
+        return hmac.compare_digest(a, b)
+    except Exception:
+        # Fallback constant-ish compare.
+        if len(a) != len(b):
+            return False
+        diff = 0
+        for x, y in zip(a, b):
+            diff |= ord(x) ^ ord(y)
+        return diff == 0
+
+
+def _write_tool_authorized(auth_token):
+    """FO-1 control-tool gate decision. Returns (allowed, reason).
+
+    Operator decision (DCENT design-language §MCP-auth, RESOLVED): DEV builds
+    stay open for shop convenience, but a RELEASE/production image must REQUIRE
+    a valid Bearer token for every control/write tool — a shipped industrial
+    unit refuses control without auth.
+
+    Contract (fail-closed by default — only an explicit DEV marker opens it):
+      - DEV image (no `/etc/dcentos/release-image` marker): ALLOW (open, as today).
+      - Release image WITH a provisioned token: ALLOW only on constant-time match.
+      - Release image with NO provisioned token: REFUSE. This is the load-bearing
+        hardening — previously a release unit whose token file was missing/empty
+        (provisioning failure, boot race) fell OPEN because the gate was skipped
+        when `_mcp_required_token()` returned None. A release/unknown image now
+        fails CLOSED.
+    Read tools never reach this gate (only WRITE_TOOLS are checked at the call
+    site), so reads stay open on both DEV and release.
+    """
+    if not _release_image():
+        return True, "dev-image-open"
+    required = _mcp_required_token()
+    if required is None:
+        # Release image but no token provisioned → fail closed.
+        return False, "release-image-no-token-provisioned"
+    if _tokens_equal(auth_token, required):
+        return True, "release-image-token-ok"
+    return False, "release-image-token-mismatch"
+
+
+def am2_uio_fan_control_present():
+    """Return True when the FPGA fan-control block is UIO-bound."""
+    return "fan-control" in uio_names()
+
+
+def uio_names():
+    """Return UIO device names exposed by sysfs."""
+    names = []
+    try:
+        for entry in os.listdir("/sys/class/uio"):
+            path = os.path.join("/sys/class/uio", entry, "name")
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    names.append(fh.read().strip())
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return names
+
+
+def am2_target_without_fan_uio():
+    names = uio_names()
+    if "board-control" in names:
+        return "fan-control" not in names
+    for path in ("/etc/dcentos/board_target", "/etc/dcentos-platform", "/etc/dcentos/model"):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                value = fh.read().strip().lower()
+            if "am2" in value or "s19j" in value or "s19pro" in value or "s17pro" in value:
+                return "fan-control" not in names
+        except OSError:
+            pass
+    return False
+
+
+def is_am2_class():
+    """True on am2-class control boards (S19j Pro / S19 Pro / S17 Pro Zynq) whose
+    hashboard EEPROMs live at I2C 0x50-0x57. Mirrors the dcentrald HAL write-
+    denylist so this parallel MCP write path can't bypass the .74 hb2 EEPROM
+    corruption-prevention guarantee. S9 is deliberately NOT am2-class: its
+    0x55-0x57 are PIC voltage controllers (legitimate write targets), not EEPROMs,
+    so they must stay writable."""
+    for path in ("/etc/dcentos/board_target", "/etc/dcentos-platform", "/etc/dcentos/model"):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                value = fh.read().strip().lower()
+            if "am2" in value or "s19j" in value or "s19pro" in value or "s17pro" in value:
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def dcentrald_fan_cmd(args):
+    for candidate in [
+        "/usr/local/bin/dcentrald",
+        "/usr/bin/dcentrald",
+        "/tmp/dcentrald_runtime",
+        "/tmp/dcentrald_fixed",
+    ]:
+        if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+            try:
+                argv = [candidate] + (args if isinstance(args, list) else args.split())
+                result = subprocess.run(
+                    argv,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                return result.returncode == 0, (result.stdout + result.stderr).strip()
+            except Exception as exc:
+                return False, str(exc)
+    return False, "no executable dcentrald fan helper found"
+
+
+def parse_dcentrald_fan_output(out):
+    """Parse key=value fields from dcentrald fan one-shots."""
+    parsed = {}
+    for key in (
+        "commanded_pwm",
+        "commanded_readback",
+        "commanded_pwm0",
+        "commanded_pwm1",
+        "max_rpm",
+    ):
+        match = re.search(r"{}=([0-9]+)".format(key), out)
+        if match:
+            parsed[key] = int(match.group(1))
+    if "commanded_pwm" not in parsed and "commanded_readback" in parsed:
+        parsed["commanded_pwm"] = parsed["commanded_readback"]
+    match = re.search(r"per_fan_rpm=\[([^\]]*)\]", out)
+    if match:
+        values = []
+        for item in match.group(1).split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if ":" in item:
+                item = item.split(":", 1)[1].strip()
+            try:
+                values.append(int(item))
+            except ValueError:
+                pass
+        parsed["per_fan_rpm"] = values
+    return parsed
+
+
+# =============================================================================
+# MCP Tool Implementations
+# =============================================================================
+
+def tool_get_system_status(params):
+    """Get comprehensive system health snapshot."""
+    status = {
+        "hostname": run_cmd("hostname"),
+        "kernel": run_cmd("uname -r"),
+        "arch": run_cmd("uname -m"),
+        "uptime": run_cmd("uptime"),
+    }
+
+    meminfo = run_cmd("free -h 2>/dev/null | grep Mem")
+    if meminfo:
+        parts = meminfo.split()
+        status["memory"] = {
+            "total": parts[1] if len(parts) > 1 else "?",
+            "used": parts[2] if len(parts) > 2 else "?",
+            "free": parts[3] if len(parts) > 3 else "?",
+        }
+
+    loadavg = run_cmd("cat /proc/loadavg")
+    if loadavg:
+        parts = loadavg.split()
+        status["load"] = {"1m": parts[0], "5m": parts[1], "15m": parts[2]}
+
+    ip_info = run_cmd("ip addr show eth0 2>/dev/null | grep 'inet '")
+    if ip_info:
+        status["ip"] = ip_info.strip().split()[1]
+
+    uio_count = len(list(
+        f for f in os.listdir("/sys/class/uio") if f.startswith("uio")
+    )) if os.path.exists("/sys/class/uio") else 0
+    status["uio_devices"] = uio_count
+
+    fpga_ver = run_cmd("devmem 0x43C00000 32 2>/dev/null")
+    status["fpga_version"] = fpga_ver or "N/A"
+
+    return status
+
+
+def tool_get_temperatures(params):
+    """Read all temperature sensors (TMP75 on I2C, ASIC internal)."""
+    temps = {}
+    for bus in [0, 1, 2]:
+        for addr in ["0x48", "0x49", "0x4a", "0x4b", "0x4c", "0x4d", "0x4e", "0x4f"]:
+            raw = run_cmd(f"i2cget -y {bus} {addr} 0x00 w 2>/dev/null")
+            if raw and raw != "0x0000":
+                try:
+                    val = int(raw, 16)
+                    msb = val & 0xFF
+                    lsb = (val >> 8) & 0xFF
+                    temp_raw = (msb << 4) | (lsb >> 4)
+                    if temp_raw & 0x800:
+                        temp_raw -= 4096
+                    temp_c = round(temp_raw * 0.0625, 1)
+                    temps[f"bus{bus}_{addr}"] = {"celsius": temp_c, "bus": bus, "address": addr}
+                except Exception:
+                    pass
+    return {"sensors": temps, "count": len(temps)}
+
+
+def tool_get_chain_status(params):
+    """Get hash board chain detection status via FPGA GPIO.
+    GPIOs 902-904 on gpiochip897 (FPGA 0x41200000, bits 5-7).
+    Active HIGH: 1 = board plugged, 0 = not plugged."""
+    chains = {}
+    for chain_id, gpio in [("6", "902"), ("7", "903"), ("8", "904")]:
+        gpio_path = f"/sys/class/gpio/gpio{gpio}/value"
+        if not os.path.exists(gpio_path):
+            # Auto-export GPIO if not already exported
+            try:
+                with open("/sys/class/gpio/export", "w") as f:
+                    f.write(gpio)
+                with open(f"/sys/class/gpio/gpio{gpio}/direction", "w") as f:
+                    f.write("in")
+            except Exception:
+                pass
+        if os.path.exists(gpio_path):
+            try:
+                val = open(gpio_path).read().strip()
+                chains[f"chain_{chain_id}"] = {
+                    "plugged": val == "1",  # Active HIGH: 1 = connected
+                    "gpio_pin": gpio,
+                    "gpio_value": val,
+                }
+            except Exception:
+                chains[f"chain_{chain_id}"] = {"error": "cannot read GPIO"}
+        else:
+            chains[f"chain_{chain_id}"] = {"gpio_exported": False}
+    return {"chains": chains}
+
+
+def tool_get_fpga_registers(params):
+    """Read FPGA registers. Args: base_addr (hex), count (int, default 6)."""
+    base = int(params.get("base_addr", "0x43C00000"), 16)
+    count = min(int(params.get("count", 6)), 32)
+    regs = {}
+    for i in range(count):
+        addr = base + (i * 4)
+        val = run_cmd(f"devmem 0x{addr:08X} 32 2>/dev/null")
+        regs[f"0x{addr:08X}"] = val or "ERROR"
+    return {"base": f"0x{base:08X}", "registers": regs}
+
+
+def tool_get_i2c_scan(params):
+    """Scan I2C bus for connected devices. Args: bus (int, default 0)."""
+    bus = int(params.get("bus", 0))
+    output = run_cmd(f"i2cdetect -y {bus} 2>/dev/null")
+    devices = []
+    for line in output.split("\n")[1:]:
+        parts = line.split(":")
+        if len(parts) == 2:
+            row_base = int(parts[0].strip(), 16)
+            cols = parts[1].split()
+            for j, col in enumerate(cols):
+                if col != "--" and col != "UU" and col != "":
+                    try:
+                        addr = int(col, 16)
+                        devices.append({"address": f"0x{addr:02x}", "status": "active"})
+                    except ValueError:
+                        if col == "UU":
+                            devices.append({"address": f"0x{row_base + j:02x}", "status": "in-use"})
+    return {"bus": bus, "devices": devices, "count": len(devices)}
+
+
+def tool_read_i2c_register(params):
+    """Read I2C register. Args: bus, address, register."""
+    bus = int(params.get("bus", 0))
+    addr = params.get("address", "0x48")
+    reg = params.get("register", "0x00")
+    mode = params.get("mode", "b")  # b=byte, w=word
+    val = run_cmd(f"i2cget -y {bus} {addr} {reg} {mode} 2>/dev/null")
+    return {"bus": bus, "address": addr, "register": reg, "value": val or "ERROR"}
+
+
+def tool_get_nand_info(params):
+    """Get NAND partition layout."""
+    mtd = run_cmd("cat /proc/mtd 2>/dev/null")
+    partitions = []
+    if mtd:
+        for line in mtd.split("\n")[1:]:
+            if line.strip():
+                parts = line.split()
+                if len(parts) >= 4:
+                    size_bytes = int(parts[1], 16)
+                    partitions.append({
+                        "dev": parts[0].rstrip(":"),
+                        "size_hex": parts[1],
+                        "size_mb": round(size_bytes / 1048576, 1),
+                        "name": parts[3].strip('"'),
+                    })
+    ubi = run_cmd("ubinfo -a 2>/dev/null | head -30")
+    return {"partitions": partitions, "ubi_info": ubi or "N/A"}
+
+
+def tool_get_uio_devices(params):
+    """List all UIO (Userspace I/O) devices mapped by the FPGA."""
+    devices = []
+    uio_base = "/sys/class/uio"
+    if os.path.exists(uio_base):
+        for uio in sorted(os.listdir(uio_base)):
+            uio_path = os.path.join(uio_base, uio)
+            name = ""
+            addr = ""
+            try:
+                with open(os.path.join(uio_path, "name")) as f:
+                    name = f.read().strip()
+            except Exception:
+                pass
+            try:
+                with open(os.path.join(uio_path, "maps", "map0", "addr")) as f:
+                    addr = f.read().strip()
+            except Exception:
+                pass
+            devices.append({"id": uio, "name": name, "address": addr})
+    return {"devices": devices, "count": len(devices)}
+
+
+def tool_run_diagnostic(params):
+    """Run full hardware diagnostic suite."""
+    results = {
+        "system": tool_get_system_status({}),
+        "temperatures": tool_get_temperatures({}),
+        "chains": tool_get_chain_status({}),
+        "uio": tool_get_uio_devices({}),
+    }
+
+    # Quick health assessment
+    issues = []
+    if results["uio"]["count"] == 0:
+        issues.append("No UIO devices found — FPGA bitstream may not be loaded")
+    if results["temperatures"]["count"] == 0:
+        issues.append("No temperature sensors detected — boards may need power")
+    for cid in ["6", "7", "8"]:
+        chain = results["chains"]["chains"].get(f"chain_{cid}", {})
+        if chain.get("plugged") is False:
+            issues.append(f"Chain {cid} not plugged in")
+
+    results["health"] = "OK" if not issues else "ISSUES"
+    results["issues"] = issues
+    return results
+
+
+def tool_get_fan_speed(params):
+    """Read current fan speed. AM2 uses dcentrald UIO; S9 uses devmem."""
+    if am2_uio_fan_control_present():
+        ok, out = dcentrald_fan_cmd(["--get-fan"])
+        parsed = parse_dcentrald_fan_output(out)
+        commanded = parsed.get("commanded_pwm")
+        result = {
+            "backend": "dcentrald_uio",
+            "ok": ok,
+            "raw": out,
+            "commanded_pwm": commanded,
+            "commanded_pwm0": parsed.get("commanded_pwm0"),
+            "commanded_pwm1": parsed.get("commanded_pwm1"),
+            "max_rpm": parsed.get("max_rpm"),
+            "per_fan_rpm": parsed.get("per_fan_rpm", []),
+            "pwm": commanded,
+            "pwm_percent": commanded,
+            "rpm": parsed.get("max_rpm"),
+            "note": "fan-control is UIO-bound; devmem is not fan proof",
+        }
+        if not ok:
+            result["error"] = out or "dcentrald fan helper failed"
+        return result
+
+    if am2_target_without_fan_uio():
+        return {
+            "ok": False,
+            "status": "fan_uio_missing",
+            "error": "AM2/XIL fan-control UIO is missing; devmem fan reads are not valid fan evidence",
+        }
+
+    fan0_rps = run_cmd("devmem 0x42800000 32 2>/dev/null")
+    fan1_rps = run_cmd("devmem 0x42800004 32 2>/dev/null")
+    fan_pwm0 = run_cmd("devmem 0x42800010 32 2>/dev/null")
+    fan_pwm1 = run_cmd("devmem 0x42800014 32 2>/dev/null")
+    result = {"fan0": {}, "fan1": {}}
+    try:
+        rps0 = int(fan0_rps, 0) & 0xFF if fan0_rps else 0
+        result["fan0"]["rps"] = rps0
+        result["fan0"]["rpm"] = rps0 * 60
+    except ValueError:
+        result["fan0"]["rpm"] = 0
+    try:
+        rps1 = int(fan1_rps, 0) & 0xFF if fan1_rps else 0
+        result["fan1"]["rps"] = rps1
+        result["fan1"]["rpm"] = rps1 * 60
+    except ValueError:
+        result["fan1"]["rpm"] = 0
+    try:
+        pwm = int(fan_pwm0, 0) & 0x7F if fan_pwm0 else 0
+        result["pwm"] = pwm
+        result["pwm_percent"] = min(round(pwm / 1.27), 100)
+    except ValueError:
+        result["pwm"] = 0
+    # Primary RPM = whichever fan has a reading (fan0 preferred, fallback to fan1)
+    rpm0 = result["fan0"].get("rpm", 0)
+    rpm1 = result["fan1"].get("rpm", 0)
+    result["rpm"] = rpm0 if rpm0 > 0 else rpm1
+    return result
+
+
+def tool_set_fan_speed(params):
+    """Set fan PWM. Args: pwm (0-30 on AM2/home, 0-127 legacy) or percent."""
+    if "pwm" not in params and "percent" not in params:
+        return {
+            "ok": False,
+            "error": "missing required pwm or percent; refusing to change fan speed by default",
+        }
+    if am2_uio_fan_control_present():
+        # MCP-4: `percent` (0-100) and `pwm` (raw 0-127 PWM scale) are DISTINCT
+        # units. dcentrald --set-fan expects a RAW PWM value, so a `percent`
+        # request is first converted to PWM (percent * 1.27, the same factor the
+        # legacy devmem path uses) — previously a `percent` value was applied
+        # verbatim as raw PWM. Either unit is then hard-clamped to the PWM-30
+        # home cap so this control can never command a louder-than-home fan.
+        if "pwm" in params:
+            requested_unit = "pwm"
+            requested_pwm = max(0, int(params["pwm"]))
+        else:
+            requested_unit = "percent"
+            requested_percent = max(0, min(100, int(params["percent"])))
+            requested_pwm = int(round(requested_percent * 1.27))
+        pwm_val = max(0, min(30, requested_pwm))
+        ok, out = dcentrald_fan_cmd(["--set-fan", str(pwm_val)])
+        parsed = parse_dcentrald_fan_output(out)
+        result = {
+            "backend": "dcentrald_uio",
+            "ok": ok,
+            "requested_unit": requested_unit,
+            "requested_pwm_raw": requested_pwm,
+            "requested_pwm": pwm_val,
+            "home_cap_pwm": 30,
+            "pwm_scale_max": 127,
+            "clamped": pwm_val != requested_pwm,
+            "commanded_pwm": parsed.get("commanded_pwm"),
+            "commanded_pwm0": parsed.get("commanded_pwm0"),
+            "commanded_pwm1": parsed.get("commanded_pwm1"),
+            "max_rpm": parsed.get("max_rpm"),
+            "per_fan_rpm": parsed.get("per_fan_rpm", []),
+            "raw": out,
+            "note": "commanded PWM is not acoustic proof; check max_rpm/operator hearing",
+        }
+        if not ok:
+            result["error"] = out or "dcentrald fan helper failed"
+        return result
+
+    if am2_target_without_fan_uio():
+        return {
+            "ok": False,
+            "status": "fan_uio_missing",
+            "error": "AM2/XIL fan-control UIO is missing; refusing stale devmem fan write",
+        }
+
+    if "pwm" in params:
+        pwm_val = max(0, min(127, int(params["pwm"])))
+    elif "percent" in params:
+        pct = max(0, min(100, int(params["percent"])))
+        pwm_val = int(pct * 1.27)
+    run_cmd(f"devmem 0x42800010 32 {pwm_val} 2>/dev/null")
+    run_cmd(f"devmem 0x42800014 32 {pwm_val} 2>/dev/null")
+    return {"set_pwm": pwm_val, "set_percent": min(round(pwm_val / 1.27), 100)}
+
+
+def tool_read_devmem(params):
+    """Read memory-mapped register. Args: address (hex string)."""
+    addr = params.get("address", "0x43C00000")
+    # Sanitize address to prevent command injection
+    if not re.match(r'^0x[0-9a-fA-F]{1,8}$', addr):
+        return {"address": addr, "value": "ERROR", "error": "Invalid address format (use 0x hex)"}
+    val = run_cmd(f"devmem {addr} 32 2>/dev/null")
+    return {"address": addr, "value": val or "ERROR"}
+
+
+def _validate_hex(value, name="value"):
+    """Validate a hex string for devmem/I2C commands. Returns error dict or None."""
+    if not re.match(r'^0x[0-9a-fA-F]{1,8}$', value):
+        return {"error": f"Invalid {name} format (use 0x hex, e.g. 0x1A)"}
+    return None
+
+
+def tool_write_fpga_register(params):
+    """Write 32-bit FPGA register via devmem. Args: address (hex), value (hex)."""
+    addr = params.get("address", "")
+    value = params.get("value", "")
+    err = _validate_hex(addr, "address")
+    if err:
+        return err
+    err = _validate_hex(value, "value")
+    if err:
+        return err
+    run_cmd(f"devmem {addr} 32 {value} 2>/dev/null")
+    # Read back to confirm
+    readback = run_cmd(f"devmem {addr} 32 2>/dev/null")
+    return {"address": addr, "written": value, "readback": readback or "ERROR"}
+
+
+def tool_write_devmem(params):
+    """Write arbitrary physical address via devmem. Args: address (hex), value (hex)."""
+    addr = params.get("address", "")
+    value = params.get("value", "")
+    err = _validate_hex(addr, "address")
+    if err:
+        return err
+    err = _validate_hex(value, "value")
+    if err:
+        return err
+    run_cmd(f"devmem {addr} 32 {value} 2>/dev/null")
+    readback = run_cmd(f"devmem {addr} 32 2>/dev/null")
+    return {"address": addr, "written": value, "readback": readback or "ERROR"}
+
+
+def tool_write_i2c_register(params):
+    """Write I2C device register via i2cset. Args: bus, address, register, value, mode."""
+    bus = int(params.get("bus", 0))
+    addr = params.get("address", "0x48")
+    reg = params.get("register", "0x00")
+    value = params.get("value", "0x00")
+    mode = params.get("mode", "b")
+    # Validate hex args
+    for name, val in [("address", addr), ("register", reg), ("value", value)]:
+        if not re.match(r'^0x[0-9a-fA-F]{1,4}$', val):
+            return {"error": f"Invalid {name} format (use 0x hex)"}
+    if mode not in ("b", "w"):
+        return {"error": "mode must be 'b' (byte) or 'w' (word)"}
+    # HAL corruption-prevention parity: refuse writes to the hashboard EEPROM
+    # range 0x50-0x57 on am2-class boards (the .74 hb2 EEPROM-corruption class
+    # the dcentrald HAL denylist exists to prevent). This MCP tool is a parallel
+    # write path that does not go through the HAL, so it must honor the same
+    # denylist. Reads (i2cget / tool_read_i2c_register) stay unrestricted.
+    # Lab override: DCENT_MCP_ALLOW_UNSAFE_I2C_WRITE=1.
+    try:
+        addr_int = int(addr, 16)
+    except ValueError:
+        addr_int = -1
+    if (
+        is_am2_class()
+        and 0x50 <= addr_int <= 0x57
+        and os.environ.get("DCENT_MCP_ALLOW_UNSAFE_I2C_WRITE") != "1"
+    ):
+        return {
+            "error": (
+                "I2C write to EEPROM range 0x50-0x57 is denied on am2-class boards "
+                "(HAL corruption-prevention guarantee; .74 hb2 incident). "
+                "Set DCENT_MCP_ALLOW_UNSAFE_I2C_WRITE=1 to override (lab only)."
+            ),
+            "bus": bus,
+            "address": addr,
+            "status": "refused",
+        }
+    result = run_cmd(f"i2cset -y {bus} {addr} {reg} {value} {mode} 2>/dev/null")
+    # Read back
+    readback = run_cmd(f"i2cget -y {bus} {addr} {reg} {mode} 2>/dev/null")
+    return {
+        "bus": bus, "address": addr, "register": reg,
+        "written": value, "readback": readback or "ERROR",
+    }
+
+
+def tool_pic_status(params):
+    """Read all 3 PICs at I2C addresses 0x55, 0x56, 0x57 on bus 1."""
+    pics = {}
+    status_map = {0xCC: "bootloader", 0x60: "app_mode"}
+    for addr_int, label in [(0x55, "chain_6"), (0x56, "chain_7"), (0x57, "chain_8")]:
+        addr_hex = f"0x{addr_int:02x}"
+        raw = run_cmd(f"i2cget -y 1 {addr_hex} 2>/dev/null")
+        if raw:
+            try:
+                val = int(raw, 16)
+                state = status_map.get(val, "unknown")
+                pics[label] = {
+                    "address": addr_hex,
+                    "raw_byte": f"0x{val:02x}",
+                    "state": state,
+                }
+            except ValueError:
+                pics[label] = {"address": addr_hex, "raw": raw, "state": "parse_error"}
+        else:
+            pics[label] = {"address": addr_hex, "state": "no_response"}
+    return {"pics": pics}
+
+
+def tool_gpio_read(params):
+    """Read any GPIO pin. Args: pin (int)."""
+    pin = int(params.get("pin", 0))
+    gpio_path = f"/sys/class/gpio/gpio{pin}/value"
+    if not os.path.exists(gpio_path):
+        try:
+            with open("/sys/class/gpio/export", "w") as f:
+                f.write(str(pin))
+            with open(f"/sys/class/gpio/gpio{pin}/direction", "w") as f:
+                f.write("in")
+        except Exception as e:
+            return {"pin": pin, "error": f"Cannot export GPIO: {e}"}
+    try:
+        val = open(gpio_path).read().strip()
+        return {"pin": pin, "value": int(val)}
+    except Exception as e:
+        return {"pin": pin, "error": str(e)}
+
+
+def tool_gpio_write(params):
+    """Write GPIO pin with safety check. Args: pin (int), value (0/1).
+    REFUSES if pin < 890 to prevent accidental writes to critical system GPIOs."""
+    pin = int(params.get("pin", 0))
+    value = int(params.get("value", 0))
+    if pin < 890:
+        return {"pin": pin, "error": "REFUSED: pin < 890 — writing to low GPIO pins risks damaging system hardware"}
+    if value not in (0, 1):
+        return {"pin": pin, "error": "value must be 0 or 1"}
+    gpio_path = f"/sys/class/gpio/gpio{pin}"
+    if not os.path.exists(gpio_path):
+        try:
+            with open("/sys/class/gpio/export", "w") as f:
+                f.write(str(pin))
+        except Exception as e:
+            return {"pin": pin, "error": f"Cannot export GPIO: {e}"}
+    try:
+        with open(f"{gpio_path}/direction", "w") as f:
+            f.write("out")
+        with open(f"{gpio_path}/value", "w") as f:
+            f.write(str(value))
+        return {"pin": pin, "value": value, "status": "ok"}
+    except Exception as e:
+        return {"pin": pin, "error": str(e)}
+
+
+def tool_board_control(params):
+    """Enable/disable/reset hash board by chain ID (6/7/8).
+    Uses devmem on FPGA CTRL_REG at chain base address."""
+    chain_id = int(params.get("chain_id", 6))
+    action = params.get("action", "enable")
+    chain_bases = {6: 0x43C00000, 7: 0x43C10000, 8: 0x43C20000}
+    if chain_id not in chain_bases:
+        return {"error": "chain_id must be 6, 7, or 8"}
+    if action not in ("enable", "disable", "reset"):
+        return {"error": "action must be enable, disable, or reset"}
+    base = chain_bases[chain_id]
+    ctrl_addr = f"0x{base:08X}"
+    if action == "enable":
+        run_cmd(f"devmem {ctrl_addr} 32 0x0C 2>/dev/null")
+    elif action == "disable":
+        run_cmd(f"devmem {ctrl_addr} 32 0x00 2>/dev/null")
+    elif action == "reset":
+        run_cmd(f"devmem {ctrl_addr} 32 0x00 2>/dev/null")
+        time.sleep(0.1)
+        run_cmd(f"devmem {ctrl_addr} 32 0x0C 2>/dev/null")
+    readback = run_cmd(f"devmem {ctrl_addr} 32 2>/dev/null")
+    return {"chain_id": chain_id, "action": action, "ctrl_reg": readback or "ERROR"}
+
+
+def tool_get_hashrate(params):
+    """Get live hashrate from dcentrald REST API at localhost:8080."""
+    raw = run_cmd("curl -s http://127.0.0.1:8080/api/status", timeout=3)
+    if not raw:
+        return {"error": "dcentrald API not responding — daemon may not be running"}
+    try:
+        data = json.loads(raw)
+        return {
+            "hashrate": data.get("hashrate"),
+            "hashrate_5m": data.get("hashrate_5m"),
+            "hashrate_1h": data.get("hashrate_1h"),
+            "unit": data.get("hashrate_unit", "TH/s"),
+            "accepted": data.get("accepted"),
+            "rejected": data.get("rejected"),
+        }
+    except json.JSONDecodeError:
+        return {"error": "Invalid JSON from dcentrald API", "raw": raw[:200]}
+
+
+def tool_get_status(params):
+    """Shared cross-firmware status snapshot."""
+    return tool_live_stats(params)
+
+
+def tool_get_device_info(params):
+    """Shared cross-firmware device identity snapshot."""
+    raw = run_cmd("curl -s http://127.0.0.1:8080/api/system/info", timeout=3)
+    if not raw:
+        return {"error": "dcentrald system info endpoint not responding"}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {"error": "Invalid JSON from /api/system/info", "raw": raw[:200]}
+
+
+def tool_get_swarm_status(params):
+    """Shared cross-firmware swarm status snapshot."""
+    raw = run_cmd("curl -s http://127.0.0.1:8080/api/swarm", timeout=3)
+    if not raw:
+        return {"error": "dcentrald swarm endpoint not responding"}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {"error": "Invalid JSON from /api/swarm", "raw": raw[:200]}
+
+
+def tool_identify_device(params):
+    """Toggle the identify LED pattern via dcentrald REST API."""
+    raw = run_cmd(
+        "curl -s -X POST -H 'Content-Type: application/json' http://127.0.0.1:8080/api/system/identify",
+        timeout=3,
+    )
+    if not raw:
+        return {"error": "dcentrald identify endpoint not responding"}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {"status": "sent", "raw_response": raw[:200]}
+
+
+def tool_restart_mining(params):
+    """Restart mining via dcentrald REST API."""
+    raw = run_cmd(
+        "curl -s -X POST -H 'Content-Type: application/json' http://127.0.0.1:8080/api/action/restart",
+        timeout=5,
+    )
+    if not raw:
+        return {"error": "dcentrald restart endpoint not responding"}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {"status": "sent", "raw_response": raw[:200]}
+
+
+def tool_set_pool(params):
+    """Shared cross-firmware alias for pool switching."""
+    return tool_pool_switch(params)
+
+
+def tool_get_config(params):
+    """Read dcentrald config file. Returns raw TOML text."""
+    config_path = "/data/dcentrald.toml"
+    if not os.path.exists(config_path):
+        config_path = "/etc/dcentrald.toml"
+    if not os.path.exists(config_path):
+        return {"error": "No config file found at /data/dcentrald.toml or /etc/dcentrald.toml"}
+    try:
+        with open(config_path) as f:
+            content = f.read()
+        # MCP-2: mask the operator wallet (worker=) + strip any pool URL
+        # user:pass@ credentials before returning the raw TOML (read tool, ungated).
+        return {"path": config_path, "content": sanitize_secrets(content)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_set_config(params):
+    """Update config key. Args: key, value. Simple text-based TOML update."""
+    key = params.get("key", "")
+    value = params.get("value", "")
+    if not key:
+        return {"error": "key is required"}
+    # Sanitize key to prevent injection
+    if not re.match(r'^[a-zA-Z0-9_.-]+$', key):
+        return {"error": "Invalid key format (alphanumeric, underscore, dot, dash only)"}
+    config_path = "/data/dcentrald.toml"
+    if not os.path.exists(config_path):
+        config_path = "/etc/dcentrald.toml"
+    if not os.path.exists(config_path):
+        return {"error": "No config file found"}
+    try:
+        with open(config_path) as f:
+            lines = f.readlines()
+        found = False
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith(f"{key} ") or stripped.startswith(f"{key}="):
+                lines[i] = f"{key} = {value}\n"
+                found = True
+                break
+        if not found:
+            # Append under [general] if it exists, else at end
+            general_idx = None
+            for i, line in enumerate(lines):
+                if line.strip() == "[general]":
+                    general_idx = i
+                    break
+            if general_idx is not None:
+                lines.insert(general_idx + 1, f"{key} = {value}\n")
+            else:
+                lines.append(f"\n[general]\n{key} = {value}\n")
+        with open(config_path, "w") as f:
+            f.writelines(lines)
+        return {"path": config_path, "key": key, "value": value, "status": "updated" if found else "appended"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_tail_log(params):
+    """Last N lines of /tmp/dcentrald.log. Args: lines (int, default 50)."""
+    n = min(int(params.get("lines", 50)), 500)
+    output = run_cmd(f"tail -n {n} /tmp/dcentrald.log 2>/dev/null")
+    if not output:
+        return {"error": "Log file empty or not found at /tmp/dcentrald.log"}
+    # MCP-2: mask wallet addresses + pool credentials in returned log lines.
+    return {"lines": n, "log": sanitize_secrets(output)}
+
+
+def tool_grep_log(params):
+    """Search log for pattern. Args: pattern (str), lines (int, default 20)."""
+    pattern = params.get("pattern", "")
+    n = min(int(params.get("lines", 20)), 200)
+    # Sanitize pattern to prevent command injection
+    if not re.match(r'^[a-zA-Z0-9 .\[\]\|_:/-]+$', pattern):
+        return {"error": "Invalid pattern — only alphanumeric, spaces, dots, brackets, pipes, underscores, colons, slashes, dashes allowed"}
+    output = run_cmd(f"grep '{pattern}' /tmp/dcentrald.log 2>/dev/null | tail -n {n}")
+    if not output:
+        return {"pattern": pattern, "matches": 0, "log": ""}
+    line_count = len(output.split("\n"))
+    # MCP-2: mask wallet addresses + pool credentials in matched log lines.
+    return {"pattern": pattern, "matches": line_count, "log": sanitize_secrets(output)}
+
+
+def tool_check_daemon(params):
+    """Check dcentrald daemon status: PID, uptime, API health."""
+    pid = run_cmd("pidof dcentrald 2>/dev/null")
+    result = {"running": bool(pid), "pid": int(pid) if pid else None}
+    if pid:
+        # Get uptime from /proc/PID/stat
+        stat = run_cmd(f"cat /proc/{pid}/stat 2>/dev/null")
+        if stat:
+            parts = stat.split()
+            if len(parts) > 21:
+                try:
+                    start_ticks = int(parts[21])
+                    uptime_s = run_cmd("cat /proc/uptime 2>/dev/null")
+                    clk_tck = int(run_cmd("getconf CLK_TCK 2>/dev/null") or "100")
+                    if uptime_s:
+                        sys_uptime = float(uptime_s.split()[0])
+                        proc_start = start_ticks / clk_tck
+                        result["uptime_seconds"] = round(sys_uptime - proc_start)
+                except (ValueError, IndexError):
+                    pass
+        # Check API health
+        api_raw = run_cmd("curl -s http://127.0.0.1:8080/api/status", timeout=3)
+        result["api_healthy"] = bool(api_raw)
+    else:
+        result["api_healthy"] = False
+    return result
+
+
+def tool_system_health(params):
+    """Combined system health: CPU, memory, disk, NAND, uptime."""
+    health = {}
+    # CPU load
+    loadavg = run_cmd("cat /proc/loadavg 2>/dev/null")
+    if loadavg:
+        parts = loadavg.split()
+        health["cpu_load"] = {"1m": parts[0], "5m": parts[1], "15m": parts[2]}
+    # Memory
+    mem = run_cmd("free -h 2>/dev/null | grep Mem")
+    if mem:
+        parts = mem.split()
+        health["memory"] = {
+            "total": parts[1] if len(parts) > 1 else "?",
+            "used": parts[2] if len(parts) > 2 else "?",
+            "free": parts[3] if len(parts) > 3 else "?",
+        }
+    # Disk
+    disk = run_cmd("df -h / 2>/dev/null | tail -1")
+    if disk:
+        parts = disk.split()
+        health["disk"] = {
+            "size": parts[1] if len(parts) > 1 else "?",
+            "used": parts[2] if len(parts) > 2 else "?",
+            "avail": parts[3] if len(parts) > 3 else "?",
+            "use_pct": parts[4] if len(parts) > 4 else "?",
+        }
+    # NAND health
+    nand = run_cmd("dmesg | grep -i nand 2>/dev/null | tail -5")
+    health["nand_dmesg"] = nand or "N/A"
+    # Uptime
+    health["uptime"] = run_cmd("uptime 2>/dev/null") or "N/A"
+    return health
+
+
+def tool_live_stats(params):
+    """Snapshot from dcentrald /api/status. Proxy the full JSON response."""
+    raw = run_cmd("curl -s http://127.0.0.1:8080/api/status", timeout=3)
+    if not raw:
+        return {"error": "dcentrald API not responding — daemon may not be running"}
+    try:
+        # MCP-2: recursively mask wallet/pool credentials in the proxied JSON
+        # (the pool URL + worker can surface in /api/status). Also covers
+        # tool_get_status, which delegates here.
+        return sanitize_obj(json.loads(raw))
+    except json.JSONDecodeError:
+        return {"error": "Invalid JSON from dcentrald API", "raw": sanitize_secrets(raw)[:200]}
+
+
+def tool_pool_status(params):
+    """Pool connection info from dcentrald /api/pools."""
+    raw = run_cmd("curl -s http://127.0.0.1:8080/api/pools", timeout=3)
+    if not raw:
+        return {"error": "dcentrald API not responding — daemon may not be running"}
+    try:
+        # MCP-2: defense-in-depth — recursively mask wallet/pool credentials in
+        # the proxied JSON. /api/pools carries pool URLs (which may embed a
+        # user:pass@ credential) and the worker (a BTC payout address in V1
+        # solo); the Rust handler masks at source, but this belt-and-suspenders
+        # wrap matches tool_live_stats so this higher-risk endpoint can never
+        # leak either even if the source masking regresses.
+        return sanitize_obj(json.loads(raw))
+    except json.JSONDecodeError:
+        return {"error": "Invalid JSON from dcentrald API", "raw": sanitize_secrets(raw)[:200]}
+
+
+def tool_pool_switch(params):
+    """Switch active pool. Args: url, worker, password."""
+    url = params.get("url", "")
+    worker = params.get("worker", "")
+    password = params.get("password", "x")
+    if not url or not worker:
+        return {"error": "url and worker are required"}
+    # Sanitize inputs to prevent injection via curl
+    for name, val in [("url", url), ("worker", worker), ("password", password)]:
+        if not re.match(r'^[a-zA-Z0-9._:/@+-]+$', val):
+            return {"error": f"Invalid {name} format — alphanumeric, dots, colons, slashes, @, +, - only"}
+    payload = json.dumps({"url": url, "worker": worker, "password": password})
+    raw = run_cmd(
+        f"curl -s -X POST -H 'Content-Type: application/json' "
+        f"-d '{payload}' http://127.0.0.1:8080/api/pools",
+        timeout=5,
+    )
+    if not raw:
+        return {"error": "dcentrald API not responding — daemon may not be running"}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {"status": "sent", "raw_response": raw[:200]}
+
+
+def tool_service_control(params):
+    """Start/stop/restart dcentrald or MCP. Args: service, action."""
+    service = params.get("service", "")
+    action = params.get("action", "")
+    if service not in ("dcentrald", "mcp"):
+        return {"error": "service must be 'dcentrald' or 'mcp'"}
+    if action not in ("start", "stop", "restart"):
+        return {"error": "action must be 'start', 'stop', or 'restart'"}
+    if service == "mcp" and action in ("stop", "restart"):
+        return {"error": "REFUSED: stopping MCP would kill this server — use SSH instead"}
+    if service == "dcentrald":
+        for init_script in ("/etc/init.d/S82dcentrald", "/etc/init.d/dcentrald"):
+            if os.path.exists(init_script):
+                output = run_cmd(f"{init_script} {action} 2>&1", timeout=15)
+                return {
+                    "service": service,
+                    "action": action,
+                    "init_script": init_script,
+                    "output": output or "ok",
+                }
+        return {
+            "error": "dcentrald service wrapper not found; refusing unsafe direct process control",
+            "expected": ["/etc/init.d/S82dcentrald", "/etc/init.d/dcentrald"],
+        }
+    elif service == "mcp" and action == "start":
+        return {"service": service, "action": action, "status": "MCP is already running (this server)"}
+    return {"error": "Unknown service/action combination"}
+
+
+# =============================================================================
+# Bosminer-handoff diagnostic tools (read-only; no destructive ops).
+# Dev-firmware-only: gated via _release_image(), the same no-auth posture
+# as the rest of the dev-firmware MCP surface (intentional for DEV images).
+# These tools register only when _release_image() is False; on a release
+# image they are NOT in the TOOLS dict at all, so tools/list omits them and
+# there is no surface leak.
+# =============================================================================
+
+DEV_ONLY_DESCRIPTION_PREFIX = "[DEV firmware only] "
+
+
+def tool_wave54_recipe_state(params):
+    """Read-only view of the bosminer-handoff recipe env state.
+
+    Proxies `GET /api/env/recipe` on the local dcentrald (no auth, dev
+    firmware posture). Returns:
+      - applied: dict of required env vars that ARE set
+      - missing: list of required env vars that are NOT set
+      - forbidden_detected: list of forbidden env vars that ARE set
+        (each is known to break mining on this hardware class — non-empty
+         means the daemon refuses to start on this hardware)
+      - fingerprint: platform / board_target / psu_hardware_variant
+      - is_xil_25_class: True only on the PSU-spoof handoff hardware class
+      - wave54_recipe_intact: True iff all required applied + zero forbidden
+    """
+    raw = run_cmd("curl -s http://127.0.0.1:8080/api/env/recipe", timeout=3)
+    if not raw:
+        return {"error": "dcentrald /api/env/recipe not responding"}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {"error": "Invalid JSON from /api/env/recipe", "raw": raw[:200]}
+
+
+def tool_chain_enum_diff(params):
+    """Per-chain chips_responding/chips_expected diff.
+
+    Proxies `GET /api/mining/chain/presence`. Returns per-chain pillar
+    data the dashboard's ChainPresencePanel renders, plus the chip-rail
+    mV actual-vs-target reading for the ChipRailMvPill. Useful for
+    quickly seeing whether the full chip enumeration engaged (or just a
+    partial-chain pattern that still produces accepted shares but is not
+    a healthy baseline).
+    """
+    raw = run_cmd("curl -s http://127.0.0.1:8080/api/mining/chain/presence", timeout=3)
+    if not raw:
+        return {"error": "dcentrald /api/mining/chain/presence not responding"}
+    try:
+        data = json.loads(raw)
+        # Enrich with per-chain ratio for at-a-glance reading.
+        for chain in data.get("chains", []):
+            resp = chain.get("chips_responding", 0)
+            exp = chain.get("chips_expected", 0) or 1
+            chain["presence_ratio"] = round(resp / exp, 3)
+            chain["presence_verdict"] = (
+                "healthy" if resp / exp >= 0.9
+                else "partial" if resp / exp >= 0.5
+                else "broken"
+            )
+        return data
+    except json.JSONDecodeError:
+        return {"error": "Invalid JSON from /api/mining/chain/presence", "raw": raw[:200]}
+
+
+def tool_psu_loki_state(params):
+    """Read-only PSU spoof-board state probe.
+
+    Probes the SMBus slave at i2c-0 @ 0x10 (the spoof board's address)
+    for its current fw-version-byte response. Read-only: only uses
+    `i2cget` on `0x00` (GetFwVersion). The expected spoof FW byte on a
+    healthy board is `0x71` (matches the "PSU: Version '0x71' detected"
+    log line); a NAK or unexpected byte means the spoof state is broken
+    (most likely the operator set `DCENT_AM2_PSU_LOKI_REGISTER_POINTER=1`
+    or `DCENT_AM2_PSU_CALIBRATION_PROBE_WAKE=1`, both of which are on the
+    handoff-recipe forbidden list).
+    """
+    # GetFwVersion on the Loki spoof (SMBus byte read at register 0x00).
+    fw_raw = run_cmd("i2cget -y 0 0x10 0x00 b 2>/dev/null", timeout=3)
+    if not fw_raw:
+        return {
+            "loki_present": False,
+            "fw_byte": None,
+            "verdict": "no_response",
+            "note": (
+                "i2c-0 @ 0x10 did not respond. Either no Loki board is "
+                "attached, the spoof state is corrupted (Wave-54 forbidden "
+                "env set?), or the i2c bus is owned by another process."
+            ),
+        }
+    fw_byte_str = fw_raw.strip()
+    # Match the expected APW121215a spoof FW byte from
+    #  and the
+    # bosminer canonical detection log line.
+    healthy = fw_byte_str.lower() in ("0x71", "71")
+    return {
+        "loki_present": True,
+        "fw_byte": fw_byte_str,
+        "expected_fw_byte": "0x71",
+        "verdict": "healthy" if healthy else "unexpected",
+        "note": (
+            "Loki spoof board returning expected 0x71 — bosminer would "
+            "detect this as APW121215a fw=0x71."
+            if healthy else
+            "Loki spoof returned a non-0x71 byte. Either non-Loki PSU "
+            "or spoof state corrupted (check Wave-54 forbidden env vars)."
+        ),
+    }
+
+
+def tool_capture_chain_uart_bytes(params):
+    """Capture N bytes from the chain UART for diagnostics.
+
+    READ-ONLY raw byte capture from `/dev/ttyS1` (default — the primary
+    chain UART) using stty + dd to read up to `bytes` octets over
+    `timeout_s` seconds without writing anything to the chain. Returns
+    hex-encoded bytes.
+
+    Useful when sustained-mining drops chips mid-run — captures the live
+    nonce frames + heartbeat traffic for offline analysis without
+    disrupting the daemon's chain.
+    """
+    device = params.get("device", "/dev/ttyS1")
+    if not isinstance(device, str) or not device.startswith("/dev/tty"):
+        return {"error": "device must be a /dev/tty* path"}
+    timeout_s = int(params.get("timeout_s", 3))
+    timeout_s = max(1, min(timeout_s, 10))  # clamp 1..10s
+    max_bytes = int(params.get("bytes", 256))
+    max_bytes = max(16, min(max_bytes, 4096))  # clamp 16..4096
+
+    if not os.path.exists(device):
+        return {"error": f"device {device} does not exist"}
+
+    try:
+        # Read raw bytes — no writes, no stty changes (daemon owns the
+        # baud rate config). dd with iflag=nonblock + a bounded timeout
+        # avoids hanging if no bytes arrive.
+        result = subprocess.run(
+            ["dd", f"if={device}", f"bs={max_bytes}", "count=1", "iflag=nonblock"],
+            capture_output=True,
+            timeout=timeout_s,
+        )
+        captured = result.stdout
+        hex_dump = captured.hex()
+        return {
+            "device": device,
+            "requested_bytes": max_bytes,
+            "captured_bytes": len(captured),
+            "hex": hex_dump,
+            "stderr": result.stderr.decode("utf-8", errors="replace")[:200],
+            "note": (
+                "Read-only capture. dd nonblock + 1-count means we either "
+                "get up to `bytes` octets immediately or return what was "
+                "buffered. The daemon's chain ownership is unaffected."
+            ),
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "device": device,
+            "error": "capture timeout — no bytes available on the UART",
+        }
+    except Exception as exc:
+        return {"error": f"capture failed: {exc}"}
+
+
+# =============================================================================
+# MCP Protocol Handler
+# =============================================================================
+
+TOOLS = {
+    "get_status": {
+        "description": "Shared cross-firmware miner status summary.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_get_status,
+    },
+    "get_device_info": {
+        "description": "Shared cross-firmware device identity and ASIC metadata.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_get_device_info,
+    },
+    "get_swarm_status": {
+        "description": "Shared cross-firmware swarm and discovery status.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_get_swarm_status,
+    },
+    "identify_device": {
+        "description": "Toggle the physical identify signal for the miner.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_identify_device,
+    },
+    "restart_mining": {
+        "description": "Restart mining without changing pool configuration.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_restart_mining,
+    },
+    "set_pool": {
+        "description": "Shared cross-firmware pool update alias.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Pool URL (e.g. stratum+tcp://pool.example.com:3333)"},
+                "worker": {"type": "string", "description": "Worker name (e.g. bc1q.../worker1)"},
+                "password": {"type": "string", "description": "Pool password (default: x)", "default": "x"},
+            },
+            "required": ["url", "worker"],
+        },
+        "handler": tool_set_pool,
+    },
+    "get_system_status": {
+        "description": "Get comprehensive system health snapshot including kernel, memory, load, network, FPGA version, and UIO device count.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_get_system_status,
+    },
+    "get_temperatures": {
+        "description": "Read all temperature sensors (TMP75/NCT218 on I2C buses). Returns celsius readings for each detected sensor.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_get_temperatures,
+    },
+    "get_chain_status": {
+        "description": "Get hash board chain detection status for chains 6, 7, 8. Shows GPIO plug-detect state for each chain slot.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_get_chain_status,
+    },
+    "get_fpga_registers": {
+        "description": "Read FPGA registers starting from a base address. Useful for inspecting UART FIFO status, baud rate config, and chain control registers.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "base_addr": {"type": "string", "description": "Hex address (default: 0x43C00000)", "default": "0x43C00000"},
+                "count": {"type": "integer", "description": "Number of 32-bit registers to read (max 32)", "default": 6},
+            },
+        },
+        "handler": tool_get_fpga_registers,
+    },
+    "get_i2c_scan": {
+        "description": "Scan an I2C bus to discover connected devices (PIC voltage controllers, temperature sensors, EEPROM, PSU).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bus": {"type": "integer", "description": "I2C bus number (0-7)", "default": 0},
+            },
+        },
+        "handler": tool_get_i2c_scan,
+    },
+    "read_i2c_register": {
+        "description": "Read a specific register from an I2C device.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bus": {"type": "integer", "description": "I2C bus number"},
+                "address": {"type": "string", "description": "Device address (hex, e.g. 0x48)"},
+                "register": {"type": "string", "description": "Register address (hex, e.g. 0x00)"},
+                "mode": {"type": "string", "description": "Read mode: b=byte, w=word", "default": "b"},
+            },
+            "required": ["bus", "address", "register"],
+        },
+        "handler": tool_read_i2c_register,
+    },
+    "get_nand_info": {
+        "description": "Get NAND flash partition layout (MTD) and UBI volume information.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_get_nand_info,
+    },
+    "get_uio_devices": {
+        "description": "List all UIO (Userspace I/O) devices. These are FPGA-mapped register regions for fan control, hash chain communication, and glitch monitoring.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_get_uio_devices,
+    },
+    "run_diagnostic": {
+        "description": "Run a comprehensive hardware diagnostic. Checks system health, temperatures, chain detection, and UIO devices. Returns issues list if any problems found.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_run_diagnostic,
+    },
+    "get_fan_speed": {
+        "description": "Read current fan command and physical RPM. AM2 uses the UIO dcentrald one-shot; devmem is not fan proof.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_get_fan_speed,
+    },
+    # S5 convergence: `set_fan_speed` is the SOLE OS-exposed member of the
+    # cross-firmware MCP tuning superset `dcent.cross-firmware.tuning.v1`
+    # (Rust source of truth: dcent-schema::mcp::tuning_profile()). The other 5
+    # superset extensions are axe-only by design (keep-unique fence,
+    # mcp-auth-contract §2.2/§6) — OS reaches frequency/voltage EFFECTS through
+    # its OWN low-level tools (set_config / write_i2c_register), which are NOT
+    # superset aliases and stay OS-private. As a CONTROL tool, set_fan_speed is
+    # a WRITE_TOOLS member and routes through _write_tool_authorized()
+    # (open-on-dev / locked-on-release, fail-CLOSED). Drift-pinned by
+    # dcent-schema/tests/python_overlay_drift.rs::python_overlays_match_the_tuning_superset.
+    "set_fan_speed": {
+        "description": "Set fan PWM command. WARNING: AM2 low PWM may still have a loud physical RPM floor; verify max_rpm.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "percent": {"type": "integer", "description": "Fan PWM percentage (0-100)", "minimum": 0, "maximum": 100},
+            },
+            "required": ["percent"],
+        },
+        "handler": tool_set_fan_speed,
+    },
+    "read_devmem": {
+        "description": "Read a 32-bit value from a memory-mapped register address. Used for FPGA register inspection.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string", "description": "Memory address in hex (e.g. 0x43C00000)"},
+            },
+            "required": ["address"],
+        },
+        "handler": tool_read_devmem,
+    },
+    "write_fpga_register": {
+        "description": "Write a 32-bit value to an FPGA register via devmem. Reads back to confirm.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string", "description": "FPGA register address in hex (e.g. 0x43C00004)"},
+                "value": {"type": "string", "description": "Value to write in hex (e.g. 0x0C)"},
+            },
+            "required": ["address", "value"],
+        },
+        "handler": tool_write_fpga_register,
+    },
+    "write_devmem": {
+        "description": "Write a 32-bit value to any physical memory address via devmem. Reads back to confirm.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string", "description": "Physical address in hex (e.g. 0x43C00000)"},
+                "value": {"type": "string", "description": "Value to write in hex (e.g. 0x00000007)"},
+            },
+            "required": ["address", "value"],
+        },
+        "handler": tool_write_devmem,
+    },
+    "write_i2c_register": {
+        "description": "Write a value to an I2C device register via i2cset. Reads back to confirm.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bus": {"type": "integer", "description": "I2C bus number"},
+                "address": {"type": "string", "description": "Device address in hex (e.g. 0x48)"},
+                "register": {"type": "string", "description": "Register address in hex (e.g. 0x00)"},
+                "value": {"type": "string", "description": "Value to write in hex (e.g. 0x0A)"},
+                "mode": {"type": "string", "description": "Write mode: b=byte, w=word", "default": "b"},
+            },
+            "required": ["bus", "address", "register", "value"],
+        },
+        "handler": tool_write_i2c_register,
+    },
+    "pic_status": {
+        "description": "Read all 3 PIC voltage controllers (0x55, 0x56, 0x57 on I2C bus 1). Returns state: bootloader (0xCC), app_mode (0x60), or unknown/dead.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_pic_status,
+    },
+    "gpio_read": {
+        "description": "Read a GPIO pin value. Auto-exports the pin if needed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pin": {"type": "integer", "description": "GPIO pin number"},
+            },
+            "required": ["pin"],
+        },
+        "handler": tool_gpio_read,
+    },
+    "gpio_write": {
+        "description": "Write a GPIO pin (0 or 1). REFUSES pins below 890 to protect critical system GPIOs.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pin": {"type": "integer", "description": "GPIO pin number (must be >= 890)"},
+                "value": {"type": "integer", "description": "0 or 1", "minimum": 0, "maximum": 1},
+            },
+            "required": ["pin", "value"],
+        },
+        "handler": tool_gpio_write,
+    },
+    "board_control": {
+        "description": "Enable, disable, or reset a hash board by chain ID. Writes FPGA CTRL_REG. WARNING: disable can break FPGA UART state if traffic is flowing.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "chain_id": {"type": "integer", "description": "Chain ID: 6, 7, or 8", "enum": [6, 7, 8]},
+                "action": {"type": "string", "description": "Action: enable, disable, or reset", "enum": ["enable", "disable", "reset"]},
+            },
+            "required": ["chain_id", "action"],
+        },
+        "handler": tool_board_control,
+    },
+    "get_hashrate": {
+        "description": "Get live hashrate from dcentrald REST API. Returns hashrate, accepted/rejected shares.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_get_hashrate,
+    },
+    "get_config": {
+        "description": "Read the current dcentrald configuration file (/data/dcentrald.toml or /etc/dcentrald.toml). Returns raw TOML text.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_get_config,
+    },
+    "set_config": {
+        "description": "Update a single key in the dcentrald config file. Text-based TOML update — appends under [general] if key not found.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Config key name (e.g. frequency_mhz)"},
+                "value": {"type": "string", "description": "New value (e.g. 650)"},
+            },
+            "required": ["key", "value"],
+        },
+        "handler": tool_set_config,
+    },
+    "tail_log": {
+        "description": "Get last N lines of /tmp/dcentrald.log. Max 500 lines.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "lines": {"type": "integer", "description": "Number of lines (default 50, max 500)", "default": 50},
+            },
+        },
+        "handler": tool_tail_log,
+    },
+    "grep_log": {
+        "description": "Search dcentrald log for a pattern. Returns matching lines (max 200). Pattern is sanitized to prevent injection.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Search pattern (alphanumeric, spaces, dots, brackets, pipes)"},
+                "lines": {"type": "integer", "description": "Max matching lines to return (default 20)", "default": 20},
+            },
+            "required": ["pattern"],
+        },
+        "handler": tool_grep_log,
+    },
+    "check_daemon": {
+        "description": "Check dcentrald daemon status: running, PID, uptime in seconds, API health.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_check_daemon,
+    },
+    "system_health": {
+        "description": "Combined system health snapshot: CPU load, memory, disk usage, NAND dmesg, uptime. Single comprehensive call.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_system_health,
+    },
+    "live_stats": {
+        "description": "Full snapshot from dcentrald /api/status. Proxies the complete JSON response.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_live_stats,
+    },
+    "pool_status": {
+        "description": "Get pool connection info from dcentrald /api/pools.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_pool_status,
+    },
+    "pool_switch": {
+        "description": "Switch the active mining pool. POSTs new pool config to dcentrald.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Pool URL (e.g. stratum+tcp://pool.example.com:3333)"},
+                "worker": {"type": "string", "description": "Worker name (e.g. bc1q.../worker1)"},
+                "password": {"type": "string", "description": "Pool password (default: x)", "default": "x"},
+            },
+            "required": ["url", "worker"],
+        },
+        "handler": tool_pool_switch,
+    },
+    "service_control": {
+        "description": "Start, stop, or restart dcentrald or MCP service. REFUSES to stop MCP (would kill itself).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "service": {"type": "string", "description": "Service name: dcentrald or mcp", "enum": ["dcentrald", "mcp"]},
+                "action": {"type": "string", "description": "Action: start, stop, or restart", "enum": ["start", "stop", "restart"]},
+            },
+            "required": ["service", "action"],
+        },
+        "handler": tool_service_control,
+    },
+}
+
+
+# Register the bosminer-handoff diagnostic tools ONLY on DEV firmware images.
+# _release_image() returns True on a release/production image (stamped via
+# /etc/dcentos/release-image at Buildroot post-build); False on DEV/lab. On DEV,
+# _mcp_required_token() returns None, so these tools are no-auth, matching the
+# rest of the dev-firmware MCP surface (intentional for DEV images). On release,
+# they're not in TOOLS at all, so tools/list omits them and there is no leak.
+if not _release_image():
+    TOOLS["wave54_recipe_state"] = {
+        "description": DEV_ONLY_DESCRIPTION_PREFIX + (
+            "Read-only view of the bosminer-handoff recipe env state. "
+            "Returns required env-var coverage, detection of env vars known "
+            "to break mining on this hardware class, a hardware fingerprint, "
+            "and a recipe-intact verdict. "
+            "Source: GET /api/env/recipe on local dcentrald."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_wave54_recipe_state,
+    }
+    TOOLS["chain_enum_diff"] = {
+        "description": DEV_ONLY_DESCRIPTION_PREFIX + (
+            "Per-chain chips_responding vs chips_expected diff, plus chip-rail "
+            "mV actual vs target. Includes presence_ratio + presence_verdict "
+            "(healthy/partial/broken) per chain. Source: "
+            "GET /api/mining/chain/presence on local dcentrald."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_chain_enum_diff,
+    }
+    TOOLS["psu_loki_state"] = {
+        "description": DEV_ONLY_DESCRIPTION_PREFIX + (
+            "Read-only PSU spoof-board firmware-version probe. SMBus "
+            "GetFwVersion byte read at i2c-0 @ 0x10. Returns the expected "
+            "0x71 on a healthy board (matches the APW121215a fw=0x71 "
+            "detection); any other byte or NAK means the spoof state is "
+            "corrupted. Read-only — does not write to the bus."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_psu_loki_state,
+    }
+    TOOLS["capture_chain_uart_bytes"] = {
+        "description": DEV_ONLY_DESCRIPTION_PREFIX + (
+            "Read-only N-byte capture from the chain UART (default "
+            "/dev/ttyS1, the primary chain UART). Returns a hex dump of up "
+            "to `bytes` octets read over `timeout_s` seconds. Does NOT write "
+            "to the UART — daemon ownership of the chain is preserved. "
+            "Useful for chain-UART debugging without restarting dcentrald."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "device": {
+                    "type": "string",
+                    "description": "UART device path (default /dev/ttyS1)",
+                    "default": "/dev/ttyS1",
+                },
+                "timeout_s": {
+                    "type": "integer",
+                    "description": "Capture timeout in seconds (1..10, default 3)",
+                    "default": 3,
+                    "minimum": 1,
+                    "maximum": 10,
+                },
+                "bytes": {
+                    "type": "integer",
+                    "description": "Max bytes to capture (16..4096, default 256)",
+                    "default": 256,
+                    "minimum": 16,
+                    "maximum": 4096,
+                },
+            },
+        },
+        "handler": tool_capture_chain_uart_bytes,
+    }
+
+RESOURCES = [
+    {
+        "uri": "miner://status",
+        "name": "System Status",
+        "description": "Live system status including kernel, memory, load, and network information",
+        "mimeType": "application/json",
+    },
+    {
+        "uri": "miner://temperatures",
+        "name": "Temperature Readings",
+        "description": "Current temperature sensor readings from all I2C sensors",
+        "mimeType": "application/json",
+    },
+    {
+        "uri": "miner://chains",
+        "name": "Chain Status",
+        "description": "Hash board chain plug-detect status for chains 6, 7, 8",
+        "mimeType": "application/json",
+    },
+    {
+        "uri": "miner://hashrate",
+        "name": "Live Hashrate",
+        "description": "Live hashrate from dcentrald daemon API",
+        "mimeType": "application/json",
+    },
+    {
+        "uri": "miner://config",
+        "name": "Miner Config",
+        "description": "Current dcentrald configuration",
+        "mimeType": "application/json",
+    },
+]
+
+
+# FO-1 (SEC-W24-3): tools that mutate hardware/config/mining state. On a
+# release image these require a valid Bearer token; read-only tools stay open
+# so dashboards/diagnostics keep working. On a DEV image NOTHING requires a
+# token (open, byte-identical to today).
+WRITE_TOOLS = {
+    "identify_device",
+    "restart_mining",
+    "set_pool",
+    "pool_switch",
+    # set_fan_speed is the OS-exposed CONTROL tool of the cross-firmware tuning
+    # superset `dcent.cross-firmware.tuning.v1` (S5). Membership in WRITE_TOOLS
+    # is the load-bearing fail-closed guarantee: on a release image with no
+    # token provisioned the tools/call gate REFUSES it (-32001). Drift-pinned
+    # against tuning_profile() by tests/python_overlay_drift.rs.
+    "set_fan_speed",
+    "set_config",
+    "write_fpga_register",
+    "write_devmem",
+    "write_i2c_register",
+    "gpio_write",
+    "board_control",
+    "service_control",
+}
+
+
+# MCP-1 (P1 security, defense-in-depth): explicit read-only allowlist.
+#
+# `WRITE_TOOLS` is the membership set the release-image bearer gate keys off of.
+# A latent risk is that a future edit DROPS or RENAMES a mutating tool out of
+# `WRITE_TOOLS` while its handler stays live in `TOOLS` — that tool would then
+# skip the gate and be callable WITHOUT a token on a release image under
+# `--bind 0.0.0.0`. To make that fail CLOSED instead of fail OPEN, the gate
+# (see `_tool_requires_auth`) treats any tool that is NOT in this explicit
+# READ_TOOLS allowlist as a write tool on a release image. Reads stay open
+# because they are enumerated here; dev images stay fully open regardless.
+#
+# INVARIANT (pinned by tests/python_overlay_drift.rs): every key in TOOLS is in
+# exactly one of READ_TOOLS or WRITE_TOOLS. A new mutating tool added to TOOLS
+# but to NEITHER set is denied on release (fail-closed) until it is classified.
+READ_TOOLS = {
+    "get_status",
+    "get_device_info",
+    "get_swarm_status",
+    "get_system_status",
+    "get_temperatures",
+    "get_chain_status",
+    "get_fpga_registers",
+    "get_i2c_scan",
+    "read_i2c_register",
+    "get_nand_info",
+    "get_uio_devices",
+    "run_diagnostic",
+    "get_fan_speed",
+    "read_devmem",
+    "pic_status",
+    "gpio_read",
+    "get_hashrate",
+    "get_config",
+    "tail_log",
+    "grep_log",
+    "check_daemon",
+    "system_health",
+    "live_stats",
+    "pool_status",
+    #  dev-only diagnostic tools (registered only when not _release_image())
+    # are all read-only; they never reach the release auth gate (dev images are
+    # open), but list them so the all-classified invariant holds on dev too.
+    "wave54_recipe_state",
+    "chain_enum_diff",
+    "psu_loki_state",
+    "capture_chain_uart_bytes",
+}
+
+
+def _tool_requires_auth(tool_name):
+    """MCP-1 fail-closed write-classification for the release auth gate.
+
+    A tool requires a bearer token on a release image iff it is NOT in the
+    explicit READ_TOOLS allowlist. This means:
+      - known write tools (WRITE_TOOLS) → require auth (as before);
+      - known read tools (READ_TOOLS)   → stay open;
+      - any UNKNOWN tool (e.g. a mutating tool dropped/renamed out of
+        WRITE_TOOLS, or a new tool added to TOOLS but never classified) →
+        require auth → fail CLOSED rather than silently fall open.
+    The dev-image open posture is unchanged: `_write_tool_authorized` returns
+    (True, "dev-image-open") for every tool on a DEV image, so reads AND writes
+    stay open there.
+    """
+    return tool_name not in READ_TOOLS
+
+
+def handle_jsonrpc(request, auth_token=None):
+    """Process a JSON-RPC 2.0 request per MCP spec.
+
+    `auth_token` is the Bearer token extracted from the HTTP request (or None).
+    On a release image, write tools require it to match the provisioned MCP
+    token; on a DEV image it is ignored (open).
+    """
+    method = request.get("method", "")
+    req_id = request.get("id")
+    params = request.get("params", {})
+
+    # MCP lifecycle
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {
+                    "tools": {"listChanged": False},
+                    "resources": {"subscribe": False, "listChanged": False},
+                },
+                "serverInfo": {
+                    "name": SERVER_NAME,
+                    "version": VERSION,
+                    "profileId": PROFILE_ID,
+                },
+                "profile": minimal_profile(),
+            },
+        }
+
+    if method == "notifications/initialized":
+        return None  # No response for notifications
+
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {}}
+
+    # Tool listing
+    if method == "tools/list":
+        tool_list = []
+        for name, spec in TOOLS.items():
+            tool_list.append({
+                "name": name,
+                "description": spec["description"],
+                "inputSchema": spec["inputSchema"],
+            })
+        return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": tool_list}}
+
+    # Tool invocation
+    if method == "tools/call":
+        tool_name = params.get("name", "")
+        tool_args = params.get("arguments", {})
+        # FO-1 + MCP-1: control/write-tool auth gate. DEV images stay open (shop
+        # convenience). Release/production images REQUIRE a valid Bearer token
+        # for every mutating tool and fail CLOSED when no token is provisioned
+        # (see _write_tool_authorized). Known read tools (READ_TOOLS) never enter
+        # this branch and stay open. MCP-1 hardening: classification is now
+        # read-allowlist-based (`_tool_requires_auth`) so a mutating tool that is
+        # dropped/renamed out of WRITE_TOOLS — or any future unclassified tool —
+        # fails CLOSED on a release image instead of silently falling open.
+        if _tool_requires_auth(tool_name):
+            allowed, _reason = _write_tool_authorized(auth_token)
+            if not allowed:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32001,
+                        "message": "Unauthorized: control tools require a valid Bearer token on a release image",
+                    },
+                }
+        if tool_name in TOOLS:
+            try:
+                result = TOOLS[tool_name]["handler"](tool_args)
+                is_error = isinstance(result, dict) and result.get("ok") is False
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "content": [
+                            {"type": "text", "text": json.dumps(result, indent=2)}
+                        ],
+                        "isError": is_error,
+                    },
+                }
+            except Exception as e:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "content": [{"type": "text", "text": f"Error: {str(e)}"}],
+                        "isError": True,
+                    },
+                }
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"},
+        }
+
+    # Resource listing
+    if method == "resources/list":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {"resources": RESOURCES}}
+
+    # Resource reading
+    if method == "resources/read":
+        uri = params.get("uri", "")
+        if uri == "miner://status":
+            data = tool_get_system_status({})
+        elif uri == "miner://temperatures":
+            data = tool_get_temperatures({})
+        elif uri == "miner://chains":
+            data = tool_get_chain_status({})
+        elif uri == "miner://hashrate":
+            data = tool_get_hashrate({})
+        elif uri == "miner://config":
+            data = tool_get_config({})
+        else:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32602, "message": f"Unknown resource: {uri}"},
+            }
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "contents": [
+                    {"uri": uri, "mimeType": "application/json", "text": json.dumps(data, indent=2)}
+                ]
+            },
+        }
+
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {"code": -32601, "message": f"Method not found: {method}"},
+    }
+
+
+class MCPHandler(http.server.BaseHTTPRequestHandler):
+    """HTTP handler for MCP Streamable HTTP transport."""
+
+    def do_POST(self):
+        if self.path != "/mcp":
+            self.send_error(404)
+            return
+
+        # MCP-3: reject a malformed or oversized Content-Length before reading
+        # the body, so a single huge POST can't exhaust memory.
+        try:
+            content_len = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self.send_json_error(-32600, "Invalid Content-Length")
+            return
+        if content_len < 0 or content_len > MAX_REQUEST_BODY_BYTES:
+            self.send_json_error(
+                -32600, f"Request body too large (max {MAX_REQUEST_BODY_BYTES} bytes)"
+            )
+            return
+        body = self.rfile.read(content_len)
+
+        try:
+            request = json.loads(body)
+        except json.JSONDecodeError:
+            self.send_json_error(-32700, "Parse error")
+            return
+
+        auth_token = _extract_bearer(self.headers)
+        response = handle_jsonrpc(request, auth_token=auth_token)
+
+        if response is None:
+            # Notification — no response body
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        body_bytes = json.dumps(response).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(body_bytes))
+        self.end_headers()
+        self.wfile.write(body_bytes)
+
+    def do_GET(self):
+        if self.path == "/mcp":
+            # Info endpoint
+            info = {
+                "name": SERVER_NAME,
+                "version": VERSION,
+                "protocol": PROTOCOL_VERSION,
+                "transport": "streamable-http",
+                "profileId": PROFILE_ID,
+                "profile": minimal_profile(),
+                "tools": len(TOOLS),
+                "resources": len(RESOURCES),
+            }
+            body = json.dumps(info, indent=2).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_error(404)
+
+    def send_json_error(self, code, message):
+        resp = json.dumps({
+            "jsonrpc": "2.0", "id": None,
+            "error": {"code": code, "message": message}
+        }).encode("utf-8")
+        self.send_response(400)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(resp))
+        self.end_headers()
+        self.wfile.write(resp)
+
+    def log_message(self, format, *args):
+        pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description="DCENTos MCP Server")
+    parser.add_argument("--port", type=int, default=3000, help="MCP port (default: 3000)")
+    # FO-1 (SEC-W24-3): default bind is loopback. The MCP server exposes raw
+    # hardware access (FPGA registers, I2C, GPIO, pool switch); a safe default
+    # must be baked into the program, not just the init script. An operator can
+    # still pass --bind 0.0.0.0 explicitly, but the release-image token gate on
+    # write tools (see handle_jsonrpc) then protects the mutating surface.
+    parser.add_argument("--bind", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    args = parser.parse_args()
+
+    server = http.server.HTTPServer((args.bind, args.port), MCPHandler)
+    print(f"DCENTos MCP Server v{VERSION}")
+    print(f"  Endpoint: http://{args.bind}:{args.port}/mcp")
+    print(f"  Protocol: MCP {PROTOCOL_VERSION} (Streamable HTTP)")
+    print(f"  Tools:    {len(TOOLS)}")
+    print(f"  Resources: {len(RESOURCES)}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

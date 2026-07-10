@@ -1,0 +1,13 @@
+[pool]
+url = "stratum+tcp://pool.example.com:3333"
+worker = "frozen-beta-serial"
+password = "x"
+
+[mining]
+enabled = true
+serial_device = "/dev/ttyS1"
+frequency_mhz = 525
+voltage_mv = 13700
+
+[watchdog]
+enabled = true

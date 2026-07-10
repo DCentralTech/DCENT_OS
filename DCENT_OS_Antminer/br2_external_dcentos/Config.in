@@ -1,0 +1,2 @@
+source "$BR2_EXTERNAL_DCENTOS_PATH/packages/dcentos-tools/Config.in"
+source "$BR2_EXTERNAL_DCENTOS_PATH/packages/seed-entropy/Config.in"

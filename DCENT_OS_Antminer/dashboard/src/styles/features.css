@@ -1,0 +1,2288 @@
+/* DCENTos Sprint 5 — Differentiation Features Styles
+   Uses CSS custom properties from existing theme (standard.css)
+   Green accent for environmental, blue for energy, orange for D-Central brand */
+
+/* ─── Feature-specific custom properties ──────────────────────
+   C-12 (Wave-6 P4, F6 §3h spec): the --feat-* brand literals are now
+   aliases of the canonical tokens.css tokens — one line each, zero
+   call-site churn (every 'var(--feat-*)' usage is preserved). Same
+   D-15 class F1 fixed for current-block.css.
+
+   NON-BYTE-IDENTICAL cases flagged for the merge-gate (do NOT silently
+   shift opacity — preserved deliberately per F6 spec):
+     • --feat-blue-dim: was rgba(59,130,246,0.15); --blue-dim resolves
+       to rgba(59,130,246,0.14) (global.css cascade-winner per tokens.css:59).
+       Δ = 0.01 alpha on the blue energy-tint surfaces. F6-approved
+       visual-diff case (token convergence chosen over a one-off literal).
+     • --feat-*-glow (0.25): NO exact existing token in tokens.css
+       (closest --accent-glow is 0.15). Per F6 spec these stay as the
+       exact original literals — NOT remapped to a different opacity. */
+:root {
+  --feat-green: var(--green);
+  --feat-green-dim: var(--green-dim);
+  --feat-green-glow: rgba(34, 197, 94, 0.25);   /* C-12: no exact token — literal preserved */
+  --feat-blue: var(--blue);
+  --feat-blue-dim: var(--blue-dim);              /* C-12: 0.15→0.14 (token cascade-winner) — flagged */
+  --feat-blue-glow: rgba(59, 130, 246, 0.25);   /* C-12: no exact token — literal preserved */
+  --feat-orange: var(--accent);
+  --feat-orange-dim: var(--accent-glow);
+  --feat-yellow: var(--yellow);
+  --feat-yellow-dim: var(--yellow-dim);
+  --feat-red: var(--red);
+  --feat-red-dim: var(--red-dim);
+}
+
+/* Companion card: DCENT_axe-style miner pet for DCENT_OS modes. */
+.mode-standard .dashboard-insight-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.75fr) minmax(300px, .85fr);
+  gap: 16px;
+  align-items: stretch;
+  margin-bottom: 20px;
+}
+
+.mode-standard .dashboard-insight-grid .chart-container {
+  margin-bottom: 0;
+}
+
+.companion-card {
+  --companion-accent: var(--accent, #FAA500);
+  --companion-accent-glow: var(--accent-glow, rgba(250, 165, 0, .16));
+  position: relative;
+  overflow: hidden;
+  min-height: 100%;
+  padding: 18px;
+  border-radius: var(--radius, 16px);
+  border: 1px solid var(--border-glass, var(--border, rgba(255, 255, 255, .1)));
+  background:
+    radial-gradient(circle at 70% 12%, var(--companion-accent-glow), transparent 34%),
+    var(--card-bg, rgba(20, 20, 24, .86));
+  box-shadow: var(--card-shadow, 0 8px 28px rgba(0, 0, 0, .32));
+  color: var(--text, #E8E0D6);
+}
+
+.companion-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--companion-accent), transparent);
+  opacity: .45;
+  pointer-events: none;
+}
+
+.companion-card.mood-happy {
+  --companion-accent: var(--green, #22C55E);
+  --companion-accent-glow: rgba(34, 197, 94, .16);
+}
+
+.companion-card.mood-sad {
+  --companion-accent: var(--red, #EF4444);
+  --companion-accent-glow: rgba(239, 68, 68, .14);
+}
+
+.companion-card.mood-offline {
+  --companion-accent: var(--text-dim, #6B7280);
+  --companion-accent-glow: rgba(107, 114, 128, .12);
+}
+
+.companion-ambient {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(120deg, transparent 0%, rgba(255, 255, 255, .035) 42%, transparent 58%),
+    repeating-linear-gradient(90deg, transparent 0 16px, rgba(255, 255, 255, .018) 16px 17px);
+  opacity: .35;
+}
+
+.companion-header,
+.companion-main,
+.companion-stat-grid,
+.companion-achievements {
+  position: relative;
+  z-index: 1;
+}
+
+.companion-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.companion-eyebrow {
+  font-size: .68rem;
+  font-weight: 800;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--text-dim, #8A8F98);
+}
+
+.companion-name {
+  margin: 2px 0 0;
+  font-family: var(--font-heading);
+  font-size: 1.25rem;
+  line-height: 1;
+  color: var(--text, #fff);
+}
+
+.companion-stage {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid var(--companion-accent);
+  background: var(--companion-accent-glow);
+  color: var(--companion-accent);
+  font-size: .68rem;
+  font-weight: 800;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.companion-main {
+  display: grid;
+  grid-template-columns: 118px minmax(0, 1fr);
+  gap: 14px;
+  align-items: center;
+}
+
+.companion-face-shell {
+  position: relative;
+  display: grid;
+  place-items: center;
+  gap: 7px;
+}
+
+.companion-face {
+  display: grid;
+  place-items: center;
+  width: 104px;
+  height: 104px;
+  border-radius: 28px;
+  border: 1px solid var(--companion-accent);
+  background:
+    radial-gradient(circle at 45% 35%, var(--companion-accent-glow), transparent 56%),
+    rgba(0, 0, 0, .22);
+  color: var(--companion-accent);
+  font-family: 'JetBrains Mono', var(--font-mono, monospace);
+  font-size: 1.35rem;
+  font-weight: 800;
+  text-shadow: 0 0 18px var(--companion-accent-glow);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .06), 0 0 24px var(--companion-accent-glow);
+  animation: companionBreathe 3.6s ease-in-out infinite;
+}
+
+.companion-face-caption {
+  font-size: .68rem;
+  font-family: 'JetBrains Mono', var(--font-mono, monospace);
+  color: var(--text-dim, #8A8F98);
+}
+
+.companion-copy {
+  min-width: 0;
+}
+
+.companion-speech {
+  min-height: 56px;
+  padding: 12px 13px;
+  border-radius: var(--radius-sm, 10px);
+  border: 1px solid var(--border-glass, rgba(255, 255, 255, .08));
+  background: rgba(0, 0, 0, .16);
+  color: var(--text-secondary, #A0A6B2);
+  font-size: .86rem;
+  line-height: 1.45;
+}
+
+.companion-meter {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  margin-top: 12px;
+  color: var(--text-dim, #8A8F98);
+  font-family: 'JetBrains Mono', var(--font-mono, monospace);
+  font-size: .72rem;
+}
+
+.companion-meter-track {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .07);
+}
+
+.companion-meter-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--companion-accent);
+  box-shadow: 0 0 14px var(--companion-accent-glow);
+  transition: width .35s var(--ease-standard, ease);
+}
+
+.companion-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.companion-stat {
+  padding: 9px 10px;
+  border-radius: var(--radius-sm, 10px);
+  background: rgba(255, 255, 255, .035);
+  border: 1px solid rgba(255, 255, 255, .055);
+}
+
+.companion-stat span,
+.companion-achievement-head span {
+  display: block;
+  font-size: .62rem;
+  font-weight: 800;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--text-dim, #8A8F98);
+}
+
+.companion-stat strong {
+  display: block;
+  margin-top: 4px;
+  font-family: 'JetBrains Mono', var(--font-mono, monospace);
+  font-size: .78rem;
+  color: var(--text, #fff);
+  white-space: nowrap;
+}
+
+.companion-achievements {
+  margin-top: 15px;
+}
+
+.companion-achievement-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.companion-achievement-head strong {
+  color: var(--companion-accent);
+  font-family: 'JetBrains Mono', var(--font-mono, monospace);
+  font-size: .76rem;
+}
+
+.companion-achievement-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.companion-achievement {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, .055);
+  background: rgba(255, 255, 255, .025);
+  color: var(--text-dim, #8A8F98);
+}
+
+.companion-achievement.unlocked {
+  color: var(--companion-accent);
+  border-color: var(--companion-accent);
+  background: var(--companion-accent-glow);
+}
+
+.companion-achievement span {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, .2);
+  font-family: 'JetBrains Mono', var(--font-mono, monospace);
+  font-size: .7rem;
+  font-weight: 900;
+}
+
+.companion-achievement em {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-style: normal;
+  font-size: .7rem;
+  font-weight: 700;
+}
+
+.mode-basic .companion-card {
+  z-index: 1;
+}
+
+.mode-basic .companion-heater-card {
+  margin: 0 20px 12px;
+}
+
+.mode-hacker .companion-card {
+  margin-bottom: 16px;
+  border-color: var(--border);
+  background:
+    radial-gradient(circle at 70% 12%, rgba(0, 255, 65, .12), transparent 34%),
+    var(--card-bg);
+  font-family: var(--font-mono);
+}
+
+.mode-hacker .companion-name,
+.mode-hacker .companion-face,
+.mode-hacker .companion-stat strong {
+  font-family: var(--font-mono);
+}
+
+.mode-hacker .companion-stage {
+  border-radius: 2px;
+}
+
+@keyframes companionBreathe {
+  0%, 100% { transform: translateY(0) scale(1); filter: brightness(1); }
+  50% { transform: translateY(-2px) scale(1.025); filter: brightness(1.12); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .companion-face {
+    animation: none;
+  }
+}
+
+/*  P4 breakpoint sweep (D-17): snapped to the canonical 5-tier
+   ladder, UP not down (1100 -> 1023.98 lg, 620 -> 767.98 md, 768 -> 767.98
+   md) so narrower-layout rules degrade gracefully and never hide content. */
+@media (max-width: 1023.98px) {
+  .mode-standard .dashboard-insight-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 767.98px) {
+  .companion-main {
+    grid-template-columns: 1fr;
+  }
+
+  .companion-face {
+    width: 92px;
+    height: 92px;
+  }
+
+  .companion-stat-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .companion-achievement-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ─── Page Layout ───────────────────────────────────────────── */
+.feat-page {
+  padding: 20px 24px;
+  max-width: 1100px;
+  animation: fadeIn 0.3s ease-out;
+}
+
+.feat-header {
+  margin-bottom: 20px;
+}
+
+.feat-title {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 1.5rem;
+  color: var(--text, #E8E8E8);
+  margin-bottom: 4px;
+}
+
+.feat-title-green { color: var(--feat-green); }
+.feat-title-blue { color: var(--feat-blue); }
+
+.feat-subtitle {
+  font-size: 0.85rem;
+  color: var(--text-secondary, #9CA3AF);
+  line-height: 1.4;
+}
+
+/* ─── Cards ─────────────────────────────────────────────────── */
+.feat-card {
+  background: var(--card-bg, #242432);
+  border-radius: var(--radius, 12px);
+  padding: 20px;
+  border: 1px solid var(--border, #333333);
+  margin-bottom: 16px;
+}
+
+.feat-card-title {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1.1rem;
+  color: var(--text, #E8E8E8);
+  margin-bottom: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.feat-card-subtitle {
+  font-size: 0.85rem;
+  color: var(--text-secondary, #9CA3AF);
+  margin-bottom: 12px;
+}
+
+/* ─── Forms ─────────────────────────────────────────────────── */
+.feat-form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.feat-span-2 {
+  grid-column: span 2;
+}
+
+.feat-input-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.feat-label {
+  font-size: 0.75rem;
+  color: var(--text-dim, #6B7280);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+}
+
+.feat-label-sm {
+  font-size: 0.7rem;
+  color: var(--text-dim, #6B7280);
+}
+
+.feat-input {
+  width: 100%;
+  padding: 10px 14px;
+  background: var(--bg, #1A1A1A);
+  border: 1px solid var(--border, #333333);
+  border-radius: var(--radius-sm, 8px);
+  color: var(--text, #E8E8E8);
+  font-size: 0.9rem;
+  outline: none;
+  transition: border-color var(--dur-fast, 0.15s) var(--ease-standard, ease);
+}
+
+.feat-input:focus {
+  border-color: var(--accent, #FAA500);
+}
+
+.feat-input-sm {
+  padding: 6px 10px;
+  font-size: 0.8rem;
+}
+
+.feat-textarea {
+  width: 100%;
+  padding: 12px 14px;
+  background: var(--bg, #1A1A1A);
+  border: 1px solid var(--border, #333333);
+  border-radius: var(--radius-sm, 8px);
+  color: var(--text, #E8E8E8);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  resize: vertical;
+  outline: none;
+  transition: border-color var(--dur-fast, 0.15s) var(--ease-standard, ease);
+}
+
+.feat-textarea:focus {
+  border-color: var(--accent, #FAA500);
+}
+
+.feat-hint {
+  font-size: 0.7rem;
+  color: var(--text-dim, #6B7280);
+  margin-top: 4px;
+}
+
+.feat-error {
+  font-size: 0.8rem;
+  color: var(--feat-red);
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: var(--feat-red-dim);
+  border-radius: var(--radius-sm, 8px);
+}
+
+/* ─── Buttons ───────────────────────────────────────────────── */
+.feat-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 20px;
+  border-radius: var(--radius-sm, 8px);
+  font-weight: 600;
+  font-size: 0.9rem;
+  transition: all var(--dur-fast, 0.15s) var(--ease-standard, ease);
+  cursor: pointer;
+  border: none;
+}
+
+.feat-btn-primary {
+  background: var(--accent, #FAA500);
+  color: white;
+}
+
+.feat-btn-primary:hover {
+  background: var(--accent-light, #FFa940);
+}
+
+.feat-btn-secondary {
+  background: var(--card-bg, #242432);
+  color: var(--text, #E8E8E8);
+  border: 1px solid var(--border, #333333);
+}
+
+.feat-btn-secondary:hover {
+  border-color: var(--text-secondary, #9CA3AF);
+}
+
+.feat-btn-large {
+  padding: 14px 32px;
+  font-size: 1rem;
+}
+
+.feat-btn-sm {
+  padding: 6px 14px;
+  font-size: 0.8rem;
+}
+
+.feat-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.feat-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* ─── Toggle Switch ─────────────────────────────────────────── */
+.feat-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  cursor: pointer;
+}
+
+.feat-toggle-label {
+  font-size: 0.9rem;
+  color: var(--text, #E8E8E8);
+  font-weight: 600;
+}
+
+.feat-toggle {
+  width: 48px;
+  height: 26px;
+  border-radius: 13px;
+  background: var(--border, #333333);
+  border: none;
+  cursor: pointer;
+  position: relative;
+  transition: background var(--dur-med, 0.2s) var(--ease-standard, ease);
+  flex-shrink: 0;
+}
+
+.feat-toggle.active {
+  background: var(--feat-green);
+}
+
+.feat-toggle-knob {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: white;
+  transition: transform var(--dur-med, 0.2s) var(--ease-standard, ease);
+}
+
+.feat-toggle.active .feat-toggle-knob {
+  transform: translateX(22px);
+}
+
+/*  P4 (D-16): reconciled to the F1 canonical focus visual instead
+   of deleting (this element-scoped override wins on raw specificity by
+   design — it must never render a weaker ring than the canonical one).
+   Mirrors design-system.css §F1-FOCUS: accent outline + soft halo +
+   ambient glow + radius; hacker mode swaps to phosphor-green. */
+.feat-toggle:focus-visible {
+  outline: 2px solid var(--accent, #FAA500);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm, 8px);
+  box-shadow:
+    0 0 0 4px var(--focus-ring-soft, rgba(250, 165, 0, 0.28)),
+    0 0 14px var(--accent-glow-hi, rgba(250, 165, 0, 0.45));
+}
+
+.mode-hacker .feat-toggle:focus-visible {
+  outline-color: var(--hacker-green, #00FF41);
+  box-shadow:
+    0 0 0 4px rgba(0, 255, 65, 0.26),
+    0 0 14px rgba(0, 255, 65, 0.42);
+}
+
+/* ─── Status ────────────────────────────────────────────────── */
+.feat-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.8rem;
+  color: var(--text-secondary, #9CA3AF);
+}
+
+.feat-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.feat-status-error {
+  color: var(--feat-red);
+}
+
+/* ─── Spinner ───────────────────────────────────────────────── */
+.feat-spinner {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  border-top-color: white;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .feat-spinner {
+    animation: none;
+    /* Retain the visual shape so the disabled-button context is
+       still clearly "busy", just without spinning. */
+    opacity: 0.6;
+  }
+}
+
+/* ─── TOU Schedule Grid ─────────────────────────────────────── */
+.feat-tier-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.feat-tier-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.feat-tier-badge {
+  width: 90px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-weight: 600;
+  font-size: 0.75rem;
+  text-align: center;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  flex-shrink: 0;
+}
+
+.feat-tier-inputs {
+  display: flex;
+  gap: 12px;
+  flex: 1;
+}
+
+.feat-brush-row {
+  display: flex;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.feat-brush-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-radius: var(--radius-sm, 8px);
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid;
+  transition: all var(--dur-fast, 0.15s) var(--ease-standard, ease);
+}
+
+.feat-brush-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.feat-schedule-grid {
+  user-select: none;
+  overflow-x: auto;
+}
+
+.feat-grid-header,
+.feat-grid-row {
+  display: flex;
+  gap: 1px;
+}
+
+.feat-grid-header {
+  margin-bottom: 2px;
+}
+
+.feat-grid-label {
+  width: 40px;
+  flex-shrink: 0;
+  font-size: 0.65rem;
+  color: var(--text-dim, #6B7280);
+  display: flex;
+  align-items: center;
+  font-weight: 600;
+}
+
+.feat-grid-hour {
+  flex: 1;
+  min-width: 28px;
+  text-align: center;
+  font-size: 0.55rem;
+  color: var(--text-dim, #6B7280);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.feat-grid-cell {
+  flex: 1;
+  min-width: 28px;
+  height: 24px;
+  border-radius: 3px;
+  cursor: pointer;
+  /* C-06: 0.1s kept (no exact --dur tier; --dur-fast 150ms would slow this
+     snappy hover-opacity 50% — intentional, do NOT converge). */
+  transition: opacity 0.1s var(--ease-standard, ease);
+  opacity: 0.7;
+}
+
+.feat-grid-cell:hover {
+  opacity: 1;
+}
+
+.feat-grid-row {
+  margin-bottom: 2px;
+}
+
+/* Cost preview */
+.feat-cost-preview {
+  background: var(--bg-subtle, #1E1E2A);
+}
+
+.feat-cost-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 0;
+}
+
+.feat-cost-label {
+  font-size: 0.85rem;
+  color: var(--text-secondary, #9CA3AF);
+}
+
+.feat-cost-value {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1.3rem;
+  color: var(--text, #E8E8E8);
+}
+
+.feat-cost-detail {
+  border-top: 1px solid var(--border, #333333);
+  margin-top: 8px;
+  padding-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.feat-cost-tier {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.8rem;
+  color: var(--text-secondary, #9CA3AF);
+}
+
+.feat-cost-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.feat-cost-behavior {
+  margin-left: auto;
+  font-size: 0.7rem;
+  color: var(--text-dim, #6B7280);
+  text-transform: uppercase;
+}
+
+/* ─── Green Mining / Battery Visual ─────────────────────────── */
+.feat-battery-hero {
+  background: linear-gradient(135deg, var(--card-bg, #242432), rgba(34, 197, 94, 0.05));
+  border-color: rgba(34, 197, 94, 0.2);
+}
+
+.feat-battery-headline {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 1.4rem;
+  color: var(--feat-green);
+  margin-bottom: 4px;
+}
+
+.feat-battery-subtitle {
+  font-size: 0.85rem;
+  color: var(--text-secondary, #9CA3AF);
+  margin-bottom: 20px;
+  max-width: 600px;
+}
+
+.feat-battery-visual {
+  display: flex;
+  gap: 24px;
+  align-items: center;
+  margin-bottom: 24px;
+}
+
+.feat-battery-shell {
+  width: 80px;
+  flex-shrink: 0;
+}
+
+.feat-battery-cap {
+  width: 32px;
+  height: 8px;
+  background: var(--border, #333333);
+  border-radius: 4px 4px 0 0;
+  margin: 0 auto;
+}
+
+.feat-battery-body {
+  width: 80px;
+  height: 120px;
+  border: 3px solid var(--feat-green);
+  border-radius: 4px;
+  position: relative;
+  overflow: hidden;
+}
+
+.feat-battery-fill {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: linear-gradient(to top, var(--feat-green), var(--feat-green-glow));
+  transition: height 1s var(--ease-standard, ease);
+}
+
+.feat-battery-label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 1;
+}
+
+.feat-battery-value {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1.1rem;
+  color: var(--text, #E8E8E8);
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+}
+
+.feat-battery-unit {
+  font-size: 0.6rem;
+  color: var(--text-secondary, #9CA3AF);
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+}
+
+.feat-battery-metrics {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1;
+}
+
+/* Metric cards */
+.feat-metric-card {
+  padding: 12px 16px;
+  border-radius: var(--radius-sm, 8px);
+  border: 1px solid var(--border, #333333);
+}
+
+.feat-metric-green {
+  background: var(--feat-green-dim);
+  border-color: rgba(34, 197, 94, 0.2);
+}
+
+.feat-metric-blue {
+  background: var(--feat-blue-dim);
+  border-color: rgba(59, 130, 246, 0.2);
+}
+
+.feat-metric-label {
+  font-size: 0.7rem;
+  color: var(--text-dim, #6B7280);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 4px;
+}
+
+.feat-metric-value {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1.2rem;
+  color: var(--text, #E8E8E8);
+}
+
+.feat-value-green { color: var(--feat-green); }
+.feat-value-blue { color: var(--feat-blue); }
+
+/* Comparison section */
+.feat-comparison {
+  padding-top: 16px;
+  border-top: 1px solid var(--border, #333333);
+}
+
+.feat-comparison-title {
+  font-size: 0.85rem;
+  color: var(--text-secondary, #9CA3AF);
+  margin-bottom: 10px;
+  font-weight: 600;
+}
+
+.feat-comparison-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.feat-comparison-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.85rem;
+  color: var(--text, #E8E8E8);
+}
+
+.feat-comparison-icon {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  flex-shrink: 0;
+}
+
+.feat-icon-green {
+  background: var(--feat-green-dim);
+  color: var(--feat-green);
+}
+
+/* Carbon section */
+.feat-carbon-row {
+  display: flex;
+  gap: 24px;
+  align-items: center;
+}
+
+.feat-carbon-gauge {
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.feat-carbon-value {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1.8rem;
+  color: var(--feat-green);
+  margin-top: 4px;
+}
+
+.feat-carbon-unit {
+  display: block;
+  font-size: 0.6rem;
+  color: var(--text-dim, #6B7280);
+  font-family: 'Inter', sans-serif;
+  font-weight: 400;
+}
+
+.feat-carbon-info {
+  display: flex;
+  gap: 24px;
+  flex: 1;
+}
+
+.feat-carbon-score,
+.feat-carbon-hours {
+  flex: 1;
+}
+
+/* Solar metrics */
+.feat-solar-metrics {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border, #333333);
+}
+
+.feat-solar-metric {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.85rem;
+}
+
+.feat-solar-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.feat-solar-label {
+  color: var(--text-secondary, #9CA3AF);
+  flex: 1;
+}
+
+.feat-solar-value {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  color: var(--text, #E8E8E8);
+}
+
+/* ─── Methane Results ───────────────────────────────────────── */
+.feat-methane-results {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.feat-result-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.feat-result-card {
+  padding: 14px 16px;
+  border-radius: var(--radius-sm, 8px);
+  border: 1px solid var(--border, #333333);
+  background: var(--bg, #1A1A1A);
+}
+
+.feat-result-blue {
+  background: var(--feat-blue-dim);
+  border-color: rgba(59, 130, 246, 0.2);
+}
+
+.feat-result-green {
+  background: var(--feat-green-dim);
+  border-color: rgba(34, 197, 94, 0.2);
+}
+
+.feat-result-label {
+  font-size: 0.7rem;
+  color: var(--text-dim, #6B7280);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 4px;
+}
+
+.feat-result-value {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1.3rem;
+  color: var(--text, #E8E8E8);
+}
+
+.feat-result-sub {
+  font-size: 0.7rem;
+  color: var(--text-dim, #6B7280);
+  margin-top: 2px;
+}
+
+/* Impact banner */
+.feat-impact-banner {
+  margin-top: 16px;
+  padding: 14px 18px;
+  border-radius: var(--radius-sm, 8px);
+  background: var(--feat-green-dim);
+  border: 1px solid rgba(34, 197, 94, 0.2);
+}
+
+.feat-impact-text {
+  font-size: 0.85rem;
+  color: var(--text, #E8E8E8);
+  line-height: 1.5;
+}
+
+.feat-impact-text strong {
+  color: var(--feat-green);
+}
+
+/* ─── MQTT Entity List ──────────────────────────────────────── */
+.feat-entity-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  background: var(--border, #333333);
+  border-radius: var(--radius-sm, 8px);
+  overflow: hidden;
+}
+
+.feat-entity-row {
+  display: grid;
+  grid-template-columns: 100px 1fr 1fr 60px;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--bg, #1A1A1A);
+  font-size: 0.8rem;
+  align-items: center;
+}
+
+.feat-entity-type {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  color: var(--feat-blue);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+}
+
+.feat-entity-name {
+  color: var(--text, #E8E8E8);
+}
+
+.feat-entity-id {
+  color: var(--text-dim, #6B7280);
+  font-size: 0.7rem;
+}
+
+.feat-entity-unit {
+  color: var(--text-dim, #6B7280);
+  font-size: 0.75rem;
+  text-align: right;
+}
+
+.feat-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+/* ─── Fleet Discovery ───────────────────────────────────────── */
+.feat-fleet-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.feat-fleet-stat {
+  background: var(--card-bg, #242432);
+  border-radius: var(--radius, 12px);
+  padding: 16px;
+  border: 1px solid var(--border, #333333);
+  text-align: center;
+}
+
+.feat-fleet-stat-value {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1.6rem;
+  color: var(--accent, #FAA500);
+}
+
+.feat-fleet-stat-label {
+  font-size: 0.7rem;
+  color: var(--text-dim, #6B7280);
+  text-transform: uppercase;
+  margin-top: 2px;
+}
+
+.feat-fleet-stat-source {
+  color: var(--text-dim, #6B7280);
+  font-size: 0.72rem;
+  line-height: 1.25;
+  margin-top: 6px;
+  min-height: 1.8em;
+}
+
+.feat-fleet-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.feat-fleet-card {
+  background: var(--card-bg, #242432);
+  border-radius: var(--radius, 12px);
+  border: 1px solid var(--border, #333333);
+  overflow: hidden;
+}
+
+.feat-fleet-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border, #333333);
+}
+
+.feat-fleet-card-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  color: var(--text, #E8E8E8);
+  /* D8: now an <h3> for SR card-skim — neutralize UA heading margin +
+     font-size so the render is pixel-identical to the prior <div>. */
+  margin: 0;
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.feat-fleet-card-status {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.feat-fleet-card-body {
+  padding: 12px 16px;
+}
+
+.feat-fleet-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.8rem;
+  padding: 3px 0;
+}
+
+.feat-fleet-label {
+  color: var(--text-dim, #6B7280);
+}
+
+.feat-fleet-value {
+  color: var(--text, #E8E8E8);
+}
+
+.feat-fleet-card-footer {
+  padding: 10px 16px;
+  border-top: 1px solid var(--border, #333333);
+}
+
+.feat-empty-state {
+  text-align: center;
+  padding: 40px 20px;
+  color: var(--text-dim, #6B7280);
+}
+
+.feat-empty-icon {
+  font-size: 2rem;
+  margin-bottom: 12px;
+}
+
+/* ─── Tax Table ─────────────────────────────────────────────── */
+.feat-tax-table {
+  overflow-x: auto;
+}
+
+.feat-tax-header,
+.feat-tax-row {
+  display: grid;
+  grid-template-columns: 100px 1fr 80px 80px 80px 80px;
+  gap: 8px;
+  padding: 8px 12px;
+  font-size: 0.8rem;
+  align-items: center;
+}
+
+.feat-tax-header {
+  font-weight: 600;
+  color: var(--text-dim, #6B7280);
+  text-transform: uppercase;
+  font-size: 0.7rem;
+  border-bottom: 1px solid var(--border, #333333);
+}
+
+.feat-tax-row {
+  border-bottom: 1px solid rgba(51, 51, 51, 0.5);
+  color: var(--text, #E8E8E8);
+}
+
+.feat-tax-more {
+  color: var(--text-dim, #6B7280);
+  font-style: italic;
+  grid-column: span 6;
+  text-align: center;
+}
+
+.feat-tax-total {
+  font-weight: 700;
+  border-top: 2px solid var(--border, #333333);
+  border-bottom: none;
+}
+
+/* ─── Circuit Calculator ────────────────────────────────────── */
+.feat-circuit-gauge {
+  margin: 16px 0;
+}
+
+.feat-circuit-bar-bg {
+  height: 24px;
+  background: var(--bg, #1A1A1A);
+  border-radius: 12px;
+  overflow: hidden;
+  position: relative;
+}
+
+.feat-circuit-bar-fill {
+  height: 100%;
+  border-radius: 12px;
+  transition: width 0.5s var(--ease-standard, ease);
+}
+
+.feat-circuit-bar-over {
+  position: absolute;
+  top: 0;
+  right: 0;
+  height: 100%;
+  background: repeating-linear-gradient(
+    45deg,
+    var(--feat-red),
+    var(--feat-red) 4px,
+    transparent 4px,
+    transparent 8px
+  );
+  border-radius: 0 12px 12px 0;
+}
+
+.feat-circuit-gauge-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.7rem;
+  color: var(--text-dim, #6B7280);
+  margin-top: 4px;
+}
+
+.feat-safety-display {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.feat-range {
+  flex: 1;
+  appearance: none;
+  height: 6px;
+  background: var(--border, #333333);
+  border-radius: 3px;
+  outline: none;
+}
+
+.feat-range::-webkit-slider-thumb {
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--accent, #FAA500);
+  cursor: pointer;
+}
+
+.feat-range-value {
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 700;
+  font-size: 0.9rem;
+  color: var(--text, #E8E8E8);
+  min-width: 40px;
+  text-align: right;
+}
+
+.feat-safety-banner {
+  margin-top: 16px;
+  padding: 12px 16px;
+  border-radius: var(--radius-sm, 8px);
+  font-weight: 600;
+  font-size: 0.9rem;
+  text-align: center;
+}
+
+.feat-safe {
+  background: var(--feat-green-dim);
+  color: var(--feat-green);
+  border: 1px solid rgba(34, 197, 94, 0.3);
+}
+
+.feat-unsafe {
+  background: var(--feat-red-dim);
+  color: var(--feat-red);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
+/* ─── Demand Response ───────────────────────────────────────── */
+.feat-demand-status {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  flex-wrap: wrap;
+}
+
+.feat-demand-price {
+  text-align: center;
+}
+
+.feat-demand-price-value {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 2.5rem;
+  line-height: 1;
+}
+
+.feat-demand-price-unit {
+  font-size: 0.7rem;
+  color: var(--text-dim, #6B7280);
+}
+
+.feat-demand-signal {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.feat-demand-badge {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 12px;
+  font-weight: 700;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+}
+
+.feat-demand-curtailed {
+  font-size: 0.75rem;
+  color: var(--feat-red);
+  font-weight: 600;
+}
+
+.feat-demand-stats {
+  display: flex;
+  gap: 20px;
+  margin-left: auto;
+}
+
+.feat-demand-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.feat-demand-stat-label {
+  font-size: 0.7rem;
+  color: var(--text-dim, #6B7280);
+}
+
+.feat-demand-stat-value {
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 700;
+  font-size: 1rem;
+  color: var(--text, #E8E8E8);
+}
+
+.feat-negative-price-badge {
+  margin-top: 12px;
+  padding: 10px 16px;
+  border-radius: var(--radius-sm, 8px);
+  background: var(--feat-blue-dim);
+  color: var(--feat-blue);
+  font-size: 0.8rem;
+  font-weight: 600;
+  border: 1px solid rgba(59, 130, 246, 0.3);
+}
+
+/* ─── Immersion Mode ────────────────────────────────────────── */
+.feat-immersion-notice {
+  margin-top: 12px;
+  padding: 10px 16px;
+  border-radius: var(--radius-sm, 8px);
+  background: var(--feat-blue-dim);
+  color: var(--text-secondary, #9CA3AF);
+  font-size: 0.8rem;
+  border: 1px solid rgba(59, 130, 246, 0.2);
+}
+
+.feat-coolant-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+}
+
+.feat-coolant-card {
+  padding: 14px;
+  border-radius: var(--radius-sm, 8px);
+  border: 2px solid var(--border, #333333);
+  background: var(--bg, #1A1A1A);
+  cursor: pointer;
+  transition: all var(--dur-fast, 0.15s) var(--ease-standard, ease);
+  text-align: left;
+}
+
+.feat-coolant-card:hover {
+  border-color: var(--text-dim, #6B7280);
+}
+
+.feat-coolant-card.active {
+  border-color: var(--feat-blue);
+  background: var(--feat-blue-dim);
+}
+
+.feat-coolant-name {
+  font-weight: 700;
+  font-size: 0.9rem;
+  color: var(--text, #E8E8E8);
+  margin-bottom: 4px;
+}
+
+.feat-coolant-desc {
+  font-size: 0.75rem;
+  color: var(--text-secondary, #9CA3AF);
+  margin-bottom: 6px;
+}
+
+.feat-coolant-temp {
+  font-size: 0.7rem;
+  color: var(--feat-blue);
+  font-weight: 600;
+}
+
+.feat-immersion-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 12px;
+}
+
+/* ─── Profile Sharing ───────────────────────────────────────── */
+.feat-profile-preview {
+  margin-top: 16px;
+  padding: 12px;
+  background: var(--bg, #1A1A1A);
+  border: 1px solid var(--border, #333333);
+  border-radius: var(--radius-sm, 8px);
+}
+
+.feat-profile-preview-label {
+  font-size: 0.7rem;
+  color: var(--text-dim, #6B7280);
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+
+.feat-profile-json {
+  font-size: 0.75rem;
+  color: var(--text-secondary, #9CA3AF);
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 0;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.feat-profile-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.feat-profile-card {
+  padding: 14px 16px;
+  border: 1px solid var(--border, #333333);
+  border-radius: var(--radius-sm, 8px);
+  background: var(--bg, #1A1A1A);
+}
+
+.feat-profile-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.feat-profile-name {
+  font-weight: 700;
+  font-size: 1rem;
+  color: var(--text, #E8E8E8);
+}
+
+.feat-profile-target {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid;
+}
+
+.feat-profile-meta {
+  display: flex;
+  gap: 12px;
+  font-size: 0.75rem;
+  color: var(--text-dim, #6B7280);
+  margin-bottom: 6px;
+}
+
+.feat-profile-specs {
+  display: flex;
+  gap: 12px;
+  font-size: 0.8rem;
+  color: var(--text-secondary, #9CA3AF);
+  font-family: 'JetBrains Mono', monospace;
+  margin-bottom: 6px;
+}
+
+.feat-profile-desc {
+  font-size: 0.8rem;
+  color: var(--text-secondary, #9CA3AF);
+  margin-bottom: 10px;
+}
+
+.feat-profile-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* ─── Language Selector ─────────────────────────────────────── */
+.feat-language-selector {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.feat-lang-buttons {
+  display: flex;
+  gap: 4px;
+}
+
+.feat-lang-btn {
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-dim, #6B7280);
+  background: transparent;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: all var(--dur-fast, 0.15s) var(--ease-standard, ease);
+}
+
+.feat-lang-btn:hover {
+  color: var(--text, #E8E8E8);
+}
+
+.feat-lang-btn.active {
+  background: var(--feat-orange-dim);
+  color: var(--accent, #FAA500);
+  border-color: var(--accent, #FAA500);
+}
+
+/* ─── Responsive ────────────────────────────────────────────── */
+/*  P4 (D-17): 768 -> 767.98 (md tier, pairs with no min-width
+   companion here so the .02 form is canonical). */
+@media (max-width: 767.98px) {
+  .feat-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .feat-span-2 {
+    grid-column: span 1;
+  }
+
+  .feat-methane-results,
+  .feat-result-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .feat-fleet-stats {
+    grid-template-columns: 1fr;
+  }
+
+  .feat-fleet-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .feat-battery-visual {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .feat-carbon-row {
+    flex-direction: column;
+  }
+
+  .feat-demand-status {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .feat-demand-stats {
+    margin-left: 0;
+  }
+
+  .feat-coolant-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .feat-entity-row {
+    grid-template-columns: 80px 1fr 60px;
+  }
+
+  .feat-entity-id {
+    display: none;
+  }
+
+  .feat-tax-header,
+  .feat-tax-row {
+    grid-template-columns: 80px 1fr 70px 70px;
+  }
+
+  .feat-tax-header span:nth-child(3),
+  .feat-tax-row span:nth-child(3) {
+    display: none;
+  }
+
+  .feat-tax-header span:nth-child(4),
+  .feat-tax-row span:nth-child(4) {
+    display: none;
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   P4 wave5: features suite + profile-import + restore-to-stock polish
+   ────────────────────────────────────────────────────────────────────
+   Scoped, strictly-additive Wave-5 chrome. NEVER edits standard.css
+   (P2-frozen) — profile-import / restore-to-stock keep their existing
+   inline styles harmless underneath; these classes layer premium glass /
+   glow / motion on top and reinforce the load-bearing truth-contract
+   copy with calm, confidence-building chrome. Words are NEVER changed
+   here — chrome only (Wave-4 W2 contract preserved verbatim).
+   ════════════════════════════════════════════════════════════════════ */
+
+/* ── Features suite: premium glass card elevation ──────────────────── */
+.feat-page {
+  /* keep the existing fadeIn; layer a gentle staggered entrance feel */
+  animation: featPageIn 0.34s var(--ease-out-soft, cubic-bezier(0.22, 1, 0.36, 1)) both;
+}
+
+@keyframes featPageIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .feat-page { animation: none; }
+}
+
+.feat-card {
+  position: relative;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.022), transparent 42%),
+    var(--card-bg, #242432);
+  backdrop-filter: blur(var(--blur-sm, 12px));
+  -webkit-backdrop-filter: blur(var(--blur-sm, 12px));
+  box-shadow:
+    var(--elevation-base, 0 6px 22px rgba(0, 0, 0, 0.30)),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  transition:
+    border-color 0.2s var(--ease-standard, ease),
+    box-shadow 0.24s var(--ease-standard, ease),
+    transform 0.24s var(--ease-standard, ease);
+}
+
+/* Brand hairline on every feature card, hacker mode → phosphor green. */
+.feat-card::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--accent, #FAA500), transparent);
+  opacity: 0.4;
+  pointer-events: none;
+  border-radius: var(--radius, 12px) var(--radius, 12px) 0 0;
+}
+
+.mode-hacker .feat-card::before {
+  background: linear-gradient(90deg, transparent, var(--hacker-green, #00FF41), transparent);
+}
+
+.feat-card:hover {
+  border-color: var(--accent-border, rgba(250, 165, 0, 0.28));
+  box-shadow:
+    var(--elevation-raised, 0 12px 34px rgba(0, 0, 0, 0.40)),
+    0 0 0 1px var(--accent-tint-08, rgba(250, 165, 0, 0.08)),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .feat-card { transition: none; }
+  .feat-card:hover { transform: none; }
+}
+
+/* Hero cards (battery / green) get a warmer ambient glow halo. */
+.feat-battery-hero {
+  box-shadow:
+    var(--elevation-base, 0 6px 22px rgba(0, 0, 0, 0.30)),
+    0 0 36px var(--feat-green-glow);
+}
+
+/* Primary CTA — premium accent gradient + tactile press, keeps shape. */
+.feat-btn-primary {
+  background: var(--accent-gradient, linear-gradient(135deg, #FAA500, #FA6700));
+  box-shadow: 0 4px 14px var(--accent-shadow-28, rgba(250, 103, 0, 0.28));
+}
+
+.feat-btn-primary:hover {
+  background: var(--accent-gradient, linear-gradient(135deg, #FFB733, #FA6700));
+  box-shadow: 0 6px 20px var(--accent-shadow-55, rgba(250, 103, 0, 0.45));
+  transform: translateY(-1px);
+}
+
+.feat-btn:active {
+  transform: translateY(1px) scale(0.985);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .feat-btn-primary:hover,
+  .feat-btn:active { transform: none; }
+}
+
+/* Branded input focus — match the canonical accent + soft halo. */
+.feat-input:focus,
+.feat-textarea:focus {
+  border-color: var(--accent, #FAA500);
+  box-shadow: 0 0 0 3px var(--accent-tint-14, rgba(250, 165, 0, 0.14));
+  outline: none;
+}
+
+/* Toggle ON glow so the live/enabled state reads at a glance. */
+.feat-toggle.active {
+  box-shadow: 0 0 12px var(--feat-green-glow);
+}
+
+/* Telemetry value cards: gentle 1 Hz-safe pulse opt-in (.is-live). */
+.feat-metric-card.is-live::after,
+.feat-fleet-stat.is-live::after {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 8px;
+  border-radius: 50%;
+  background: var(--feat-green);
+  box-shadow: 0 0 8px var(--feat-green-glow);
+  animation: featLivePulse 2s ease-in-out infinite;
+  vertical-align: middle;
+}
+
+@keyframes featLivePulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .feat-metric-card.is-live::after,
+  .feat-fleet-stat.is-live::after { animation: none; }
+}
+
+/* Coolant / preset cards: lift + accent edge on hover. */
+.feat-coolant-card,
+.feat-fleet-card {
+  transition:
+    border-color 0.18s var(--ease-standard, ease),
+    box-shadow 0.18s var(--ease-standard, ease),
+    transform 0.18s var(--ease-standard, ease);
+}
+
+.feat-coolant-card:hover,
+.feat-fleet-card:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--elevation-raised, 0 10px 26px rgba(0, 0, 0, 0.36));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .feat-coolant-card,
+  .feat-fleet-card { transition: none; }
+  .feat-coolant-card:hover,
+  .feat-fleet-card:hover { transform: none; }
+}
+
+/* Empty-state CTA inside features gets a friendly accent. */
+.feat-empty-state .ds-btn {
+  margin-top: 12px;
+}
+
+/* ── Shared "info dot" inline affordance next to feature labels ────── */
+/* The F1 <InfoDot> renders .dcent-infodot (global). This just gives a
+   little breathing room when it sits inside a .feat-label / heading. */
+.feat-label .dcent-infodot,
+.feat-card-title .dcent-infodot,
+.feat-metric-label .dcent-infodot,
+.feat-solar-label .dcent-infodot {
+  margin-left: 5px;
+  vertical-align: baseline;
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   profile-import wizard chrome (D-32: align with SetupWizard W1 shell)
+   ──────────────────────────────────────────────────────────────────── */
+.p4-wizard-shell {
+  position: relative;
+  max-width: 840px;
+  margin: 0 auto;
+  padding: 18px 22px;
+}
+
+.p4-wizard-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.p4-wizard-title {
+  margin: 0;
+  font-family: var(--font-heading);
+  font-size: 1.5rem;
+  font-weight: 800;
+  letter-spacing: 0.005em;
+  color: var(--text, #E8E8E8);
+}
+
+.p4-wizard-sub {
+  margin-top: 3px;
+  font-size: 0.8rem;
+  color: var(--text-secondary, #8b8b9e);
+  line-height: 1.45;
+  max-width: 60ch;
+}
+
+/* Stepper — glass rail with a clear accent-progress fill. */
+.p4-stepper {
+  display: flex;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-radius: var(--radius-sm, 10px);
+  overflow: hidden;
+  border: 1px solid var(--border-glass, var(--border, rgba(255, 255, 255, 0.10)));
+  background: var(--grad-glass-rail, rgba(255, 255, 255, 0.025));
+  backdrop-filter: blur(var(--blur-xs, 6px));
+  -webkit-backdrop-filter: blur(var(--blur-xs, 6px));
+}
+
+.p4-step {
+  flex: 1;
+  padding: 9px 10px;
+  text-align: center;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-secondary, #8b8b9e);
+  border-right: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+  transition: background 0.22s var(--ease-standard, ease), color 0.22s var(--ease-standard, ease);
+}
+
+.p4-step:last-child { border-right: none; }
+
+.p4-step__num {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  margin-right: 5px;
+  border-radius: 50%;
+  font-size: 0.62rem;
+  background: rgba(255, 255, 255, 0.07);
+  vertical-align: -1px;
+}
+
+.p4-step.is-done {
+  color: var(--green, #2DD4A0);
+  background: rgba(45, 212, 160, 0.07);
+}
+
+.p4-step.is-done .p4-step__num {
+  background: rgba(45, 212, 160, 0.22);
+  color: var(--green, #2DD4A0);
+}
+
+.p4-step.is-active {
+  color: var(--accent, #FAA500);
+  background: var(--accent-tint-14, rgba(250, 165, 0, 0.14));
+}
+
+.p4-step.is-active .p4-step__num {
+  background: var(--accent, #FAA500);
+  color: #0a0a0f;
+}
+
+/* Danger-flavored stepper variant for restore-to-stock. */
+.p4-stepper--danger .p4-step.is-active {
+  color: var(--red, #EF4444);
+  background: rgba(239, 68, 68, 0.13);
+}
+
+.p4-stepper--danger .p4-step.is-active .p4-step__num {
+  background: var(--red, #EF4444);
+  color: #fff;
+}
+
+.p4-wizard-nav {
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+  margin-top: 24px;
+}
+
+/* Trust-level radio cards (SourceClassSelect) — premium selectable card. */
+.p4-trust-card {
+  display: flex;
+  gap: 12px;
+  padding: 11px 13px;
+  border-radius: var(--radius-sm, 8px);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+  background: var(--grad-glass-rail, rgba(18, 18, 26, 0.6));
+  cursor: pointer;
+  transition:
+    border-color 0.16s var(--ease-standard, ease),
+    background 0.16s var(--ease-standard, ease),
+    box-shadow 0.16s var(--ease-standard, ease);
+}
+
+.p4-trust-card:hover {
+  border-color: var(--accent-border, rgba(250, 165, 0, 0.28));
+}
+
+.p4-trust-card.is-checked {
+  border-color: var(--accent, #FAA500);
+  background: var(--accent-tint-08, rgba(250, 165, 0, 0.08));
+  box-shadow: 0 0 0 1px var(--accent-tint-14, rgba(250, 165, 0, 0.14));
+}
+
+.p4-trust-card.is-locked {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .p4-trust-card { transition: none; }
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   restore-to-stock: calm, confidence-building brick-anxiety chrome
+   ────────────────────────────────────────────────────────────────────
+   The WORDS are load-bearing and preserved verbatim by the components.
+   These classes only make the surrounding surface feel deliberate and
+   calm rather than alarming — a steady hand, not a panic button.
+   ════════════════════════════════════════════════════════════════════ */
+.p4-danger-page {
+  padding: 0 20px;
+}
+
+.p4-danger-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+
+.p4-danger-title {
+  margin: 0;
+  font-size: 1.4rem;
+  font-weight: 800;
+  color: var(--red, #EF4444);
+  letter-spacing: 0.005em;
+}
+
+/* The restore card: a recessed, deliberate "operating table" surface —
+   firm red hairline, calm dark glass, NOT a flashing alarm. */
+.p4-restore-card {
+  position: relative;
+  padding: 18px;
+  border-radius: var(--radius, 12px);
+  background:
+    radial-gradient(circle at 80% -10%, rgba(239, 68, 68, 0.07), transparent 46%),
+    var(--card-bg, rgba(18, 18, 26, 0.7));
+  border: 1px solid rgba(239, 68, 68, 0.24);
+  box-shadow:
+    var(--elevation-base, 0 6px 22px rgba(0, 0, 0, 0.32)),
+    inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  backdrop-filter: blur(var(--blur-sm, 12px));
+  -webkit-backdrop-filter: blur(var(--blur-sm, 12px));
+}
+
+.p4-restore-card::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--red, #EF4444), transparent);
+  opacity: 0.55;
+  pointer-events: none;
+  border-radius: var(--radius, 12px) var(--radius, 12px) 0 0;
+}
+
+/* Modal body wrapper — slightly stronger glass for the destructive flow. */
+.p4-restore-modal {
+  padding: 20px;
+  color: var(--text);
+}
+
+.p4-restore-modal__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.p4-restore-modal__title {
+  margin: 0;
+  font-size: 1.25rem;
+  font-weight: 800;
+  letter-spacing: 0.005em;
+}
+
+/* Calm summary grid card (state stats) — quiet inset glass. */
+.p4-quiet-panel {
+  padding: 12px;
+  border-radius: var(--radius-sm, 8px);
+  background: var(--grad-glass-rail, rgba(18, 18, 26, 0.6));
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+  backdrop-filter: blur(var(--blur-xs, 6px));
+  -webkit-backdrop-filter: blur(var(--blur-xs, 6px));
+}
+
+/* The X/5 GATES pill gets a confident, readable treatment (chrome only —
+   the count + label text come from SafetyPreflight, never changed). */
+.p4-gate-pill {
+  position: relative;
+}
+
+.p4-gate-pill.success {
+  /* C-02 converge: canonical success/green halo token (F6 §3b). */
+  box-shadow: var(--glow-success, 0 0 12px rgba(45, 212, 160, 0.30));
+}
+
+/* Branded range/slider thumb for the arming slider (no behavior change —
+   accentColor is still set inline; this only enriches WebKit thumbs).
+   C-02 EXCEPTION: the rgba(239,68,68,0.5) thumb rings below are
+   DELIBERATELY kept as literals, NOT converged to var(--glow-danger).
+   This is the destructive restore-to-stock ARMING slider — the tight,
+   intense 10px/0.5α red ring is a safety affordance signal; the canonical
+   --glow-danger (18px/0.28α) is softer/wider and would WEAKEN it. Per the
+   F6 §3 rule "Never weaken a safety/contrast/focus treatment to converge."
+   Do NOT "fix" these to a token in a future wave. */
+.p4-arm-slider {
+  height: 8px;
+  border-radius: 4px;
+  background: linear-gradient(90deg,
+    var(--accent, #FAA500) 0%,
+    rgba(239, 68, 68, 0.5) 70%,
+    var(--red, #EF4444) 100%);
+}
+
+.p4-arm-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--text, #fff);
+  border: 3px solid var(--red, #EF4444);
+  box-shadow: 0 0 10px rgba(239, 68, 68, 0.5);
+  cursor: grab;
+}
+
+.p4-arm-slider::-webkit-slider-thumb:active { cursor: grabbing; }
+
+.p4-arm-slider::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--text, #fff);
+  border: 3px solid var(--red, #EF4444);
+  box-shadow: 0 0 10px rgba(239, 68, 68, 0.5);
+  cursor: grab;
+}
+
+/* Persistent breaker/noise reminder — calm amber glass, soft inset glow.
+   role="note" + words are load-bearing; this is chrome only. */
+.p4-breaker-note {
+  backdrop-filter: blur(var(--blur-xs, 6px));
+  -webkit-backdrop-filter: blur(var(--blur-xs, 6px));
+  box-shadow: inset 0 0 0 1px rgba(240, 180, 41, 0.06);
+}
+
+.p4-breaker-note .dcent-infodot {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+/* Subtle in-progress writer/log surface — terminal-inset, NOT a strobe. */
+.p4-restore-log {
+  background: var(--grad-terminal, rgba(10, 10, 15, 0.85));
+}
+
+/* Reduced-motion + print: nothing here animates, but keep glow tame on
+   print so the destructive page is legible on paper. */
+@media print {
+  .p4-restore-card,
+  .p4-restore-card::before,
+  .feat-card::before,
+  .feat-battery-hero { box-shadow: none; background: none; }
+}

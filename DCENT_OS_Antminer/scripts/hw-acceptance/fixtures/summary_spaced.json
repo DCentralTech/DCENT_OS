@@ -1,0 +1,14 @@
+{
+  "STATUS": [ { "STATUS": "S", "When": 1719900000, "Code": 11, "Msg": "Summary" } ],
+  "SUMMARY": [
+    {
+      "Elapsed": 1200,
+      "MHS av": 95000.7,
+      "Accepted": 42,
+      "Rejected": 1,
+      "Difficulty Accepted": 10752.0,
+      "Best Share": 250000
+    }
+  ],
+  "id": 1
+}

@@ -1,0 +1,30 @@
+[package]
+name = "dcentrald-chip-analysis"
+version.workspace = true  # Single source: dcentrald/Cargo.toml [workspace.package]
+edition = "2021"
+license = "GPL-3.0"
+description = "Pure no-HAL chip-health math (Laplacian gradient, cross-slot z-score, nonce-deficit) for DCENT_OS"
+
+# A44 (Knowledge Goldmine 2026-06-10, ranks 22 / s16b-IC-B1 + s16b-IC-B3 +
+# s17-WM-C1): clean-room port of the three pure-math chip-health functions
+# from the WhatsMiner chip_map tool. This crate is a PRECURSOR — nothing
+# depends on it yet (B26 autotuner chip-health integration is a separate,
+# review-gated follow-up). It has ZERO hardware I/O and ZERO third-party
+# dependencies (std-only math), so it compiles and tests host-side on
+# Windows and Linux identically.
+[dependencies]
+
+[dev-dependencies]
+
+# W4.7 lint inheritance + grandfather override (DCENT_DevOps + DCENT_QA, 2026-05-07).
+# This crate's only unwrap/expect/panic/indexing occurrences are inside the
+# inline `#[cfg(test)]` worked-example module (slice indexing of fixed test
+# vectors + float-compare asserts). Lints are downgraded to `allow` to match
+# the sibling no-HAL crates (`dcentrald-api-types`, `dcentrald-silicon-profiles`).
+# cargo 1.95+: per-crate overrides cannot coexist with `[lints] workspace = true`.
+[lints.clippy]
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+indexing_slicing = "allow"
+unwrap_in_result = "allow"

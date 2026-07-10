@@ -1,0 +1,28 @@
+# DCENTos Buildroot defconfig — Antminer S21 XP (Amlogic am3-aml NoPic).
+# D-Central Technologies, 2026.
+#
+# Target: Amlogic A113D (ARM Cortex-A53 quad, aarch64).
+# Chip:   BM1370 (3 nm) — BUILD-CLEAN SCAFFOLD, no live unit (chip count TODO-confirm).
+# PSU:    APW12 class, PMBus enable plus GPIO 437 PSU_nEN.
+# Boot:   BL2 -> FIP -> U-Boot 2015.01 -> kernel 4.9.113 (no FPGA bitstream).
+#
+# Per-product OVERRIDE layer. Shared content lives in:
+#   dcentos-common.fragment           (workspace-wide package set + identity)
+#   dcentos_am3_aml_common.fragment   (aarch64 + Linaro toolchain + cpio.gz)
+#
+# Sibling of dcentos_am3_s19kpro_defconfig — same Amlogic SoC, same boot
+# chain, same S11board family, only
+# product identity differs.
+
+# =============================================================================
+# Per-product identity.
+# =============================================================================
+BR2_TARGET_GENERIC_HOSTNAME="dcentos-s21xp"
+BR2_TARGET_GENERIC_ISSUE="DCENTos for S21 XP (am3-aml NoPic) - D-Central Technologies"
+
+# =============================================================================
+# Overlay-on-overlay — shared amlogic overlay first, am3-s21xp identity last.
+# =============================================================================
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/am3-s21xp/rootfs-overlay"
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/am3-s21xp/post-build.sh"
+BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/am3-s21xp/post-image.sh"

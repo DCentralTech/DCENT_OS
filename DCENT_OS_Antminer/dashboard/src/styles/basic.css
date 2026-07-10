@@ -1,0 +1,2799 @@
+/* Basic Mode (Space Heater) — Warm firelight theme
+ *
+ * The emotional center of DCENT_OS. Design intent: a Bitcoin space heater
+ * that you'd actually invite into your living room. Firelight palette,
+ * generous touch targets, premium card depth, ember-glow accents when
+ * heating is live.
+ *
+ * NOTE: the cool-bg values below are SUPERSEDED at runtime by the
+ * design-system.css '.mode-basic' warm override block (~line 810). They
+ * remain here as a documented fallback if the design-system layer is
+ * stripped or fails to load.
+ */
+
+.mode-basic {
+  --bg: #1A1410;
+  --bg-subtle: #221C16;
+  --card-bg: #2A2218;
+  --card-hover: #34291D;
+  /* Layered firelight shadow — close ambient + warm orange undertone */
+  --card-shadow:
+    0 1px 0 rgba(255, 220, 180, 0.04) inset,
+    0 8px 24px rgba(0, 0, 0, 0.42),
+    0 2px 6px rgba(250, 103, 0, 0.06);
+  --border: rgba(255, 220, 180, 0.10);
+  --border-glass: rgba(255, 220, 180, 0.14);
+  --text: #F4ECDF;
+  --text-secondary: #B4A893;
+  --text-dim: #80735F;
+  --accent: #FAA500;
+  --accent-deep: #FA6700;
+  --accent-light: #FFC94D;
+  --accent-hover: #FFC94D;
+  --sphere-hi: #FFC94D;
+  --accent-glow: rgba(250, 165, 0, 0.14);
+  --accent-glow-hi: rgba(250, 165, 0, 0.32);
+  --accent-border: rgba(250, 165, 0, 0.32);
+  --accent-gradient: linear-gradient(135deg, var(--sphere-hi) 0%, var(--accent) 50%, var(--accent-deep) 100%);
+  --warm: #FFC94D;
+  --warm-glow: rgba(255, 201, 77, 0.16);
+  /* Cool-grey/blue reserved for safety-critical states ONLY */
+  --green: #22C55E;
+  --red: #EF4444;
+  --yellow: #F59E0B;
+  --blue: #3B82F6;
+  --radius: 16px;
+  --radius-sm: 10px;
+  --focus-ring: var(--accent-light);
+  --focus-ring-soft: rgba(250, 165, 0, 0.28);
+
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  padding-bottom: env(safe-area-inset-bottom, 0);
+}
+
+/* Night-mode adapter — dim the whole shell honestly without breaking
+ * the toggle wiring. NightMode sets data-night-mode on the wrapper;
+ * brightness clamp + accent dim happens here. */
+.mode-basic[data-night-mode='on'] {
+  filter: brightness(0.86) saturate(0.92);
+  --accent-glow:    rgba(250, 165, 0, 0.08);
+  --accent-glow-hi: rgba(250, 165, 0, 0.18);
+  --card-shadow:
+    0 1px 0 rgba(255, 220, 180, 0.03) inset,
+    0 6px 18px rgba(0, 0, 0, 0.46);
+}
+
+/* ─── Header ─────────────────────────────────────────────── */
+
+.mode-basic .dashboard-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  background: var(--card-bg);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.mode-basic .dashboard-header .logo {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 1.4rem;
+  color: var(--accent);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  letter-spacing: 0.01em;
+}
+
+.mode-basic .dashboard-header .device-name {
+  font-size: 0.9rem;
+  color: var(--text-secondary);
+}
+
+.mode-basic .basic-page-copy {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  margin-top: 2px;
+  max-width: 320px;
+}
+
+.mode-basic .basic-status-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 20px 6px;
+}
+
+.mode-basic .basic-status-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.mode-basic .basic-status-chip.success {
+  color: var(--green);
+  background: rgba(34, 197, 94, 0.12);
+  border-color: rgba(34, 197, 94, 0.18);
+}
+
+.mode-basic .basic-status-chip.warning {
+  color: var(--warm);
+  background: rgba(245, 158, 11, 0.12);
+  border-color: rgba(245, 158, 11, 0.2);
+}
+
+.mode-basic .basic-status-chip.info {
+  color: var(--accent);
+  background: var(--accent-glow);
+  border-color: rgba(250, 165, 0, 0.18);
+}
+
+.mode-basic .basic-status-chip.danger {
+  color: var(--red);
+  background: rgba(239, 68, 68, 0.1);
+  border-color: rgba(239, 68, 68, 0.18);
+}
+
+.mode-basic .basic-status-chip.neutral {
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.03);
+  border-color: var(--border);
+}
+
+.mode-basic .basic-status-page {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+}
+
+.mode-basic .basic-mode-switch-wrap {
+  padding: 0 20px 12px;
+}
+
+/* ─── Safety Badge ───────────────────────────────────────── */
+/* Replaces the previous full-inline-style implementation.
+   Colors driven entirely by CSS tokens — no hard-coded hex. */
+.mode-basic .safety-badge {
+  margin: 0 16px 8px 16px;
+  padding: 10px 14px;
+  border-radius: var(--radius-sm, 10px);
+  border: 1px solid transparent;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.mode-basic .safety-badge--normal {
+  color: var(--green);
+  background: rgba(34, 197, 94, 0.08);
+  border-color: rgba(34, 197, 94, 0.20);
+}
+.mode-basic .safety-badge--warm {
+  color: var(--yellow);
+  background: rgba(245, 158, 11, 0.08);
+  border-color: rgba(245, 158, 11, 0.20);
+}
+.mode-basic .safety-badge--hot {
+  color: var(--red);
+  background: rgba(239, 68, 68, 0.08);
+  border-color: rgba(239, 68, 68, 0.20);
+}
+
+.mode-basic .safety-badge__body {
+  flex: 1;
+  min-width: 0;
+}
+
+.mode-basic .safety-badge__label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: inherit;
+  line-height: 1.3;
+}
+
+.mode-basic .safety-badge__sub {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+/* ─── Header CTA ─────────────────────────────────────────── */
+/* Pulled out of inline styles to make the warm pill cleaner. */
+.mode-basic .basic-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mode-basic .basic-readiness-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(245, 158, 11, 0.22);
+  background: rgba(245, 158, 11, 0.08);
+  color: var(--text);
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.18s var(--ease-standard), transform 0.12s var(--ease-standard), border-color 0.18s var(--ease-standard);
+}
+
+.mode-basic .basic-readiness-cta:hover {
+  background: rgba(245, 158, 11, 0.14);
+  border-color: rgba(245, 158, 11, 0.34);
+}
+
+.mode-basic .basic-readiness-cta:active {
+  transform: scale(0.97);
+}
+
+.mode-basic .basic-readiness-cta__count {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(245, 158, 11, 0.18);
+  color: #F59E0B;
+  font-size: 0.72rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ─── Connection Banner ──────────────────────────────────── */
+
+.mode-basic .connection-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: rgba(250,165,0,0.15);
+  color: var(--accent);
+  font-size: 0.8rem;
+  font-weight: 600;
+  z-index: 110;
+  animation: bannerSlideDown 0.3s ease-out;
+}
+
+@keyframes bannerSlideDown {
+  from { transform: translateY(-100%); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+/* ─── Thermostat ─────────────────────────────────────────── */
+/* The emotional centerpiece. Premium dial with multi-stop firelight
+ * bezel + ember-halo when mining. The SVG ring stays in Thermostat.tsx;
+ * this is the physical-dial enclosure look. */
+
+.mode-basic .thermostat-container {
+  display: flex;
+  justify-content: center;
+  padding: 36px 20px 20px;
+  position: relative;
+}
+
+.mode-basic .thermostat {
+  position: relative;
+  width: 240px;
+  height: 240px;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 30% 30%, rgba(255, 201, 77, 0.08), transparent 55%),
+    linear-gradient(135deg, var(--card-bg) 0%, var(--bg-subtle) 100%);
+  box-shadow:
+    0 8px 32px rgba(0, 0, 0, 0.42),
+    0 0 0 1px rgba(255, 220, 180, 0.05),
+    inset 0 1px 2px rgba(255, 220, 180, 0.08),
+    inset 0 -8px 18px rgba(0, 0, 0, 0.4);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  transition: box-shadow 0.5s var(--ease-out-soft), transform 0.3s var(--ease-out-soft);
+}
+
+/* Ember-glow halo behind the dial — appears only when mining is live.
+ * Pure decoration; pointer-events disabled. */
+.mode-basic .thermostat::before {
+  content: '';
+  position: absolute;
+  inset: -40px;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 50% 60%, rgba(250, 103, 0, 0.30) 0%, transparent 60%),
+    radial-gradient(circle at 50% 40%, rgba(250, 165, 0, 0.18) 0%, transparent 70%);
+  filter: blur(8px);
+  opacity: 0;
+  transition: opacity 0.6s var(--ease-out-soft);
+  pointer-events: none;
+  z-index: -1;
+}
+
+.mode-basic .thermostat.mining-glow {
+  box-shadow:
+    0 12px 44px rgba(250, 103, 0, 0.22),
+    0 0 64px rgba(250, 165, 0, 0.12),
+    0 0 0 1px rgba(250, 165, 0, 0.18),
+    inset 0 1px 2px rgba(255, 220, 180, 0.10),
+    inset 0 -8px 18px rgba(0, 0, 0, 0.4);
+  animation: thermostatGlow 3.6s ease-in-out infinite;
+}
+
+.mode-basic .thermostat.mining-glow::before {
+  opacity: 1;
+  animation: thermostatEmberHalo 4.2s ease-in-out infinite;
+}
+
+@keyframes thermostatGlow {
+  0%, 100% {
+    box-shadow:
+      0 12px 44px rgba(250, 103, 0, 0.22),
+      0 0 64px rgba(250, 165, 0, 0.12),
+      0 0 0 1px rgba(250, 165, 0, 0.18),
+      inset 0 1px 2px rgba(255, 220, 180, 0.10),
+      inset 0 -8px 18px rgba(0, 0, 0, 0.4);
+  }
+  50% {
+    box-shadow:
+      0 14px 52px rgba(250, 103, 0, 0.32),
+      0 0 84px rgba(250, 165, 0, 0.18),
+      0 0 0 1px rgba(250, 165, 0, 0.26),
+      inset 0 1px 2px rgba(255, 220, 180, 0.12),
+      inset 0 -8px 18px rgba(0, 0, 0, 0.4);
+  }
+}
+
+@keyframes thermostatEmberHalo {
+  0%, 100% { opacity: 0.85; transform: scale(1); }
+  50%      { opacity: 1;    transform: scale(1.04); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mode-basic .thermostat.mining-glow,
+  .mode-basic .thermostat.mining-glow::before {
+    animation: none;
+  }
+}
+
+.mode-basic .thermostat-ring {
+  position: absolute;
+  top: 0;
+  left: 0;
+  /* The SVG is 340px, but the arc's blurred glow (#hdialArcGlow) + drop-shadow
+     extend past that box. A non-root <svg> defaults to overflow:hidden, which
+     hard-clips the bloom into a visible square edge (the "invisible border"
+     around the glow). Let the glow paint freely instead. */
+  overflow: visible;
+}
+
+.mode-basic .thermostat-ring .heat-ring-fill {
+  transition: stroke-dasharray 0.8s var(--ease-out-soft);
+}
+
+.mode-basic .thermostat-inner {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.mode-basic .thermostat .temp-value {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 3.5rem;
+  color: var(--text);
+  line-height: 1;
+}
+
+.mode-basic .thermostat .temp-unit {
+  font-size: 1.5rem;
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.mode-basic .thermostat .temp-label {
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+
+.mode-basic .thermostat .temp-label.temp-secondary {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  opacity: 0.8;
+}
+
+.mode-basic .thermostat .btu-center-value {
+  font-size: 2.8rem;
+  color: var(--accent);
+  line-height: 1;
+}
+
+.mode-basic .thermostat .btu-center-unit {
+  font-size: 1rem;
+  color: var(--text-secondary);
+  font-weight: 600;
+  margin-left: 0;
+}
+
+/* ─── Sats Counter ───────────────────────────────────────── */
+/* ( P1 net-lean: deleted dead '.thermostat-preset-label',
+   '.sats-counter*' 8-rule block, and the unused '.heating-value-breakdown'
+   /'.heating-value-divider' — 0 component references; SatsCounter renders
+   via '.sats-ticker-card', HeatingValueSummary via '.hv-*'.) */
+
+.mode-basic .sats-counter {
+  text-align: center;
+  padding: 16px 20px 8px;
+}
+
+/* ─── Heating Value Summary ──────────────────────────────── */
+
+.mode-basic .heating-value-summary {
+  text-align: center;
+  padding: 8px 20px 16px;
+}
+
+.mode-basic .heating-value-amount {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 1.8rem;
+  color: var(--green);
+}
+
+.mode-basic .heating-value-label {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-top: 2px;
+  cursor: help;
+}
+
+/* ─── Power Presets ──────────────────────────────────────── */
+
+.mode-basic .presets-section {
+  padding: 16px 20px;
+}
+
+.mode-basic .presets-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+/* Canonical breakpoint ladder ( D-17): xs 360/359.98 · sm 480/479.98 ·
+   md 768/767.98 · lg 1024/1023.98 · xl 1280/1279.98. Old 640px snapped UP to
+   the md tier (767.98) so the stacked header degrades gracefully. */
+@media (max-width: 767.98px) {
+  .mode-basic .dashboard-header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  .mode-basic .basic-header-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+}
+
+.mode-basic .preset-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 16px 10px 14px;
+  min-height: 88px; /* generous touch target — primary mobile interaction */
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background:
+    linear-gradient(180deg, rgba(255, 220, 180, 0.03), transparent),
+    var(--card-bg);
+  text-align: center;
+  transition: all 0.2s var(--ease-standard);
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+  position: relative;
+  overflow: hidden;
+  box-shadow: var(--card-shadow);
+}
+
+/* Color-coded top accent bar — quiet (blue) / balanced (orange) / max (red).
+ * Mapped via data-preset-tone attribute set in PowerPresets.tsx. */
+.mode-basic .preset-btn::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 3px;
+  background: var(--preset-tone, var(--accent));
+  opacity: 0.55;
+  transition: opacity 0.2s var(--ease-standard), height 0.2s var(--ease-standard);
+}
+
+.mode-basic .preset-btn[data-preset-tone='eco']      { --preset-tone: #22C55E; }
+.mode-basic .preset-btn[data-preset-tone='quiet']    { --preset-tone: #3B82F6; }
+.mode-basic .preset-btn[data-preset-tone='balanced'] { --preset-tone: #FAA500; }
+.mode-basic .preset-btn[data-preset-tone='max']      { --preset-tone: #FA6700; }
+.mode-basic .preset-btn[data-preset-tone='silent']   { --preset-tone: #3B82F6; }
+
+.mode-basic .preset-btn:active {
+  transform: scale(0.97);
+}
+
+.mode-basic .preset-btn.disabled {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.mode-basic .preset-btn-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.mode-basic .preset-btn .preset-name {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.mode-basic .preset-btn .watts {
+  display: block;
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1.1rem;
+  color: var(--text);
+}
+
+.mode-basic .preset-btn .preset-specs {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 0.6rem;
+  color: var(--text-dim);
+  line-height: 1.3;
+}
+
+.mode-basic .preset-btn.active {
+  border-color: var(--accent);
+  background:
+    radial-gradient(ellipse at 50% 0%, rgba(250, 165, 0, 0.12), transparent 70%),
+    var(--accent-glow);
+  color: var(--accent);
+  box-shadow:
+    0 0 20px rgba(250, 165, 0, 0.18),
+    0 6px 18px rgba(0, 0, 0, 0.35),
+    0 0 0 1px rgba(250, 165, 0, 0.18) inset;
+}
+
+.mode-basic .preset-btn.active::before {
+  opacity: 1;
+  height: 4px;
+}
+
+.mode-basic .preset-btn.active .watts {
+  color: var(--accent);
+}
+
+.mode-basic .preset-btn.active .preset-name {
+  color: var(--accent);
+}
+
+.mode-basic .preset-btn .preset-btu {
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.mode-basic .preset-btn .preset-noise {
+  color: var(--text-dim);
+}
+
+.mode-basic .preset-btn.active .preset-btu {
+  color: var(--accent);
+}
+
+/* Smooth preset transition */
+.mode-basic .preset-btn {
+  transition: all 0.25s var(--ease-standard);
+}
+
+/* ─── BTU Hero Card ─────────────────────────────────────── */
+
+.mode-basic .heater-status-section {
+  padding: 0 20px;
+}
+
+.mode-basic .btu-hero-card {
+  padding: 26px 22px 22px;
+  text-align: center;
+  position: relative;
+  overflow: hidden;
+  margin-bottom: 12px;
+  background:
+    radial-gradient(ellipse at 50% 0%, rgba(250, 103, 0, 0.10), transparent 60%),
+    linear-gradient(180deg, var(--card-bg) 0%, var(--bg-subtle) 100%);
+  border-radius: var(--radius);
+  box-shadow: var(--card-shadow);
+  border: 1px solid rgba(250, 165, 0, 0.22);
+  transition: box-shadow 0.4s var(--ease-out-soft), border-color 0.4s var(--ease-out-soft), transform 0.18s var(--ease-standard);
+}
+
+.mode-basic .btu-hero-card::after {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  border-radius: var(--radius);
+  pointer-events: none;
+  background: radial-gradient(circle at 50% 110%, rgba(250, 103, 0, 0.15), transparent 50%);
+  opacity: 0.6;
+  z-index: 0;
+}
+
+.mode-basic .btu-hero-card > * {
+  position: relative;
+  z-index: 1;
+}
+
+@media (hover: hover) {
+  .mode-basic .btu-hero-card:hover {
+    border-color: rgba(250, 165, 0, 0.36);
+    box-shadow:
+      0 12px 36px rgba(0, 0, 0, 0.46),
+      0 4px 14px rgba(250, 103, 0, 0.10),
+      0 0 0 1px rgba(255, 220, 180, 0.05) inset;
+  }
+}
+
+.mode-basic .btu-hero-header {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.mode-basic .btu-hero-label {
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.mode-basic .btu-power-source {
+  font-size: 0.6rem;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(250, 165, 0, 0.12);
+  color: var(--accent);
+  text-transform: uppercase;
+}
+
+.mode-basic .btu-hero-value {
+  font-family: var(--font-heading);
+  font-weight: 900;
+  font-size: 4.5rem;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum';
+  /* Firelight gradient — warm yellow (--warm) at top, deep orange (--accent-deep) at bottom */
+  background: linear-gradient(180deg, var(--warm, #FFD27A) 0%, var(--accent, #FAA500) 45%, var(--accent-deep, #FA6700) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: var(--accent);
+  text-shadow: 0 0 24px rgba(250, 103, 0, 0.18);
+}
+
+/* Tabular figures for every Basic-mode numeric readout */
+.mode-basic .status-card .value,
+.mode-basic .thermostat .temp-value,
+.mode-basic .thermostat .btu-center-value,
+.mode-basic .preset-btn .watts,
+.mode-basic .preset-btn .preset-btu,
+.mode-basic .history-summary-value,
+.mode-basic .history-bar-value {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum';
+}
+
+/* D-16 RECONCILED ( P1): the universal Basic-mode :focus-visible copies
+   (preset-btn / history-period-btn / summary-link-button / toggle-switch /
+   temp-unit-toggle / night-mode-pill) are removed — they are all <button>
+   elements, so the single canonical ring in design-system.css §F1-FOCUS
+   (accent outline + 4px soft halo + 14px ambient glow + radius) now covers
+   them with a strictly RICHER ring than these stripped copies provided.
+   Only intentional per-element overrides (the inset bottom-nav ring below)
+   are kept, and that one is enriched to the canonical visual. */
+
+/* ConnectionBanner icon: pulse stroke with currentColor when offline */
+.mode-basic .connection-banner-icon {
+  color: currentColor;
+  flex-shrink: 0;
+}
+
+.mode-basic .btu-hero-unit {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1.4rem;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+.mode-basic .btu-hero-comparison {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  font-style: italic;
+  margin-top: 8px;
+}
+
+.mode-basic .btu-hero-watts {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  font-weight: 600;
+  margin-top: 6px;
+}
+
+/* Flame icon container — actual animation now provided by .ds-flame-flicker
+   utility from design-system.css. Keeping the wrapper class for selector
+   targeting but no longer redeclaring the keyframes here. */
+.mode-basic .flame-icon-animated {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ─── Status Cards ───────────────────────────────────────── */
+
+.mode-basic .status-cards {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+  padding: 0;
+}
+
+.mode-basic .status-card {
+  padding: 14px 12px;
+  text-align: center;
+  position: relative;
+  overflow: hidden;
+  background: var(--card-bg);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--card-shadow);
+}
+
+/* Colored top borders */
+.mode-basic .status-card.border-orange { border-top: 3px solid var(--accent); }
+.mode-basic .status-card.border-red { border-top: 3px solid #EF4444; }
+.mode-basic .status-card.border-blue { border-top: 3px solid #3B82F6; }
+.mode-basic .status-card.border-amber { border-top: 3px solid var(--accent-light, #FFC94D); }
+.mode-basic .status-card.border-green { border-top: 3px solid #22C55E; }
+
+.mode-basic .status-card .value {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1.5rem;
+  color: var(--text);
+}
+
+.mode-basic .status-card .value.sats-value {
+  color: var(--warm);
+}
+
+.mode-basic .status-card .value.net-positive {
+  color: #22C55E;
+}
+
+.mode-basic .status-card .value.net-negative {
+  color: #EF4444;
+}
+
+.mode-basic .status-card .unit {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
+.mode-basic .status-card .label {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  margin-top: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.mode-basic .status-card .card-comparison {
+  font-size: 0.6rem;
+  color: var(--text-dim);
+  margin-top: 4px;
+  font-style: italic;
+  line-height: 1.3;
+}
+
+/* ─── Power Toggle ───────────────────────────────────────── */
+/* ( P1 net-lean: deleted dead '.power-toggle' — 0 refs.) */
+
+.mode-basic .toggle-switch {
+  position: relative;
+  width: 80px;
+  height: 44px;
+  border-radius: 22px;
+  background: var(--border);
+  cursor: pointer;
+  transition: background 0.3s var(--ease-standard);
+}
+
+.mode-basic .toggle-switch.on {
+  background: var(--accent);
+}
+
+.mode-basic .toggle-switch .thumb {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--text);
+  box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+  transition: transform 0.3s var(--ease-standard);
+}
+
+.mode-basic .toggle-switch.on .thumb {
+  transform: translateX(36px);
+}
+
+/* .toggle-switch / .temp-unit-toggle :focus-visible copies removed (D-16) —
+   both are <button>, covered by the canonical §F1-FOCUS ring. */
+
+/* ─── Night Mode Card (in Settings) ──────────────────────── */
+
+.mode-basic .night-mode-card {
+  margin: 0 0 20px;
+  padding: 20px;
+  background: var(--card-bg);
+  border-radius: var(--radius);
+  box-shadow: var(--card-shadow);
+}
+
+/* ─── Night Mode Pill ────────────────────────────────────── */
+
+.mode-basic .night-mode-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 20px;
+  background: rgba(99, 102, 241, 0.1);
+  color: #6366F1;
+  font-size: 0.7rem;
+  font-weight: 600;
+  border: 1px solid rgba(99, 102, 241, 0.2);
+  cursor: pointer;
+  transition: background 0.2s var(--ease-standard);
+}
+
+.mode-basic .night-mode-pill:hover {
+  background: rgba(99, 102, 241, 0.15);
+}
+
+/* .night-mode-pill / .summary-link-button :focus-visible copies removed
+   (D-16) — both are <button>, covered by the canonical §F1-FOCUS ring. */
+
+/* ─── Heater home page layout ────────────────────────────── */
+/* Single-column, mobile-first. Centered hero, max-width contains the warm
+   experience on tablets/desktops. Children stack with breathing room.    */
+
+.mode-basic .heater-home-page,
+.mode-basic .heater-history-page,
+.mode-basic .heater-settings-page {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  max-width: 480px;
+  margin: 0 auto;
+  padding: 4px 0 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mode-basic .heater-home-next-steps {
+  padding: 0 20px 12px;
+}
+
+/* Hero stack — thermostat dial centered, BTU readout under it.
+   Mirrors HeaterMode.jsx "warm, centered, glowing" gestalt.             */
+.mode-basic .heater-page-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  padding: 8px 0 4px;
+  position: relative;
+}
+
+/* Soft warm halo behind the hero stack (mining only). Pure decoration,
+   pointer-events disabled. Sits below content via z-index.              */
+.mode-basic .heater-page-hero::before {
+  content: '';
+  position: absolute;
+  inset: -24px 0 auto 0;
+  height: 320px;
+  background: radial-gradient(
+    ellipse 70% 60% at 50% 30%,
+    rgba(250, 103, 0, 0.10) 0%,
+    rgba(250, 165, 0, 0.04) 45%,
+    transparent 70%
+  );
+  pointer-events: none;
+  z-index: -1;
+}
+
+.mode-basic .heater-hero-note,
+.mode-basic .heater-transition-note {
+  text-align: center;
+  padding: 0 24px;
+  font-family: 'Inter', sans-serif;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  color: var(--text-secondary);
+}
+
+.mode-basic .heater-transition-note.is-starting {
+  color: var(--accent);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.mode-basic .heater-transition-note.is-stopping {
+  color: var(--text-secondary);
+}
+
+.mode-basic .heater-state-line {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 4px 20px 12px;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.mode-basic .heater-state-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  background: var(--text-dim);
+  box-shadow: 0 0 8px currentColor;
+}
+
+/* Heating → warm green pulse dot (replaces the inline background style) */
+.mode-basic .heater-state-line.is-heating .heater-state-dot {
+  background: var(--green);
+}
+
+/* Power presets section — sits beneath the hero in the single column.   */
+.mode-basic .heater-home-presets {
+  padding: 4px 0 8px;
+}
+
+.mode-basic .heater-home-sats {
+  padding: 0 0 4px;
+}
+
+/* Hover lift on preset cards — adds a polished, tactile feel.           */
+.mode-basic .preset-btn {
+  transform: translateY(0);
+  transition:
+    transform 0.18s var(--ease-standard),
+    box-shadow 0.18s var(--ease-standard),
+    border-color 0.18s var(--ease-standard),
+    background 0.25s var(--ease-standard);
+}
+
+@media (hover: hover) {
+  .mode-basic .preset-btn:hover:not(.disabled):not(.active) {
+    transform: translateY(-2px);
+    border-color: var(--accent-border);
+    box-shadow: 0 8px 22px rgba(0, 0, 0, 0.35), var(--glow-orange);
+  }
+}
+
+/* Bottom-nav spacer — height tracks the fixed nav so content never hides. */
+.mode-basic .heater-bottom-spacer {
+  height: 84px;
+}
+
+@media (max-width: 479.98px) {
+  .mode-basic .heater-bottom-spacer { height: 92px; }
+}
+
+/* ─── Bottom Navigation ──────────────────────────────────── */
+/* Apple-esque: tall touch targets, soft top divider, active-tab orange
+   dot above the icon, scale press feedback. Touch height is set in the
+   design-system polish layer (min 60-64px); we just refine the look.   */
+
+.mode-basic .bottom-nav {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: stretch;
+  justify-content: space-around;
+  background:
+    linear-gradient(180deg, rgba(42, 34, 24, 0.92), rgba(26, 20, 16, 0.96));
+  backdrop-filter: blur(var(--blur-md)) saturate(140%);
+  -webkit-backdrop-filter: blur(var(--blur-md)) saturate(140%);
+  border-top: 1px solid var(--border);
+  z-index: 100;
+  padding: 4px 0 calc(env(safe-area-inset-bottom, 0px) + 4px);
+  box-shadow:
+    0 -8px 24px rgba(0, 0, 0, 0.42),
+    0 -1px 0 rgba(255, 220, 180, 0.06) inset;
+}
+
+/* Top firelight hairline above bottom nav — Apple-esque premium feel */
+.mode-basic .bottom-nav::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 8%;
+  right: 8%;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(250, 165, 0, 0.32) 50%,
+    transparent
+  );
+  pointer-events: none;
+}
+
+.mode-basic .bottom-nav-tab {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 10px 0 8px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-dim);
+  min-height: 56px; /* iOS HIG min, well above 44 px floor */
+  position: relative;
+  transition: color 0.18s var(--ease-standard), transform 0.12s var(--ease-standard);
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* D-16: INTENTIONAL per-element override kept — the bottom nav is
+   position:fixed, so the ring must be INSET (-4px) or it is clipped by the
+   viewport edge. Reconciled to the canonical visual: same accent colour +
+   soft halo + ambient glow as §F1-FOCUS, just inset instead of outset. */
+.mode-basic .bottom-nav-tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -4px;
+  box-shadow:
+    inset 0 0 0 4px var(--focus-ring-soft, rgba(250, 165, 0, 0.28)),
+    0 0 14px var(--accent-glow-hi, rgba(250, 165, 0, 0.35));
+  border-radius: 8px;
+}
+
+.mode-basic .bottom-nav-tab.active {
+  color: var(--accent);
+}
+
+.mode-basic .bottom-nav-tab:active {
+  transform: scale(0.97);
+}
+
+/* Orange dot indicator above the icon when active */
+.mode-basic .bottom-nav-indicator {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: transparent;
+  margin-bottom: 2px;
+  transition: background 0.18s var(--ease-standard), box-shadow 0.18s var(--ease-standard), transform 0.18s var(--ease-standard);
+  transform: scale(0.6);
+}
+
+.mode-basic .bottom-nav-tab.active .bottom-nav-indicator {
+  background: var(--accent);
+  box-shadow: 0 0 8px rgba(250, 165, 0, 0.7), 0 0 16px rgba(250, 103, 0, 0.45);
+  transform: scale(1);
+}
+
+.mode-basic .bottom-nav-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+}
+
+.mode-basic .bottom-nav-label {
+  font-size: 0.66rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+/* ─── History View ───────────────────────────────────────── */
+
+.mode-basic .history-view {
+  padding: 20px;
+}
+
+.mode-basic .history-title {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1.4rem;
+  margin: 0 0 16px;
+  color: var(--text);
+}
+
+.mode-basic .history-period-selector {
+  display: flex;
+  gap: 4px;
+  background: var(--bg-subtle);
+  border-radius: var(--radius-sm);
+  padding: 4px;
+  margin-bottom: 16px;
+}
+
+.mode-basic .history-period-btn {
+  flex: 1;
+  padding: 8px 16px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.2s var(--ease-standard);
+}
+
+.mode-basic .history-period-btn.active {
+  background: var(--card-bg);
+  color: var(--accent);
+  box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+}
+
+.mode-basic .history-summary-cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-bottom: 20px;
+}
+
+.mode-basic .history-summary-card {
+  background: var(--card-bg);
+  border-radius: var(--radius-sm);
+  padding: 12px 8px;
+  text-align: center;
+  box-shadow: var(--card-shadow);
+}
+
+.mode-basic .history-summary-card.accent {
+  background: var(--accent-glow);
+  border: 1px solid rgba(250, 165, 0, 0.2);
+}
+
+.mode-basic .history-summary-value {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1.2rem;
+  color: var(--text);
+}
+
+.mode-basic .history-summary-card.accent .history-summary-value {
+  color: var(--accent);
+}
+
+.mode-basic .history-summary-label {
+  font-size: 0.65rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin-top: 2px;
+}
+
+.mode-basic .history-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  height: 200px;
+  padding: 16px 0;
+}
+
+.mode-basic .history-bar-wrapper {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  height: 100%;
+  min-width: 0;
+}
+
+.mode-basic .history-bar-value {
+  font-size: 0.6rem;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+  white-space: nowrap;
+}
+
+.mode-basic .history-bar-track {
+  flex: 1;
+  width: 100%;
+  max-width: 40px;
+  background: var(--bg-subtle);
+  border-radius: 4px 4px 0 0;
+  display: flex;
+  align-items: flex-end;
+  overflow: hidden;
+}
+
+.mode-basic .history-bar-fill {
+  width: 100%;
+  background: linear-gradient(to top, var(--accent), var(--warm));
+  border-radius: 4px 4px 0 0;
+  min-height: 4px;
+  transition: height 0.4s var(--ease-out-soft);
+}
+
+.mode-basic .history-bar-label {
+  font-size: 0.6rem;
+  color: var(--text-dim);
+  margin-top: 4px;
+  white-space: nowrap;
+}
+
+.mode-basic .history-loading,
+.mode-basic .history-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 48px 16px;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  text-align: center;
+}
+
+.mode-basic .history-empty-icon {
+  opacity: 0.5;
+}
+
+/* ─── SessionActivity (HistoryView fallback) ─────────────── */
+
+.mode-basic .history-profitability-link-wrap {
+  text-align: center;
+  margin-bottom: 16px;
+}
+
+.mode-basic .history-profitability-link {
+  background: none;
+  border: none;
+  color: var(--warm, #FAA500);
+  font-size: 0.82rem;
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.mode-basic .history-empty-hint {
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+
+.mode-basic .session-activity-wrapper {
+  padding: 16px 0;
+}
+
+.mode-basic .session-activity-title {
+  text-align: center;
+  margin-bottom: 16px;
+  font-weight: 700;
+  font-size: 1rem;
+}
+
+.mode-basic .session-sparkline {
+  height: 80px;
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  padding: 0 8px;
+  margin-bottom: 16px;
+}
+
+.mode-basic .session-sparkline-bar {
+  flex: 1;
+  /* decorative fire-intensity gradient — scoped local custom prop (PR-075) */
+  --history-spark-grad: linear-gradient(to top, #f59e0b, #ff6e00);
+  background: var(--history-spark-grad);
+  border-radius: 3px 3px 0 0;
+  transition: height 0.3s var(--ease-out-soft);
+}
+
+.mode-basic .session-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+  padding: 0 8px;
+}
+
+.mode-basic .session-stat-cell {
+  text-align: center;
+  padding: 12px;
+  background: rgba(0, 0, 0, 0.04);
+  border-radius: 12px;
+}
+
+.mode-basic .session-stat-value {
+  font-size: 1.4rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.mode-basic .session-stat-value--accent {
+  color: var(--accent, #FAA500);
+}
+
+.mode-basic .session-stat-value--green {
+  color: var(--green, #22C55E);
+}
+
+.mode-basic .session-stat-label {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+}
+
+/* ─── Settings View ──────────────────────────────────────── */
+
+.mode-basic .settings-view {
+  padding: 20px;
+}
+
+.mode-basic .settings-title {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1.4rem;
+  margin: 0 0 20px;
+  color: var(--text);
+}
+
+.mode-basic .settings-section {
+  margin-bottom: 20px;
+}
+
+.mode-basic .settings-label {
+  display: block;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+
+.mode-basic .settings-hint {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+}
+
+.mode-basic .settings-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.mode-basic .settings-input {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-subtle);
+  font-size: 0.9rem;
+  color: var(--text);
+  outline: none;
+  transition: border-color 0.2s var(--ease-standard);
+  box-sizing: border-box;
+}
+
+.mode-basic .settings-input:focus {
+  border-color: var(--accent);
+}
+
+.mode-basic .settings-input-group {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  position: relative;
+}
+
+.mode-basic .settings-input-prefix {
+  position: absolute;
+  left: 12px;
+  font-size: 0.9rem;
+  color: var(--text-dim);
+  pointer-events: none;
+}
+
+.mode-basic .settings-input-suffix {
+  position: absolute;
+  right: 12px;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  pointer-events: none;
+}
+
+.mode-basic .settings-input.with-prefix {
+  padding-left: 24px;
+}
+
+.mode-basic .settings-input.with-suffix {
+  padding-right: 36px;
+}
+
+.mode-basic .settings-input-group .settings-input {
+  flex: 1;
+}
+
+.mode-basic .temp-unit-toggle {
+  display: flex;
+  background: var(--bg-subtle);
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.mode-basic .temp-unit-toggle span {
+  padding: 6px 14px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-dim);
+  transition: all 0.2s var(--ease-standard);
+}
+
+.mode-basic .temp-unit-toggle span.active {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+.mode-basic .settings-save-btn {
+  width: 100%;
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  border: none;
+  /*  ZONE-E: flat accent → canonical accent gradient + dark ink (matches
+     the Standard/Hacker primary grammar + the cross-zone --accent-ink contract;
+     dark ink reads cleanly on the orange gradient). */
+  background: var(--accent-gradient, var(--accent));
+  color: var(--accent-ink, #1a0f00);
+  font-weight: 600;
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition: opacity 0.2s var(--ease-standard),
+              box-shadow 0.2s var(--ease-standard),
+              transform 0.12s var(--ease-standard);
+}
+
+.mode-basic .settings-save-btn:not(.settings-save-btn--ghost):hover {
+  box-shadow: 0 4px 18px var(--accent-glow, rgba(250, 165, 0, 0.28));
+  transform: translateY(-1px);
+}
+
+.mode-basic .settings-save-btn:active {
+  opacity: 0.8;
+  transform: translateY(0);
+}
+
+.mode-basic .settings-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 24px 0;
+}
+
+.mode-basic .settings-info-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mode-basic .settings-info-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.85rem;
+  padding: 8px 12px;
+  background: var(--bg-subtle);
+  border-radius: 8px;
+}
+
+.mode-basic .settings-info-row span:first-child {
+  color: var(--text-secondary);
+}
+
+.mode-basic .settings-info-row span:last-child {
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* ( P1 net-lean: deleted dead '.settings-mining-mode-btn' — 0 refs;
+   the Settings mode-action buttons use '.settings-save-btn[--ghost]'.) */
+
+/* ─── Responsive ─────────────────────────────────────────── */
+
+@media (min-width: 480px) {
+  .mode-basic .status-cards {
+    grid-template-columns: repeat(4, 1fr);
+  }
+  .mode-basic .btu-hero-value {
+    font-size: 5.5rem;
+  }
+  .mode-basic .thermostat {
+    width: 280px;
+    height: 280px;
+  }
+  .mode-basic .thermostat .temp-value {
+    font-size: 4rem;
+  }
+  .mode-basic .thermostat .btu-center-value {
+    font-size: 3.2rem;
+  }
+  .mode-basic .thermostat-ring {
+    width: 280px !important;
+    height: 280px !important;
+  }
+  .mode-basic .presets-grid {
+    grid-template-columns: repeat(6, 1fr);
+  }
+  .mode-basic .history-summary-cards {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
+@media (max-width: 359.98px) {
+  .mode-basic .presets-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .mode-basic .history-summary-cards {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ─── Round 6 polish: Basic-mode page transition wrapper ───
+ * The generic '.page-transition-fadein' keyframes live in canonical.css.
+ * Basic mode wraps each per-page block (heater-home / heater-history /
+ * heater-settings) in this class with a 'key' matching 'currentPage',
+ * so navigating between pages re-mounts and re-fires the animation.
+ */
+.mode-basic .page-transition-fadein {
+  /* Inherits keyframes + duration from canonical.css */
+}
+
+
+/* ─── Density pass (audit 2026-05-14) — Basic mode should stay roomy.
+   Only marginal tightening to align the rhythm with the section grid. */
+.mode-basic .setting-row { padding: 16px 0; }
+
+/* ─── -05-15 deep-redesign additions ──────────────────────────── */
+
+/* Premium summary-link button polish (used by SatsCounter wrapper). */
+.mode-basic .summary-link-button {
+  transition:
+    background 0.25s var(--ease-standard),
+    box-shadow 0.25s var(--ease-standard),
+    transform 0.12s var(--ease-standard);
+  -webkit-tap-highlight-color: transparent;
+}
+
+@media (hover: hover) {
+  .mode-basic .summary-link-button:hover {
+    background: rgba(250, 165, 0, 0.06) !important;
+    box-shadow: 0 0 0 1px rgba(250, 165, 0, 0.18);
+  }
+}
+
+.mode-basic .summary-link-button:active {
+  transform: scale(0.98);
+}
+
+/* Sats ticker card — premium warm container around the live count-up.
+ * Cypress-safe (no test ids added) and degrades cleanly to a plain box
+ * if the design-system layer ever strips the warm tokens. */
+.mode-basic .sats-ticker-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 14px 20px;
+  margin: 0 16px;
+  border-radius: var(--radius);
+  background:
+    radial-gradient(ellipse at 50% 0%, rgba(255, 201, 77, 0.08), transparent 70%),
+    var(--card-bg);
+  border: 1px solid rgba(250, 165, 0, 0.16);
+  box-shadow: var(--card-shadow);
+  transition: border-color 0.3s var(--ease-standard), box-shadow 0.3s var(--ease-standard);
+}
+
+.mode-basic .sats-ticker-card.is-mining {
+  border-color: rgba(250, 165, 0, 0.32);
+  box-shadow:
+    0 6px 20px rgba(0, 0, 0, 0.36),
+    0 0 24px rgba(250, 165, 0, 0.08);
+}
+
+.mode-basic .sats-ticker-card .sats-ticker-line {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 1.4rem;
+  color: var(--accent, #FAA500);
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum';
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.mode-basic .sats-ticker-card .sats-ticker-label {
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  letter-spacing: 0.02em;
+}
+
+.mode-basic .sats-ticker-card .sats-ticker-usd {
+  font-family: 'Inter', sans-serif;
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.mode-basic .sats-ticker-card .sats-ticker-arrow {
+  color: var(--text-dim);
+  font-size: 0.9rem;
+  margin-left: 4px;
+}
+
+/* CircuitWarning prominence — top-of-page banner with warm-red firelight
+ * tone. Load-bearing safety surface; do NOT soften beyond contrast a11y. */
+.mode-basic .circuit-warning-host {
+  padding: 0 16px 8px;
+}
+
+/* Night-mode card — warmer panel with subtle moon glow when active.
+ * The component uses its own '.night-mode-card' class. */
+.mode-basic .night-mode-card {
+  position: relative;
+  overflow: hidden;
+}
+
+.mode-basic .night-mode-card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at 90% 0%, rgba(99, 102, 241, 0.06), transparent 60%);
+  pointer-events: none;
+}
+
+.mode-basic .night-mode-card > * {
+  position: relative;
+}
+
+/* Status card warm-toned border refinement.
+ * Original border-orange used --accent flat. Add a soft inner top-glow. */
+.mode-basic .status-card {
+  transition:
+    transform 0.18s var(--ease-standard),
+    box-shadow 0.25s var(--ease-standard),
+    border-color 0.25s var(--ease-standard);
+  position: relative;
+}
+
+@media (hover: hover) {
+  .mode-basic .status-card:hover {
+    transform: translateY(-2px);
+    box-shadow:
+      0 10px 28px rgba(0, 0, 0, 0.46),
+      0 4px 12px rgba(250, 103, 0, 0.06);
+  }
+}
+
+/* Heater state line — emphasize the warm-tone preset name */
+.mode-basic .heater-state-line {
+  letter-spacing: 0.01em;
+}
+
+.mode-basic .heater-state-line .heater-state-dot {
+  filter: drop-shadow(0 0 6px currentColor);
+}
+
+/* CircuitWarning — make sure it sits cleanly above the hero in Basic. */
+.mode-basic .heater-home-page > [role="alert"],
+.mode-basic .heater-home-page .circuit-warning-host > [role="alert"] {
+  margin: 0 16px 12px;
+}
+
+/* ─── Agent F — warm-palette overrides for shared components () ───────
+ * CompanionCard and ModePillSwitch are mode-shared components. In Basic
+ * (Mining Heater) mode they should adopt the warm token surface so the
+ * heater aesthetic stays cohesive. Pure CSS overrides — no component
+ * prop or behavior change. The standard/hacker appearance is untouched.
+ *
+ * Tokens consumed: --bg-warm-card, --fg-warm-primary, --fg-warm-secondary,
+ * --border-warm (defined in tokens.css). Falls back gracefully if missing.
+ */
+
+/* CompanionCard heater variant — warm-palette opt-in.
+ * The base .companion-card surface uses var(--card-bg) (dark) with a
+ * radial accent glow. In Basic mode, swap the surface and border for warm
+ * tokens; keep the radial-gradient accent and ::before highlight intact so
+ * the mood-tone variants (mood-happy/mood-sad/mood-offline) still tint.
+ */
+.mode-basic .companion-card.companion-heater-card {
+  background:
+    radial-gradient(circle at 70% 12%, var(--companion-accent-glow), transparent 34%),
+    var(--bg-warm-card, #2A2218);
+  border-color: var(--border-warm, #3D3228);
+  color: var(--fg-warm-primary, #E8E0D6);
+}
+
+.mode-basic .companion-card.companion-heater-card .companion-eyebrow,
+.mode-basic .companion-card.companion-heater-card .companion-stage {
+  color: var(--fg-warm-secondary, #A09888);
+}
+
+.mode-basic .companion-card.companion-heater-card .companion-name {
+  color: var(--fg-warm-primary, #E8E0D6);
+}
+
+.mode-basic .companion-card.companion-heater-card .companion-stat span {
+  color: var(--fg-warm-secondary, #A09888);
+}
+
+.mode-basic .companion-card.companion-heater-card .companion-stat strong {
+  color: var(--fg-warm-primary, #E8E0D6);
+}
+
+/* ModePillSwitch — warm-palette in Basic mode.
+ * The base .mode-pill-switch in global.css uses a translucent white surface
+ * + cool text-secondary. In Basic we want a warm-card surface, warm-dim text
+ * for inactive pills, and the existing accent (D-Central Orange) for the
+ * active pill since accent already harmonizes with the warm palette.
+ */
+.mode-basic .mode-pill-switch {
+  background: var(--bg-warm-subtle, #221C16);
+  border-color: var(--border-warm, #3D3228);
+}
+
+.mode-basic .mode-pill-btn {
+  color: var(--fg-warm-secondary, #A09888);
+}
+
+.mode-basic .mode-pill-btn:hover:not(:disabled) {
+  color: var(--fg-warm-primary, #E8E0D6);
+  background: color-mix(in srgb, var(--fg-warm-primary, #E8E0D6) 6%, transparent);
+}
+
+.mode-basic .mode-pill-btn.active {
+  color: var(--accent, #FAA500);
+  background: var(--accent-glow, rgba(250, 165, 0, 0.16));
+  border-color: color-mix(in srgb, var(--accent, #FAA500) 30%, transparent);
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ *  P1 — Bitcoin-Heating mode deep polish (2026-05-17)
+ *
+ * Cozy hearth/ember warmth, reward-rich, zero-jargon, reassuring.
+ * Everything below replaces inline 'style=(())' blocks migrated out of the
+ * Basic/Heater components (D-28/D-29 inline-spacing tokenisation, banner
+ * de-duplication, NightMode/SettingsView/HeatingValueSummary class-ification)
+ * and adds the "are you earning?" reassurance panel + quiet-boot friendliness.
+ * Net-lean: this section's additions are offset by the removed inline blocks
+ * and the deleted redundant :focus-visible copies above.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/* ── Shared shell offset (D-28/D-29) ──────────────────────────────────────
+ * One canonical inset for chrome rows that sit flush against the heater
+ * page gutters (SafetyBadge, HonestModeCard, quiet-boot banner). Replaces
+ * the ad-hoc inline 'padding:'0 20px 12px'' / 'margin:'0 20px 12px''. */
+.mode-basic .ds-shell-offset {
+  padding: 0 16px 12px;
+}
+
+/* ── Quiet-boot expectation banner (R1 pain #3) ──────────────────────────
+ * Warm, friendly framing of the cut-hash-before-noise differentiator. The
+ * InfoBanner primitive owns the chrome; this only spaces it in the column. */
+.mode-basic .basic-quiet-boot-banner {
+  margin: 0;
+}
+
+/* ── Earning-proof reassurance panel (R1 pain #1 — killer feature) ────────
+ * The antidote to "is it actually working / earning?" anxiety. Big plain-
+ * language verdict, last-accepted-share heartbeat, friendly accept-rate. */
+.mode-basic .earning-proof {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  margin: 0 0 14px;
+  padding: 16px 18px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-glass);
+  background:
+    radial-gradient(ellipse at 0% 0%, rgba(255, 201, 77, 0.06), transparent 60%),
+    linear-gradient(180deg, var(--card-bg) 0%, var(--bg-subtle) 100%);
+  box-shadow: var(--card-shadow);
+  cursor: help;
+  transition: border-color 0.3s var(--ease-standard), box-shadow 0.3s var(--ease-standard), transform 0.18s var(--ease-standard);
+}
+
+@media (hover: hover) {
+  .mode-basic .earning-proof:hover {
+    transform: translateY(-2px);
+  }
+}
+
+.mode-basic .earning-proof--good {
+  border-color: rgba(34, 197, 94, 0.34);
+  box-shadow:
+    var(--card-shadow),
+    0 0 22px rgba(34, 197, 94, 0.08);
+}
+.mode-basic .earning-proof--warming {
+  border-color: rgba(250, 165, 0, 0.30);
+  box-shadow:
+    var(--card-shadow),
+    0 0 22px rgba(250, 165, 0, 0.08);
+}
+.mode-basic .earning-proof--idle {
+  border-color: var(--border);
+}
+
+.mode-basic .earning-proof__pulse {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 2px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.mode-basic .earning-proof__pulse-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--text-dim);
+}
+
+.mode-basic .earning-proof--good .earning-proof__pulse-dot {
+  background: var(--green);
+  box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.5);
+  animation: earningHeartbeat 2.4s ease-out infinite;
+}
+.mode-basic .earning-proof--warming .earning-proof__pulse-dot {
+  background: var(--accent);
+  box-shadow: 0 0 8px rgba(250, 165, 0, 0.6);
+  animation: earningHeartbeat 2.8s ease-out infinite;
+}
+
+@keyframes earningHeartbeat {
+  0%   { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.45); }
+  70%  { box-shadow: 0 0 0 12px rgba(34, 197, 94, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mode-basic .earning-proof__pulse-dot { animation: none !important; }
+}
+
+.mode-basic .earning-proof__body {
+  flex: 1;
+  min-width: 0;
+}
+
+.mode-basic .earning-proof__headline {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 1.15rem;
+  line-height: 1.2;
+  color: var(--text);
+}
+.mode-basic .earning-proof--good .earning-proof__headline { color: var(--green); }
+.mode-basic .earning-proof--warming .earning-proof__headline { color: var(--accent); }
+
+.mode-basic .earning-proof__detail {
+  margin-top: 3px;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+.mode-basic .earning-proof__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.mode-basic .earning-proof__rate,
+.mode-basic .earning-proof__rejects {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  border: 1px solid transparent;
+  cursor: help;
+}
+
+.mode-basic .earning-proof__rate--good {
+  color: var(--green);
+  background: rgba(34, 197, 94, 0.12);
+  border-color: rgba(34, 197, 94, 0.22);
+}
+.mode-basic .earning-proof__rate--warn {
+  color: var(--yellow);
+  background: rgba(245, 158, 11, 0.12);
+  border-color: rgba(245, 158, 11, 0.22);
+}
+.mode-basic .earning-proof__rate--bad {
+  color: var(--red);
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.22);
+}
+.mode-basic .earning-proof__rate--neutral {
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.04);
+  border-color: var(--border);
+}
+
+.mode-basic .earning-proof__rejects {
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.03);
+  border-color: var(--border);
+}
+
+.mode-basic .earning-proof__hint {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.68rem;
+  font-weight: 700;
+  font-style: italic;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  margin-top: 2px;
+}
+
+/* ── Thermostat start-hint (replaces inline style on the CTA copy) ──────── */
+.mode-basic .thermostat .thermostat-start-hint {
+  margin-top: 6px;
+  font-size: 0.78rem;
+  color: var(--accent);
+  cursor: help;
+}
+
+/* ── PowerPresets notes (replaces 3 inline-styled note divs) ───────────── */
+.mode-basic .presets-note {
+  text-align: center;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  margin-top: 6px;
+}
+.mode-basic .presets-note--italic {
+  font-style: italic;
+  font-size: 0.75rem;
+}
+.mode-basic .presets-quiet-note {
+  text-align: center;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  margin-top: 12px;
+  padding: 8px 14px;
+  border-radius: var(--radius-sm);
+  background: rgba(250, 165, 0, 0.05);
+  border: 1px solid rgba(250, 165, 0, 0.14);
+  line-height: 1.45;
+  cursor: help;
+}
+
+/* ── SettingsView class-ification (replaces inline style blocks) ───────── */
+.mode-basic .settings-microcopy {
+  margin-top: 6px;
+  font-family: 'Inter', sans-serif;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  line-height: 1.4;
+}
+.mode-basic .settings-inline-banner {
+  margin: 6px 0 0;
+}
+.mode-basic .settings-hint--tight { margin-bottom: 4px; }
+.mode-basic .settings-hint--block { margin-bottom: 4px; display: block; }
+.mode-basic .settings-hint--spaced { margin-bottom: 10px; }
+.mode-basic .settings-pool-block { margin-bottom: 12px; }
+.mode-basic .settings-pool-url {
+  padding: 8px 12px;
+  background: var(--bg-subtle);
+  border-radius: 8px;
+  font-family: 'Inter', sans-serif;
+  font-size: 0.82rem;
+  color: var(--text);
+  word-break: break-all;
+  border: 1px solid var(--border);
+}
+.mode-basic .settings-save-btn.is-dim { opacity: 0.6; }
+.mode-basic .settings-link-row {
+  text-align: center;
+  margin-top: 10px;
+}
+.mode-basic .settings-text-link {
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-family: 'Inter', sans-serif;
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  padding: 0;
+}
+.mode-basic .settings-mono {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+}
+.mode-basic .settings-mode-actions {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+.mode-basic .settings-save-btn--ghost {
+  background: var(--card-bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+@media (hover: hover) {
+  .mode-basic .settings-save-btn--ghost:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+}
+.mode-basic .settings-led-card {
+  background: var(--card-bg);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  padding: 16px;
+  margin-bottom: 16px;
+}
+.mode-basic .settings-bottom-spacer { height: 32px; }
+
+/* ── HeatingValueSummary breakdown (replaces inline style blocks) ──────── */
+.mode-basic .hv-breakdown {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-family: 'Inter', sans-serif;
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
+.mode-basic .hv-row {
+  display: flex;
+  justify-content: space-between;
+  color: var(--text-secondary);
+}
+.mode-basic .hv-amount { font-weight: 600; }
+.mode-basic .hv-amount--earn { color: var(--green); }
+.mode-basic .hv-amount--cost { color: var(--red); }
+.mode-basic .hv-amount--offset {
+  color: var(--text-dim);
+  text-decoration: line-through;
+}
+.mode-basic .hv-offset-note {
+  font-size: 0.7rem;
+  color: var(--green);
+  font-style: italic;
+  padding: 2px 0;
+}
+.mode-basic .hv-row--total {
+  border-top: 1px solid var(--border);
+  padding-top: 4px;
+  margin-top: 2px;
+  font-weight: 700;
+}
+.mode-basic .hv-row--total.is-positive { color: var(--green); }
+.mode-basic .hv-row--total.is-negative { color: var(--red); }
+.mode-basic .hv-mode-toggle {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  cursor: help;
+}
+.mode-basic .hv-switch {
+  background: var(--border);
+  border: none;
+  border-radius: 12px;
+  width: 36px;
+  height: 20px;
+  position: relative;
+  cursor: pointer;
+  transition: background 0.2s var(--ease-standard);
+  padding: 0;
+}
+.mode-basic .hv-switch.is-on { background: var(--accent); }
+.mode-basic .hv-switch__thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--text);
+  transition: left 0.2s var(--ease-standard);
+}
+.mode-basic .hv-switch.is-on .hv-switch__thumb { left: 18px; }
+.mode-basic .hv-mode-state { font-weight: 400; }
+.mode-basic .hv-mode-state.is-yes {
+  font-weight: 600;
+  color: var(--green);
+}
+
+/* ── NightMode card class-ification (replaces ~22 inline style blocks) ─── */
+.mode-basic .night-mode-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+.mode-basic .night-mode-title {
+  font-weight: 700;
+  font-size: 1rem;
+  cursor: help;
+}
+.mode-basic .night-mode-subtitle {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+.mode-basic .night-mode-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mode-basic .night-mode-active-pill {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(34, 197, 94, 0.15);
+  color: var(--green);
+  cursor: help;
+}
+.mode-basic .night-mode-toggle {
+  width: 52px;
+  height: 28px;
+  border: none;
+  padding: 0;
+}
+.mode-basic .night-mode-toggle .thumb {
+  width: 22px;
+  height: 22px;
+  top: 3px;
+  left: 3px;
+}
+.mode-basic .night-mode-toggle.on .thumb {
+  transform: translateX(24px);
+}
+.mode-basic .night-mode-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.mode-basic .night-mode-hours {
+  display: flex;
+  gap: 12px;
+}
+.mode-basic .night-mode-field { flex: 1; }
+.mode-basic .night-mode-field-label {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.mode-basic .night-mode-select {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-subtle);
+  font-size: 0.9rem;
+  color: var(--text);
+}
+.mode-basic .night-mode-slider-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+.mode-basic .night-mode-slider-head label {
+  font-weight: normal;
+  cursor: help;
+}
+.mode-basic .night-mode-slider-value {
+  font-weight: 600;
+  color: var(--text);
+}
+.mode-basic .night-mode-range {
+  width: 100%;
+  accent-color: var(--accent);
+}
+.mode-basic .night-mode-range-scale {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.65rem;
+  color: var(--text-dim);
+}
+.mode-basic .night-mode-save { margin-top: 0; }
+
+/* ── CircuitWarning — class-ified, UNSCOPED so it renders identically in
+ * Standard mode too (the component is shared with StandardDashboard; its
+ * prop/markup API is frozen — only the chrome moved off inline styles).
+ * Load-bearing safety surface: do NOT soften beyond a11y contrast. */
+.circuit-warning {
+  background: linear-gradient(180deg, rgba(239, 68, 68, 0.18) 0%, rgba(239, 68, 68, 0.08) 100%);
+  border: 1px solid rgba(239, 68, 68, 0.45);
+  border-left: 4px solid #EF4444;
+  border-radius: 12px;
+  padding: 14px 18px;
+  margin-bottom: 16px;
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+}
+.circuit-warning__icon {
+  flex-shrink: 0;
+  margin-top: 2px;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: rgba(239, 68, 68, 0.2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #FCA5A5;
+  font-size: 1.05rem;
+  font-weight: 700;
+  font-family: var(--font-heading);
+}
+.circuit-warning__content {
+  flex: 1;
+  min-width: 0;
+}
+.circuit-warning__title {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1rem;
+  color: #FCA5A5;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+}
+.circuit-warning__body {
+  font-family: 'Inter', sans-serif;
+  color: #FECACA;
+  font-size: 0.85rem;
+  line-height: 1.55;
+}
+.circuit-warning__action {
+  margin-top: 10px;
+  background: rgba(239, 68, 68, 0.18);
+  border: 1px solid rgba(239, 68, 68, 0.45);
+  border-radius: 8px;
+  padding: 8px 14px;
+  color: #FECACA;
+  font-family: var(--font-heading);
+  font-weight: 600;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: background 0.15s var(--ease-standard);
+}
+@media (hover: hover) {
+  .circuit-warning__action:hover {
+    background: rgba(239, 68, 68, 0.28);
+  }
+}
+
+/* ───  P1: EncryptedIndicator (ConnectionBanner) ──────────────────────
+   Pixel-equivalent migration of the prior inline style block to a class so
+   the Basic zone is inline-style-free and the indicator reads consistently
+   wherever a pool surface mounts it. Visual is a 1:1 port. */
+.encrypted-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.75rem;
+  color: var(--green, #4ade80);
+  opacity: 0.85;
+  margin-left: 8px;
+  vertical-align: middle;
+}
+.encrypted-indicator-glyph {
+  flex-shrink: 0;
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Heater redesign — design-handoff Wave 2
+   Left sidebar (replaces bottom-nav), BTC block ticker, input-temperature
+   source selector, and the 3-up big-readout row. Additive + scoped to
+   .mode-basic; the centered single-column hero (.heater-*-page max-width)
+   is preserved INSIDE .basic-main. <=768px the sidebar collapses to a
+   horizontal top strip (operator: "left like the other dashboards").
+   ═════════════════════════════════════════════════════════════════════════ */
+
+.mode-basic .basic-shell {
+  display: flex;
+  align-items: stretch;
+  min-height: 100vh;
+  position: relative;
+  z-index: 1;
+}
+.mode-basic .basic-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Left sidebar */
+.mode-basic .basic-sidebar {
+  flex: 0 0 240px;
+  width: 240px;
+  position: sticky;
+  top: 0;
+  align-self: flex-start;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 20px 14px;
+  background: var(--surface-glass-sidebar, rgba(20, 16, 12, 0.92));
+  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px);
+  border-right: 1px solid var(--border);
+  z-index: 50;
+}
+@supports not ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+  .mode-basic .basic-sidebar { background: #1d1712; }
+}
+.mode-basic .basic-sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 8px 14px;
+}
+.mode-basic .basic-sidebar-brand-text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.1;
+}
+.mode-basic .basic-sidebar-brand-name {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 1.15rem;
+  letter-spacing: 0.02em;
+  color: var(--accent);
+}
+.mode-basic .basic-sidebar-brand-tag {
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.mode-basic .basic-sidebar-eyebrow {
+  font-size: 0.6rem;
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 10px 10px 6px;
+}
+.mode-basic .basic-sidebar-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.mode-basic .basic-sidebar-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 11px 12px;
+  border: none;
+  background: transparent;
+  border-radius: var(--radius-sm, 10px);
+  color: var(--text-secondary);
+  font-family: 'Inter', sans-serif;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s, color 0.15s;
+}
+.mode-basic .basic-sidebar-item:hover {
+  background: rgba(255, 220, 180, 0.05);
+  color: var(--text);
+}
+.mode-basic .basic-sidebar-item.is-active {
+  background: var(--accent-glow);
+  color: var(--accent);
+}
+.mode-basic .basic-sidebar-bar {
+  position: absolute;
+  left: 0;
+  top: 7px;
+  bottom: 7px;
+  width: 3px;
+  border-radius: 0 2px 2px 0;
+  background: transparent;
+}
+.mode-basic .basic-sidebar-item.is-active .basic-sidebar-bar {
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent-glow-hi);
+}
+.mode-basic .basic-sidebar-icon {
+  display: inline-flex;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+}
+.mode-basic .basic-sidebar-spacer {
+  flex: 1 1 auto;
+  min-height: 16px;
+}
+.mode-basic .basic-sidebar-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 10px 4px;
+  border-top: 1px solid var(--border);
+}
+.mode-basic .basic-sidebar-foot-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+}
+.mode-basic .basic-sidebar-foot-mono {
+  font-family: var(--font-mono, monospace);
+  font-size: 0.66rem;
+  color: var(--text-dim);
+}
+.mode-basic .basic-sidebar-foot-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 8px var(--green);
+}
+
+/* BTC block ticker pill */
+.mode-basic .heater-block-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--accent-border);
+  background: var(--accent-glow);
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.mode-basic .heater-block-pill.is-unavailable {
+  border-color: var(--border);
+  background: var(--card-bg);
+}
+.mode-basic .heater-block-pill-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent);
+  animation: pulse 2.4s ease-in-out infinite;
+}
+.mode-basic .heater-block-pill-eyebrow {
+  font-size: 0.58rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.mode-basic .heater-block-pill-height {
+  font-family: var(--font-mono, monospace);
+  font-weight: 700;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+.mode-basic .heater-block-pill-age,
+.mode-basic .heater-block-pill-na {
+  font-family: var(--font-mono, monospace);
+  font-size: 0.68rem;
+  color: var(--text-dim);
+}
+
+/* Input-temperature source module */
+.mode-basic .heater-sensor {
+  margin: 4px auto 2px;
+  max-width: 360px;
+  width: 100%;
+  padding: 12px 16px;
+  border-radius: var(--radius, 16px);
+  border: 1px solid var(--border);
+  background: var(--card-bg);
+  box-shadow: var(--card-shadow);
+}
+.mode-basic .heater-sensor::before {
+  content: '';
+  display: block;
+  height: 1px;
+  margin: -12px -16px 12px;
+  background: linear-gradient(90deg, transparent, var(--accent-border), transparent);
+}
+.mode-basic .heater-sensor-head {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  margin-bottom: 10px;
+}
+.mode-basic .heater-sensor-eyebrow {
+  font-size: 0.6rem;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.mode-basic .heater-sensor-value {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 2rem;
+  line-height: 1;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.mode-basic .heater-sensor-value small {
+  font-size: 0.95rem;
+  color: var(--text-secondary);
+  margin-left: 2px;
+}
+.mode-basic .heater-sensor-value--na { color: var(--text-dim); }
+.mode-basic .heater-sensor-active {
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+}
+.mode-basic .heater-sensor-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: center;
+}
+.mode-basic .heater-sensor-tab {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
+  font-size: 0.76rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+.mode-basic .heater-sensor-tab:hover { border-color: var(--accent-border); }
+.mode-basic .heater-sensor-tab.is-active {
+  border-color: var(--accent);
+  background: var(--accent-glow);
+  color: var(--accent);
+}
+.mode-basic .heater-sensor-tab.is-unpaired {
+  opacity: 0.55;
+}
+.mode-basic .heater-sensor-tab small {
+  font-size: 0.56rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+/* Three big readouts (BTU/h, W, dB) */
+.mode-basic .heater-big-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  padding: 4px 0 6px;
+}
+.mode-basic .heater-big {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 12px 12px 11px;
+  border-radius: var(--radius, 16px);
+  border: 1px solid var(--border);
+  background: var(--card-bg);
+  box-shadow: var(--card-shadow);
+  transition: transform 0.18s var(--ease-standard), border-color 0.18s var(--ease-standard);
+}
+.mode-basic .heater-big::before {
+  content: '';
+  display: block;
+  height: 2px;
+  margin: -12px -12px 9px;
+  border-radius: var(--radius, 16px) var(--radius, 16px) 0 0;
+}
+.mode-basic .heater-big.tone-accent::before { background: var(--accent-gradient); }
+.mode-basic .heater-big.tone-primary::before { background: linear-gradient(90deg, transparent, var(--accent-border), transparent); }
+.mode-basic .heater-big.tone-green::before { background: linear-gradient(90deg, transparent, rgba(34,197,94,0.5), transparent); }
+@media (hover: hover) {
+  .mode-basic .heater-big:hover {
+    transform: translateY(-2px);
+    border-color: var(--accent-border);
+  }
+}
+.mode-basic .heater-big-eyebrow {
+  font-size: 0.6rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.mode-basic .heater-big-value {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 2.2rem;
+  line-height: 1;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.mode-basic .heater-big.tone-accent .heater-big-value { color: var(--accent); }
+.mode-basic .heater-big.tone-green .heater-big-value { color: var(--green); }
+.mode-basic .heater-big-value small {
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+.mode-basic .heater-big-foot {
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  line-height: 1.35;
+}
+
+/* Responsive: <=768px -> sidebar becomes a top strip */
+@media (max-width: 767.98px) {
+  .mode-basic .basic-shell { flex-direction: column; }
+  .mode-basic .basic-sidebar {
+    flex: 0 0 auto;
+    width: 100%;
+    height: auto;
+    position: sticky;
+    top: 0;
+    flex-direction: row;
+    align-items: center;
+    gap: 4px;
+    /* Safe-area top inset: this sticky strip is the real Heater mobile top bar
+       (the frozen responsive.css inset targets a .basic-topbar not rendered). */
+    padding: calc(8px + env(safe-area-inset-top, 0px)) 12px 8px;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+  .mode-basic .basic-sidebar-brand { padding: 2px 8px 2px 4px; }
+  .mode-basic .basic-sidebar-brand-tag { display: none; }
+  .mode-basic .basic-sidebar-eyebrow,
+  .mode-basic .basic-sidebar-foot { display: none; }
+  .mode-basic .basic-sidebar-nav {
+    flex-direction: row;
+    flex: 1 1 auto;
+    justify-content: flex-end;
+    gap: 2px;
+  }
+  /* Icon-only at this width — meet the 44px coarse-pointer tap floor
+     (.basic-sidebar-item is not in the responsive.css tap-target allowlist). */
+  .mode-basic .basic-sidebar-item { width: auto; min-width: 44px; min-height: 44px; padding: 8px 12px; }
+  .mode-basic .basic-sidebar-label { display: none; }
+  .mode-basic .basic-sidebar-bar { display: none; }
+  .mode-basic .basic-sidebar-item.is-active {
+    box-shadow: inset 0 -2px 0 var(--accent);
+  }
+  .mode-basic .basic-sidebar-spacer { display: none; }
+}
+@media (max-width: 479.98px) {
+  .mode-basic .heater-big-row { grid-template-columns: 1fr; }
+  .mode-basic .heater-big-value { font-size: 1.9rem; }
+}
+
+/*  — real room-temp feed for external sensor sources
+   (api.setRoomTemp / POST /api/home/room-temp). */
+.mode-basic .heater-sensor-feed {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.mode-basic .heater-sensor-feed-note {
+  margin: 0 0 8px;
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  line-height: 1.45;
+}
+.mode-basic .heater-sensor-feed-note code {
+  font-family: var(--font-mono, monospace);
+  font-size: 0.64rem;
+  color: var(--text-secondary);
+}
+.mode-basic .heater-sensor-feed-row {
+  display: flex;
+  gap: 8px;
+}
+.mode-basic .heater-sensor-feed-input {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono, monospace);
+}
+.mode-basic .heater-sensor-feed-btn {
+  flex: 0 0 auto;
+  padding: 0 16px;
+  border-radius: var(--radius-sm, 10px);
+  border: 1px solid var(--accent-border);
+  background: var(--accent-gradient);
+  color: #1a0d00;
+  font-weight: 700;
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: filter 0.15s;
+}
+.mode-basic .heater-sensor-feed-btn:hover:not(:disabled) { filter: brightness(1.06); }
+.mode-basic .heater-sensor-feed-btn:disabled { opacity: 0.45; cursor: not-allowed; }

@@ -1,0 +1,3 @@
+[toolchain]
+channel = "esp"
+components = ["rustfmt", "rustc-dev"]

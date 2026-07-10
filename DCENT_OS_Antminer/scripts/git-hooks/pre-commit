@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+#
+# DCENT_OS fast pre-commit verification gate.
+#
+# Runs source/static gates before a commit is created. This is intentionally
+# lighter than the pre-push `make verify` path: it catches banned source shapes
+# and orphaned safety tests early without doing Docker or full Cargo work.
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+DCENTOS_DIR="$REPO_ROOT/DCENT_OS_Antminer"
+ESP_DIR="$REPO_ROOT/DCENT_OS_ESP"
+STAGED_FILES="$(git diff --cached --name-only --diff-filter=ACMR || true)"
+GIT_LOCAL_ENV="$(git rev-parse --local-env-vars)"
+
+if [ ! -f "$DCENTOS_DIR/scripts/ci_offline_gates.sh" ]; then
+    echo "pre-commit: ERROR - DCENT_OS offline gate script missing." >&2
+    exit 1
+fi
+
+reject_staged_repo_hygiene_violations() {
+    if [ -z "$STAGED_FILES" ]; then
+        return 0
+    fi
+
+    bad_paths="$(
+        printf '%s\n' "$STAGED_FILES" \
+            | grep -E '^(tmp|node_modules|target)(/|$)|^[^/]*;C(/|$)' \
+            || true
+    )"
+
+    if [ -n "$bad_paths" ]; then
+        echo "pre-commit: ERROR - refusing to stage disposable root artifacts:" >&2
+        printf '%s\n' "$bad_paths" >&2
+        echo "pre-commit: root tmp/, node_modules/, target/, and *;C/ artifact dirs are not durable source." >&2
+        exit 1
+    fi
+}
+
+reject_staged_repo_hygiene_violations
+
+if [ "${DCENT_SKIP_VERIFY:-0}" = "1" ]; then
+    echo "pre-commit: DCENT_SKIP_VERIFY=1 - skipping fast DCENT_OS gates after staged-path hygiene." >&2
+    exit 0
+fi
+
+run_static_gates() {
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+        MINGW*|MSYS*|CYGWIN*)
+            if command -v wsl.exe >/dev/null 2>&1; then
+                if command -v cygpath >/dev/null 2>&1; then
+                    repo_win="$(cygpath -w "$REPO_ROOT")"
+                else
+                    repo_win="$REPO_ROOT"
+                fi
+                repo_wsl="$(MSYS_NO_PATHCONV=1 wsl.exe wslpath -a "$repo_win" | tr -d '\r')"
+                MSYS_NO_PATHCONV=1 wsl.exe -e bash -lc 'cd "$1" && bash DCENT_OS_Antminer/scripts/ci_offline_gates.sh --static-only' _ "$repo_wsl"
+                return
+            fi
+            ;;
+    esac
+
+    (
+    while IFS= read -r name; do
+        [ -n "$name" ] && unset "$name"
+    done <<EOF
+$GIT_LOCAL_ENV
+EOF
+    bash "$DCENTOS_DIR/scripts/ci_offline_gates.sh" --static-only
+    )
+}
+
+echo "pre-commit: running DCENT_OS static offline gates..." >&2
+run_static_gates
+
+if printf '%s\n' "$STAGED_FILES" | grep -qE '^(DCENT_OS_ESP/|\.github/workflows/dcentos-esp-)'; then
+    if [ -x "$ESP_DIR/scripts/ci_ban_gates.sh" ]; then
+        echo "pre-commit: running DCENT_OS-for-ESP ban gates..." >&2
+        (cd "$ESP_DIR" && bash scripts/ci_ban_gates.sh)
+    else
+        echo "pre-commit: ESP files staged; scripts/ci_ban_gates.sh not present yet (CI-3 will wire this)." >&2
+    fi
+fi
+
+echo "pre-commit: fast gates passed." >&2

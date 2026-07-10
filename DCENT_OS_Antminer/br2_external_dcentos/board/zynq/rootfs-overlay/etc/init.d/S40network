@@ -1,0 +1,171 @@
+#!/bin/sh
+#
+# S40network - Configure network interface
+#
+# Default: DHCP on eth0
+# Override: create /etc/network/static with IP=x.x.x.x MASK=24 or MASK=255.255.255.0 GW=x.x.x.x
+#
+
+INTERFACE="eth0"
+STATIC_CONF="/etc/network/static"
+
+mask_to_prefix() {
+    case "$1" in
+        *.*.*.*)
+            old_ifs=$IFS
+            IFS=.
+            set -- $1
+            IFS=$old_ifs
+
+            prefix=0
+            state="full"
+            for octet in "$@"; do
+                case "$octet" in
+                    255)
+                        [ "$state" = "full" ] || return 1
+                        prefix=$((prefix + 8))
+                        ;;
+                    254)
+                        [ "$state" = "full" ] || return 1
+                        prefix=$((prefix + 7))
+                        state="partial"
+                        ;;
+                    252)
+                        [ "$state" = "full" ] || return 1
+                        prefix=$((prefix + 6))
+                        state="partial"
+                        ;;
+                    248)
+                        [ "$state" = "full" ] || return 1
+                        prefix=$((prefix + 5))
+                        state="partial"
+                        ;;
+                    240)
+                        [ "$state" = "full" ] || return 1
+                        prefix=$((prefix + 4))
+                        state="partial"
+                        ;;
+                    224)
+                        [ "$state" = "full" ] || return 1
+                        prefix=$((prefix + 3))
+                        state="partial"
+                        ;;
+                    192)
+                        [ "$state" = "full" ] || return 1
+                        prefix=$((prefix + 2))
+                        state="partial"
+                        ;;
+                    128)
+                        [ "$state" = "full" ] || return 1
+                        prefix=$((prefix + 1))
+                        state="partial"
+                        ;;
+                    0)
+                        state="zero"
+                        ;;
+                    *)
+                        return 1
+                        ;;
+                esac
+            done
+
+            echo "$prefix"
+            ;;
+        *)
+            echo "$1"
+            ;;
+    esac
+}
+
+case "$1" in
+    start)
+        echo "Configuring network on $INTERFACE..."
+
+        # Bring up interface
+        ip link set "$INTERFACE" up
+
+        if [ -f "$STATIC_CONF" ]; then
+            # Static IP configuration
+            . "$STATIC_CONF"
+            PREFIX=$(mask_to_prefix "$MASK") || {
+                echo "  [ERR] Invalid static netmask/prefix: $MASK"
+                exit 1
+            }
+            echo "  Using static IP: $IP"
+            ip addr add "$IP/$PREFIX" dev "$INTERFACE"
+            [ -n "$GW" ] && ip route add default via "$GW"
+            [ -n "$DNS" ] && echo "nameserver $DNS" > /etc/resolv.conf
+        else
+            # DHCP (default)
+            #
+            # Stable DHCP identity across the firmware swap (BUG 3 fix):
+            # BraiinsOS/stock Bitmain send RFC 2132 option 61 (client-identifier)
+            # derived from the interface MAC, so the DHCP server keys the lease on
+            # the MAC and the unit keeps the SAME IP when DCENT_OS replaces the
+            # stock/Braiins firmware. busybox udhcpc DEFAULTS to a client-id built
+            # from the *hostname* (-x hostname / a hashed client-id), which is a
+            # DIFFERENT identifier than BraiinsOS sends — that mismatch is why the
+            # live BraiinsOS->DCENT_OS install pulled a NEW lease (.135 -> .100)
+            # and the dashboard "vanished" from the old IP.
+            #
+            # Send option 61 as the hardware-type-prefixed MAC ("01" + 6 MAC
+            # bytes), which is the canonical RFC 2132 form and matches what stock
+            # firmware emits. We also explicitly suppress the hostname option so
+            # udhcpc never falls back to a hostname-derived client-id.
+            CLIENTID_HEX=""
+            IFACE_MAC=$(cat "/sys/class/net/$INTERFACE/address" 2>/dev/null)
+            case "$IFACE_MAC" in
+                ??:??:??:??:??:??)
+                    # "01" = Ethernet (hardware type 1) per RFC 2132, then the
+                    # 6 MAC octets with the colons stripped: e.g. "0132304127f6ab".
+                    CLIENTID_HEX="01$(echo "$IFACE_MAC" | tr -d ':' | tr 'A-F' 'a-f')"
+                    ;;
+            esac
+
+            echo "  Requesting DHCP lease..."
+            if [ -n "$CLIENTID_HEX" ]; then
+                echo "  Using stable MAC-based client-id (RFC 2132 opt 61): $CLIENTID_HEX"
+                # -x 0x3d:<hex>  -> send raw option 61 (client-identifier)
+                # -V ""          -> no vendor-class drift
+                # busybox udhcpc has no flag to "not send hostname"; not passing
+                # -x hostname:... means it sends none, so the only identifier the
+                # server sees is our MAC-based option 61.
+                udhcpc -i "$INTERFACE" -b -q -x "0x3d:$CLIENTID_HEX" 2>/dev/null &
+            else
+                # Could not read the MAC — fall back to a plain request rather
+                # than a hostname-derived client-id (still better than a drifting
+                # identifier, and very rare on a real NIC).
+                echo "  [WARN] Could not read $INTERFACE MAC; requesting without a stable client-id"
+                udhcpc -i "$INTERFACE" -b -q 2>/dev/null &
+            fi
+        fi
+
+        # Show assigned IP after brief delay
+        sleep 2
+        ASSIGNED_IP=$(ip addr show "$INTERFACE" 2>/dev/null | grep 'inet ' | awk '{print $2}')
+        if [ -n "$ASSIGNED_IP" ]; then
+            echo "  [OK] Network: $ASSIGNED_IP"
+        else
+            echo "  [WAIT] DHCP still acquiring..."
+        fi
+        ;;
+
+    stop)
+        echo "Stopping network on $INTERFACE..."
+        ip addr flush dev "$INTERFACE"
+        ip link set "$INTERFACE" down
+        ;;
+
+    restart)
+        $0 stop
+        sleep 1
+        $0 start
+        ;;
+
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac
+
+exit 0

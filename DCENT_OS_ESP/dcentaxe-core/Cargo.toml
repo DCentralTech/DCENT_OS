@@ -1,0 +1,48 @@
+[package]
+name = "dcentaxe-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Host-testable pure logic for DCENT_axe (config safety/clamp + OTA canonicalization)"
+
+[features]
+# board.rs has a compile_error! demanding exactly one pin family; default to the
+# bitaxe pins for host tests. dcentaxe does NOT depend on dcentaxe-core, so this
+# selection never reaches a firmware image.
+#
+# `pins-lora` is additive/orthogonal to the pin family: enabling it in the default
+# host feature set compiles dcentaxe-hal's `lora_pins` module so its pin-map table
+# test host-runs under `cargo test -p dcentaxe-hal -p dcentaxe-core` (feature
+# unification), catching a silent SX1262 GPIO renumber. It never reaches a firmware
+# image (dcentaxe does not depend on dcentaxe-core).
+default = ["pins-bitaxe", "pins-lora"]
+pins-bitaxe = ["dcentaxe-hal/pins-bitaxe"]
+pins-nerd = ["dcentaxe-hal/pins-nerd"]
+pins-lora = ["dcentaxe-hal/pins-lora"]
+
+[dependencies]
+dcentaxe-hal = { path = "../dcentaxe-hal", default-features = false }
+dcentaxe-stratum = { path = "../dcentaxe-stratum" }
+dcentaxe-asic = { path = "../dcentaxe-asic" }
+# Host-only: the LoRa MCP tool DEFINITIONS (names + read/control access classes)
+# are pure serde (no esp-idf), so the `mcp_lora_contract_guards` test can assert
+# the real access-class contract compile-linked (not just against source text).
+# All of dcentaxe-lora's host deps (log/serde/hmac/sha2, serde_json dev) are
+# already in the workspace lock → ZERO new lock entries, `--locked` undisturbed.
+# The `esp-idf` feature stays OFF so no esp-idf-sys is pulled into the host gate.
+dcentaxe-lora = { path = "../dcentaxe-lora" }
+dcent-schema = { path = "../../shared/dcent-schema" }
+serde = { version = "1", features = ["derive"] }
+ed25519-dalek = "2"
+# `config.rs` (re-included via #[path]) now hosts `migrate_config`, whose
+# schema-migration log lines use the `log` facade. `log` is host-pure (no
+# esp-idf) and already in the lockfile via the `dcentaxe` binary + dcentaxe-hal,
+# so adding this edge does not change any resolved version. Required for the
+# moved mutation to host-compile in the `cargo test -p dcentaxe-core` gate.
+log = "0.4"
+# `mqtt_ha.rs` (re-included via #[path]) builds its HA discovery + state JSON with
+# serde_json::json!, so this must be a regular (not dev) dependency for the lib
+# build, not just the tests. Already in the lockfile via the dcentaxe binary crate
+# (which depends on serde_json directly), so `--locked` is undisturbed. Also used
+# by the config / discovery host tests below.
+serde_json = "1"

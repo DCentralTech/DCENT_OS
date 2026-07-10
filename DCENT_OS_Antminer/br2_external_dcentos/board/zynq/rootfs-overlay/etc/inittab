@@ -1,0 +1,30 @@
+# DCENTos Hacker Shell v0.2.9 - /etc/inittab
+# D-Central Technologies
+#
+# BraiinsOS 4.4.0-xilinx kernel: NO devtmpfs, squashfs root is read-only
+# dcentos-early-init.sh sets up /dev (tmpfs + mknod), /tmp, /run
+# Then rcS runs S10udevd (populates /dev), S40network, S50dropbear, etc.
+
+# Early init: mount /dev (tmpfs), /tmp, /run, create device nodes
+::sysinit:/etc/dcentos-early-init.sh
+
+# Init scripts (S10udevd, S40network, S50dropbear, S80dashboard, etc.)
+::sysinit:/etc/init.d/rcS
+
+# Serial console — auto-login as root (no password required).
+# Matches BraiinsOS/Bitmain stock behavior. Essential for Claude Code
+# debug workflow via COM port. SSH still requires password for security.
+# NOTE: login -f root directly, not via getty script — getty -n -l broke silently.
+#
+# CAVEAT: On DCENT_OS the custom PID 1 is `dcentos-init` (/sbin/init), which
+# does NOT read this inittab — it spawns the serial console itself via
+# spawn_getty() (which now ALSO uses `/bin/login -f root` first, with a
+# correctly-argument-ordered getty fallback). This stanza is therefore only
+# honoured when BusyBox init is PID 1 (legacy/compat). Keep the two in sync:
+# the console contract is "passwordless root on ttyPS0, recovery-critical".
+ttyPS0::respawn:/bin/login -f root
+
+# Graceful shutdown
+::shutdown:/etc/init.d/rcK
+::shutdown:/bin/umount -a -r
+::restart:/sbin/init

@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "miner_model": "antminer_s19",
+  "hashboard": "BHB42821",
+  "chip": "bm1366",
+  "source": {
+    "vendor": "bitmain",
+    "firmware_version": "S19jPro_stock_2022-12-26",
+    "extracted_from_sha256": "47ae203e33fe04baa22ae5ba6218878d60e111afdec7d7213c4206cebd6d20f5",
+    "extraction_date": "2026-05-03",
+    "extracted_by": "scripts/migrate-baked-profiles.py"
+  },
+  "source_class": "vendor_extracted",
+  "presets": [
+    {
+      "step": 0,
+      "freq_mhz": 675,
+      "voltage_v": 1.58,
+      "wall_watts": null,
+      "hashrate_ths": null,
+      "source": "vendor_extracted"
+    },
+    {
+      "step": 1,
+      "freq_mhz": 675,
+      "voltage_v": 1.6,
+      "wall_watts": null,
+      "hashrate_ths": null,
+      "source": "vendor_extracted"
+    },
+    {
+      "step": 2,
+      "freq_mhz": 645,
+      "voltage_v": 1.56,
+      "wall_watts": null,
+      "hashrate_ths": null,
+      "source": "vendor_extracted"
+    },
+    {
+      "step": 3,
+      "freq_mhz": 645,
+      "voltage_v": 1.58,
+      "wall_watts": null,
+      "hashrate_ths": null,
+      "source": "vendor_extracted"
+    },
+    {
+      "step": 4,
+      "freq_mhz": 645,
+      "voltage_v": 1.6,
+      "wall_watts": null,
+      "hashrate_ths": null,
+      "source": "vendor_extracted"
+    },
+    {
+      "step": 5,
+      "freq_mhz": 615,
+      "voltage_v": 1.53,
+      "wall_watts": null,
+      "hashrate_ths": null,
+      "source": "vendor_extracted"
+    },
+    {
+      "step": 6,
+      "freq_mhz": 615,
+      "voltage_v": 1.56,
+      "wall_watts": null,
+      "hashrate_ths": null,
+      "source": "vendor_extracted"
+    },
+    {
+      "step": 7,
+      "freq_mhz": 615,
+      "voltage_v": 1.58,
+      "wall_watts": null,
+      "hashrate_ths": null,
+      "source": "vendor_extracted"
+    },
+    {
+      "step": 8,
+      "freq_mhz": 615,
+      "voltage_v": 1.6,
+      "wall_watts": null,
+      "hashrate_ths": null,
+      "source": "vendor_extracted"
+    },
+    {
+      "step": 9,
+      "freq_mhz": 615,
+      "voltage_v": 1.54,
+      "wall_watts": null,
+      "hashrate_ths": null,
+      "source": "vendor_extracted"
+    },
+    {
+      "step": 10,
+      "freq_mhz": 675,
+      "voltage_v": 1.53,
+      "wall_watts": null,
+      "hashrate_ths": null,
+      "source": "vendor_extracted"
+    },
+    {
+      "step": 11,
+      "freq_mhz": 645,
+      "voltage_v": 1.53,
+      "wall_watts": null,
+      "hashrate_ths": null,
+      "source": "vendor_extracted"
+    },
+    {
+      "step": 12,
+      "freq_mhz": 675,
+      "voltage_v": 1.56,
+      "wall_watts": null,
+      "hashrate_ths": null,
+      "source": "vendor_extracted"
+    }
+  ],
+  "metadata": {
+    "vnish_hotelfee_devfee_present": false,
+    "secure_boot_set_seen": false,
+    "hashcore_root_hash_seen": false,
+    "atlas_ssh_key_present": false,
+    "notes": "Extracted from levels.json inside Bitmain stock S19j Pro firmware (2022-12-26) \u2014  wall_watts + hashrate_ths left null (vendor source has only freq+voltage)."
+  }
+}

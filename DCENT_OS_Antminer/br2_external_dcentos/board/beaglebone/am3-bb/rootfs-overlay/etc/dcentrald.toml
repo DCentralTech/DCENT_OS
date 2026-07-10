@@ -1,0 +1,95 @@
+# DCENT_OS Mining Daemon Configuration - Antminer S19j Pro BeagleBone Black (am3-bb)
+
+[general]
+hostname = "dcentos-bb"
+log_level = "info"
+
+[mining]
+enabled = false
+chip = "BM1362"
+chips_per_chain = 126
+chains = 3
+frequency_mhz = 545
+voltage_mv = 13700
+model = "s19jpro-bb"
+suggest_difficulty = 8192
+passthrough = false
+version_rolling = true
+serial_device = "/dev/ttyO1"
+serial_chip_count = 126
+serial_chip_type = "BM1362"
+
+[platform]
+target = "am3-bb"
+
+[pool]
+url = ""
+worker = ""
+password = "d=1"
+
+[thermal]
+target_temp_c = 65.0
+hot_temp_c = 75.0
+dangerous_temp_c = 88.0
+die_dangerous_c = 105.0
+cooldown_temp_c = 45.0
+min_fan_rpm = 2000
+fan_max_pwm = 30
+fan_min_pwm = 0
+
+[psu]
+model = "APW121215f"
+power_target_w = 754
+power_step_w = 300
+hashrate_target_ths = 100.0
+hashrate_step_ths = 10.0
+
+[api]
+cgminer_port = 4028
+http_port = 8080
+websocket = true
+cgminer_bind_lan = false
+# API-1 (security): allow MUTATING CGMiner/LuxOS verbs (addpool/switchpool/
+# config changes) from NON-loopback LAN peers. DEFAULT false (fail-closed):
+# even with cgminer_bind_lan=true, remote mutating verbs stay blocked unless
+# this is ALSO true (loopback writes always work). Set true ONLY on a trusted LAN.
+cgminer_lan_writes = false
+metrics_require_auth = true
+
+[donation]
+enabled = true
+percent = 2.0
+pool_url = "stratum+tcp://pool.d-central.tech:3333"
+worker = "DungeonMaster"
+password = "x"
+fallback_enabled = true
+fallback_pool_url = "stratum+tcp://stratum.braiins.com:3333"
+fallback_worker = "DungeonMaster"
+fallback_password = "x"
+cycle_duration_s = 3600
+
+[watchdog]
+enabled = false
+kick_interval_s = 5
+
+[hash_on_disconnect]
+enabled = true
+
+[mode]
+active = "standard"
+
+[led]
+enabled = true
+heartbeat_on_ms = 100
+heartbeat_off_ms = 900
+locate_pattern = "imperial_march"
+locate_duration_s = 30
+flash_on_accepted_share = true
+flash_on_rejected_share = true
+night_mode_disable = false
+celebration_on_lucky_share = true
+chain_status_blink_codes = true
+
+[autotuner]
+enabled = false
+preset = "balanced_home"

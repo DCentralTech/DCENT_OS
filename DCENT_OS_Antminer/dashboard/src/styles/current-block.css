@@ -1,0 +1,1146 @@
+/* ──────────────────────────────────────────────────────────────────────────
+   current-block.css — DCENT_OS Current Block hero card + source-manifest
+   modal. Visual reference: DCENT_OS_ESP/dcentaxe/src/dashboard/
+   block-tile.css (DCENT_axe). All selectors are scoped under
+   .current-block-card or .current-block-modal-scope so this file does not
+   bleed onto the rest of the dashboard.
+
+   Wave-6 P6 token-converge (F6 §3c): the 3 raw 'cubic-bezier()' easing
+   literals converged to F1 '--ease-*' tokens — the two
+   'cubic-bezier(0.22,1,0.36,1)' "new block" beats → '--ease-out-soft'
+   (nearest tier, identical 0.22/0.36 x-control points), and the modal
+   'bmPop' 'cubic-bezier(0.34,1.56,0.64,1)' → '--ease-spring' (exact match).
+   F1's D-15 brand-literal→token migration is FULLY INTACT and untouched:
+   every 'rgba(250,165,0,…)'/'rgba(250,103,0,…)' here is a
+   'var(--accent-*, rgba(…))' graceful-degradation FALLBACK (token primary),
+   NOT a reintroduced brand literal — stripping them would regress D-15.
+   Radii/blur were already 100% tokenized by F1; no raw px remained.
+   ──────────────────────────────────────────────────────────────────────── */
+
+/* ── Hero button card ──────────────────────────────────────────────────── */
+.current-block-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  text-align: left;
+  padding: 22px 24px 20px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-glass);
+  background: var(--surface-glass-card, rgba(18, 18, 26, 0.80));
+  backdrop-filter: blur(var(--blur-sm, 12px));
+  -webkit-backdrop-filter: blur(var(--blur-sm, 12px));
+  color: var(--fg-primary);
+  cursor: pointer;
+  overflow: hidden;
+  font: inherit;
+  transition:
+    transform var(--dur-fast, 150ms) var(--ease-standard, ease),
+    border-color var(--dur-fast, 150ms) var(--ease-standard, ease),
+    box-shadow var(--dur-fast, 150ms) var(--ease-standard, ease);
+}
+.current-block-card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(130% 90% at 100% 0%, var(--accent-glow, rgba(250,165,0,0.18)), transparent 62%),
+    radial-gradient(85% 65% at 0% 100%, var(--accent-deep-10, rgba(250,103,0,0.10)), transparent 72%),
+    linear-gradient(180deg, rgba(255,255,255,0.012) 0%, rgba(255,255,255,0) 60%);
+  pointer-events: none;
+  opacity: 0.92;
+  z-index: 0;
+}
+/* Subtle accent border-gradient hairline along the top edge — premium framing
+   without competing with the height typography. */
+.current-block-card::after {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--accent-border, rgba(250,165,0,0.32)) 22%,
+    var(--accent) 50%,
+    var(--accent-border, rgba(250,165,0,0.32)) 78%,
+    transparent 100%
+  );
+  opacity: 0.55;
+  pointer-events: none;
+  z-index: 1;
+}
+.current-block-card > * {
+  position: relative;
+  z-index: 1;
+}
+.current-block-card:hover,
+.current-block-card:focus-visible {
+  transform: translateY(-2px);
+  border-color: var(--accent-border, rgba(250, 165, 0, 0.32));
+  box-shadow: var(--shadow-elevated, 0 8px 32px rgba(0,0,0,0.4)), 0 0 24px var(--accent-glow, rgba(250,165,0,0.15));
+  outline: none;
+}
+.current-block-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.current-block-card-compact {
+  /* Content-sized (was min-height:100%): next to the much taller ASIC Core
+     column this forced the card to fill the row height, and 'cta (margin-top:
+     auto)' below then pushed the SOURCE footer to the bottom — leaving a large
+     empty middle. Let the card be its natural compact height (the grid is
+     align-items:start) so the footer sits right under the stat cells. */
+  min-height: 0;
+  padding: 18px;
+}
+
+.current-block-card-compact::before {
+  opacity: 0.58;
+}
+
+.current-block-card-compact .current-block-card-head {
+  margin-bottom: 12px;
+}
+
+.current-block-card-compact .current-block-height {
+  font-size: clamp(2.1rem, 1.8rem + 1.4vw, 3rem);
+}
+
+.current-block-card-compact .current-block-grid4 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.current-block-card-compact .current-block-cell {
+  padding: 9px 10px;
+}
+
+.current-block-card-compact .current-block-cta {
+  margin-top: auto;
+}
+
+/* Severity tinting (preserved tone classes) */
+.current-block-card-warning {
+  border-color: rgba(234, 179, 8, 0.32);
+}
+.current-block-card-success {
+  border-color: rgba(34, 197, 94, 0.32);
+}
+.current-block-card-muted {
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+/* Header row */
+.current-block-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.current-block-kicker {
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  letter-spacing: 1.8px;
+  text-transform: uppercase;
+  color: var(--fg-secondary, #8B8B9E);
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.current-block-kicker-glyph {
+  width: 10px;
+  height: 10px;
+  display: inline-block;
+  background: var(--accent-gradient);
+  transform: rotate(45deg);
+  border-radius: 1px;
+}
+
+/* Live / Stale pill */
+.current-block-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: var(--radius-pill, 999px);
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  letter-spacing: 1.4px;
+  font-weight: 700;
+  text-transform: uppercase;
+  background: rgba(34, 197, 94, 0.12);
+  border: 1px solid rgba(34, 197, 94, 0.35);
+  color: var(--green, #22C55E);
+}
+.current-block-live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green, #22C55E);
+  box-shadow: 0 0 6px rgba(34, 197, 94, 0.8);
+  animation: pulse 1.6s infinite;
+}
+.current-block-live-stale {
+  background: rgba(234, 179, 8, 0.12);
+  border-color: rgba(234, 179, 8, 0.35);
+  color: var(--yellow, #EAB308);
+}
+.current-block-live-stale .current-block-live-dot {
+  background: var(--yellow, #EAB308);
+  box-shadow: 0 0 6px rgba(234, 179, 8, 0.8);
+  animation: none;
+}
+
+/* Big height — large mono numerals with tabular-nums + accent gradient */
+.current-block-height {
+  font-family: var(--font-mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-weight: 800;
+  font-size: 2.85rem;
+  line-height: 1.0;
+  letter-spacing: -1.2px;
+  background: var(--accent-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  filter: drop-shadow(0 0 14px var(--accent-shadow-28, rgba(250, 165, 0, 0.28)));
+  font-variant-numeric: tabular-nums;
+  margin: 0;
+  /* Soft entry on new-block render; the 'data-new-block' attr below toggles
+     the more pronounced pulse. */
+  transition: filter 200ms var(--ease-standard, ease);
+}
+.current-block-card[data-new-block="true"] .current-block-height {
+  /* F6 §3c: raw cubic-bezier(0.22,1,0.36,1) → nearest-tier --ease-out-soft
+     (identical 0.22/0.36 x-control points). */
+  animation: currentBlockHeightPulse 1200ms var(--ease-out-soft, cubic-bezier(0.22, 1, 0.36, 1)) 1;
+}
+@keyframes currentBlockHeightPulse {
+  0%   { filter: drop-shadow(0 0 14px var(--accent-shadow-28, rgba(250, 165, 0, 0.28))); }
+  35%  { filter: drop-shadow(0 0 26px var(--accent-shadow-55, rgba(250, 165, 0, 0.55))); }
+  100% { filter: drop-shadow(0 0 14px var(--accent-shadow-28, rgba(250, 165, 0, 0.28))); }
+}
+/*  P6 polish: the top accent hairline flares brighter for the same
+   ~1.2s as the height pulse — a single coordinated "new block" reward cue
+   beat across the whole card, not two unsynced animations. Token-only. */
+.current-block-card[data-new-block="true"]::after {
+  /* F6 §3c: raw cubic-bezier(0.22,1,0.36,1) → nearest-tier --ease-out-soft
+     (same coordinated "new block" beat as the height pulse). */
+  animation: currentBlockEdgeFlare 1200ms var(--ease-out-soft, cubic-bezier(0.22, 1, 0.36, 1)) 1;
+}
+@keyframes currentBlockEdgeFlare {
+  0%   { opacity: 0.55; }
+  30%  { opacity: 1;    }
+  100% { opacity: 0.55; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .current-block-card[data-new-block="true"] .current-block-height,
+  .current-block-card[data-new-block="true"]::after {
+    animation: none !important;
+  }
+}
+.current-block-height-fallback {
+  background: none;
+  -webkit-text-fill-color: var(--fg-secondary, #8B8B9E);
+  color: var(--fg-secondary, #8B8B9E);
+  filter: none;
+  font-size: 1.5rem;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+/* Hash row */
+.current-block-hash-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-top: 10px;
+  font-family: var(--font-mono, monospace);
+  font-size: 11.5px;
+  color: var(--fg-primary, #F0F0F0);
+}
+.current-block-hash-row-label {
+  color: var(--fg-dim, #6E6E80); /* PR-073: H-1 corrected fallback — matches tokens.css --fg-dim WCAG AA */
+  text-transform: uppercase;
+  letter-spacing: 1.3px;
+  font-size: 9.5px;
+  font-weight: 700;
+}
+.current-block-hash-row-value {
+  word-break: break-all;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 4-cell stats grid */
+.current-block-grid4 {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin-top: 14px;
+}
+.current-block-cell {
+  position: relative;
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.026) 0%, rgba(255,255,255,0.014) 100%);
+  border: 1px solid var(--border-subtle, rgba(255,255,255,0.06));
+  border-radius: var(--radius-sm, 8px);
+  padding: 11px 13px;
+  min-width: 0;
+  transition: border-color var(--dur-fast, 150ms) var(--ease-standard, ease);
+}
+.current-block-cell::after {
+  /*  P6 polish: a 1px top accent hairline that fades in on hover so
+     each stat cell feels individually "live" without competing with the
+     hero height. Token-only (F1 D-15 set) — no brand literal. */
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--accent-border, rgba(250, 165, 0, 0.32)) 50%,
+    transparent 100%
+  );
+  opacity: 0;
+  transition: opacity var(--dur-fast, 150ms) var(--ease-standard, ease);
+  pointer-events: none;
+}
+.current-block-cell:hover {
+  border-color: var(--accent-border, rgba(250, 165, 0, 0.22));
+  background:
+    linear-gradient(180deg, var(--accent-tint-08, rgba(250,165,0,0.08)) 0%, rgba(255,255,255,0.014) 100%);
+}
+.current-block-cell:hover::after {
+  opacity: 0.7;
+}
+.current-block-cell-label {
+  display: block;
+  font-family: var(--font-mono, monospace);
+  font-size: 8.5px;
+  color: var(--fg-dim, #6E6E80); /* PR-073: H-1 corrected fallback — matches tokens.css --fg-dim WCAG AA */
+  letter-spacing: 1.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  margin-bottom: 5px;
+}
+.current-block-cell-val {
+  display: block;
+  font-family: var(--font-mono, monospace);
+  font-size: 14.5px;
+  font-weight: 700;
+  letter-spacing: -0.25px;
+  color: var(--fg-primary, #F0F0F0);
+  font-variant-numeric: tabular-nums;
+  word-break: break-all;
+  line-height: 1.18;
+}
+/* Optional unit subscript next to a value (e.g. "BTC", "sats"). Authors can
+   wrap units in '<span class="current-block-cell-unit">' to dim them. */
+.current-block-cell-unit {
+  font-size: 9.5px;
+  color: var(--fg-dim, #6A6A7E);
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  margin-left: 4px;
+  text-transform: uppercase;
+}
+
+/* Bottom CTA strip */
+.current-block-cta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border-subtle, rgba(255,255,255,0.06));
+  font-family: var(--font-mono, monospace);
+  font-size: 10.5px;
+  letter-spacing: 1.2px;
+  color: var(--fg-secondary, #8B8B9E);
+  text-transform: uppercase;
+}
+.current-block-cta-source {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.current-block-cta-arrow {
+  color: var(--accent);
+  font-family: var(--font-mono, monospace);
+  font-weight: 700;
+  font-size: 14px;
+  line-height: 1;
+}
+
+/* ── Responsive (mobile) ──────────────────────────────────────────────── */
+/* D-17: 600 → canonical md-max 767.98 (--bp-md). Stacking is graceful on
+   the extra 600–768 tablet band. */
+@media (max-width: 767.98px) {
+  .current-block-card {
+    padding: 18px 16px 16px;
+  }
+  .current-block-height {
+    font-size: 2.0rem;
+  }
+  .current-block-grid4 {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+/* ── Reduced motion ───────────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  .current-block-live-dot { animation: none !important; }
+  .current-block-card,
+  .current-block-card:hover,
+  .current-block-card:focus-visible { transform: none !important; }
+}
+
+/* ── Print-safe ( P6) ───────────────────────────────────────────────
+   No animation/glow on paper; the card structure + values still print. */
+@media print {
+  .current-block-live-dot,
+  .current-block-card[data-new-block="true"] .current-block-height,
+  .current-block-card[data-new-block="true"]::after { animation: none !important; }
+  .current-block-card { box-shadow: none !important; transform: none !important; }
+  .current-block-card::before { opacity: 0.2 !important; }
+}
+
+/* ── Modal scope (DCENT_axe-style upgrade) ────────────────────────────── */
+.current-block-modal-scope {
+  font: inherit;
+  color: var(--fg-primary, #F0F0F0);
+}
+
+.current-block-modal-scope .current-block-modal {
+  background: linear-gradient(180deg, var(--bg-overlay, #1e1e2e) 0%, var(--bg-base, #0a0a0f) 100%);
+  border: 1px solid var(--accent-border, rgba(250, 165, 0, 0.32));
+  border-radius: var(--radius-md, 12px);
+  padding: 24px 28px;
+  position: relative;
+  box-shadow:
+    0 24px 80px rgba(0, 0, 0, 0.7),
+    0 0 80px var(--accent-tint-14, rgba(250, 165, 0, 0.14)),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  /* F6 §3c: raw cubic-bezier(0.34,1.56,0.64,1) → --ease-spring (exact match
+     — gentle overshoot, the canonical modal-pop spring). */
+  animation: bmPop 0.28s var(--ease-spring, cubic-bezier(0.34, 1.56, 0.64, 1));
+  max-height: 90vh;
+  overflow: auto;
+}
+
+/* Header */
+.current-block-modal-scope .bm-head {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 22px;
+  padding-bottom: 18px;
+  border-bottom: 1px dashed var(--border-subtle, rgba(255, 255, 255, 0.08));
+}
+.current-block-modal-scope .bm-head-text {
+  min-width: 0;
+}
+.current-block-modal-scope .bm-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  letter-spacing: 1.6px;
+  font-weight: 700;
+  color: var(--fg-secondary, #8B8B9E);
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+.current-block-modal-scope .bm-title {
+  font-family: var(--font-heading);
+  font-size: 1.75rem;
+  font-weight: 800;
+  color: var(--fg-primary, #F0F0F0);
+  letter-spacing: -0.4px;
+  margin: 0 0 8px;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.current-block-modal-scope .bm-title-height {
+  font-family: var(--font-mono, monospace);
+  font-weight: 800;
+  background: var(--accent-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  font-variant-numeric: tabular-nums;
+}
+.current-block-modal-scope .bm-sub {
+  font-family: var(--font-mono, monospace);
+  font-size: 11.5px;
+  color: var(--fg-dim, #6E6E80); /* PR-073: H-1 corrected fallback — matches tokens.css --fg-dim WCAG AA */
+  letter-spacing: 0.6px;
+}
+
+.current-block-modal-scope .current-block-close {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-glass, rgba(255, 255, 255, 0.08));
+  border-radius: var(--radius-sm, 8px);
+  min-width: 46px;
+  min-height: 46px;
+  width: 46px;
+  height: 46px;
+  color: var(--fg-primary, #F0F0F0);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: all var(--dur-fast, 150ms) var(--ease-standard, ease);
+  flex-shrink: 0;
+}
+.current-block-modal-scope .current-block-close:hover {
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.35);
+  color: var(--red, #EF4444);
+}
+.current-block-modal-scope .current-block-close:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Section blocks */
+.current-block-modal-scope .bm-section {
+  margin-top: 20px;
+}
+.current-block-modal-scope .bm-section-h {
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  color: var(--accent);
+  letter-spacing: 1.8px;
+  font-weight: 700;
+  margin: 0 0 12px;
+  text-transform: uppercase;
+}
+
+/* Prev-hash callout row */
+.current-block-modal-scope .bm-hrow {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-family: var(--font-mono, monospace);
+  background: rgba(0, 0, 0, 0.3);
+  padding: 12px 14px;
+  border-radius: var(--radius-sm, 8px);
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.06));
+}
+.current-block-modal-scope .bm-hrow-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.current-block-modal-scope .bm-hrow code {
+  flex: 1 1 240px;
+  color: var(--fg-primary, #F0F0F0);
+  font-size: 11px;
+  word-break: break-all;
+  background: rgba(0, 0, 0, 0.35);
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.06));
+}
+.current-block-modal-scope .bm-hrow-btn {
+  font-family: var(--font-mono, monospace);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  padding: 6px 12px;
+  border-radius: var(--radius-sm, 8px);
+  border: 1px solid var(--border-glass, rgba(255, 255, 255, 0.08));
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--fg-primary, #F0F0F0);
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: all var(--dur-fast, 150ms) var(--ease-standard, ease);
+}
+.current-block-modal-scope .bm-hrow-btn:hover {
+  border-color: var(--accent-border, rgba(250, 165, 0, 0.32));
+  background: var(--accent-tint-08, rgba(250, 165, 0, 0.08));
+}
+.current-block-modal-scope .bm-hrow-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.current-block-modal-scope .bm-hrow-toast {
+  font-family: var(--font-mono, monospace);
+  font-size: 10.5px;
+  color: var(--green, #22C55E);
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+}
+
+/* 4-col block-facts table grid */
+.current-block-modal-scope .bm-grid4 {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+}
+/* D-17: 600 → canonical md-max 767.98 (--bp-md). */
+@media (max-width: 767.98px) {
+  .current-block-modal-scope .bm-grid4 {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+.current-block-modal-scope .bm-cb {
+  background: rgba(255, 255, 255, 0.022);
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.06));
+  border-radius: var(--radius-sm, 8px);
+  padding: 10px 12px;
+}
+.current-block-modal-scope .bm-cb-k {
+  font-family: var(--font-mono, monospace);
+  font-size: 8.5px;
+  color: var(--fg-dim, #6E6E80); /* PR-073: H-1 corrected fallback — matches tokens.css --fg-dim WCAG AA */
+  letter-spacing: 1.4px;
+  font-weight: 700;
+  margin-bottom: 4px;
+  text-transform: uppercase;
+}
+.current-block-modal-scope .bm-cb-v {
+  font-family: var(--font-mono, monospace);
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.2px;
+  color: var(--fg-primary, #F0F0F0);
+  word-break: break-all;
+  line-height: 1.25;
+}
+
+/* Source manifest details/summary */
+.current-block-modal-scope .bm-details {
+  background: rgba(255, 255, 255, 0.018);
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.06));
+  border-radius: var(--radius-sm, 8px);
+  padding: 0;
+  overflow: hidden;
+}
+.current-block-modal-scope .bm-details > summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 12px 14px;
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  letter-spacing: 1.6px;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.current-block-modal-scope .bm-details > summary::-webkit-details-marker { display: none; }
+.current-block-modal-scope .bm-details > summary::after {
+  content: '+';
+  color: var(--fg-dim, #6E6E80); /* PR-073: H-1 corrected fallback — matches tokens.css --fg-dim WCAG AA */
+  font-size: 14px;
+}
+.current-block-modal-scope .bm-details[open] > summary::after { content: '-'; }
+.current-block-modal-scope .bm-details > .bm-details-body {
+  padding: 0 14px 12px;
+}
+
+/* DetailRow inside modal — reuse existing class for selector parity */
+.current-block-modal-scope .current-block-detail-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 0;
+  border-bottom: 1px dashed var(--border-subtle, rgba(255, 255, 255, 0.06));
+  font-family: var(--font-mono, monospace);
+  font-size: 11.5px;
+}
+.current-block-modal-scope .current-block-detail-row:last-child { border-bottom: 0; }
+.current-block-modal-scope .current-block-detail-row > span {
+  color: var(--fg-dim, #6E6E80); /* PR-073: H-1 corrected fallback — matches tokens.css --fg-dim WCAG AA */
+  text-transform: uppercase;
+  letter-spacing: 1.1px;
+  font-size: 9.5px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.current-block-modal-scope .current-block-detail-row > strong {
+  color: var(--fg-primary, #F0F0F0);
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  text-align: right;
+  word-break: break-all;
+  min-width: 0;
+}
+
+/* Explain bullets */
+.current-block-modal-scope .current-block-explain h3 {
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  color: var(--accent);
+  letter-spacing: 1.8px;
+  font-weight: 700;
+  margin: 0 0 10px;
+  text-transform: uppercase;
+}
+.current-block-modal-scope .current-block-explain ul {
+  margin: 0;
+  padding-left: 18px;
+  font-family: var(--font-mono, monospace);
+  font-size: 11.5px;
+  color: var(--fg-primary, #F0F0F0);
+  line-height: 1.55;
+}
+.current-block-modal-scope .current-block-explain li {
+  margin: 2px 0;
+}
+
+/* Reduced motion in modal */
+@media (prefers-reduced-motion: reduce) {
+  .current-block-modal-scope .current-block-modal { animation: none !important; }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   SIGNATURE-LIVE-COMPONENT kit surfaces (S3)
+
+   The kit AutotunerCard.jsx (.atc-ribbon / .atc-rail / .atc-grade /
+   .atc-step-strip) and ChipMap.jsx (.chipmap-shell / -bar / -grid / -cell /
+   -legend) signature sub-surfaces have NO production-hook equivalent that
+   handoff-skin-live.css can target — that skin explicitly flags them as
+   "component edit (out of scope for CSS)". The components now emit the kit
+   class names; these rules give them the EXACT kit pixel values
+   (ui_kits/dashboard/styles.css:1290-1491). Same D-15 contract as the rest
+   of this file: token primary + brand-literal graceful fallback only.
+
+   These selectors are NOT scoped under .current-block-*; they are the one
+   place an S3-owned stylesheet can carry kit-named structure the live skin
+   leaves to the component. Class names are kit-unique (atc-/chipmap-) so
+   there is zero collision with production / motion / design-system rules.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── AutotunerCard — phase ribbon ──────────────────────────────────────── */
+.atc-ribbon {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+  padding: 6px;
+  border-radius: var(--radius-sm, 8px);
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.06));
+  margin-bottom: 14px;
+}
+.atc-ribbon-step {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  font-family: var(--font-mono, monospace);
+  font-size: 10.5px;
+  letter-spacing: 1px;
+  font-weight: 700;
+  color: var(--fg-secondary, #8B8B9E);
+  text-transform: uppercase;
+}
+.atc-ribbon-step.done {
+  color: var(--fg-primary, #F0F0F0);
+  background: rgba(255, 255, 255, 0.04);
+}
+.atc-ribbon-step.now {
+  color: var(--accent);
+  background: var(--accent-tint-10, rgba(250, 165, 0, 0.10));
+  border: 1px solid var(--accent-border, rgba(250, 165, 0, 0.32));
+  box-shadow: 0 0 12px var(--accent-tint-12, rgba(250, 165, 0, 0.12));
+}
+.atc-ribbon-step.pending {
+  color: var(--fg-dim, #6E6E80);
+  opacity: 0.55;
+}
+/* : the 4-up phase ribbon clipped "CHARACTERIZING" in an ~82px column
+   on phones — drop to 2 columns + smaller text below 480px. */
+@media (max-width: 479.98px) {
+  .atc-ribbon {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 2px;
+  }
+  .atc-ribbon-step {
+    font-size: 9px;
+  }
+}
+.atc-ribbon-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  box-shadow: 0 0 4px currentColor;
+}
+.atc-ribbon-step.now .atc-ribbon-dot {
+  animation: pulse 1.6s ease-in-out infinite;
+}
+
+/* ── AutotunerCard — per-chain ramp rails ──────────────────────────────── */
+.atc-chains {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+@media (max-width: 1023.98px) {
+  .atc-chains { grid-template-columns: 1fr; }
+}
+.atc-chain {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.01));
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.06));
+  border-radius: var(--radius-sm, 8px);
+  padding: 10px 12px;
+}
+.atc-chain-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.atc-chain-id {
+  font-family: var(--font-mono, monospace);
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.8px;
+  color: var(--fg-primary, #F0F0F0);
+}
+.atc-chain-detail {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+.atc-chain-rails {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.atc-rail {
+  display: grid;
+  grid-template-columns: 36px 1fr 32px;
+  gap: 8px;
+  align-items: center;
+}
+.atc-rail-label {
+  font-family: var(--font-mono, monospace);
+  font-size: 9px;
+  letter-spacing: 1.2px;
+  color: var(--fg-dim, #6E6E80);
+  font-weight: 700;
+}
+.atc-rail-track {
+  position: relative;
+  height: 6px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.06);
+}
+.atc-rail-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  border-radius: 999px;
+  transition: width 0.8s var(--ease-standard, ease);
+}
+.atc-rail-target {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  width: 2px;
+  background: rgba(255, 255, 255, 0.55);
+  transform: translateX(-2px);
+}
+.atc-rail-target-val {
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  color: var(--fg-dim, #6E6E80);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.atc-chain-grades {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.atc-grade {
+  display: grid;
+  grid-template-columns: 14px 1fr 28px;
+  gap: 6px;
+  align-items: center;
+}
+.atc-grade-label {
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  font-weight: 700;
+  text-align: center;
+}
+.atc-grade-track {
+  height: 5px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+.atc-grade-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.5s var(--ease-standard, ease);
+}
+.atc-grade-count {
+  font-family: var(--font-mono, monospace);
+  font-size: 9.5px;
+  color: var(--fg-dim, #6E6E80);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── AutotunerCard — "last step" strip ─────────────────────────────────── */
+.atc-step-strip {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 12px;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.06));
+  border-radius: var(--radius-sm, 8px);
+  font-family: var(--font-mono, monospace);
+  font-size: 10.5px;
+  color: var(--fg-secondary, #8B8B9E);
+}
+.atc-step-label {
+  font-size: 9px;
+  letter-spacing: 1.4px;
+  color: var(--fg-dim, #6E6E80);
+  text-transform: uppercase;
+  font-weight: 700;
+}
+.atc-step-val {
+  color: var(--fg-primary, #F0F0F0);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  animation: atcStepFlash 0.8s var(--ease-standard, ease);
+}
+.atc-step-time {
+  margin-left: auto;
+  color: var(--fg-dim, #6E6E80);
+}
+@keyframes atcStepFlash {
+  0%   { color: var(--accent); text-shadow: 0 0 8px var(--accent-shadow-55, rgba(250, 165, 0, 0.55)); }
+  100% { color: var(--fg-primary, #F0F0F0); text-shadow: none; }
+}
+
+/* ── ChipHeatMap — kit chipmap shell / bar / grid / legend ─────────────── */
+.chipmap-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+.chipmap-bar-lh {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.chipmap-chain-label {
+  font-family: var(--font-mono, monospace);
+  font-weight: 700;
+  color: var(--fg-primary, #F0F0F0);
+  font-size: 0.9rem;
+}
+.chipmap-chain-detail {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono, monospace);
+  font-size: 0.72rem;
+  color: var(--fg-dim, #6E6E80);
+}
+.chipmap-ramp {
+  color: var(--accent);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 700;
+}
+.chipmap-ramp-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+.chipmap-bar-rh {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.chipmap-mode-switch {
+  display: inline-flex;
+  border: 1px solid var(--border-glass, rgba(255, 255, 255, 0.08));
+  border-radius: 6px;
+  padding: 2px;
+  background: rgba(0, 0, 0, 0.25);
+}
+.chipmap-mode-btn {
+  border: none;
+  background: transparent;
+  color: var(--fg-secondary, #8B8B9E);
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: var(--font-ui, inherit);
+  transition: all var(--dur-fast, 150ms) var(--ease-standard, ease);
+}
+.chipmap-mode-btn:hover { color: var(--fg-primary, #F0F0F0); }
+.chipmap-mode-btn.active {
+  background: var(--accent-tint-14, rgba(250, 165, 0, 0.14));
+  color: var(--accent);
+}
+.chipmap-grid {
+  padding: 8px;
+  background: rgba(0, 0, 0, 0.30);
+  border-radius: 6px;
+}
+.chipmap-cell {
+  position: relative;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  font-family: var(--font-mono, monospace);
+  font-weight: 700;
+  font-size: 0.65rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  line-height: 1.05;
+  cursor: pointer;
+  transition:
+    transform var(--dur-fast, 150ms) var(--ease-standard, ease),
+    box-shadow var(--dur-fast, 150ms) var(--ease-standard, ease);
+}
+.chipmap-cell-num {
+  font-size: 0.55rem;
+  opacity: 0.65;
+  font-weight: 600;
+}
+.chipmap-cell-val {
+  font-variant-numeric: tabular-nums;
+}
+.chipmap-cell:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  border-color: rgba(255, 255, 255, 0.4);
+  z-index: 2;
+}
+.chipmap-cell.focused {
+  border-color: #fff;
+  box-shadow: 0 0 0 1px #fff, 0 4px 14px rgba(0, 0, 0, 0.5);
+  z-index: 3;
+}
+.chipmap-cell.flash {
+  animation: chipNonceFlash 0.55s ease-out;
+}
+.chipmap-cell.flash::after {
+  content: '\26A1'; /* ⚡ — kit signature nonce-find glyph */
+  position: absolute;
+  top: -7px;
+  right: -3px;
+  font-size: 9px;
+  color: #fff;
+  text-shadow: 0 0 6px #fff, 0 0 12px var(--accent-shadow-55, rgba(250, 165, 0, 0.8));
+  animation: chipNonceFlash 0.55s ease-out;
+  pointer-events: none;
+}
+@keyframes chipNonceFlash {
+  0%   { box-shadow: 0 0 0 0 rgba(255,255,255,0.9), 0 0 18px var(--accent-shadow-55, rgba(250,165,0,0.7)); filter: brightness(1.6); }
+  60%  { box-shadow: 0 0 0 6px rgba(255,255,255,0),   0 0 8px var(--accent-shadow-28, rgba(250,165,0,0.3)); filter: brightness(1.2); }
+  100% { box-shadow: 0 0 0 0 rgba(255,255,255,0),     0 0 0 rgba(250,165,0,0);                              filter: brightness(1); }
+}
+.chipmap-legend {
+  display: grid;
+  grid-template-columns: auto 100px auto auto 1fr;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.06));
+  font-family: var(--font-mono, monospace);
+  font-size: 0.68rem;
+  color: var(--fg-secondary, #8B8B9E);
+}
+.chipmap-legend-lbl {
+  color: var(--fg-dim, #6E6E80);
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  font-weight: 700;
+}
+.chipmap-legend-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: linear-gradient(90deg, rgb(34, 197, 94), rgb(234, 179, 8), rgb(249, 115, 22), rgb(239, 68, 68));
+}
+.chipmap-legend-min,
+.chipmap-legend-max {
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-dim, #6E6E80);
+}
+.chipmap-hover-detail {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--fg-secondary, #8B8B9E);
+}
+.chipmap-hover-detail strong {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .atc-ribbon-step.now .atc-ribbon-dot,
+  .atc-step-val,
+  .chipmap-ramp-dot,
+  .chipmap-cell.flash,
+  .chipmap-cell.flash::after {
+    animation: none !important;
+  }
+}
+@media print {
+  .atc-ribbon-step.now .atc-ribbon-dot,
+  .atc-step-val,
+  .chipmap-ramp-dot,
+  .chipmap-cell.flash,
+  .chipmap-cell.flash::after {
+    animation: none !important;
+  }
+}

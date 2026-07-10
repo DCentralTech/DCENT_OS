@@ -1,0 +1,5 @@
+#!/bin/sh
+# Auto-login as root on serial console (no password prompt).
+# Matches BraiinsOS/Bitmain stock behavior for development access.
+# SSH still requires password authentication for network security.
+exec /bin/login -f root

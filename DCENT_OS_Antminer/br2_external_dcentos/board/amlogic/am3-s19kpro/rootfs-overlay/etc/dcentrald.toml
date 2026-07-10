@@ -1,0 +1,141 @@
+# DCENT_OS Mining Daemon Configuration — Antminer S19K Pro NoPic (am3-aml)
+# D-Central Technologies — Phase H baseline
+#
+# Baked baseline for am3-aml-s19k (Amlogic A113D, BM1366, 3 chains × 77 chips).
+# Values are sourced from the .78 live capture of /etc/bosminer_model.json
+# (
+# bosminer_model.json) but tightened to D-Central home-mining defaults:
+#   - mining disabled by default (operator opts in post-flash)
+#   - thermal envelope below industrial extremes (75/88 hot/dangerous)
+#   - fan_max_pwm = 30 ( B3 — home-mining default, matches S21 overlay)
+#   - [mode] active = "home" (matches the conservative thermal envelope)
+#   - rambo_mode_max_bad_responses = 0 (operator can raise to 8 to mine
+#     past the .78 chain-1 bad-response fault)
+#
+# Industrial opt-in: edit /data/dcentrald.toml (survives sysupgrade) and set
+#   [thermal] fan_max_pwm = 80
+#   [mode]    active = "standard"
+# This raises noise considerably; verify the unit is in a non-residential
+# environment before doing so. The 30-cap is enforced by the runtime safety
+# rules; even with this baseline change,
+# emergency / fan-failure / stale-temp paths still cap fans at PWM 30 to
+# protect users from acoustic shock.
+#
+#
+# for the regression note.
+#
+# Override order: /data/dcentrald.toml > /etc/dcentrald.toml
+# Persistent custom config goes in /data/ (survives firmware updates).
+
+[general]
+hostname = "dcentos-s19kpro"
+log_level = "info"
+
+[mining]
+enabled = false
+chip = "BM1366"
+chips_per_chain = 77
+chains = 3
+frequency_mhz = 670
+voltage_mv = 13900
+model = "s19k"
+suggest_difficulty = 8192
+passthrough = false
+version_rolling = true
+
+[platform]
+target = "am3-aml-s19k"
+
+[pool]
+url = ""
+worker = ""
+password = "d=1"
+
+[thermal]
+target_temp_c = 65.0
+hot_temp_c = 75.0
+dangerous_temp_c = 88.0
+die_dangerous_c = 105.0
+cooldown_temp_c = 45.0
+min_fan_rpm = 2000
+#  B3: home-mining default. Industrial users opt-in via [mode] / [modes.standard].
+fan_max_pwm = 30
+fan_min_pwm = 0
+
+[psu]
+model = "APW121215f"
+power_target_w = 754
+power_step_w = 300
+hashrate_target_ths = 120.0
+hashrate_step_ths = 11.0
+
+[hashboard]
+eeprom_parser = "x21_aes"
+decoded_ = "/etc/dcentos/hashboard_decoded.json"
+
+[experimental]
+rambo_mode_max_bad_responses = 0
+
+[api]
+cgminer_port = 4028
+http_port = 8080
+websocket = true
+cgminer_bind_lan = false
+# API-1 (security): allow MUTATING CGMiner/LuxOS verbs (addpool/switchpool/
+# config changes) from NON-loopback LAN peers. DEFAULT false (fail-closed):
+# even with cgminer_bind_lan=true, remote mutating verbs stay blocked unless
+# this is ALSO true (loopback writes always work). Set true ONLY on a trusted LAN.
+cgminer_lan_writes = false
+metrics_require_auth = true
+
+[donation]
+# Voluntary 2% donation supports open-source firmware development.
+# Set enabled = false to disable, or adjust percent between 0 and 5.
+enabled = true
+percent = 2.0
+pool_url = "stratum+tcp://pool.d-central.tech:3333"
+worker = "DungeonMaster"
+password = "x"
+fallback_enabled = true
+fallback_pool_url = "stratum+tcp://stratum.braiins.com:3333"
+fallback_worker = "DungeonMaster"
+fallback_password = "x"
+cycle_duration_s = 3600
+
+[watchdog]
+# Autonomous crash-recovery for the NoPic Amlogic family. Unlike am2/S9 there is
+# NO PIC/dsPIC hardware heartbeat backstop, so a silent (non-panicking) daemon
+# hang would otherwise leave the boards energized indefinitely (thermal risk on a
+# home space heater). The kicker opens /dev/watchdog AFTER hardware init (the
+# bring-up window can't trip it) and degrades gracefully (warns + continues) if
+# the SoC watchdog is unavailable or the timeout can't be set. Matches the proven
+# zynq/am1 production config; restores the struct default (enabled=true) these
+# overlays previously overrode.
+enabled = true
+timeout_s = 30
+kick_interval_s = 5
+
+[hash_on_disconnect]
+enabled = true
+
+[mode]
+#  B3: home is the default to match the 30 PWM thermal cap above.
+# Operator can switch to "standard" or "hacker" at runtime via
+# `dcent config set mode=standard`.
+active = "home"
+
+[led]
+enabled = true
+heartbeat_on_ms = 100
+heartbeat_off_ms = 900
+locate_pattern = "imperial_march"
+locate_duration_s = 30
+flash_on_accepted_share = true
+flash_on_rejected_share = true
+night_mode_disable = false
+celebration_on_lucky_share = true
+chain_status_blink_codes = true
+
+[autotuner]
+enabled = false
+preset = "balanced_home"

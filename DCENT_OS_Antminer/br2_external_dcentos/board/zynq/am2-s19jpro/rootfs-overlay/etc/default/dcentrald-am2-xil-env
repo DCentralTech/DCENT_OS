@@ -1,0 +1,187 @@
+# dcentrald-am2-xil-env — AM2 Xilinx (Zynq S19j Pro) mining environment recipe
+#
+# Variant-aware environment recipe for the AM2 Xilinx control board (Zynq
+# S19j Pro on a Loki/APW3 PSU rail). It branches on the board_target stamp:
+#   - the STANDALONE path (board_target ending in `xil`) is for a
+#     DCENT_OS-from-NAND cold boot, where the chip starts cold and DCENT_OS
+#     engages the rail itself;
+#   - the HANDOFF path (every other AM2 Xilinx unit) trusts a chip rail that
+#     a prior firmware already engaged in the inactive boot slot.
+#
+# Loaded by S82dcentrald (am2-s19jpro variant) before each `dcentrald`
+# launch via `. /etc/default/dcentrald-am2-xil-env`. The `-f` test in the
+# loader makes the source line a no-op on platforms that don't ship this
+# file (S9 am1, am3-aml, am3-bb) — board-scoped by the Buildroot overlay path.
+#
+# Safety net: any of the 4 FORBIDDEN gates listed below, if present in the
+# active environment, trips the recipe-broken runtime guard
+# (`wave55a_recipe_guard.rs`, called from `main.rs::run_main`) which
+# fail-closes with EX_CONFIG=78 on the xil standalone board class. Other
+# AM2 Xilinx units are unaffected — the guard fingerprints on a board_target
+# ending in `xil`, not on the broader AM2 platform.
+#
+# Carve-out: `DCENT_AM2_PIC_RESET_AND_START_APP` is conditionally allowed
+# under `DCENT_AM2_STANDALONE_RE_FIX=1` (the cold-boot bootloader->app-mode
+# dsPIC transition). See `wave55a_recipe_guard.rs::evaluate_guard()`.
+
+# ---------------------------------------------------------------------------
+# Shared exports (apply to BOTH the standalone and handoff paths)
+# ---------------------------------------------------------------------------
+# These 12 gates are the proven baseline for any AM2 Xilinx Loki unit and do
+# not vary between the standalone and handoff modes.
+
+# PL UART MCR=0x0B (DTR+RTS+OUT2). Without OUT2 set, the FPGA UART TX
+# clock-out stays gated and the chain wire is silent.
+export DCENT_AM2_MCR_OUT2=1
+
+# PL UART IER=0x05 — interrupt-enable register parity.
+export DCENT_AM2_IER_BOSMINER_PARITY=1
+
+# Read fw=0x89 dsPIC via the framed-4b read shape `[17 FW 00 CK]`, matching
+# the chip's reply format once it is engaged. (Harmless on a fw=0x82
+# cold-boot chip — the framed-4b reader handles both.)
+export DCENT_AM2_GET_VERSION_FRAMED_4B=1
+
+# PSU bit-bang timing (10 kHz I²C half-period) matching the Loki spoof
+# transaction cadence.
+export DCENT_AM2_PSU_BITBANG_HALF_PERIOD_US=50
+
+# Use the mmap'd AXI GPIO path for PSU bit-bang instead of the sysfs gpio
+# path — sysfs latency breaks the 10 kHz timing window.
+export DCENT_AM2_PSU_BITBANG_USE_MMAP=1
+
+# 6 ms inter-byte timing on the i2c-0 dsPIC chain — pacing that keeps the
+# dsPIC parser FSM in step.
+export DCENT_AM2_DSPIC_BOSMINER_FAITHFUL=1
+
+# Read EEPROM 0x50 / 0x52 on i2c-0 before the dsPIC at 0x20 — the pre-dsPIC
+# bus warmup pattern. READ-ONLY — the EEPROM 0x50..0x57 write-denylist is
+# still enforced by the HAL at platform startup.
+export DCENT_AM2_EEPROM_BUS_WARMUP=1
+
+# Use the I2C_SLAVE (0x0703) safe ioctl, NOT I2C_SLAVE_FORCE (0x0706).
+export DCENT_AM2_I2C_SLAVE_SAFE=1
+
+# Keep the chain at 115200 baud — skip the 3.125 MHz FastUART handover. On
+# most AM2 Xilinx chips the FastUART handover collapses the chain; locking to
+# 115200 is stable mining.
+export DCENT_AM2_SKIP_FAST_UART=1
+
+# Skip the per-chip A8/MiscCtrl 115200 init loop — on AM2 this loop collapses
+# the chain from the full chip count to a single chip address. Without this
+# skip, mining fails.
+export DCENT_AM2_SKIP_115200_PER_CHIP=1
+
+# Use the serial work-dispatch path (NOT the FPGA WORK_TX FIFO path). The
+# FPGA FIFO path has never produced an AM2 nonce; the serial path is the only
+# proven AM2 path.
+export DCENT_AM2_SERIAL_WORK_DISPATCH=1
+
+# Enable BM1362 UART relay register 0x2C broadcast so chips forward UART
+# signals chip-to-chip down the chain.
+export DCENT_BM1362_ENABLE_UART_RELAY_LAB=1
+
+# ---------------------------------------------------------------------------
+# Variant routing — standalone (xil) vs handoff
+# ---------------------------------------------------------------------------
+# Read `/etc/dcentos/board_target` and branch on the `xil` suffix. The
+# `${VAR%suffix}` POSIX form works under both BusyBox ash and bash (this file
+# is sourced into S82dcentrald's BusyBox ash environment).
+
+BOARD_TARGET=$(cat /etc/dcentos/board_target 2>/dev/null)
+if [ "${BOARD_TARGET%xil}" != "$BOARD_TARGET" ]; then
+    # ----------------------------------------------------------------
+    # STANDALONE path (xil board class, cold-boot proven)
+    # ----------------------------------------------------------------
+    # DCENT_OS-from-NAND boot. The chip starts cold at dsPIC fw=0x82
+    # BOOTLOADER. The BARE warmup is the only proven transition to fw=0x82
+    # APP MODE; the FRAMED warmup fails in this state. A standalone Loki
+    # cold-wake + LM75A passthrough warmup engage the chip rail without a
+    # prior firmware having pre-engaged it.
+    #
+    # The carve-out in wave55a_recipe_guard.rs::evaluate_guard() ALLOWS
+    # DCENT_AM2_PIC_RESET_AND_START_APP=1 when DCENT_AM2_STANDALONE_RE_FIX=1
+    # is set (the cold-boot BARE warmup is correct for a fw=0x82 cold chip;
+    # it is only forbidden once the chip is at fw=0x89 post-handoff).
+
+    # Umbrella for the standalone cold-boot path. Engages:
+    #   - Loki SetVoltage(13700) via opcode 0x83 (chip-rail engagement)
+    #   - LM75A passthrough warmup (dsPIC MSSP FSM warming)
+    #   - dsPIC SetVoltage SKIP (opcode 0x10 is a no-op on a cold fw=0x82 chip)
+    export DCENT_AM2_STANDALONE_RE_FIX=1
+
+    # Standalone Loki cold-wake engagement. Required by the dsPIC
+    # SetVoltage SKIP compound gate.
+    export DCENT_AM2_PSU_LOKI_COLD_BOOT_FULL=1
+
+    # BARE warmup — required for a cold fw=0x82 chip. The recipe-guard
+    # carve-out allows this under standalone mode (default-forbidden under
+    # handoff because it pulls fw=0x89 -> fw=0x82).
+    export DCENT_AM2_PIC_RESET_AND_START_APP=1
+
+    # Framed READ-CONFIG-LATCH opcode 0x00. The engaging firmware emits 4
+    # framed opcodes between the 7-byte sync prelude and the first LM75A
+    # passthrough (RESET -> 0x00 READ-CONFIG-LATCH -> GET_VERSION); without
+    # the framed 0x00 opcode the dsPIC ACKs SetVoltage at the parser level but
+    # the internal DAC setpoint never programs — the chip rail stays at 0 V
+    # and chain enumeration returns no chips.
+    export DCENT_AM2_DSPIC_READ_CONFIG_LATCH=1
+
+    # Explicitly UNSET the handoff-only gate that conflicts with standalone:
+    # TRUST_RAIL_FALLBACK assumes the rail was pre-engaged, which is false on
+    # a cold standalone boot.
+    unset DCENT_AM2_TRUST_RAIL_FALLBACK
+
+    # Declare the proven PWR_CONTROL polarity for the xil board class so the
+    # daemon's PsuGpioGate asserts the correct level AND S82dcentrald's audited
+    # `--safe-off` emergency hash-cut is ARMED (S82 skips the cut when polarity
+    # is unknown — `am2_pwr_control_polarity_known()`). gpio907 on this board
+    # class is ACTIVE-LOW: "0" = rail ON, "1" = rail OFF
+    # (psu_gpio_gate.rs:111-120). Scoped to the xil branch ONLY — other
+    # AM2 Xilinx units have unproven polarity and keep S82's conservative
+    # skip + WARN. Satisfies the exactly-one-polarity-marker rule in
+    # am2_wave56_override_runtime_preflight.
+    export DCENT_AM2_PWR_CONTROL_ACTIVE_LOW=1
+else
+    # ----------------------------------------------------------------
+    # HANDOFF path (every other AM2 Xilinx unit)
+    # ----------------------------------------------------------------
+    # The chip arrives at dsPIC fw=0x89 (engaged by a prior firmware in the
+    # inactive boot slot) with the chip rail already at 13.7 V. DCENT_OS
+    # skips warmup, trusts the rail state, and dispatches work immediately.
+
+    # Trust the rail-engaged state instead of re-engaging it ourselves — the
+    # prior firmware's pre-engagement is the only currently-proven path to
+    # bring the chip rail up before DCENT_OS takes over.
+    export DCENT_AM2_TRUST_RAIL_FALLBACK=1
+
+    # Cross-branch safety: defensively unset the READ-CONFIG-LATCH standalone
+    # gate. If a standalone variant ran in the same shell context, this
+    # prevents the gate from leaking into the handoff path (which would
+    # re-RESET the already-engaged chip from fw=0x89 -> fw=0x82 and break
+    # mining).
+    unset DCENT_AM2_DSPIC_READ_CONFIG_LATCH
+fi
+
+# ---------------------------------------------------------------------------
+# 4 FORBIDDEN — explicit unsets (belt-and-suspenders next to the runtime guard)
+# ---------------------------------------------------------------------------
+# Each of these was independently falsified before the recipe was locked in.
+# Setting any of them re-breaks the proven path. The recipe-broken runtime
+# guard (wave55a_recipe_guard.rs) is the load-bearing safety net; these
+# explicit unsets are defense-in-depth against a stale operator override
+# leaking into the daemon environment.
+#
+# NOTE: DCENT_AM2_PIC_RESET_AND_START_APP is forbidden ONLY in handoff mode —
+# it is CONDITIONALLY-EXPORTED above for the standalone branch via the
+# carve-out. Do NOT unset it here unconditionally.
+
+# FORBIDDEN — FRAMED warmup (fw=0x89 -> 0x82 transition problem).
+unset DCENT_AM2_PIC_RESET_STRACE_DERIVED
+
+# FORBIDDEN — Loki Enable bytes corrupt the spoof state (the next handoff
+# engagement fails until an AC cycle).
+unset DCENT_AM2_PSU_LOKI_REGISTER_POINTER
+
+# FORBIDDEN — the calibration probe corrupts the Loki spoof state (same as above).
+unset DCENT_AM2_PSU_CALIBRATION_PROBE_WAKE

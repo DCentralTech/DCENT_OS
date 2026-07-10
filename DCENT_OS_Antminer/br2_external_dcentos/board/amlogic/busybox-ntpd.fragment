@@ -1,0 +1,38 @@
+# DCENTos am3-aml BusyBox config FRAGMENT — enable the SNTP client applet.
+# D-Central Technologies, 2026.
+#
+# WHY: the amlogic-aarch64 family (S21 / S19j Pro AML / S19K Pro AML / S21 Pro
+# / T21 — every target that merges dcentos_am3_aml_common.fragment) does NOT set
+# BR2_PACKAGE_BUSYBOX_CONFIG, so it inherits Buildroot's DEFAULT busybox config,
+# which ships `# CONFIG_NTPD is not set`. (SCOPE: this fragment is wired ONLY
+# into the shared aml-aarch64 fragment; the am3-bb [armv7] and cv1835 families
+# share board/amlogic/rootfs-overlay — so they get the ported S41ntp script's
+# restore/persist legs — but they do NOT merge this fragment and so keep the
+# default busybox without ntpd. Enabling ntpd there is a separate per-toolchain
+# follow-up; bb has a real AM335x RTC and cv1835 has no live unit, so it is
+# lower priority.) The Amlogic A113D has a battery-less *virtual* RTC: the kernel
+# boots the wall clock to 2015-01-01 (live evidence: the .78 cap_init dmesg
+# `aml_vrtc rtc: setting system clock to 2015-01-01`). Without `ntpd`, the
+# S41ntp init script (ported to board/amlogic/rootfs-overlay/etc/init.d/ in
+# the same change) can RESTORE the clock from /data and PERSIST it, but it
+# cannot do a fresh one-shot network SNTP sync on a unit with no prior
+# last-good mark — so a first-boot amlogic unit would stay at 2015 until a
+# manual sync. Every daemon log line, API timestamp, share/thermal forensic,
+# and time-based lifecycle decision (scheduled reboot, donation cycle,
+# curtailment window) then runs on a 2015 wall clock.
+#
+# This fragment is the standard Buildroot ADDITIVE mechanism
+# (BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES, see
+# package/busybox/Config.in): it is merged OVER the default config, so it can
+# only ADD the `ntpd` applet — it never removes or alters an existing applet.
+# It mirrors exactly what board/zynq/busybox.config:118 enables for the S9/
+# Zynq no-RTC board. We enable only the SNTP CLIENT (`ntpd -q` one-shot); the
+# FEATURE_NTPD_SERVER / FEATURE_NTPD_CONF daemon/server sub-options stay OFF.
+#
+# `date` and `ip` (the other applets S41ntp uses) are already `=y` in the
+# Buildroot default busybox config — only `ntpd` was missing.
+#
+# Build-verify note: the busybox rebuild that picks this up must run on a
+# Linux Buildroot host (cannot be verified on the Windows dev host) — same
+# deferred-build-verify standard as the S43logrotate / S41ntp rootfs ports.
+CONFIG_NTPD=y

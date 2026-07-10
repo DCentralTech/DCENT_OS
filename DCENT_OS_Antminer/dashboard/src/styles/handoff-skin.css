@@ -1,0 +1,100 @@
+/* ═════════════════════════════════════════════════════════════════════════
+   DCENT_OS — Claude-Design handoff visual recreation
+   Foundation layer (VR1). Loaded LAST in main.tsx so it re-skins every mode.
+
+   This is the operator-directed full visual recreation: production must LOOK
+   like the handoff kit ('ui_kits/dashboard/styles.css'), not just carry its
+   features. VR1 ports the STRUCTURE-INDEPENDENT signature — the ambient
+   orange aurora + masked grid + base treatment + scrollbar — which applies
+   regardless of each mode's DOM. Per-mode structural recreation is VR2–VR5.
+
+   Token foundation needs no reconciliation: production 'tokens.css' was
+   itself sourced from this bundle's 'colors_and_type.css' (verified 1:1 on
+   sphere/glow/glass/blur/ease/type). The visual gap was always the ambient
+   layers + component treatments, never the tokens.
+
+   Faithful to the handoff: the aurora is brand-orange literals (the kit's
+   signature). The rest of the UI still recolors via the Wave-1 accent
+   engine; the aurora intentionally stays the D-Central wash.
+   ───────────────────────────────────────────────────────────────────────── */
+
+/* Subtle global tightening from the kit's 'body' rule (kit also set
+   overflow:hidden + height:100% — deliberately NOT ported; production owns
+   its own scroll container and that would break it). */
+body {
+  letter-spacing: -0.005em;
+}
+
+/* ─── Ambient orange aurora (kit 'body::before' + auroraDrift) ───
+   Fixed, behind all content (production content sits at z-index ≥ 1).
+   This is the single biggest "feels like the handoff" shift. */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background:
+    radial-gradient(ellipse 80% 60% at 8% 0%,  rgba(250, 103, 0, 0.14), transparent 55%),
+    radial-gradient(ellipse 80% 60% at 95% 95%, rgba(250, 165, 0, 0.08), transparent 55%),
+    radial-gradient(ellipse 40% 40% at 50% 50%, rgba(250, 165, 0, 0.03), transparent 60%);
+  pointer-events: none;
+  z-index: 0;
+  animation: auroraDrift 24s ease-in-out infinite;
+}
+
+/* ─── Masked technical grid (kit 'body::after') ─── */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px);
+  background-size: 64px 64px;
+  -webkit-mask-image: radial-gradient(ellipse 60% 80% at 50% 50%, #000 40%, transparent 90%);
+  mask-image: radial-gradient(ellipse 60% 80% at 50% 50%, #000 40%, transparent 90%);
+}
+
+@keyframes auroraDrift {
+  0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
+  50%      { transform: translate3d(-1.5%, 1%, 0) scale(1.03); }
+}
+
+/* The aurora/grid are decorative ambient loops — collapse to a held state
+   under reduced-motion (mirrors the kit + production's motion policy). */
+@media (prefers-reduced-motion: reduce) {
+  body::before { animation: none; }
+}
+
+/* Hacker mode keeps its own near-black + CRT identity; the warm orange
+   aurora would fight the phosphor-green. Damp it hard there (the kit's
+   hacker screen also drops the orange aurora for its terminal floor). */
+.mode-hacker body::before,
+body:has(.mode-hacker)::before {
+  opacity: 0.25;
+}
+
+/* ─── Scrollbar (kit '.page-scroll' scrollbar — applied globally) ─── */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.08) transparent;
+}
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 4px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--accent-glow-hi, rgba(250, 165, 0, 0.2));
+  background-clip: padding-box;
+}
+
+/* Print: kill the ambient layers for legibility (parity with tokens.css
+   print policy). */
+@media print {
+  body::before, body::after { display: none !important; }
+}

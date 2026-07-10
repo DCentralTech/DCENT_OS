@@ -1,0 +1,57 @@
+# DCENT_OS dcentrald config - Braiins BCB100 S19j Pro (ADVANCED / EXPERIMENTAL)
+#
+# Use with:
+#   DCENT_BCB100_ACCEPT_UNVERIFIED=1 dcentrald --config bcb100-s19jpro-passthrough-lab.toml --serial-mining
+#
+# EXPERIMENTAL: BCB100 support in DCENT_OS is not yet fully validated. This
+# example is for advanced users doing passthrough / warm-handoff after
+# BraiinsOS/bosminer has already powered and configured the hashboards — it is
+# not a cold-boot support path. GPIO reset, fan PWM/tach, PSU control, and PIC
+# I2C mapping use conservative defaults; tune them for your hardware.
+
+[general]
+hostname = "dcentos-bcb100-lab"
+log_level = "debug"
+
+[pool]
+url = ""
+protocol = "sv1"
+worker = ""
+password = "x"
+
+[mining]
+enabled = false
+frequency_mhz = 400
+voltage_mv = 13700
+suggest_difficulty = 256
+passthrough = true
+version_rolling = true
+serial_device = "/dev/ttySTM0"
+serial_chip_count = 126
+serial_chip_type = "BM1362"
+model = "s19jpro"
+skip_board_temp = true
+
+[power]
+target_watts = 800
+
+[thermal]
+target_temp_c = 65
+hot_temp_c = 75
+dangerous_temp_c = 80
+fan_min_pwm = 10
+fan_max_pwm = 30
+
+[api]
+cgminer_port = 4028
+http_port = 8080
+websocket = true
+
+[watchdog]
+enabled = false
+
+[hash_on_disconnect]
+enabled = false
+
+[autotuner]
+enabled = false

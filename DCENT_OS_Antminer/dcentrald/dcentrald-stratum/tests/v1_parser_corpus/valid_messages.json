@@ -1,0 +1,52 @@
+[
+  {
+    "name": "notify_clean_job",
+    "input": "{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"job-7\",\"00000000000000000004f87f7e46b2a0c6b30f8f7e771c8e6a0b5b5d9c0a0000\",\"0100000001\",\"ffffffff\",[\"4d5e6f\",\"001122\"],\"20000000\",\"170fffff\",\"65f0abcd\",true]}",
+    "expect": { "variant": "notify", "job_id": "job-7", "clean_jobs": true }
+  },
+  {
+    "name": "set_difficulty_float",
+    "input": "{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[2048.5]}",
+    "expect": { "variant": "set_difficulty", "value": 2048.5 }
+  },
+  {
+    "name": "set_extranonce_default_size",
+    "input": "{\"id\":null,\"method\":\"mining.set_extranonce\",\"params\":[\"deadbeef\"]}",
+    "expect": { "variant": "set_extranonce", "extranonce1": "deadbeef", "extranonce2_size": 4 }
+  },
+  {
+    "name": "set_extranonce_explicit_size",
+    "input": "{\"id\":null,\"method\":\"mining.set_extranonce\",\"params\":[\"cafebabe\",8]}",
+    "expect": { "variant": "set_extranonce", "extranonce1": "cafebabe", "extranonce2_size": 8 }
+  },
+  {
+    "name": "set_version_mask_raw",
+    "input": "{\"id\":null,\"method\":\"mining.set_version_mask\",\"params\":[\"1fffe000\"]}",
+    "expect": { "variant": "set_version_mask", "mask": "1fffe000" }
+  },
+  {
+    "name": "ping_with_id",
+    "input": "{\"id\":42,\"method\":\"mining.ping\",\"params\":[]}",
+    "expect": { "variant": "ping", "id": 42 }
+  },
+  {
+    "name": "reconnect_wait_clamped",
+    "input": "{\"id\":null,\"method\":\"client.reconnect\",\"params\":[\"pool.example.com\",3333,86400]}",
+    "expect": { "variant": "reconnect", "host": "pool.example.com", "port": 3333, "wait_seconds": 300 }
+  },
+  {
+    "name": "get_version_with_id",
+    "input": "{\"id\":7,\"method\":\"client.get_version\",\"params\":[]}",
+    "expect": { "variant": "get_version", "id": 7 }
+  },
+  {
+    "name": "show_message",
+    "input": "{\"id\":null,\"method\":\"client.show_message\",\"params\":[\"Maintenance window starts soon\"]}",
+    "expect": { "variant": "show_message", "contains": "Maintenance window" }
+  },
+  {
+    "name": "submit_response",
+    "input": "{\"id\":2,\"result\":true,\"error\":null}",
+    "expect": { "variant": "response", "id": 2 }
+  }
+]

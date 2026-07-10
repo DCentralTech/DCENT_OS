@@ -1,0 +1,372 @@
+#!/bin/sh
+#
+# S82dcentrald - DCENT_OS mining daemon (am3-bb-s19jpro variant copy)
+#
+# Provenance:
+#   Mirror of board/amlogic/rootfs-overlay/etc/init.d/S82dcentrald
+#   (which already detects beaglebone/AM335x via /proc/cpuinfo + ttyO1).
+#   Copied verbatim into this variant overlay so the s19jpro defconfig
+#   does not have to chain the amlogic overlay just to inherit S82.
+#
+#   The S19j Pro BeagleBone branch is intentionally different from the
+#   generic serial boards:
+#     - beaglebone starts dcentrald with --am3-bb-mining.
+#     - dsPIC early-enable is exported because it is part of the proven .79
+#       accepted-share lane.
+#     - FastUART/devmem/no-RX lab overrides are cleared for installed boots.
+#     - fallback safety caps fans and asserts ASIC resets/board-enable off.
+#
+# Wave reference: AGENT B3 wave W10.x (2026-05-09).
+#
+# dcentrald owns REST/WebSocket on :8080. The dashboard owns :80.
+
+DAEMON="/usr/local/bin/dcentrald"
+CONFIG="/etc/dcentrald/dcentrald.toml"
+[ -f /data/dcentrald.toml ] && CONFIG="/data/dcentrald.toml"
+[ ! -f "$CONFIG" ] && [ -f /etc/dcentrald.toml ] && CONFIG="/etc/dcentrald.toml"
+LOGFILE="/tmp/dcentrald.log"
+PIDFILE="/var/run/dcentrald.pid"
+CHILD_PIDFILE="/var/run/dcentrald-child.pid"
+EXPECTFILE="/tmp/dcentrald.expected_exit.pid"
+API_PORT=8080
+MAX_CRASH_RESTARTS=5
+RESTART_DELAY=2
+SCRIPT="$0"
+
+# Production-readiness matrix §7 #4 (AM3-BB cold-boot management-only gate).
+#
+# The .79-class AM3-BB native cold-boot install image is NOT yet proven
+# (SD-first UART boot, SSH/MCP/dashboard/API reachability, cold-boot accepted
+# shares, thermal supervisor, NAND backup, and restore are all still blocked).
+# An install image for an unproven boot rail MUST come up MANAGEMENT-ONLY and
+# must NOT auto-energize the PSU or drive the ASIC chains on cold boot before
+# that proof + an explicit operator gate. (The proven .79 accepted-share lane
+# was a /tmp-staged dcentrald run under LuxOS, run MANUALLY — NOT this
+# install-image cold boot, which this gate does not touch.)
+#
+# Mechanism mirrors the /etc/dcentos/release-image trust-boundary marker
+# (release_image_provision.sh): a marker file flips posture. ABSENT (the
+# install-image default) => management-only config + no --am3-bb-mining, so the
+# daemon's existing `mining_start_enabled()` gate enters management-only-idle
+# (API/dashboard/MCP/SSH up; no PSU/chain I/O). PRESENT (operator has captured
+# the cold-boot proof) => the full mining profile + --am3-bb-mining.
+AM3_BB_COLDBOOT_PROOF_MARKER="/data/dcentos/am3-bb-coldboot-proven"
+AM3_BB_MGMT_ONLY_CONFIG="/etc/dcentrald.management-only.toml"
+
+detect_platform() {
+    if [ -e /dev/uio0 ]; then
+        echo "zynq"
+    elif grep -qiE 'AM33XX|AM335x|TI AM335' /proc/cpuinfo 2>/dev/null || [ -e /dev/ttyO1 ]; then
+        echo "beaglebone"
+    elif [ -e /dev/ttyS1 ] || [ -e /dev/ttyS2 ]; then
+        echo "amlogic"
+    else
+        echo "unknown"
+    fi
+}
+
+migrate_legacy_api_port() {
+    [ -f "$CONFIG" ] || return 0
+
+    if ! grep -Eq '^[[:space:]]*http_port[[:space:]]*=[[:space:]]*80([[:space:]]*(#.*)?)?$' "$CONFIG" 2>/dev/null; then
+        return 0
+    fi
+
+    TMPFILE="${CONFIG}.tmp.$$"
+    if awk '
+        BEGIN { in_api = 0 }
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            in_api = ($0 ~ /^[[:space:]]*\[api\][[:space:]]*$/)
+        }
+        in_api && /^[[:space:]]*http_port[[:space:]]*=[[:space:]]*80([[:space:]]*(#.*)?)?$/ {
+            sub(/80/, "8080")
+        }
+        { print }
+    ' "$CONFIG" > "$TMPFILE" 2>/dev/null; then
+        if mv "$TMPFILE" "$CONFIG" 2>/dev/null; then
+            echo "  [MIGRATE] dcentrald API http_port 80 to 8080 in $CONFIG"
+        else
+            rm -f "$TMPFILE"
+            echo "  [WARN] Could not migrate legacy dcentrald API port in $CONFIG"
+        fi
+    else
+        rm -f "$TMPFILE"
+        echo "  [WARN] Could not inspect dcentrald API port in $CONFIG"
+    fi
+}
+
+gpio_set_out() {
+    GPIO_NUM="$1"
+    GPIO_VALUE="$2"
+    GPIO_ACTIVE_LOW="$3"
+    GPIO_DIR="/sys/class/gpio/gpio${GPIO_NUM}"
+
+    [ -d "$GPIO_DIR" ] || echo "$GPIO_NUM" > /sys/class/gpio/export 2>/dev/null || true
+    [ -d "$GPIO_DIR" ] || return 0
+    echo "$GPIO_ACTIVE_LOW" > "$GPIO_DIR/active_low" 2>/dev/null || true
+    echo out > "$GPIO_DIR/direction" 2>/dev/null || true
+    echo "$GPIO_VALUE" > "$GPIO_DIR/value" 2>/dev/null || true
+}
+
+am3_bb_hashboard_safety_override() {
+    # S19J_IO_BOARD_V2_0 / .79-class: ASIC reset GPIOs are active-low,
+    # represented through sysfs active_low=1 with value=1 meaning asserted.
+    for g in 49 60 27 22; do
+        gpio_set_out "$g" 1 1
+    done
+    # gpio59 board-enable is active-high; value=0 turns the board off.
+    gpio_set_out 59 0 0
+}
+
+fan_safety_override() {
+    FAN_PLATFORM=${PLATFORM:-$(detect_platform)}
+    fan_detail="fans commanded to safe PWM; AM3 BB resets asserted and board-enable off where available"
+    case "$FAN_PLATFORM" in
+        amlogic)
+            if [ -d /sys/class/pwm/pwmchip0/pwm0 ]; then
+                echo 30000 > /sys/class/pwm/pwmchip0/pwm0/duty_cycle 2>/dev/null
+                echo 30000 > /sys/class/pwm/pwmchip0/pwm1/duty_cycle 2>/dev/null
+            fi
+            ;;
+        beaglebone)
+            # AM335x BB carrier (S19j Pro 3-board variant) -- 4 fans on
+            # sysfs PWM. PWM=30 cap (30000ns / 100000ns period) across every
+            # exported channel. Both LuxOS/DCENT_OS pwmchip0+pwmchip2
+            # paths and Bitmain stock legacy pwm1/pwm2 are tolerated.
+            for p in /sys/class/pwm/pwmchip0/pwm0/duty_cycle \
+                     /sys/class/pwm/pwmchip0/pwm1/duty_cycle \
+                     /sys/class/pwm/pwmchip2/pwm0/duty_cycle; do
+                [ -e "$p" ] && echo 30000 > "$p" 2>/dev/null
+            done
+            for p in /sys/class/pwm/pwm1/duty_ns /sys/class/pwm/pwm2/duty_ns; do
+                [ -e "$p" ] && echo 30000 > "$p" 2>/dev/null
+            done
+            am3_bb_hashboard_safety_override
+            ;;
+        zynq)
+            # AM2/XIL fan-control is UIO-bound; devmem writes are stale/no-op.
+            # NOTE: this is the beaglebone (am3-bb) overlay; detect_platform
+            # here returns "beaglebone" (or "amlogic"), so this zynq arm is a
+            # defensive branch that does NOT execute on this board. The canonical
+            # AM2 fan-hold fix (persistent `dcentrald --hold-fan` custodian,
+            # since a bare --set-fan one-shot lets the AM2 board revert fans to
+            # full speed — )
+            # lives in the board/zynq/* overlays that actually ship to AM2 units.
+            # This branch is intentionally left as the simple one-shot because it
+            # is unreachable on this overlay; do not duplicate the custodian here.
+            if [ -x "$DAEMON" ]; then
+                if "$DAEMON" --set-fan 30 >/tmp/s82dcentrald-fan-safety.log 2>&1; then
+                    fan_detail="AM2 fans commanded to PWM 30 via dcentrald UIO (one-shot; AM2 hold lives in board/zynq/*)"
+                else
+                    fan_detail="WARN: AM2 fan safety command failed; see /tmp/s82dcentrald-fan-safety.log"
+                fi
+            else
+                fan_detail="WARN: AM2 fan safety command skipped; $DAEMON missing"
+            fi
+            ;;
+    esac
+    echo "$(date): SAFETY: $fan_detail" >> "$LOGFILE"
+}
+
+case "$1" in
+    start)
+        [ -x "$DAEMON" ] || { echo "  [SKIP] $DAEMON not found"; exit 0; }
+        [ -f "$CONFIG" ] || { echo "  [SKIP] $CONFIG not found"; exit 0; }
+
+        if [ -d /data/dcent ]; then
+            chmod 0700 /data/dcent 2>/dev/null
+        fi
+        if [ -f /data/dcent/auth.json ]; then
+            chmod 0600 /data/dcent/auth.json 2>/dev/null
+        fi
+
+        PLATFORM=$(detect_platform)
+        ARGS="--config $CONFIG"
+        case "$PLATFORM" in
+            amlogic) ARGS="--serial-mining $ARGS" ;;
+            beaglebone)
+                # AM3-BB cold-boot management-only gate (matrix §7 #4).
+                # Mining starts ONLY when the operator has captured the
+                # cold-boot proof and dropped the marker on /data. Absent it
+                # (the install-image default), come up management-only: NO
+                # --am3-bb-mining, and point dcentrald at the management-only
+                # config so its `mining_start_enabled()` gate keeps the PSU
+                # de-energized and the ASIC chains untouched while SSH/MCP/
+                # dashboard/API stay reachable. The mining profile at $CONFIG
+                # is preserved verbatim and used unchanged once proven.
+                if [ -f "$AM3_BB_COLDBOOT_PROOF_MARKER" ]; then
+                    echo "  [AM3-BB] cold-boot proof marker present ($AM3_BB_COLDBOOT_PROOF_MARKER) — starting mining"
+                    echo "$(date): AM3-BB cold-boot proof present; starting --am3-bb-mining with $CONFIG" >> "$LOGFILE"
+                    ARGS="--am3-bb-mining $ARGS"
+                    export DCENT_AM3_BB_DSPIC_EARLY_ENABLE=1
+                    unset DCENT_AM3_BB_ENABLE_FAST_UART
+                    unset DCENT_AM3_BB_USE_DEVMEM_UART
+                    unset DCENT_AM3_BB_ALLOW_NO_RX_MINING
+                    unset DCENT_AM3_BB_SKIP_THERMAL_SUPERVISOR
+                    unset DCENT_AM3_BB_SKIP_DSPIC_HEARTBEAT
+                    unset DCENT_AM3_BB_DISABLE_HEARTBEAT_SUPERVISOR
+                else
+                    echo "  [AM3-BB] MANAGEMENT-ONLY until cold-boot proof: marker $AM3_BB_COLDBOOT_PROOF_MARKER absent"
+                    echo "  [AM3-BB]   SSH/MCP/dashboard/API will come up; PSU + ASIC chains stay OFF (no mining)."
+                    echo "  [AM3-BB]   To enable mining after capturing the cold-boot proof:"
+                    echo "  [AM3-BB]     touch $AM3_BB_COLDBOOT_PROOF_MARKER && $SCRIPT restart"
+                    echo "$(date): AM3-BB management-only cold boot (no proof marker); PSU/chains OFF, no --am3-bb-mining" >> "$LOGFILE"
+                    if [ -f "$AM3_BB_MGMT_ONLY_CONFIG" ]; then
+                        CONFIG="$AM3_BB_MGMT_ONLY_CONFIG"
+                        ARGS="--config $CONFIG"
+                    else
+                        # Fail-closed: if the management-only config is somehow
+                        # missing we must NOT energize. Dropping --am3-bb-mining
+                        # is NOT sufficient on its own — dcentrald auto-detects
+                        # the AM3-BB board and would still enter the energize
+                        # path if the loaded config has `[mining].enabled=true`
+                        # + a pool (the baked mining profile does). The CLI
+                        # cannot override `[mining].enabled` pile-independently,
+                        # so the only safe action here is to NOT start the
+                        # mining daemon. SSH (S50dropbear) and MCP (S81mcp) come
+                        # from separate init scripts and stay up; the operator
+                        # can restore the management-only config (or drop the
+                        # proof marker) and restart.
+                        echo "  [AM3-BB]   ERROR: $AM3_BB_MGMT_ONLY_CONFIG missing — refusing to start dcentrald to avoid cold-boot energize."
+                        echo "  [AM3-BB]   SSH (S50dropbear) + MCP (S81mcp) remain up. Restore the config or drop the proof marker, then: $SCRIPT restart"
+                        echo "$(date): ERROR AM3-BB management-only config missing; refusing to start mining daemon (fail-closed, no energize)" >> "$LOGFILE"
+                        exit 0
+                    fi
+                fi
+                ;;
+        esac
+
+        migrate_legacy_api_port
+        fan_safety_override
+
+        ORPHAN_PIDS=$(pidof dcentrald 2>/dev/null || true)
+        [ -n "$ORPHAN_PIDS" ] && {
+            echo "  [WARN] Killing orphaned dcentrald PID(s): $ORPHAN_PIDS"
+            for ORPHAN_PID in $ORPHAN_PIDS; do
+                echo "$ORPHAN_PID" > "$EXPECTFILE"
+                kill -TERM "$ORPHAN_PID" 2>/dev/null
+            done
+            for i in $(seq 1 30); do
+                pidof dcentrald > /dev/null 2>&1 || break
+                sleep 1
+            done
+            REMAINING_PIDS=$(pidof dcentrald 2>/dev/null || true)
+            [ -n "$REMAINING_PIDS" ] && {
+                rm -f "$EXPECTFILE"
+                fan_safety_override
+                for ORPHAN_PID in $REMAINING_PIDS; do
+                    kill -9 "$ORPHAN_PID" 2>/dev/null
+                done
+                sleep 1
+            }
+            rm -f "$CHILD_PIDFILE"
+        }
+
+        echo "  Starting dcentrald (platform=$PLATFORM)..."
+        echo "  Config: $CONFIG"
+        echo "  API: REST/WebSocket :$API_PORT"
+        echo "  Dashboard: HTTP :80 via S80dashboard"
+        start-stop-daemon -S -b -m -p "$PIDFILE" \
+            -x /bin/sh -- -c "
+                CRASH_COUNT=0
+                while true; do
+                    $DAEMON $ARGS >>$LOGFILE 2>&1 &
+                    CHILD_PID=\$!
+                    echo \$CHILD_PID > $CHILD_PIDFILE
+                    wait \$CHILD_PID
+                    EXIT_CODE=\$?
+                    EXPECTED_PID=\$(cat $EXPECTFILE 2>/dev/null || true)
+                    rm -f $CHILD_PIDFILE
+
+                    if [ \"\$EXPECTED_PID\" = \"\$CHILD_PID\" ]; then
+                        rm -f $EXPECTFILE
+                        echo \"\$(date): expected dcentrald exit for PID \$CHILD_PID (code \$EXIT_CODE)\" >> $LOGFILE
+                        exit \$EXIT_CODE
+                    fi
+
+                    rm -f $EXPECTFILE
+                    if [ \$EXIT_CODE -eq 0 ]; then
+                        echo \"\$(date): dcentrald exited cleanly\" >> $LOGFILE
+                        exit 0
+                    fi
+
+                    CRASH_COUNT=\$((CRASH_COUNT + 1))
+                    echo \"\$(date): dcentrald exited with code \$EXIT_CODE (crash \$CRASH_COUNT/$MAX_CRASH_RESTARTS)\" >> $LOGFILE
+                    \"$SCRIPT\" safety
+                    if [ \$CRASH_COUNT -ge $MAX_CRASH_RESTARTS ]; then
+                        echo \"\$(date): dcentrald restart limit reached\" >> $LOGFILE
+                        exit \$EXIT_CODE
+                    fi
+                    sleep $RESTART_DELAY
+                done
+            "
+
+        sleep 3
+        if pidof dcentrald > /dev/null 2>&1; then
+            echo "  [OK] dcentrald running (PID $(pidof dcentrald), REST/WebSocket :$API_PORT)"
+        else
+            echo "  [FAIL] dcentrald not started"
+            fan_safety_override
+        fi
+        ;;
+
+    stop)
+        echo "  Stopping dcentrald..."
+        CHILD_PID=$(cat "$CHILD_PIDFILE" 2>/dev/null || pidof dcentrald 2>/dev/null | awk '{print $1}')
+        WRAPPER_PID=$(cat "$PIDFILE" 2>/dev/null || true)
+        [ -n "$CHILD_PID" ] && echo "$CHILD_PID" > "$EXPECTFILE"
+        [ -n "$CHILD_PID" ] && kill -TERM "$CHILD_PID" 2>/dev/null
+
+        for i in $(seq 1 30); do
+            if [ -z "$CHILD_PID" ] || ! kill -0 "$CHILD_PID" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+
+        TIMED_OUT=0
+        if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+            echo "  [WARN] dcentrald did not exit in 30s - force killing"
+            rm -f "$EXPECTFILE"
+            TIMED_OUT=1
+            kill -9 "$CHILD_PID" 2>/dev/null
+        fi
+
+        if [ -n "$WRAPPER_PID" ] && kill -0 "$WRAPPER_PID" 2>/dev/null; then
+            kill -TERM "$WRAPPER_PID" 2>/dev/null
+            sleep 1
+            kill -9 "$WRAPPER_PID" 2>/dev/null
+        fi
+
+        rm -f "$PIDFILE" "$CHILD_PIDFILE"
+        if [ "$TIMED_OUT" -eq 1 ]; then
+            fan_safety_override
+        fi
+        echo "  [OK] dcentrald stopped"
+        ;;
+
+    restart)
+        $0 stop
+        sleep 2
+        $0 start
+        ;;
+
+    safety)
+        fan_safety_override
+        ;;
+
+    status)
+        if pidof dcentrald > /dev/null 2>&1; then
+            echo "dcentrald: running (PID $(pidof dcentrald), REST/WebSocket :$API_PORT)"
+        else
+            echo "dcentrald: stopped"
+        fi
+        ;;
+
+    *)
+        echo "Usage: $0 {start|stop|restart|status|safety}"
+        exit 1
+        ;;
+esac
+
+exit 0

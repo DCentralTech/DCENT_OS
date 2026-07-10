@@ -1,0 +1,77 @@
+#!/bin/sh
+#
+# S99upgrade - am3-bb safe no-op/readiness marker.
+#
+# The am3-bb rootfs overlays the am3 Amlogic userspace layer, but this board is
+# an AM335x BeagleBone Black SD-card bring-up target. It has no validated
+# Amlogic recovery flag, /dev/nand_env, or firstboot U-Boot environment commit.
+# This script deliberately performs no NAND or fw_env writes.
+
+BOARD_TARGET_FILE=/etc/dcentos/board_target
+EXPECTED_BOARD=am3-bb
+
+wait_for_dcentrald_api() {
+    limit=${1:-20}
+
+    if ! command -v wget >/dev/null 2>&1; then
+        echo "  [INFO] wget unavailable; skipping local API readiness probe"
+        return 0
+    fi
+
+    echo "  Checking local dcentrald API readiness (up to ${limit}s)..."
+    i=1
+    while [ "$i" -le "$limit" ]; do
+        if wget -q -T 2 -O /dev/null http://127.0.0.1:8080/api/status 2>/dev/null; then
+            echo "  [OK] dcentrald API management endpoint is reachable"
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+
+    echo "  [WARN] dcentrald API management endpoint not reachable yet"
+    return 0
+}
+
+report_readiness() {
+    if [ -r "$BOARD_TARGET_FILE" ]; then
+        board_target=$(cat "$BOARD_TARGET_FILE" 2>/dev/null || echo unknown)
+    else
+        board_target=unknown
+    fi
+
+    if [ "$board_target" != "$EXPECTED_BOARD" ]; then
+        echo "S99upgrade am3-bb: board_target=$board_target; no AM335x upgrade commit action"
+        return 0
+    fi
+
+    echo "S99upgrade am3-bb: SD-card image; no NAND recovery flag or fw_env commit"
+
+    if ip addr show eth0 2>/dev/null | grep -q 'inet '; then
+        echo "  [OK] eth0 has an IPv4 address"
+    else
+        echo "  [INFO] eth0 IPv4 address not present at S99"
+    fi
+
+    if netstat -tln 2>/dev/null | grep -q ':22 '; then
+        echo "  [OK] SSH management port is listening"
+    else
+        echo "  [INFO] SSH management port not listening at S99"
+    fi
+
+    wait_for_dcentrald_api 20
+}
+
+case "$1" in
+    start)
+        report_readiness
+        ;;
+    stop)
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}"
+        exit 1
+        ;;
+esac
+
+exit 0

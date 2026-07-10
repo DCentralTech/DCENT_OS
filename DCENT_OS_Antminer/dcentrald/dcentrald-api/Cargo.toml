@@ -1,0 +1,112 @@
+[package]
+name = "dcentrald-api"
+version.workspace = true  # Single source: dcentrald/Cargo.toml [workspace.package]
+edition = "2021"
+description = "API server for dcentrald — CGMiner TCP, REST, and WebSocket"
+license = "GPL-3.0"
+# W5.1 (2026-05-07): the dashboard SPA is no longer compiled into
+# dcentrald via `include_str!`. It now ships as a static asset served by
+# `server.py` from `/usr/share/dcentos-dashboard/index.html` (post-build
+# overlay copy). The previous `build.rs` artifact-size gate was deleted
+# in W5.1 because the artifact is no longer part of dcentrald-api's
+# compilation unit. See `src/dashboard.rs` for the redirect stub and the
+# W5.1 rationale block.
+
+[dependencies]
+dcentrald-api-types = { path = "../dcentrald-api-types" }
+# W1.4 wallet-mask: log-tail endpoint sanitization + any future REST helper
+# that emits log lines. See `dcentrald-common/src/wallet_mask.rs`.
+dcentrald-common = { path = "../dcentrald-common" }
+dcentrald-hal = { path = "../dcentrald-hal" }
+dcentrald-asic = { path = "../dcentrald-asic" }
+dcentrald-stratum = { path = "../dcentrald-stratum" }
+dcentrald-thermal = { path = "../dcentrald-thermal" }
+dcentrald-diagnostics = { path = "../dcentrald-diagnostics" }
+dcentrald-autotuner = { path = "../dcentrald-autotuner" }
+#  W8-D: profile-import REST endpoints consume the runtime
+# `ProfileRegistry` (W5-A foundation + W7-D fixes + W8-A enum
+# extension). See `src/routes/profiles.rs`.
+dcentrald-silicon-profiles = { path = "../dcentrald-silicon-profiles" }
+dcent-schema = { path = "../../../shared/dcent-schema" }
+
+tower-http = { version = "0.5", features = ["cors"] }
+sha2 = "0.10"
+argon2 = "0.5"
+#  W9-B (R3-HIGH free-space precheck): direct statvfs(3) FFI in
+# nand_backup() so the daemon can refuse before mkdir/dd if /data has
+# less than 250 MiB free. Other dcentrald crates (dcentrald, dcentrald-hal,
+# dcentrald-asic) already pull this in at "0.2".
+libc = "0.2"
+# SECURITY (wave 8, 2026-04-28): in-Rust Ed25519 OTA signature verification.
+# Daemon verifies before invoking sysupgrade so malicious bundles are rejected
+# at the API boundary, not just by the shell script. See ota_signature.rs.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+getrandom = { version = "0.2", features = ["std"] }
+tokio.workspace = true
+tokio-util.workspace = true
+#  W12-C: async trait objects for the PreflightProbes seam in
+# routes/restore_to_stock.rs (preflight-checks endpoint). Lets the
+# integration tests inject a mock probe impl without touching the
+# real PATH or statvfs(3).
+async-trait = "0.1"
+serde.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+tokio-tungstenite.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+toml.workspace = true
+rumqttc.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+[features]
+# Test/fuzz-only surface for libFuzzer targets. Production builds leave this
+# off, so private parser helpers stay private to normal downstream crates.
+fuzzing = []
+
+[dev-dependencies]
+proptest = { workspace = true }
+#  W8-D: in-process axum router testing for the new
+# /api/profiles/silicon/* endpoints. `tower::ServiceExt::oneshot`
+# lets us drive a `Router` directly without binding a TCP socket.
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
+#  W13-A: integration tests for the autotuner runtime command
+# wiring need the dcentrald-autotuner `test-helpers` feature
+# (`AutoTuner::tick_runtime_commands_for_test`,
+#  `AutoTuner::force_state_for_test`). Stays out of the production
+# dependency graph because dev-dependencies are compiled only for
+# `cargo test`.
+dcentrald-autotuner = { path = "../dcentrald-autotuner", features = ["test-helpers"] }
+#  W12-C: integration tests use `#[async_trait]` to implement
+# the `PreflightProbes` mock against the production trait surface.
+async-trait = "0.1"
+#  W10-D (R6'-#33): replace the home-rolled `W9C_TEST_GATE`
+# StdMutex with `serial_test::serial(...)` so cargo's parallel test
+# runner serializes the restore-to-stock RESTORE_LOCK + STATUS tests
+# without bespoke gate machinery.
+serial_test = "3"
+# W6.2 (2026-05-07): share-submission e2e regression test consumes
+# `dcentrald-stratum` public surface (already in `[dependencies]`) plus
+# a localhost mock pool and per-chip-family golden midstate fixtures.
+# `hex` is needed for extranonce2 hex round-tripping in mutation
+# construction; `sha2` is already in `[dependencies]` and re-used by
+# the fixture-derivation helper. See `tests/share_submission_e2e.rs`.
+hex = "0.4"
+
+# W4.7 lint inheritance + grandfather override (DCENT_DevOps + DCENT_QA, 2026-05-07).
+# ~123 grandfathered unwrap/expect/panic occurrences in src/ + ~327 in tests/.
+# Test code is already exempt from `unwrap_used` per clippy default in `#[test]`
+# but the `tests/` integration directory is not, so the lint would still fire
+# on REST-route tests using `oneshot` + `unwrap()` boilerplate. Lints are
+# downgraded to `allow` here. Audit status:
+# .
+# cargo 1.95+: per-crate overrides cannot coexist with `[lints] workspace = true`.
+[lints.clippy]
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+indexing_slicing = "allow"
+unwrap_in_result = "allow"

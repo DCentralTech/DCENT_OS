@@ -1,0 +1,44 @@
+/* ──────────────────────────────────────────────────────────────────────────
+   flow.css — Reactive flowing graph + share strip + thermal shifter (Phase 5)
+   ──────────────────────────────────────────────────────────────────────────
+   Three reactive primitives:
+     1. <flow-graph>   smooth-Bezier hashrate ribbon under the Mining Core
+     2. .share-stream  particle drift strip — accepted/rejected dots
+     3. [data-thermal] color-mix transitions for temperature elements
+   ────────────────────────────────────────────────────────────────────────── */
+
+/* ── 1. Flow graph ──────────────────────────────────────────────────── */
+.flow-host{display:block;width:100%;height:80px;margin-top:6px}
+.flow-host svg{width:100%;height:100%;display:block}
+.flow-host #flowLine{transition:d .4s var(--ease-out);stroke-dasharray:2 5;animation:flowScroll 22s linear infinite}
+.flow-host #flowArea{transition:d .4s var(--ease-out)}
+@keyframes flowScroll{from{stroke-dashoffset:0}to{stroke-dashoffset:-200}}
+
+/* ── 2. Share particle strip ────────────────────────────────────────── */
+.share-stream{
+  position:relative;height:18px;overflow:hidden;
+  background:rgba(0,0,0,.25);
+  border-radius:9px;
+  border:1px solid var(--border);
+  margin-top:8px;
+}
+.share-p{
+  position:absolute;top:50%;width:6px;height:6px;
+  border-radius:50%;
+  transform:translateY(-50%);
+  animation:shareDrift 4s linear forwards;
+}
+.share-p.ok  {background:var(--state-active);box-shadow:0 0 8px var(--state-glow-active)}
+.share-p.bad {background:var(--state-error); box-shadow:0 0 8px var(--state-glow-error)}
+@keyframes shareDrift{
+  from {right:-10px;opacity:1}
+  90%  {opacity:1}
+  to   {right:100%;opacity:0}
+}
+
+/* ── 3. Thermal color shifter ───────────────────────────────────────── */
+[data-thermal]{transition:color .4s ease,background .4s ease,box-shadow .4s ease}
+[data-thermal="cool"]   {--thermal:var(--temp-cool);   color:var(--temp-cool)}
+[data-thermal="normal"] {--thermal:var(--temp-normal); color:var(--temp-normal)}
+[data-thermal="warm"]   {--thermal:var(--temp-warm);   color:var(--temp-warm)}
+[data-thermal="danger"] {--thermal:var(--temp-danger); color:var(--temp-danger);text-shadow:0 0 12px var(--state-glow-error)}

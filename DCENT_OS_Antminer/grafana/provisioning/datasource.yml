@@ -1,0 +1,17 @@
+# Grafana provisioned data source for the DCENT_OS Prometheus exporter.
+# Copy to /etc/grafana/provisioning/datasources/dcentos.yml
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    # Point at YOUR Prometheus, not at a miner. Prometheus scrapes the
+    # miners' /metrics; Grafana queries Prometheus.
+    url: http://localhost:9090
+    isDefault: true
+    jsonData:
+      httpMethod: POST
+      timeInterval: 15s
+    editable: true

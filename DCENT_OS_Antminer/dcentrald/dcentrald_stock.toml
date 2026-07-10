@@ -1,0 +1,75 @@
+# dcentrald_stock.toml — Stock Bitmain FPGA Mining Configuration
+#
+# For use with: dcentrald --stock-fpga --config /tmp/dcentrald_stock.toml
+#
+# This config is for S9 miners running STOCK Bitmain firmware (kernel 3.14.0-xilinx).
+# It uses /dev/axi_fpga_dev and /dev/fpga_mem instead of BraiinsOS UIO devices.
+#
+# Prerequisites:
+#   1. SSH access to the miner (via signature bypass or existing SSH)
+#   2. Kill bmminer: killall bmminer single-board-test
+#   3. Upload dcentrald binary to /tmp/
+#   4. Run: /tmp/dcentrald --stock-fpga --config /tmp/dcentrald_stock.toml
+
+[general]
+hostname = "dcentral-s9-stock"
+log_level = "info"
+
+[pool]
+url = "stratum+tcp://solo.ckpool.org:3333"
+worker = ""
+password = "d=1"
+
+[mining]
+# Conservative settings — stock FPGA passthrough (bmminer already configured ASICs)
+frequency_mhz = 500
+voltage_mv = 9100
+suggest_difficulty = 1
+# Passthrough mode: ASICs retain bmminer's config after kill
+passthrough = true
+version_rolling = false
+
+[power]
+mode = "bypass"
+target_watts = 0
+
+[thermal]
+target_temp_c = 55
+hot_temp_c = 65
+dangerous_temp_c = 75
+fan_min_pwm = 10
+fan_max_pwm = 127
+
+[api]
+cgminer_port = 4028
+http_port = 80
+websocket = false
+auth_enabled = false
+auth_password = ""
+
+[donation]
+enabled = false
+percent = 0.0
+pool_url = "stratum+tcp://donate.dcentral.pool:3333"
+worker = "dcentrald-donation"
+
+[watchdog]
+enabled = false
+kick_interval_s = 5
+
+[hash_on_disconnect]
+enabled = true
+
+[mode]
+active = "standard"
+
+[autotuner]
+enabled = false
+target_mode = "hashrate"
+measurement_window_s = 3
+verification_window_s = 15
+error_threshold_pct = 0.5
+safety_margin_pct = 5.0
+min_freq_mhz = 200
+max_freq_mhz = 750
+background_interval_s = 60

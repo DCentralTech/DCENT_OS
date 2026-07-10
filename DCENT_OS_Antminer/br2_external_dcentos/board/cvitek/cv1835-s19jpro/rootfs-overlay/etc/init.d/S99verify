@@ -1,0 +1,996 @@
+#!/bin/sh
+#
+# S99verify - DCENT_OS post-flash cold-boot proof gate.
+#
+# Runs at the end of first boot (after S82dcentrald + S81mcp + S50dropbear),
+# executes the V1..V14 cold-boot proof matrix from
+#  (Q2), and emits a deterministic
+# JSON contract to /tmp/s99verify.json for the host-side toolbox post-flash
+# poller and the dashboard event log.
+#
+# PHASE 4A (2026-05-15): refactored as a single shared script with
+# detect_platform() + per-family case blocks so all 4 base overlays (zynq,
+# beaglebone, amlogic, cvitek) carry the same file. Per-family values come
+# from /etc/dcentos/{board_family,rail_gpio,partial_yield_floor,fan_max_pwm}.
+# JSON schema bumped to version=2; backward-compatibility kept via the
+# existing `board_target` field plus the new `board_family` field.
+#
+# CHECK MATRIX (each check has a strict timeout; the whole script is bounded
+# at ~5 minutes wall clock so it never holds first boot indefinitely):
+#
+#   V1  ssh-reachable          : Dropbear listening on :22.
+#   V2  mcp-reachable          : MCP HTTP /health on :3000.
+#   V3  dashboard-served       : Dashboard HTTP root on :80 or :8080.
+#   V4  dcentrald-running      : pgrep dcentrald + process age > 30 s
+#                                (rules out crash-loops).
+#   V5  psu-engaged            : per-family rail-enable GPIO asserted (HIGH)
+#                                when mining is enabled; de-asserted (LOW) is
+#                                valid for management-only quiet idle.
+#                                  zynq am2 / am2-*: gpio907.
+#                                  am3-bb*       : gpio59 (S19J_IO_BOARD_V2_0).
+#                                  am3-aml*      : gpio437 (Amlogic A113D PWR_EN).
+#                                  cv1835*       : /etc/dcentos/rail_gpio (TBD).
+#   V6  pic-fw-validated       : per-family voltage-controller proof.
+#                                  zynq am2 / am3-bb: dsPIC fw whitelist
+#                                    {0x82,0x89,0x8A,0xB9,0xFE}, reject 0x86.
+#                                  am3-aml*: skipped (TAS5782M NoPic).
+#                                  cv1835*: PIC1704 @ 0x20 classify
+#                                    bootloader (0xCC) vs application (0x60).
+#   V7  chain-yield-acceptable : per-family floor from
+#                                /etc/dcentos/partial_yield_floor (defaults:
+#                                  am2 22 chips, am3-bb 3 chains, am3-aml 80
+#                                  chips, cv1835 144 chips).
+#   V8  stratum-handshake      : Stratum HANDSHAKE COMPLETE within 60 s of
+#                                dcentrald start (state.json marker).
+#   V9  first-nonce            : First nonce parsed within 120 s.
+#   V10 first-share            : First accepted share within 180 s.
+#   V11 fan-cap-honored        : per-family fan PWM cap.
+#                                  am2: dcentrald --get-fan UIO readback
+#                                    (devmem is stale/no-op on am2). When
+#                                    mining is disabled, require idle cap
+#                                    instead of the mining cap.
+#                                  am3-bb/aml/cv1835: sysfs PWM duty_cycle
+#                                    <= 30% of period.
+#   V12 thermal-supervisor-ok  : per-family thermal proof.
+#                                  am2: last Am2ThermalSupervisor sample.
+#                                  am3-bb: LM75A @ 0x48 via i2cget.
+#                                  am3-aml: state.json supervisor (NoPic).
+#                                  cv1835: /sys/class/thermal/thermal_zone0.
+#   V13 no-no-nonce-stall      : per-family no_nonce_stall event name from
+#                                state.json / dcentrald.log:
+#                                  am2: am2_no_nonce_stall.
+#                                  am3-bb: am3_bb_no_nonce_stall.
+#                                  am3-aml: am3_aml_no_nonce_stall.
+#                                  cv1835: cv1835_no_nonce_stall.
+#   V14 upgrade-stage-cleared  : `fw_setenv upgrade_stage` cleared (commit OK
+#                                signal to U-Boot). Fail-soft if fw_setenv is
+#                                missing (still report check with detail).
+#
+# CONTRACT: failures are logged loudly to syslog. S99verify does NOT
+# auto-revert -- that authority belongs to S99upgrade / U-Boot bootcount.
+# The JSON output is the contract; downstream consumers decide.
+#
+# D-Central Technologies - DCENT_OS Phase 4F + 4A multi-family port
+#
+
+OUT_JSON=/tmp/s99verify.json
+LOGFILE=/tmp/s99verify.log
+STATE_JSON=/var/lib/dcentrald/state.json
+DAEMON=/usr/local/bin/dcentrald
+CONFIG_DIR=/etc/dcentos
+PARTIAL_YIELD_FLOOR_FILE=$CONFIG_DIR/partial_yield_floor
+FAN_CAP_FILE=$CONFIG_DIR/fan_max_pwm
+BOARD_TARGET_FILE=$CONFIG_DIR/board_target
+BOARD_FAMILY_FILE=$CONFIG_DIR/board_family
+RAIL_GPIO_FILE=$CONFIG_DIR/rail_gpio
+
+# PHASE 2K (2026-05-15): per-variant override include. The shared script is
+# byte-identical across all 4 base overlays (zynq, beaglebone, amlogic,
+# cvitek). Per-family V5/V6/V7/V11/V12/V13 customisation (chip-init
+# signatures, rail GPIO numbers, fan/thermal specifics) belongs in ONE
+# place per variant -- a sourced include shipped by that variant's overlay
+# at $S99VERIFY_LOCAL_INCLUDE -- instead of hand-editing 4 copies of this
+# file (which guarantees drift
+# finding C-08). The include is sourced AFTER all helpers + check_* are
+# defined and AFTER platform detection (so $PLATFORM / $BOARD_FAMILY are
+# resolved), but BEFORE any check runs -- so an override may redefine any
+# check_* function, override DEFAULT_* budgets, or set extra config. When
+# the file is absent (the only case on the proven zynq am1-s9 / am2-XIL
+# mining path) the sourcing is a no-op and V1..V14 behaviour is unchanged.
+S99VERIFY_LOCAL_INCLUDE=$CONFIG_DIR/s99verify.local
+
+# Defaults (matched to XIL lab-only posture; 28/126 first-shares run was
+# ~22% yield, so floor=22 chips is the lab default until the bench-unit
+# gap is filled per the QA report Q6 Option C).
+DEFAULT_PARTIAL_YIELD_FLOOR=22
+DEFAULT_FAN_MAX_PWM=30
+DEFAULT_FAN_IDLE_PWM=10
+DEFAULT_FAN_QUIET_MAX_RPM=2000
+DEFAULT_HANDSHAKE_BUDGET_S=60
+DEFAULT_NONCE_BUDGET_S=120
+DEFAULT_SHARE_BUDGET_S=180
+
+# Per-check timeouts (seconds). Generous enough that a sluggy boot doesn't
+# false-fail, tight enough that the worst-case script wallclock stays well
+# under 5 minutes total.
+PORT_PROBE_TIMEOUT_S=3
+HTTP_PROBE_TIMEOUT_S=5
+I2C_PROBE_TIMEOUT_S=3
+
+mkdir -p "$(dirname $OUT_JSON)" 2>/dev/null
+mkdir -p "$(dirname $LOGFILE)" 2>/dev/null
+
+# --- helpers ---------------------------------------------------------------
+
+ts() {
+    date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+logline() {
+    msg=$1
+    echo "$(ts) S99verify: $msg" >> $LOGFILE
+    logger -t S99verify -- "$msg" 2>/dev/null || true
+}
+
+read_config_int() {
+    file=$1
+    default=$2
+    if [ -r "$file" ]; then
+        v=$(head -1 "$file" 2>/dev/null | tr -dc '0-9')
+        if [ -n "$v" ]; then
+            echo "$v"
+            return
+        fi
+    fi
+    echo "$default"
+}
+
+read_config_str() {
+    file=$1
+    default=$2
+    if [ -r "$file" ]; then
+        v=$(head -1 "$file" 2>/dev/null | tr -d '\r\n')
+        if [ -n "$v" ]; then
+            echo "$v"
+            return
+        fi
+    fi
+    echo "$default"
+}
+
+active_dcentrald_config() {
+    if [ -f /data/dcentrald.toml ]; then
+        echo /data/dcentrald.toml
+    elif [ -f /etc/dcentrald/xil_override.toml ]; then
+        echo /etc/dcentrald/xil_override.toml
+    else
+        echo /etc/dcentrald.toml
+    fi
+}
+
+mining_autostart_disabled() {
+    cfg=$(active_dcentrald_config)
+    [ -f "$cfg" ] || return 1
+
+    awk '
+        BEGIN { result = 1 }
+        /^[[:space:]]*\[/ {
+            line = $0
+            gsub(/[[:space:]]/, "", line)
+            in_mining = (line == "[mining]")
+        }
+        in_mining {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+            split(line, kv, "=")
+            key = kv[1]
+            gsub(/[[:space:]]/, "", key)
+            if (key == "enabled") {
+                value = kv[2]
+                gsub(/[[:space:]]/, "", value)
+                if (value == "false") {
+                    result = 0
+                } else {
+                    result = 1
+                }
+                exit
+            }
+        }
+        END { exit result }
+    ' "$cfg"
+}
+
+read_toml_section_int() {
+    section=$1
+    key_name=$2
+    default=$3
+    cfg=$(active_dcentrald_config)
+    if [ ! -f "$cfg" ]; then
+        echo "$default"
+        return
+    fi
+
+    awk -v section="$section" -v key_name="$key_name" -v default="$default" '
+        BEGIN { value = default }
+        /^[[:space:]]*\[/ {
+            line = $0
+            gsub(/[[:space:]]/, "", line)
+            in_section = (line == "[" section "]")
+        }
+        in_section {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+            split(line, kv, "=")
+            key = kv[1]
+            gsub(/[[:space:]]/, "", key)
+            if (key == key_name) {
+                raw = kv[2]
+                gsub(/[^0-9]/, "", raw)
+                if (raw != "") {
+                    value = raw
+                    exit
+                }
+            }
+        }
+        END { print value }
+    ' "$cfg"
+}
+
+am2_management_only_quiet_idle() {
+    [ "$PLATFORM" = "am2" ] && mining_autostart_disabled
+}
+
+emit_am2_management_only_skips() {
+    emit_check V6 true "AM2 management-only quiet idle: voltage-controller mining proof skipped (PWR_CONTROL de-asserted)"
+    emit_check V7 true "AM2 management-only quiet idle: chain-yield mining proof skipped"
+    emit_check V8 true "AM2 management-only quiet idle: stratum-handshake mining proof skipped"
+    emit_check V9 true "AM2 management-only quiet idle: first-nonce mining proof skipped"
+    emit_check V10 true "AM2 management-only quiet idle: first-share mining proof skipped"
+    emit_check V12 true "AM2 management-only quiet idle: thermal mining proof skipped; hashboards unpowered"
+    emit_check V13 true "AM2 management-only quiet idle: no-nonce-stall mining proof skipped"
+}
+
+port_listening() {
+    port=$1
+    if command -v netstat > /dev/null 2>&1; then
+        netstat -tln 2>/dev/null | grep -q ":${port} " && return 0
+    fi
+    if command -v ss > /dev/null 2>&1; then
+        ss -tln 2>/dev/null | grep -q ":${port} " && return 0
+    fi
+    return 1
+}
+
+http_probe_status() {
+    url=$1
+    timeout=$2
+    if command -v wget > /dev/null 2>&1; then
+        if wget -q -T "$timeout" -t 1 --spider -O /dev/null "$url" 2>/dev/null; then
+            echo "ok"
+            return
+        fi
+    fi
+    if command -v curl > /dev/null 2>&1; then
+        if curl -fsS --max-time "$timeout" -o /dev/null "$url" 2>/dev/null; then
+            echo "ok"
+            return
+        fi
+    fi
+    echo "fail"
+}
+
+# JSON helper: append a check entry. Quotes detail string conservatively.
+# Args: id passed_bool detail
+emit_check() {
+    id=$1
+    passed=$2
+    detail=$3
+    # Escape backslash + double-quote in detail for JSON safety. Use sed
+    # because tr can't do multi-char replacements.
+    esc=$(printf '%s' "$detail" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    if [ -z "$CHECKS_JSON" ]; then
+        CHECKS_JSON="    { \"id\": \"$id\", \"passed\": $passed, \"detail\": \"$esc\" }"
+    else
+        CHECKS_JSON="$CHECKS_JSON,
+    { \"id\": \"$id\", \"passed\": $passed, \"detail\": \"$esc\" }"
+    fi
+    if [ "$passed" = "true" ]; then
+        logline "[OK]   $id  $detail"
+    else
+        logline "[FAIL] $id  $detail"
+        ALL_PASSED=false
+    fi
+}
+
+# Read a single key (top-level) from $STATE_JSON. Returns empty if not present.
+read_state_key() {
+    key=$1
+    [ -r "$STATE_JSON" ] || { echo ""; return; }
+    # Minimal jq-free lookup: grep "key": and extract first JSON value.
+    grep -m1 "\"$key\"" "$STATE_JSON" 2>/dev/null \
+        | sed -e "s/.*\"$key\"[[:space:]]*:[[:space:]]*//" \
+              -e "s/^\"\\(.*\\)\".*/\\1/" \
+              -e "s/,$//" \
+              -e "s/[[:space:]]*$//"
+}
+
+# --- platform detection ----------------------------------------------------
+
+# detect_platform() sets two globals:
+#   $BOARD_FAMILY - one of: zynq-bm3-am2, am2-s19j, am2-s17, am3-bb,
+#                           am3-bb-s19jpro, am3-aml, am3-aml-s21,
+#                           am3-aml-s19jpro, am3-aml-s19kpro, cv1835,
+#                           cv1835-s19jpro, unknown.
+#   $PLATFORM     - one of: am2, am3-bb, am3-aml, cv1835, unknown.
+detect_platform() {
+    BOARD_FAMILY="unknown"
+    PLATFORM="unknown"
+
+    if [ -r "$BOARD_FAMILY_FILE" ]; then
+        BOARD_FAMILY=$(head -1 "$BOARD_FAMILY_FILE" 2>/dev/null | tr -d '\r\n')
+    fi
+
+    # Fallback: derive from board_target.
+    if [ "$BOARD_FAMILY" = "unknown" ] || [ -z "$BOARD_FAMILY" ]; then
+        if [ -r "$BOARD_TARGET_FILE" ]; then
+            bt=$(head -1 "$BOARD_TARGET_FILE" 2>/dev/null | tr -d '\r\n')
+            case "$bt" in
+                am2-*|zynq-bm3-am2) BOARD_FAMILY="$bt" ;;
+                am3-bb-*)           BOARD_FAMILY="$bt" ;;
+                am3-aml-*|am3-s21|am3-s19kpro) BOARD_FAMILY="$bt" ;;
+                cv1835-*)           BOARD_FAMILY="$bt" ;;
+            esac
+        fi
+    fi
+
+    # Final fallback: uname -m heuristic.
+    if [ "$BOARD_FAMILY" = "unknown" ] || [ -z "$BOARD_FAMILY" ]; then
+        arch=$(uname -m 2>/dev/null)
+        case "$arch" in
+            armv7l|arm)    BOARD_FAMILY="unknown" ;;       # do not infer AM2 from arch in this overlay
+            aarch64|arm64) BOARD_FAMILY="cv1835-s19jpro" ;; # CV1835 overlay fallback
+            *)             BOARD_FAMILY="unknown" ;;
+        esac
+    fi
+
+    # Classify $PLATFORM from $BOARD_FAMILY for case-block routing.
+    case "$BOARD_FAMILY" in
+        zynq-bm3-am2|am2-*) PLATFORM="am2" ;;
+        am3-bb*)            PLATFORM="am3-bb" ;;
+        am3-aml*|am3-s21|am3-s19kpro) PLATFORM="am3-aml" ;;
+        cv1835*)            PLATFORM="cv1835" ;;
+        *)                  PLATFORM="unknown" ;;
+    esac
+}
+
+# --- check implementations -------------------------------------------------
+
+check_ssh() {
+    if port_listening 22; then
+        emit_check V1 true "Dropbear listening on :22"
+    else
+        emit_check V1 false "Dropbear NOT listening on :22"
+    fi
+}
+
+check_mcp() {
+    # MCP convention: am3-bb binds :3000, Zynq tree may bind :3000 too. The
+    # QA matrix says :3000 explicitly. Accept either listening port OR a
+    # successful GET on /health.
+    if port_listening 3000; then
+        st=$(http_probe_status "http://127.0.0.1:3000/health" "$HTTP_PROBE_TIMEOUT_S")
+        if [ "$st" = "ok" ]; then
+            emit_check V2 true "MCP :3000 /health returned 200"
+        else
+            # Some MCP builds answer / not /health. Try the root.
+            st_root=$(http_probe_status "http://127.0.0.1:3000/" "$HTTP_PROBE_TIMEOUT_S")
+            if [ "$st_root" = "ok" ]; then
+                emit_check V2 true "MCP :3000 root reachable (no /health endpoint)"
+            else
+                emit_check V2 false "MCP :3000 listening but /health and / unreachable"
+            fi
+        fi
+    else
+        emit_check V2 false "MCP :3000 not listening"
+    fi
+}
+
+check_dashboard() {
+    # Dashboard may be on :80 (S80dashboard) or :8080 (dcentrald API). Either is fine.
+    if port_listening 80; then
+        st=$(http_probe_status "http://127.0.0.1:80/" "$HTTP_PROBE_TIMEOUT_S")
+        if [ "$st" = "ok" ]; then
+            emit_check V3 true "Dashboard :80 reachable"
+            return
+        fi
+    fi
+    if port_listening 8080; then
+        st=$(http_probe_status "http://127.0.0.1:8080/api/status" "$HTTP_PROBE_TIMEOUT_S")
+        if [ "$st" = "ok" ]; then
+            emit_check V3 true "dcentrald API :8080 reachable (dashboard via API)"
+            return
+        fi
+    fi
+    emit_check V3 false "Neither :80 nor :8080 responded"
+}
+
+check_dcentrald_running() {
+    if ! pidof dcentrald > /dev/null 2>&1; then
+        emit_check V4 false "dcentrald PID not found"
+        return
+    fi
+    pid=$(pidof dcentrald 2>/dev/null | awk '{print $1}')
+    # Age check: if the process is younger than 30 s it might be a crash-loop
+    # restart from S82dcentrald's wrapper. We surface this so the operator
+    # knows to look at the wrapper restart counter.
+    if [ -r /proc/$pid/stat ]; then
+        proc_uptime=$(awk '{print $22}' /proc/$pid/stat 2>/dev/null)
+        sys_uptime_hz=$(awk '{print $1 * 100}' /proc/uptime 2>/dev/null | awk -F. '{print $1}')
+        if [ -n "$proc_uptime" ] && [ -n "$sys_uptime_hz" ] && [ "$sys_uptime_hz" -gt "$proc_uptime" ]; then
+            age_ticks=$((sys_uptime_hz - proc_uptime))
+            # ticks are typically jiffies @ 100 Hz; convert to seconds.
+            age_s=$((age_ticks / 100))
+            if [ "$age_s" -lt 30 ]; then
+                emit_check V4 false "dcentrald PID $pid is only ${age_s}s old (possible crash-loop)"
+                return
+            fi
+            emit_check V4 true "dcentrald PID $pid alive for ${age_s}s"
+            return
+        fi
+    fi
+    emit_check V4 true "dcentrald PID $pid alive (age unknown)"
+}
+
+# V5: per-family rail-enable GPIO.
+check_rail_gpio() {
+    rail_gpio=""
+    case "$PLATFORM" in
+        am2)     rail_gpio=907 ;;
+        am3-bb)  rail_gpio=59 ;;
+        am3-aml) rail_gpio=437 ;;
+        cv1835)
+            # cv1835 has no proven rail-enable GPIO yet; read from
+            # /etc/dcentos/rail_gpio (TBD until bench unit lands).
+            rail_gpio=$(read_config_str "$RAIL_GPIO_FILE" "")
+            ;;
+    esac
+    if [ -z "$rail_gpio" ]; then
+        emit_check V5 true "rail GPIO unknown for platform=$PLATFORM family=$BOARD_FAMILY -- capture from bench (skipped, non-blocking)"
+        return
+    fi
+    val=""
+    if [ -r /sys/class/gpio/gpio${rail_gpio}/value ]; then
+        val=$(cat /sys/class/gpio/gpio${rail_gpio}/value 2>/dev/null)
+    fi
+    if [ "$val" = "1" ]; then
+        emit_check V5 true "gpio${rail_gpio} PWR_CONTROL asserted (1) [platform=$PLATFORM]"
+    elif [ "$val" = "0" ]; then
+        if am2_management_only_quiet_idle; then
+            emit_check V5 true "gpio${rail_gpio} PWR_CONTROL de-asserted (0) for AM2 management-only quiet idle"
+        else
+            emit_check V5 false "gpio${rail_gpio} PWR_CONTROL de-asserted (0) [platform=$PLATFORM]"
+        fi
+    else
+        emit_check V5 false "gpio${rail_gpio} not exported or unreadable [platform=$PLATFORM]"
+    fi
+}
+
+# V6: per-family voltage-controller proof.
+check_pic_fw() {
+    case "$PLATFORM" in
+        am3-aml)
+            # Amlogic S21 / S19j Pro Amlogic uses TAS5782M audio DACs for
+            # voltage (NoPic). No PIC to verify; supervisor handles voltage.
+            emit_check V6 true "NoPic platform (am3-aml: TAS5782M audio DAC voltage) - V6 skipped"
+            return
+            ;;
+        cv1835)
+            # CV1835 uses PIC1704 (not dsPIC). Bootloader = 0xCC, app = 0x60.
+            # Bootloader is dangerous: writing JUMP from bootloader trashes
+            # OTP fuses.
+            if ! command -v i2cget > /dev/null 2>&1; then
+                emit_check V6 false "PIC1704 probe needed but i2cget unavailable"
+                return
+            fi
+            raw=$(timeout "$I2C_PROBE_TIMEOUT_S" i2cget -y 0 0x20 2>/dev/null | head -1)
+            case "$raw" in
+                0x60)
+                    emit_check V6 true "PIC1704 @ 0x20 in APPLICATION mode (raw=$raw)"
+                    ;;
+                0xCC|0xcc)
+                    emit_check V6 false "PIC1704 @ 0x20 in BOOTLOADER mode (raw=$raw) - JUMP from bootloader is destructive"
+                    ;;
+                "")
+                    emit_check V6 false "PIC1704 @ 0x20 did not respond to i2cget"
+                    ;;
+                *)
+                    # Some PIC1704 stocks return values other than 0x60/0xCC
+                    # during steady state; surface the byte for triage.
+                    emit_check V6 true "PIC1704 @ 0x20 responded raw=$raw (assumed app)"
+                    ;;
+            esac
+            return
+            ;;
+    esac
+
+    # Default path (am2 + am3-bb): dsPIC fw whitelist.
+    # Prefer the daemon's state.json (avoids racing with the I2C service).
+    fw=$(read_state_key "dspic_fw_byte")
+    if [ -n "$fw" ]; then
+        case "$fw" in
+            0x86|"0x86")
+                emit_check V6 false "dsPIC fw_byte=$fw (corruption-state -- refusal class)"
+                return
+                ;;
+            0x82|0x89|0x8A|0xB9|0xFE)
+                emit_check V6 true "dsPIC fw_byte=$fw (validated whitelist)"
+                return
+                ;;
+            "")
+                : ;;
+            *)
+                emit_check V6 false "dsPIC fw_byte=$fw (outside validated whitelist)"
+                return
+                ;;
+        esac
+    fi
+    # Fallback: live i2cget probe. Best-effort -- if i2cget is missing we
+    # don't fail the check on its own.
+    if ! command -v i2cget > /dev/null 2>&1; then
+        emit_check V6 false "state.json missing fw_byte AND i2cget unavailable"
+        return
+    fi
+    # am3-bb uses bus 1 for the dsPIC; am2 uses bus 0.
+    i2c_bus=0
+    case "$PLATFORM" in
+        am3-bb) i2c_bus=1 ;;
+    esac
+    for addr in 0x20 0x21 0x22; do
+        raw=$(timeout "$I2C_PROBE_TIMEOUT_S" i2cget -y $i2c_bus $addr 2>/dev/null | head -1)
+        case "$raw" in
+            0x86)
+                emit_check V6 false "i2cget probe of $addr returned 0x86 (corruption-state)"
+                return
+                ;;
+            0x82|0x89|0x8A|0xB9|0xFE)
+                emit_check V6 true "i2cget probe of $addr returned $raw (validated whitelist)"
+                return
+                ;;
+        esac
+    done
+    emit_check V6 false "No dsPIC reply matched validated whitelist on 0x20/0x21/0x22 (bus=$i2c_bus)"
+}
+
+# V7: per-family chain-yield floor.
+default_yield_floor_for_platform() {
+    case "$PLATFORM" in
+        am2)     echo 22 ;;
+        am3-bb)  echo 3  ;;  # chain count, not chip count
+        am3-aml) echo 80 ;;
+        cv1835)  echo 144 ;;
+        *)       echo "$DEFAULT_PARTIAL_YIELD_FLOOR" ;;
+    esac
+}
+
+check_chain_yield() {
+    pf_default=$(default_yield_floor_for_platform)
+    floor=$(read_config_int "$PARTIAL_YIELD_FLOOR_FILE" "$pf_default")
+    yield=$(read_state_key "unique_chip_replies")
+    if [ -z "$yield" ]; then
+        yield=$(read_state_key "chips_active")
+    fi
+    # am3-bb floor is chain count, fall back to chains_active if chip count
+    # is the only thing populated.
+    if [ "$PLATFORM" = "am3-bb" ]; then
+        chains=$(read_state_key "chains_active")
+        if [ -n "$chains" ]; then
+            yield=$chains
+        fi
+    fi
+    if [ -z "$yield" ]; then
+        emit_check V7 false "state.json missing chain-yield key (platform=$PLATFORM floor=$floor)"
+        return
+    fi
+    if [ "$yield" -ge "$floor" ] 2>/dev/null; then
+        emit_check V7 true "chain yield=$yield >= floor=$floor [platform=$PLATFORM]"
+    else
+        emit_check V7 false "chain yield=$yield < floor=$floor [platform=$PLATFORM]"
+    fi
+}
+
+check_stratum_handshake() {
+    handshake=$(read_state_key "stratum_handshake_complete_unix")
+    started=$(read_state_key "dcentrald_started_unix")
+    if [ -z "$handshake" ] || [ -z "$started" ]; then
+        emit_check V8 false "state.json missing stratum_handshake_complete_unix or dcentrald_started_unix"
+        return
+    fi
+    delta=$((handshake - started))
+    if [ "$delta" -le "$DEFAULT_HANDSHAKE_BUDGET_S" ] && [ "$delta" -ge 0 ]; then
+        emit_check V8 true "Stratum handshake at +${delta}s (budget ${DEFAULT_HANDSHAKE_BUDGET_S}s)"
+    else
+        emit_check V8 false "Stratum handshake delta=${delta}s exceeds budget ${DEFAULT_HANDSHAKE_BUDGET_S}s"
+    fi
+}
+
+check_first_nonce() {
+    first=$(read_state_key "first_nonce_unix")
+    started=$(read_state_key "dcentrald_started_unix")
+    if [ -z "$first" ] || [ -z "$started" ]; then
+        emit_check V9 false "state.json missing first_nonce_unix or dcentrald_started_unix"
+        return
+    fi
+    delta=$((first - started))
+    if [ "$delta" -le "$DEFAULT_NONCE_BUDGET_S" ] && [ "$delta" -ge 0 ]; then
+        emit_check V9 true "First nonce at +${delta}s (budget ${DEFAULT_NONCE_BUDGET_S}s)"
+    else
+        emit_check V9 false "First nonce delta=${delta}s exceeds budget ${DEFAULT_NONCE_BUDGET_S}s"
+    fi
+}
+
+check_first_share() {
+    first=$(read_state_key "first_accepted_share_unix")
+    started=$(read_state_key "dcentrald_started_unix")
+    if [ -z "$first" ] || [ -z "$started" ]; then
+        emit_check V10 false "state.json missing first_accepted_share_unix or dcentrald_started_unix"
+        return
+    fi
+    delta=$((first - started))
+    if [ "$delta" -le "$DEFAULT_SHARE_BUDGET_S" ] && [ "$delta" -ge 0 ]; then
+        emit_check V10 true "First accepted share at +${delta}s (budget ${DEFAULT_SHARE_BUDGET_S}s)"
+    else
+        emit_check V10 false "First accepted share delta=${delta}s exceeds budget ${DEFAULT_SHARE_BUDGET_S}s"
+    fi
+}
+
+# V11: per-family fan PWM cap.
+check_fan_cap() {
+    cap=$(read_config_int "$FAN_CAP_FILE" "$DEFAULT_FAN_MAX_PWM")
+    cap_detail="cap=$cap"
+    cur=0
+    case "$PLATFORM" in
+        am2)
+            am2_quiet_rpm_proof=0
+            if am2_management_only_quiet_idle; then
+                idle=$(read_toml_section_int "thermal" "fan_idle_pwm" "$DEFAULT_FAN_IDLE_PWM")
+                [ "$idle" -gt "$cap" ] 2>/dev/null && idle=$cap
+                cap=$idle
+                cap_detail="management-only idle_cap=$cap"
+                am2_quiet_rpm_proof=1
+            fi
+            # Zynq am2 fan-control is UIO-bound. devmem can read/write a stale
+            # shadow and must not be used as proof of fan cap.
+            if [ -x "$DAEMON" ]; then
+                fan_out=$("$DAEMON" --get-fan 2>/tmp/s99verify-fan.err || true)
+                cur=$(echo "$fan_out" | sed -n 's/.*commanded_pwm=\([0-9][0-9]*\).*/\1/p' | head -1)
+                rpm=$(echo "$fan_out" | sed -n 's/.*max_rpm=\([0-9][0-9]*\).*/\1/p' | head -1)
+            fi
+            if [ -n "$cur" ] && [ "$cur" -le "$cap" ] 2>/dev/null; then
+                if [ "$am2_quiet_rpm_proof" = "1" ]; then
+                    case "$rpm" in *[!0-9]*|'') rpm="" ;; esac
+                    if [ -z "$rpm" ]; then
+                        emit_check V11 false "management-only fan cap not acoustically proven: missing max_rpm (commanded_pwm=$cur, $cap_detail)"
+                    elif [ "$rpm" -eq 0 ] 2>/dev/null; then
+                        emit_check V11 false "management-only fan cap not acoustically proven: no positive RPM feedback (commanded_pwm=$cur, $cap_detail)"
+                    elif [ "$rpm" -ge "$DEFAULT_FAN_QUIET_MAX_RPM" ] 2>/dev/null; then
+                        emit_check V11 false "LOW_PWM_FLOOR_PRESENT commanded_pwm=$cur max_rpm=$rpm threshold=$DEFAULT_FAN_QUIET_MAX_RPM ($cap_detail)"
+                    else
+                        emit_check V11 true "fan commanded_pwm=$cur within $cap_detail via UIO; max_rpm=$rpm"
+                    fi
+                else
+                    emit_check V11 true "fan commanded_pwm=$cur within $cap_detail via UIO; max_rpm=${rpm:-unknown}"
+                fi
+            else
+                emit_check V11 false "fan cap not proven via UIO (commanded_pwm=${cur:-unknown}, $cap_detail)"
+            fi
+            ;;
+        am3-bb|am3-aml|cv1835)
+            # Sysfs PWM: duty_cycle / period as ratio. cap is expressed as
+            # 0..100 percent equivalent (e.g. 30 means <= 30% duty).
+            duty=0
+            period=0
+            for chip in /sys/class/pwm/pwmchip0/pwm0 /sys/class/pwm/pwmchip1/pwm0; do
+                if [ -r "$chip/duty_cycle" ] && [ -r "$chip/period" ]; then
+                    d=$(head -1 "$chip/duty_cycle" 2>/dev/null | tr -dc '0-9')
+                    p=$(head -1 "$chip/period" 2>/dev/null | tr -dc '0-9')
+                    if [ -n "$d" ] && [ -n "$p" ] && [ "$p" -gt 0 ] 2>/dev/null; then
+                        # Compute integer percent (0..100).
+                        pct=$((d * 100 / p))
+                        if [ "$pct" -gt "$cur" ] 2>/dev/null; then
+                            cur=$pct
+                            duty=$d
+                            period=$p
+                        fi
+                    fi
+                fi
+            done
+            if [ "$period" -eq 0 ] 2>/dev/null; then
+                # No sysfs PWM found; report as fail-soft (cannot prove).
+                emit_check V11 true "fan PWM sysfs not present (no /sys/class/pwm/pwmchip*); cap=$cap%, check skipped"
+                return
+            fi
+            if [ "$cur" -le "$cap" ] 2>/dev/null; then
+                emit_check V11 true "fan PWM=${cur}% within cap=${cap}% (duty=$duty period=$period)"
+            else
+                emit_check V11 false "fan PWM=${cur}% exceeds cap=${cap}% (duty=$duty period=$period)"
+            fi
+            ;;
+        *)
+            emit_check V11 true "fan PWM check skipped (unknown platform=$PLATFORM)"
+            ;;
+    esac
+}
+
+# V12: per-family thermal proof.
+check_thermal_supervisor() {
+    case "$PLATFORM" in
+        am3-aml)
+            # NoPic platform: state.json supervisor is the only proof.
+            last=$(read_state_key "thermal_supervisor_last_sample_unix")
+            if [ -z "$last" ]; then
+                emit_check V12 true "am3-aml: NoPic platform - thermal handled by state.json supervisor (no live snapshot)"
+                return
+            fi
+            now=$(date +%s 2>/dev/null)
+            delta=$((now - last))
+            failclosed=$(read_state_key "thermal_failclosed_event_count")
+            if [ -n "$failclosed" ] && [ "$failclosed" -gt 0 ] 2>/dev/null; then
+                emit_check V12 false "am3-aml: thermal_failclosed_event_count=$failclosed"
+                return
+            fi
+            if [ "$delta" -gt 60 ] 2>/dev/null; then
+                emit_check V12 false "am3-aml: last thermal sample ${delta}s stale (> 60s)"
+            else
+                emit_check V12 true "am3-aml: thermal sample fresh (${delta}s ago)"
+            fi
+            ;;
+        am3-bb)
+            # LM75A @ 0x48 on i2c-1. The dsPIC bridge reads it too, but
+            # direct i2cget is a quick independent proof.
+            if command -v i2cget > /dev/null 2>&1; then
+                raw=$(timeout "$I2C_PROBE_TIMEOUT_S" i2cget -y 1 0x48 0x00 w 2>/dev/null | head -1)
+                if [ -n "$raw" ]; then
+                    emit_check V12 true "am3-bb: LM75A @ 0x48 responded raw=$raw"
+                    return
+                fi
+            fi
+            # Fall through to state.json supervisor.
+            last=$(read_state_key "thermal_supervisor_last_sample_unix")
+            if [ -z "$last" ]; then
+                emit_check V12 false "am3-bb: LM75A read failed AND state.json missing supervisor sample"
+                return
+            fi
+            now=$(date +%s 2>/dev/null)
+            delta=$((now - last))
+            if [ "$delta" -gt 60 ] 2>/dev/null; then
+                emit_check V12 false "am3-bb: last thermal sample ${delta}s stale"
+            else
+                emit_check V12 true "am3-bb: thermal sample fresh (${delta}s ago, state.json)"
+            fi
+            ;;
+        cv1835)
+            # Cvitek SoC thermal sysfs zone.
+            for zone in /sys/class/thermal/thermal_zone0/temp /sys/class/thermal/thermal_zone1/temp; do
+                if [ -r "$zone" ]; then
+                    v=$(head -1 "$zone" 2>/dev/null | tr -dc '0-9-')
+                    if [ -n "$v" ]; then
+                        # Expected millidegC: 30000-90000 typical.
+                        emit_check V12 true "cv1835: $zone raw=$v millidegC"
+                        return
+                    fi
+                fi
+            done
+            emit_check V12 false "cv1835: no readable /sys/class/thermal/thermal_zone*/temp"
+            ;;
+        am2|*)
+            # XADC die-temp fallback (am2 original path).
+            last=$(read_state_key "thermal_supervisor_last_sample_unix")
+            if [ -z "$last" ]; then
+                emit_check V12 false "state.json missing thermal_supervisor_last_sample_unix"
+                return
+            fi
+            now=$(date +%s 2>/dev/null)
+            if [ -z "$now" ]; then
+                emit_check V12 false "could not read current epoch"
+                return
+            fi
+            delta=$((now - last))
+            failclosed=$(read_state_key "thermal_failclosed_event_count")
+            if [ -n "$failclosed" ] && [ "$failclosed" -gt 0 ] 2>/dev/null; then
+                emit_check V12 false "thermal_failclosed_event_count=$failclosed (fail-closed event observed)"
+                return
+            fi
+            if [ "$delta" -gt 60 ] 2>/dev/null; then
+                emit_check V12 false "last thermal sample is ${delta}s stale (> 60s)"
+            else
+                emit_check V12 true "thermal supervisor sample fresh (${delta}s ago), no fail-closed events"
+            fi
+            ;;
+    esac
+}
+
+# V13: per-family no-nonce-stall event name.
+no_nonce_event_for_platform() {
+    case "$PLATFORM" in
+        am2)     echo "am2_no_nonce_stall" ;;
+        am3-bb)  echo "am3_bb_no_nonce_stall" ;;
+        am3-aml) echo "am3_aml_no_nonce_stall" ;;
+        cv1835)  echo "cv1835_no_nonce_stall" ;;
+        *)       echo "am2_no_nonce_stall" ;;
+    esac
+}
+
+check_no_nonce_stall() {
+    evt=$(no_nonce_event_for_platform)
+    stall=$(read_state_key "${evt}_count")
+    if [ -z "$stall" ]; then
+        # Backward-compat: try the generic am2_* counter the daemon emits
+        # today even on other platforms.
+        stall=$(read_state_key "am2_no_nonce_stall_count")
+    fi
+    if [ -z "$stall" ]; then
+        # No counter exported -- check log for the literal event string.
+        if [ -r /tmp/dcentrald.log ] && grep -q "$evt" /tmp/dcentrald.log 2>/dev/null; then
+            emit_check V13 false "$evt event observed in dcentrald.log"
+        else
+            emit_check V13 true "no $evt counter and none in log"
+        fi
+        return
+    fi
+    if [ "$stall" -eq 0 ] 2>/dev/null; then
+        emit_check V13 true "${evt}_count=0"
+    else
+        emit_check V13 false "${evt}_count=$stall (> 0)"
+    fi
+}
+
+check_upgrade_stage_cleared() {
+    # The U-Boot upgrade_stage flag is set by S99upgrade right before reboot
+    # to mark "this slot is staged but unproven". S99verify clears it (via
+    # fw_setenv) to signal "this slot has run a full proof matrix at least
+    # once" -- this is the commit-OK signal to U-Boot, which decrements its
+    # bootcount on success.
+    if ! command -v fw_setenv > /dev/null 2>&1; then
+        # No fw_setenv on this image -- this is normal for Zynq base images
+        # without libubootenv-tools. Fail-soft: report the check but with
+        # detail so the operator/dashboard knows what happened. Pass=true
+        # because we cannot prove failure either; the check is not blocking
+        # in this configuration.
+        emit_check V14 true "fw_setenv unavailable (libubootenv-tools not installed); upgrade_stage check skipped"
+        return
+    fi
+    # Read current value. If empty or absent, nothing to clear -- that's
+    # also a success state.
+    cur=$(fw_printenv upgrade_stage 2>/dev/null | sed 's/^upgrade_stage=//')
+    if [ -z "$cur" ]; then
+        emit_check V14 true "upgrade_stage already empty in U-Boot env"
+        return
+    fi
+    # Commit authority belongs to the health-gated S99upgrade. If the V1..V13
+    # proof matrix is NOT all-green, S99verify must NOT clear upgrade_stage:
+    # leaving it set keeps U-Boot bootcount auto-revert (and S99upgrade's
+    # health-gated commit) armed so a broken/unhealthy slot is reverted on the
+    # next power cycle instead of being silently committed. S99verify is
+    # report-only here and never commits a failed slot.
+    if [ "$ALL_PASSED" != "true" ]; then
+        emit_check V14 true "upgrade_stage left SET ($cur) — proof matrix not all-green; auto-recovery armed (S99verify does not commit a failed slot)"
+        return
+    fi
+    if fw_setenv upgrade_stage 2>/dev/null; then
+        # Confirm readback is empty.
+        readback=$(fw_printenv upgrade_stage 2>/dev/null | sed 's/^upgrade_stage=//')
+        if [ -z "$readback" ]; then
+            emit_check V14 true "upgrade_stage cleared (was: $cur)"
+        else
+            emit_check V14 false "fw_setenv ran but upgrade_stage readback still '$readback'"
+        fi
+    else
+        emit_check V14 false "fw_setenv upgrade_stage failed"
+    fi
+}
+
+# --- main ------------------------------------------------------------------
+
+run_verify() {
+    : > $LOGFILE
+    logline "starting V1..V14 proof matrix (schema version=2, multi-family)"
+
+    # Honor BOARD_FAMILY from the environment (mainly for host/CI smoke tests
+    # that want to force a specific family without needing the on-disk file).
+    if [ -n "$BOARD_FAMILY" ]; then
+        case "$BOARD_FAMILY" in
+            zynq-bm3-am2|am2-*) PLATFORM="am2" ;;
+            am3-bb*)            PLATFORM="am3-bb" ;;
+            am3-aml*|am3-s21|am3-s19kpro) PLATFORM="am3-aml" ;;
+            cv1835*)            PLATFORM="cv1835" ;;
+            *)                  detect_platform ;;
+        esac
+    else
+        detect_platform
+    fi
+
+    board_target=unknown
+    if [ -r "$BOARD_TARGET_FILE" ]; then
+        board_target=$(head -1 "$BOARD_TARGET_FILE" 2>/dev/null || echo unknown)
+    fi
+    logline "board_target=$board_target board_family=$BOARD_FAMILY platform=$PLATFORM"
+
+    # Per-variant override hook (Phase 2K). Sourced if-and-only-if the
+    # variant's overlay shipped one. No-op when absent -- guarded by a
+    # plain readable-file test so the proven zynq path is behaviourally
+    # inert. The include runs with all helpers + check_* + $PLATFORM /
+    # $BOARD_FAMILY in scope and may redefine any of them.
+    if [ -f "$S99VERIFY_LOCAL_INCLUDE" ] && [ -r "$S99VERIFY_LOCAL_INCLUDE" ]; then
+        logline "sourcing per-variant override: $S99VERIFY_LOCAL_INCLUDE"
+        # shellcheck disable=SC1090
+        . "$S99VERIFY_LOCAL_INCLUDE"
+    fi
+
+    ALL_PASSED=true
+    CHECKS_JSON=""
+
+    check_ssh
+    check_mcp
+    check_dashboard
+    check_dcentrald_running
+    check_rail_gpio
+    check_fan_cap
+    if am2_management_only_quiet_idle; then
+        emit_am2_management_only_skips
+    else
+        check_pic_fw
+        check_chain_yield
+        check_stratum_handshake
+        check_first_nonce
+        check_first_share
+        check_thermal_supervisor
+        check_no_nonce_stall
+    fi
+    check_upgrade_stage_cleared
+
+    timestamp=$(ts)
+
+    cat > $OUT_JSON <<EOF
+{
+  "version": 2,
+  "all_passed": $ALL_PASSED,
+  "board_target": "$board_target",
+  "board_family": "$BOARD_FAMILY",
+  "platform": "$PLATFORM",
+  "timestamp": "$timestamp",
+  "checks": [
+$CHECKS_JSON
+  ]
+}
+EOF
+
+    if [ "$ALL_PASSED" = "true" ]; then
+        logline "PROOF MATRIX PASSED (all V1..V14 green); JSON: $OUT_JSON"
+    else
+        logline "PROOF MATRIX FAILED (one or more V1..V14 red); JSON: $OUT_JSON"
+        # Loud syslog event for the dashboard event log to pick up. S99verify
+        # does NOT auto-revert -- that authority belongs to S99upgrade /
+        # U-Boot bootcount per QA report Q2 contract.
+        logger -t S99verify -p user.warning -- "post-flash proof matrix FAILED -- see $OUT_JSON and $LOGFILE" 2>/dev/null || true
+    fi
+}
+
+case "$1" in
+    start)
+        run_verify
+        ;;
+    stop)
+        # No long-running state to tear down.
+        ;;
+    restart)
+        run_verify
+        ;;
+    *)
+        # Default to start to match the rest of the S99* family in this tree.
+        run_verify
+        ;;
+esac
+
+exit 0

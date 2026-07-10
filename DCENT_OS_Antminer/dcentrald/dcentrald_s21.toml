@@ -1,0 +1,82 @@
+# DCENT_OS dcentrald config for Antminer S21 (Amlogic A113D)
+# Unit: 203.0.113.135, BraiinsOS 25.11, 1x108 BM1368 (chain 2 only)
+# Platform: Amlogic A113D (aarch64), NoPic (TAS5782M DAC, kernel-managed)
+# PSU: GPIO 437 (PSU_nEN active LOW) plus APW I2C/PMBus enable at bus 1 addr 0x1f
+# Verified: GPIO 2026-04-12; APW preboot sequence extracted 2026-04-29
+
+[general]
+hostname = "dcent-s21"
+log_level = "info"
+
+[pool]
+# Configure your pool and Bitcoin address before enabling mining.
+# Fresh images stay dashboard-ready and idle until mining is explicitly enabled.
+url = ""
+worker = ""
+password = "x"
+protocol = "sv1"
+
+[mining]
+enabled = false
+model = "s21"
+frequency_mhz = 400
+voltage_mv = 13550
+version_rolling = true
+passthrough = false
+suggest_difficulty = 8192
+
+# Serial ASIC communication — /dev/ttyS2 is chain 2 (only populated board on .135)
+# gpio440=1 (board present), gpio439=gpio441=0 (empty slots)
+serial_device = "/dev/ttyS2"
+serial_chip_count = 108
+serial_chip_type = "BM1368"
+
+[power]
+mode = "bypass"
+target_watts = 1500
+
+[power.psu_override]
+enabled = true
+model = "APW12"
+voltage_v = 14.0
+
+[thermal]
+target_temp_c = 60
+hot_temp_c = 70
+dangerous_temp_c = 80
+fan_min_pwm = 10
+fan_max_pwm = 30
+
+[api]
+cgminer_port = 4028
+http_port = 80
+websocket = true
+auth_enabled = false
+auth_password = ""
+
+[donation]
+enabled = false
+percent = 2.0
+pool_url = ""
+worker = ""
+password = "x"
+cycle_duration_s = 3600
+
+[watchdog]
+enabled = false
+
+[hash_on_disconnect]
+enabled = true
+
+[mode]
+active = "standard"
+
+[autotuner]
+enabled = false
+min_freq_mhz = 200
+max_freq_mhz = 500
+
+[led]
+enabled = true
+heartbeat_on_ms = 100
+heartbeat_off_ms = 900

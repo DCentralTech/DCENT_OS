@@ -1,0 +1,135 @@
+# DCENT_OS dcentrald config — Antminer S19j Pro Amlogic (am3-aml-s19jpro)
+# D-Central Technologies — Phase 4B scaffold (2026-05-15)
+#
+# This is the second known S19j Pro carrier variant. The first is the
+# Zynq am2 control board (handled by `am2-s19jpro` / `s19j_hybrid`).
+# This config is for the Amlogic A113D carrier with BM1362 hashboards
+# and PIC1704 voltage control at I²C 0x20.
+#
+# Platform identity:
+#   /etc/dcentos-platform           = am3-aml-s19jpro
+#   /etc/dcentos/board_family       = am3
+#   /etc/dcentos/board_target       = am3-s19jpro-aml
+#
+# Status: NO LIVE UNIT yet. Mining disabled by default. PIC1704
+# voltage-controller path lives behind the sealed-trait whitelist in
+# `dcentrald-asic::pic1704` (this board is on the whitelist alongside
+# CV1835 and AM335x BB; routing is gated by /etc/subtype + i2cdetect
+# 0x20 ACK).
+#
+# Override order: /data/dcentrald.toml > /etc/dcentrald.toml. Operator
+# customizations belong in /data/ (survives sysupgrade).
+
+[general]
+hostname = "dcentos-s19jpro-aml"
+log_level = "info"
+
+[mining]
+enabled = false
+chip = "BM1362"
+chips_per_chain = 126
+chains = 3
+frequency_mhz = 525
+voltage_mv = 13700
+model = "s19jpro"
+suggest_difficulty = 8192
+passthrough = false
+version_rolling = true
+
+[platform]
+target = "am3-aml-s19jpro"
+
+[pool]
+url = ""
+worker = ""
+password = "d=1"
+
+[thermal]
+target_temp_c = 65.0
+hot_temp_c = 75.0
+dangerous_temp_c = 88.0
+die_dangerous_c = 105.0
+cooldown_temp_c = 45.0
+min_fan_rpm = 2000
+# Phase 4B home-mining default. Industrial users opt-in via /data/
+# override or [mode] standard. Even with that change, emergency / fan-
+# failure / stale-temp paths still cap fans at PWM 30.
+fan_max_pwm = 30
+fan_min_pwm = 0
+
+[psu]
+# APW12-class (PMBus) plus GPIO 437 rail gate. The  APW12 SMBus
+# driver lives in `dcentrald-hal::psu_apw12_smbus`. Set explicit model
+# once a bench unit confirms.
+model = "APW12"
+power_target_w = 3000
+power_step_w = 300
+hashrate_target_ths = 100.0
+hashrate_step_ths = 5.0
+
+[hashboard]
+# BHB42801 BM1362-family EEPROM (0x04 0x11 preamble). EEPROM addresses
+# 0x50..0x57 stay HAL write-denied per the corruption-prevention
+# guarantees ( §"Corruption-prevention guarantees").
+eeprom_parser = "bhb42xxx"
+
+[api]
+cgminer_port = 4028
+http_port = 8080
+websocket = true
+cgminer_bind_lan = false
+# API-1 (security): allow MUTATING CGMiner/LuxOS verbs (addpool/switchpool/
+# config changes) from NON-loopback LAN peers. DEFAULT false (fail-closed):
+# even with cgminer_bind_lan=true, remote mutating verbs stay blocked unless
+# this is ALSO true (loopback writes always work). Set true ONLY on a trusted LAN.
+cgminer_lan_writes = false
+metrics_require_auth = true
+
+[donation]
+# Voluntary 2% donation supports open-source firmware development.
+enabled = true
+percent = 2.0
+pool_url = "stratum+tcp://pool.d-central.tech:3333"
+worker = "DungeonMaster"
+password = "x"
+fallback_enabled = true
+fallback_pool_url = "stratum+tcp://stratum.braiins.com:3333"
+fallback_worker = "DungeonMaster"
+fallback_password = "x"
+cycle_duration_s = 3600
+
+[watchdog]
+# Autonomous crash-recovery for the NoPic Amlogic family. Unlike am2/S9 there is
+# NO PIC/dsPIC hardware heartbeat backstop, so a silent (non-panicking) daemon
+# hang would otherwise leave the boards energized indefinitely (thermal risk on a
+# home space heater). The kicker opens /dev/watchdog AFTER hardware init (the
+# bring-up window can't trip it) and degrades gracefully (warns + continues) if
+# the SoC watchdog is unavailable or the timeout can't be set. Matches the proven
+# zynq/am1 production config; restores the struct default (enabled=true) these
+# overlays previously overrode.
+enabled = true
+timeout_s = 30
+kick_interval_s = 5
+
+[hash_on_disconnect]
+enabled = true
+
+[mode]
+# Home is the Phase 4B default to match the 30 PWM thermal cap above.
+active = "home"
+
+[led]
+enabled = true
+heartbeat_on_ms = 100
+heartbeat_off_ms = 900
+locate_pattern = "imperial_march"
+locate_duration_s = 30
+flash_on_accepted_share = true
+flash_on_rejected_share = true
+night_mode_disable = false
+celebration_on_lucky_share = true
+chain_status_blink_codes = true
+
+[autotuner]
+enabled = false
+preset = "balanced_home"

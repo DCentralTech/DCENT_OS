@@ -1,0 +1,82 @@
+# DCENTos Hacker Shell - Buildroot defconfig for Antminer S9 (Zynq 7010).
+# D-Central Technologies, 2026.
+#
+# Target: Xilinx Zynq-7010 (ARM Cortex-A9, dual core).
+# Purpose: Research firmware with SSH + diagnostic tools.
+# Output: rootfs.squashfs (BraiinsOS UBI path) + ramdisk.itb (stock NAND).
+#
+# Per-product OVERRIDE layer. Shared content lives in:
+#   dcentos-common.fragment   (workspace-wide package set + identity)
+#
+# scripts/build_in_docker.sh concatenates that fragment BEFORE this defconfig
+# and feeds the merged result to `make defconfig`. So when a key is declared
+# both here and upstream, the value HERE wins (later assignment overrides
+# earlier one).
+#
+# S9 is the only DCENT_OS product on Zynq Cortex-A9 + squashfs at the moment
+# (am2-s19jpro is also Zynq Cortex-A9 but on a different hashboard family).
+# The arch + filesystem block is therefore inline rather than promoted to a
+# shared "armv7 common" fragment. Promote on demand if a third Cortex-A9 /
+# squashfs product joins the matrix.
+
+# =============================================================================
+# Target Architecture: ARM Cortex-A9 (Zynq-7010).
+# =============================================================================
+BR2_arm=y
+BR2_cortex_a9=y
+BR2_ARM_ENABLE_NEON=y
+BR2_ARM_ENABLE_VFP=y
+BR2_ARM_FPU_VFPV3D16=y
+
+# =============================================================================
+# Toolchain: Linaro GCC 7.2.1-2017.11 (matches BraiinsOS 4.4.0-xilinx kernel).
+# =============================================================================
+BR2_TOOLCHAIN_EXTERNAL=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM=y
+BR2_TOOLCHAIN_EXTERNAL_DOWNLOAD=y
+BR2_TOOLCHAIN_EXTERNAL_URL="https://releases.linaro.org/components/toolchain/binaries/7.2-2017.11/arm-linux-gnueabihf/gcc-linaro-7.2.1-2017.11-x86_64_arm-linux-gnueabihf.tar.xz"
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_PREFIX="arm-linux-gnueabihf"
+BR2_TOOLCHAIN_EXTERNAL_GCC_7=y
+BR2_TOOLCHAIN_EXTERNAL_HEADERS_4_10=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_GLIBC=y
+BR2_TOOLCHAIN_EXTERNAL_CXX=y
+BR2_TOOLCHAIN_EXTERNAL_FORTRAN=y
+BR2_TOOLCHAIN_EXTERNAL_OPENMP=y
+
+# =============================================================================
+# Filesystem: DUAL OUTPUT — squashfs (for BraiinsOS UBI) + ext4 (stock NAND).
+#
+# Path 1 (PRIMARY): BraiinsOS-installed S9 — replace squashfs in UBI mtd7.
+# Path 2 (FALLBACK): Stock S9 — wrap rootfs.ext2.gz in FIT image (ramdisk.itb).
+# =============================================================================
+BR2_TARGET_ROOTFS_SQUASHFS=y
+BR2_TARGET_ROOTFS_SQUASHFS_BS_1024K=y
+BR2_TARGET_ROOTFS_SQUASHFS4_XZ=y
+BR2_TARGET_ROOTFS_SQUASHFS_EXTREME_COMP=y
+# Drop eudev's desktop hardware database (~1.34 MiB) — no miner uses it; udevd
+# keeps running. Parity with dcentos_am2_s19jpro_defconfig.
+# BR2_PACKAGE_EUDEV_ENABLE_HWDB is not set
+BR2_TARGET_ROOTFS_EXT2=y
+BR2_TARGET_ROOTFS_EXT2_4=y
+BR2_TARGET_ROOTFS_EXT2_SIZE="96M"
+
+# =============================================================================
+# Per-product identity.
+# =============================================================================
+BR2_TARGET_GENERIC_HOSTNAME="dcentos"
+BR2_TARGET_GENERIC_ISSUE="DCENTos Hacker Shell v0.1 — D-Central Technologies"
+
+# =============================================================================
+# Overlay and Scripts — single overlay (no overlay-on-overlay; S9 ships its
+# zynq overlay direct).
+# =============================================================================
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/rootfs-overlay"
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/post-build.sh"
+BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/post-image-ramdisk.sh"
+
+# =============================================================================
+# S9-specific BusyBox config — zynq-tuned (CONFIG_DEVMEM=y for FPGA register
+# poking, plus a few S9-only applets). Amlogic / am3-bb use the Buildroot
+# default busybox config and therefore do NOT inherit this line.
+# =============================================================================
+BR2_PACKAGE_BUSYBOX_CONFIG="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/busybox.config"

@@ -1,0 +1,97 @@
+# Cross-compilation settings for Antminer control boards
+#
+# dcentrald supports 4 board types across 2 architectures:
+#
+#   ARMv7 (armhf):
+#     - Zynq-7010 (S9/S17/S19) — Cortex-A9, VFPv3
+#     - BeagleBone AM335x (S19j) — Cortex-A8, VFPv3
+#
+#   AArch64:
+#     - Amlogic A113D (S19XP/S21+) — Cortex-A53
+#     - CVitek CV1835 (S21/T21 recent) — Cortex-A53
+#
+# Primary target: armv7-unknown-linux-musleabihf (static binary, no glibc dependency)
+# Fallback: armv7-unknown-linux-gnueabihf (dynamic, requires matching glibc)
+#
+# Usage:
+#   cargo build --release --target armv7-unknown-linux-musleabihf   # Zynq/BBB (static)
+#   cargo build --release --target aarch64-unknown-linux-musl        # Amlogic/CVitek (static)
+#
+# Or use the build script: scripts/build-dcentrald.sh [zynq|amlogic|beaglebone|cvitek]
+
+# --- ARMv7 musl target (Zynq + BeagleBone) — STATIC BINARY ---
+# Uses rust-lld (Rust's built-in LLVM linker) for cross-compilation from Windows.
+# No external cross-compiler needed — Rust provides the musl CRT objects and rust-lld.
+# If building from Linux with musl-cross-make, switch linker to "arm-linux-musleabihf-gcc".
+#
+# Target CPU: GENERIC ARMv7 (no `target-cpu` flag).
+# This SAME binary must run on:
+#   - Zynq XC7Z010 / XC7Z020 (S9, S17, S19, S19j Pro am2)  — Cortex-A9, dual-issue
+#   - TI AM335x (S19j Pro BeagleBone Black variant, .79)    — Cortex-A8, single-issue
+# A `target-cpu=cortex-a9` flag emits dual-issue / branch-prediction tuned code
+# that runs but is suboptimal on A8. Mining hot path is BM1362 byte-pushing
+# (kernel-side via /dev/ttyOX), so the daemon's Rust code is not perf-critical
+# enough to justify two distinct binaries. Generic ARMv7 trades ~5-10% perf in
+# control-plane code for one binary that ships on both. Per AM335x port plan
+# §P0.6 ( or session plan).
+[target.armv7-unknown-linux-musleabihf]
+linker = "rust-lld"
+rustflags = [
+    "-C", "target-feature=+crt-static",
+]
+
+# --- ARMv7 glibc target (fallback) ---
+# Same generic-ARMv7 reasoning as the musl target above.
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"
+rustflags = [
+    "-C", "link-arg=-s",
+    "-C", "target-feature=+vfp3",
+]
+
+# --- AArch64 musl target (Amlogic + CVitek) — STATIC BINARY ---
+# Uses rust-lld (Rust's built-in LLVM linker) for cross-compilation from Windows.
+# No external cross-compiler needed — Rust provides the musl CRT objects and rust-lld.
+# Build: cargo build --release --target aarch64-unknown-linux-musl
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = [
+    "-C", "target-cpu=cortex-a53",
+    "-C", "target-feature=+crt-static",
+]
+
+# --- AArch64 glibc target (fallback) ---
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+rustflags = [
+    "-C", "link-arg=-s",
+    "-C", "target-cpu=cortex-a53",
+]
+
+# --- C cross-compiler for crates with build.rs (ring, reqwest, rumqttc, secp256k1) ---
+#
+# `ring` and a few other crates build C code with the CC crate, which resolves
+# the compiler from CC_<target_triple>. rust-lld handles linking, but not
+# compilation of C sources — so without these env vars, `cargo build` fails with:
+#   error: failed to find tool `arm-linux-musleabihf-gcc`
+#
+# We do NOT put a default in a `[env]` block here: cargo resolves the path
+# to an absolute form before handing it to cc-rs, and cc-rs on Windows can
+# mis-split when that absolute path contains spaces (common: "Claude Code"
+# in this workspace). A cargo-resolved default therefore fails with "Access is
+# denied" on Windows devs, and the user sees a cryptic secp256k1 build error.
+#
+# Instead, the shipped build scripts export the env vars manually — see
+# `DCENT_OS_Antminer/dcentrald/zig-cc-arm.bat` / `zig-cc-aarch64.bat` (and the
+# matching `zig-ar-*.bat`). For ad-hoc builds on Windows:
+#
+#   set CC_armv7_unknown_linux_musleabihf=%CD%\zig-cc-arm.bat
+#   set AR_armv7_unknown_linux_musleabihf=%CD%\zig-ar-arm.bat
+#   cargo build --release --target armv7-unknown-linux-musleabihf
+#
+# On Linux/CI, export pointing at real `musl-cross-make` tools, e.g.:
+#
+#   export CC_armv7_unknown_linux_musleabihf=arm-linux-musleabihf-gcc
+#   export AR_armv7_unknown_linux_musleabihf=arm-linux-musleabihf-ar
+#
+# See also .

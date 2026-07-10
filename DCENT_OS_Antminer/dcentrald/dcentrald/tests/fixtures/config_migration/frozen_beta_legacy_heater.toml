@@ -1,0 +1,20 @@
+[pool]
+url = "stratum+tcp://solo.ckpool.org:3333"
+worker = "frozen-beta-heater"
+password = "x"
+
+[mode]
+active = "heater"
+
+[heater]
+target_watts = 800
+night_mode = true
+night_start_hour = 22
+night_end_hour = 7
+night_target_watts = 400
+
+[power]
+mode = "bypass"
+
+[mining]
+enabled = true

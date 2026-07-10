@@ -1,0 +1,62 @@
+[package]
+name = "dcentrald-silicon-profiles"
+version.workspace = true  # Single source: dcentrald/Cargo.toml [workspace.package]
+edition = "2021"
+license = "GPL-3.0"
+description = "Canonical BM1362/BM1366/BM1368/BM1387/BM1398 silicon characterization tables for DCENT_OS"
+
+[dependencies]
+serde = { workspace = true }
+#  W5-A: registry consumes JSON profile bundles at runtime
+# (`load_from_disk` reads `/etc/dcentrald/profiles.d/*.json`). serde_json
+# moved from dev-dependencies to runtime dependencies.
+serde_json = { workspace = true }
+#  W5-A: registry uses `thiserror` for `ProfileLoadError`.
+thiserror = { workspace = true }
+#  W5-A: registry references `ChipFamily` and `MinerModel` for the
+# `ProfileBundle` schema (§A of the import-infra spec).
+dcentrald-api-types = { path = "../dcentrald-api-types" }
+
+[features]
+default = []
+# `experimental_chips` exposes register-mapped-only chip families
+# (BM1360, BM1491, BM1373) that have a dcentrald-asic driver scaffold
+# / silicon table populated from RE but no live first-hash. Off by
+# default: production builds get a deterministic "unknown chip,
+# refuse to mine" path on detection. Lab/research builds opt in to
+# load the placeholder tables. Aligned with
+# `dcentrald-asic`'s `DCENT_ALLOW_SCAFFOLD_ASIC_DRIVERS=1` runtime
+# gate and `live_status: ChipStatus::RegisterMappedFromRE` per
+# silicon table.
+#
+#  detail: PLL register-encoding tables for BM1360 and BM1491
+# ( §13 cheat-sheet, BM139x+ unified
+# family) are **register-mapped from VNish cgminer ELF decode (
+# Phase C / D), NOT live-tested** — no chip has been driven through
+# these encodings, no PLL lock has been observed, no UART RX has
+# confirmed the chip ID byte pair. Production `dcentrald` builds
+# intentionally do NOT enable this feature — these placeholder chips
+# remain refuse-to-mine sentinels (cores=0, `Profile::source =
+# Reconstructed`). The feature gates the `pll_registers` sub-modules
+# that ship the inferred register table so + live-bring-up
+# code can opt-in. See per-module docs for the gap inventory and
+#  memory rule.
+experimental_chips = []
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }
+
+# W4.7 lint inheritance + grandfather override (DCENT_DevOps + DCENT_QA, 2026-05-07).
+# ~204 grandfathered unwrap/expect/panic occurrences in src/. Mostly fixture
+# table indexing (`PROFILES[chip_family][index]`) for canonical silicon
+# characterization tables — bounds are statically known. Lints downgraded
+# to `allow` until the tables are migrated to typed lookup helpers. Audit
+# status: .
+# cargo 1.95+: per-crate overrides cannot coexist with `[lints] workspace = true`.
+[lints.clippy]
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+indexing_slicing = "allow"
+unwrap_in_result = "allow"

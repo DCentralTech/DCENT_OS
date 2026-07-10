@@ -1,0 +1,3 @@
+2026-07-03T01:22:14Z INFO dcentrald::chain: chain 6 reset asserted
+2026-07-03T01:22:19Z INFO dcentrald::chain: enumerated 189 chips across 3 chains (63/63/63)
+2026-07-03T01:22:19Z INFO dcentrald::mining: open-core complete, entering mining loop

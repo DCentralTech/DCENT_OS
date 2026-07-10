@@ -1,0 +1,12 @@
+# DCENT_OS Stratum V1 proxy config — minimal.
+# Used by Phase 11 S19j Pro .139 deploy: bosminer talks to 127.0.0.1:3333 on
+# the miner; this proxy forwards upstream to Luxor. Uploaded to
+# /tmp/dcentrald_proxy.toml by scripts/s19j_proxy_deploy.sh.
+
+[stratum_proxy]
+listen_addr  = "127.0.0.1:3333"
+upstream_url = "stratum+tcp://btc.global.luxor.tech:700"
+# On S19j Pro `a lab unit` bosminer also opens a separate 64-byte binary session that
+# matches the stock Braiins dev-fee Stratum2 path. Route those sessions here
+# instead of blindly forwarding them to the user pool.
+binary_upstream_url = "stratum2+tcp://a830bcc3.bos.braiins.com:3336"

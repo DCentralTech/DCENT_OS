@@ -1,0 +1,86 @@
+# DCENTos Buildroot defconfig — Antminer S19 / S19 Pro (Zynq am2, BM1398).
+# D-Central Technologies, 2026 —  Phase 2D.
+#
+# Target: Xilinx Zynq-7007S (ARM Cortex-A9, dual core, am2 control board).
+# Chip:   BM1398 (3x114 chips, S19 / S19 Pro am2 hashboard family).
+# FPGA:   Braiins s9-io-am2 bitstream (2022-12-08) — shared with am2-s19jpro.
+#
+# DEDICATED variant cloned from dcentos_am2_s19jpro_defconfig (BM1362).
+# Before this variant existed, S19 Pro (BM1398) routed through the
+# am2-s19jpro Buildroot rootfs at runtime via /etc/subtype + board_target +
+# the dcentrald ZynqVariant::S19 dispatch. That blocked a BM1398-only
+# baked-image flash on real S19/S19 Pro hardware (s19jpro cold-boot
+# mining proven 2026-04-10 but only via /tmp overlay).
+#
+# This defconfig + its sibling board overlay differ from am2-s19jpro ONLY in:
+#   * board_target = "am2-s19pro" (NOT "am2-s19j")
+#       - sysupgrade tarball prefix = sysupgrade-am2-s19pro/
+#       - still maps to ZynqVariant::S19 in dcentrald-hal
+#         (detect_zynq_variant_from_board_target() in zynq.rs:678 — the
+#          "am2-s17"|"am2-s19j"|"am2-s19jpro"|"am2-s19pro" match arm; line
+#          drifts, grep the fn name not the number)
+#   * baked /etc/dcentrald.toml = dcentrald_s19pro_am2_baked_default.toml
+#       - serial_chip_type = "BM1398", serial_chip_count = 114,
+#         model = "s19pro", frequency_mhz = 500
+#   * board identity files (board_target / platform / dcentrald-target.conf)
+# Everything else (Cortex-A9 + Linaro 7.2.1 toolchain, squashfs+ext2 rootfs,
+# shared zynq overlay incl. S99verify V1-V14, sysupgrade A/B logic, UBI
+# geometry mtd7/mtd8 23/179/210 LEBs) is shared with am2-s19jpro because the
+# am2 control board, FPGA bitstream, PSU path, and HAL safety rails are
+# identical for BM1398 and BM1362.
+#
+# Per-product OVERRIDE layer. Shared content lives in:
+#   dcentos-common.fragment   (workspace-wide package set + identity)
+
+# =============================================================================
+# Target Architecture — same as S9 / am2-s19jpro (Zynq Cortex-A9).
+# =============================================================================
+BR2_arm=y
+BR2_cortex_a9=y
+BR2_ARM_ENABLE_NEON=y
+BR2_ARM_ENABLE_VFP=y
+BR2_ARM_FPU_VFPV3D16=y
+
+# =============================================================================
+# Toolchain — Linaro GCC 7.2.1-2017.11 (same as S9, matches BraiinsOS kernel).
+# =============================================================================
+BR2_TOOLCHAIN_EXTERNAL=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM=y
+BR2_TOOLCHAIN_EXTERNAL_DOWNLOAD=y
+BR2_TOOLCHAIN_EXTERNAL_URL="https://releases.linaro.org/components/toolchain/binaries/7.2-2017.11/arm-linux-gnueabihf/gcc-linaro-7.2.1-2017.11-x86_64_arm-linux-gnueabihf.tar.xz"
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_PREFIX="arm-linux-gnueabihf"
+BR2_TOOLCHAIN_EXTERNAL_GCC_7=y
+BR2_TOOLCHAIN_EXTERNAL_HEADERS_4_10=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_GLIBC=y
+BR2_TOOLCHAIN_EXTERNAL_CXX=y
+BR2_TOOLCHAIN_EXTERNAL_FORTRAN=y
+BR2_TOOLCHAIN_EXTERNAL_OPENMP=y
+
+# =============================================================================
+# Filesystem — squashfs primary (sysupgrade), ext4 secondary (research).
+# =============================================================================
+BR2_TARGET_ROOTFS_SQUASHFS=y
+BR2_TARGET_ROOTFS_SQUASHFS4_XZ=y
+BR2_TARGET_ROOTFS_EXT2=y
+BR2_TARGET_ROOTFS_EXT2_4=y
+BR2_TARGET_ROOTFS_EXT2_SIZE="128M"
+
+# =============================================================================
+# Per-product identity.
+# =============================================================================
+BR2_TARGET_GENERIC_HOSTNAME="dcentos-s19pro"
+BR2_TARGET_GENERIC_ISSUE="DCENTos for S19 Pro (am2, BM1398) — D-Central Technologies"
+
+# =============================================================================
+# Overlay-on-overlay — shared zynq overlay first, am2-s19pro identity last.
+# Buildroot applies overlays left-to-right so per-board files win.
+# =============================================================================
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/am2-s19pro/rootfs-overlay"
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/am2-s19pro/post-build.sh"
+BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/am2-s19pro/post-image.sh"
+
+# =============================================================================
+# Zynq-tuned BusyBox config (shared with S9 / am2-s19jpro — same FPGA
+# register applets).
+# =============================================================================
+BR2_PACKAGE_BUSYBOX_CONFIG="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/busybox.config"

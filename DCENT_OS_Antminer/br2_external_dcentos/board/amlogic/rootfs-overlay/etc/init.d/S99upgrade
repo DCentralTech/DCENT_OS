@@ -1,0 +1,446 @@
+#!/bin/sh
+#
+# S99upgrade - Commit DCENT_OS first-boot recovery flag (am3-aml)
+#
+# Two parallel U-Boot revert mechanisms must both be honored on Amlogic:
+#
+#   (a) Recovery flag byte at mtd5 LOCAL offset 0x05300000
+#       Values:
+#         0x1  RECOVERY_FLAG_INSTALLED   (host installer)
+#         0x2  RECOVERY_FLAG_FIRST_BOOT  (U-Boot, before kernel handoff)
+#         0x3  RECOVERY_FLAG_SUCCESSFUL  (this script, on healthy boot)
+#       If a reboot happens while flag still = 0x2, U-Boot reverts to mtd2
+#       stock_system. We promote 0x2 -> 0x3 only after health checks pass.
+#
+#   (b) U-Boot env vars in /dev/nand_env (e.g. firstboot)
+#       Cleared via fw_setenv. .78 uses firstboot=1 before commit and
+#       firstboot=0 after commit.
+#
+# CRITICAL fail-closed: if libubootenv-tools (fw_setenv/fw_printenv) is
+# missing, log a clear ERROR and exit non-zero. Silent ignore = brick risk
+# ( — this exact bug bricked
+# am2 and is being prevented here per O.3 spec).
+#
+# fw_env.config layout used here lives at /etc/fw_env.config and points at
+# /dev/nand_env (Amlogic NAND env chardev, single 64KB instance). Live .78
+# validation on 2026-04-29 confirmed standard U-Boot env format:
+# CRC32 + null-terminated key=value entries, fw_printenv/fw_setenv compatible.
+#
+#  B2: write-ahead log eliminates the split-state window between
+# recovery-flag commit (mtd5 byte 0x02 -> 0x03) and U-Boot env commit
+# (firstboot=0). If commit_recovery_flag succeeds but clear_uboot_env crashes
+# / loses power / EINTRs, /data/.firstboot-pending remains as a replay
+# intent. On every subsequent boot, replay_pending_env_clear() runs before
+# any recovery-flag check and idempotently re-attempts fw_setenv firstboot=0
+# until it succeeds.
+#
+
+HEALTH_OK=true
+
+[ -f /lib/functions/system.sh ] && . /lib/functions/system.sh
+
+# .78 U-Boot env: nandrecovery_flag_offset=0x00000B400000, mtd5 base
+# 0x06100000, so the local offset within /dev/mtd5 is 0x05300000.
+RECOVERY_FLAG_OFFSET=${DCENTOS_LOCAL_RECOVERY_FLAGS_OFFSET:-0x05300000}
+RECOVERY_MTD=${DCENTOS_SYSTEM_MTD:-/dev/mtd5}
+DCENT_RELEASE_IMAGE_MARKER=/etc/dcentos/release-image
+
+#  B2: write-ahead log file. Existence == "I owe a fw_setenv firstboot=0".
+# Lives in /data/ (persistent overlay) so it survives reboots. Removed only after
+# fw_printenv confirms firstboot=0 was actually written. /data/ is mounted by
+# S40 (well before S99), so this is always reachable when S99upgrade runs.
+FIRSTBOOT_PENDING_FILE=${DCENTOS_FIRSTBOOT_PENDING_FILE:-/data/.firstboot-pending}
+
+wait_for_http() {
+    LABEL="$1"
+    URL="$2"
+    LIMIT="$3"
+    [ -n "$LIMIT" ] || LIMIT=30
+
+    echo "  Waiting for $LABEL HTTP health (up to ${LIMIT}s)..."
+    for i in $(seq 1 "$LIMIT"); do
+        if command -v wget > /dev/null 2>&1; then
+            if wget -q -T 2 -O /dev/null "$URL" 2>/dev/null; then
+                echo "  [OK] $LABEL HTTP health"
+                return 0
+            fi
+        fi
+        sleep 1
+    done
+
+    echo "  [FAIL] $LABEL HTTP health did not respond at $URL"
+    return 1
+}
+
+# W8 parity (ported from board/zynq/.../S99upgrade): the length of the
+# boot-success window the daemon must survive as the SAME PID before its slot is
+# committed (catches a bind-then-crash-loop).
+MIN_HEALTHY_UPTIME_S=${DCENTOS_BOOT_SUCCESS_WINDOW_S:-25}
+
+# Real (not socket-bind) health verdict from /api/system/health. Returns
+# "healthy" (live daemon, uptime>0), "unhealthy" (reachable but zero/dead
+# uptime -> positive failure), or "unknown" (no decisive signal -> soft-pass).
+daemon_real_health_verdict() {
+    URL="http://127.0.0.1:8080/api/system/health"
+    if ! command -v wget > /dev/null 2>&1; then
+        echo "unknown"
+        return 0
+    fi
+    BODY=$(wget -q -T 4 -O - "$URL" 2>/dev/null)
+    if [ -z "$BODY" ]; then
+        echo "unknown"
+        return 0
+    fi
+    UPTIME=$(printf '%s' "$BODY" \
+        | tr ',' '\n' \
+        | sed -n 's/.*"uptime_s"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        | head -1)
+    if [ -z "$UPTIME" ]; then
+        echo "unknown"
+        return 0
+    fi
+    if [ "$UPTIME" -gt 0 ] 2>/dev/null; then
+        echo "healthy"
+    else
+        echo "unhealthy"
+    fi
+    return 0
+}
+
+check_health() {
+    # S40network runs udhcpc in background, so DHCP may not complete before S99.
+    echo "  Waiting for network (up to 60s)..."
+    for i in $(seq 1 60); do
+        if ip addr show eth0 2>/dev/null | grep -q 'inet '; then
+            break
+        fi
+        sleep 1
+    done
+
+    if ! ip addr show eth0 2>/dev/null | grep -q 'inet '; then
+        echo "  [FAIL] eth0 has no IP address after 60s"
+        HEALTH_OK=false
+        return
+    fi
+    echo "  [OK] Network interface has IP"
+
+    SSH_LISTENING=false
+    if ! netstat -tln 2>/dev/null | grep -q ':22 '; then
+        if [ -f "$DCENT_RELEASE_IMAGE_MARKER" ]; then
+            echo "  [OK] SSH intentionally locked on release image until owner credentials or authorized_keys are provisioned"
+        else
+            echo "  [FAIL] SSH server not listening on port 22"
+            HEALTH_OK=false
+            return
+        fi
+    else
+        SSH_LISTENING=true
+        echo "  [OK] SSH server listening"
+    fi
+
+    if grep -q '\-s' /etc/default/dropbear 2>/dev/null; then
+        if [ ! -s /root/.ssh/authorized_keys ] && [ ! -s /data/keys/dropbear/authorized_keys ]; then
+            if [ -f "$DCENT_RELEASE_IMAGE_MARKER" ] && [ "$SSH_LISTENING" = "false" ]; then
+                echo "  [OK] SSH key-only mode has no keys yet because release-image SSH is locked before owner setup"
+            else
+                echo "  [FAIL] SSH key-only mode (-s) but no authorized_keys - locked out!"
+                HEALTH_OK=false
+                return
+            fi
+        fi
+    fi
+    echo "  [OK] SSH access gate verified"
+
+    if ! pidof dcentrald > /dev/null 2>&1; then
+        if [ ! -x /usr/local/bin/dcentrald ]; then
+            echo "  [FAIL] dcentrald binary not found at /usr/local/bin/dcentrald"
+            HEALTH_OK=false
+            return
+        fi
+        echo "  [WAIT] dcentrald not running yet - waiting up to 30s"
+        for i in $(seq 1 30); do
+            if pidof dcentrald > /dev/null 2>&1; then
+                echo "  [OK] dcentrald started after ${i}s"
+                break
+            fi
+            sleep 1
+        done
+    fi
+
+    if ! pidof dcentrald > /dev/null 2>&1; then
+        echo "  [FAIL] dcentrald did not start within 30s"
+        HEALTH_OK=false
+        return
+    fi
+    echo "  [OK] dcentrald is running"
+
+    if ! wait_for_http "dashboard" "http://127.0.0.1/api/dashboard/health" 30; then
+        HEALTH_OK=false
+        return
+    fi
+
+    if ! wait_for_http "dcentrald API" "http://127.0.0.1:8080/api/status" 45; then
+        HEALTH_OK=false
+        return
+    fi
+
+    # Check 6 (W8 parity — ported from zynq S99upgrade): REAL health verdict.
+    # The socket-bind probes above answer the instant dcentrald binds a port —
+    # they do NOT prove the daemon is actually alive+steady. On NoPic Amlogic a
+    # bind-then-crash daemon would otherwise be committed permanently, defeating
+    # U-Boot first-boot auto-revert (the "defeated by S99" hole).
+    HEALTH_VERDICT=$(daemon_real_health_verdict)
+    case "$HEALTH_VERDICT" in
+        healthy)
+            echo "  [OK] /api/system/health reports a live daemon with positive uptime"
+            ;;
+        unhealthy)
+            echo "  [FAIL] /api/system/health reachable but reports a dead/zero-uptime daemon"
+            HEALTH_OK=false
+            return
+            ;;
+        *)
+            echo "  [SOFT-PASS] /api/system/health gave no decisive signal; not blocking commit on its absence"
+            ;;
+    esac
+
+    # Check 7 (W8 parity): BOOT-SUCCESS WINDOW. Require dcentrald to stay up for
+    # MIN_HEALTHY_UPTIME_S as the SAME PID. Catches the bind-then-crash-loop:
+    # /api/status answers the instant the socket binds, but if the daemon then
+    # dies the S82dcentrald wrapper restarts a fresh PID — committing such a slot
+    # is exactly the hole this guards. Probe in 1s steps so an early death is
+    # caught fast (and surfaced as a positive failure, not a timeout).
+    START_PID=$(pidof dcentrald 2>/dev/null | awk '{print $1}')
+    if [ -z "$START_PID" ]; then
+        echo "  [FAIL] dcentrald PID disappeared before the boot-success window"
+        HEALTH_OK=false
+        return
+    fi
+    echo "  Boot-success window: confirming dcentrald PID $START_PID stays up ${MIN_HEALTHY_UPTIME_S}s..."
+    WINDOW_LEFT=$MIN_HEALTHY_UPTIME_S
+    while [ "$WINDOW_LEFT" -gt 0 ]; do
+        sleep 1
+        WINDOW_LEFT=$((WINDOW_LEFT - 1))
+        if ! kill -0 "$START_PID" 2>/dev/null; then
+            echo "  [FAIL] dcentrald PID $START_PID died inside the boot-success window (crash-loop)"
+            HEALTH_OK=false
+            return
+        fi
+    done
+    NOW_PID=$(pidof dcentrald 2>/dev/null | awk '{print $1}')
+    if [ "$NOW_PID" != "$START_PID" ]; then
+        echo "  [FAIL] dcentrald PID changed during the window ($START_PID -> ${NOW_PID:-none}); wrapper restarted it (crash-loop)"
+        HEALTH_OK=false
+        return
+    fi
+    echo "  [OK] dcentrald survived the ${MIN_HEALTHY_UPTIME_S}s boot-success window as PID $START_PID"
+}
+
+read_recovery_flag() {
+    # Returns the single byte at mtd5+RECOVERY_FLAG_OFFSET as 0x?? on stdout.
+    if ! command -v nanddump > /dev/null 2>&1; then
+        echo "ERR_NO_NANDDUMP"
+        return 1
+    fi
+    if [ ! -e "$RECOVERY_MTD" ]; then
+        echo "ERR_NO_MTD5"
+        return 1
+    fi
+    BYTE=$(nanddump -s "$RECOVERY_FLAG_OFFSET" -l 1 "$RECOVERY_MTD" 2>/dev/null \
+        | tail -c 1 | od -An -tx1 | tr -d ' \n')
+    if [ -z "$BYTE" ]; then
+        echo "ERR_DUMP_FAILED"
+        return 1
+    fi
+    echo "0x$BYTE"
+}
+
+commit_recovery_flag() {
+    # OTA-08: AMLOGIC_RAW_NAND_RECOVERY_FLAG_EXCEPTION.
+    #
+    # This is the only target-side raw NAND write this init script is allowed to
+    # perform: one recovery-state byte in the Amlogic mtd5 recovery-flag window,
+    # after boot health has passed. It must not be copied to Zynq/CVitek/BB, and
+    # it does not update U-Boot env; firstboot remains fw_setenv-only below.
+    #
+    # The nandwrite is accepted only with an immediate read_recovery_flag()
+    # readback of 0x03. A mismatch fails closed so U-Boot can keep/replay the
+    # firstboot recovery path instead of treating an unverified flag as commit.
+    if ! command -v flash_erase > /dev/null 2>&1 || ! command -v nandwrite > /dev/null 2>&1; then
+        echo "  *** ERROR: flash_erase/nandwrite missing - cannot commit recovery flag ***"
+        echo "  *** Add BR2_PACKAGE_MTD=y to defconfig and rebuild ***"
+        return 1
+    fi
+    sync
+    if ! flash_erase "$RECOVERY_MTD" "$RECOVERY_FLAG_OFFSET" 1 2>&1; then
+        echo "  *** ERROR: flash_erase $RECOVERY_MTD $RECOVERY_FLAG_OFFSET failed ***"
+        return 1
+    fi
+    if ! printf '\x3' | nandwrite -p -s "$RECOVERY_FLAG_OFFSET" "$RECOVERY_MTD" 2>&1; then
+        echo "  *** ERROR: nandwrite of 0x3 to $RECOVERY_MTD failed ***"
+        return 1
+    fi
+    NEW=$(read_recovery_flag)
+    if [ "$NEW" != "0x03" ]; then
+        echo "  *** WARN: recovery flag readback = $NEW (expected 0x03) ***"
+        return 1
+    fi
+    echo "  [OK] recovery flag promoted 0x02 -> 0x03 (firmware committed)"
+    return 0
+}
+
+clear_uboot_env() {
+    # Best-effort: clear the AML first-boot guard after recovery-flag commit.
+    # Live .78 U-Boot env uses `firstboot` (not `first_boot`).
+    #
+    #  B2: idempotent. Safe to call multiple times. If firstboot is
+    # already 0, returns success without re-writing. The caller manages the
+    # /data/.firstboot-pending intent file (write before, remove after).
+    if ! command -v fw_setenv > /dev/null 2>&1; then
+        echo "  *** ERROR: fw_setenv missing - libubootenv-tools not installed ***"
+        echo "  *** Recovery-flag byte was committed, but U-Boot env vars NOT ***"
+        echo "  *** cleared. Add BR2_PACKAGE_LIBUBOOTENV{,_TOOLS}=y to defconfig ***"
+        return 1
+    fi
+
+    # Short-circuit if already cleared (idempotent replay).
+    if fw_printenv firstboot 2>/dev/null | grep -q '^firstboot=0$'; then
+        echo "  [OK] U-Boot env firstboot already 0 (no write needed)"
+        return 0
+    fi
+
+    if ! fw_setenv firstboot 0 2>/dev/null; then
+        echo "  *** WARN: failed to set firstboot=0 in /dev/nand_env ***"
+        return 1
+    fi
+    if fw_printenv firstboot 2>/dev/null | grep -q '^firstboot=0$'; then
+        echo "  [OK] U-Boot env firstboot=0 committed"
+    else
+        echo "  *** WARN: firstboot did not read back as 0 after fw_setenv ***"
+        return 1
+    fi
+    return 0
+}
+
+#  B2: WAL helpers --------------------------------------------------
+
+mark_firstboot_pending() {
+    # Record intent to write firstboot=0 BEFORE we commit the recovery flag.
+    # If the system reboots between recovery-flag commit and env-clear, this
+    # file remains; replay_pending_env_clear() picks it up on next boot.
+    if [ ! -d /data ]; then
+        echo "  *** WARN: /data not mounted; cannot persist firstboot WAL ***"
+        return 1
+    fi
+    if ! : > "$FIRSTBOOT_PENDING_FILE" 2>/dev/null; then
+        echo "  *** WARN: failed to write WAL marker $FIRSTBOOT_PENDING_FILE ***"
+        return 1
+    fi
+    sync
+    return 0
+}
+
+clear_firstboot_pending() {
+    if [ -f "$FIRSTBOOT_PENDING_FILE" ]; then
+        rm -f "$FIRSTBOOT_PENDING_FILE" 2>/dev/null
+        sync
+    fi
+    return 0
+}
+
+replay_pending_env_clear() {
+    # Called FIRST in the start case. If a previous boot crashed between
+    # commit_recovery_flag and clear_uboot_env, $FIRSTBOOT_PENDING_FILE
+    # exists and we owe a fw_setenv firstboot=0. Idempotent — safe to
+    # invoke whether or not the file exists.
+    [ -f "$FIRSTBOOT_PENDING_FILE" ] || return 0
+    echo "[WAL] $FIRSTBOOT_PENDING_FILE present - replaying firstboot=0 commit"
+    if clear_uboot_env; then
+        clear_firstboot_pending
+        echo "  [OK] WAL replay succeeded; intent file cleared"
+        return 0
+    fi
+    echo "  *** WAL replay failed; will retry on next boot ***"
+    return 1
+}
+# --------------------------------------------------------------------------
+
+case "$1" in
+    start)
+        if [ ! -e "$RECOVERY_MTD" ]; then
+            # No mtd5 — not on Amlogic NAND. Nothing to do.
+            exit 0
+        fi
+
+        #  B2: WAL replay runs BEFORE the recovery-flag check. If a
+        # previous boot succeeded at commit_recovery_flag but failed at
+        # clear_uboot_env, the recovery flag is now 0x03 and the 0x02 case
+        # below would skip env clearing entirely. The replay closes that gap.
+        replay_pending_env_clear
+
+        FLAG=$(read_recovery_flag)
+        case "$FLAG" in
+            0x02)
+                echo "Recovery flag = 0x02 (FIRST_BOOT) - running health checks before committing..."
+                check_health
+                if [ "$HEALTH_OK" != "true" ]; then
+                    echo "  *** HEALTH CHECK FAILED - leaving recovery flag at 0x02 ***"
+                    echo "  *** slot remains uncommitted; use the platform recovery runbook ***"
+                    echo "  *** (serial/SD boundary unless rollback is proven for this lane) ***"
+                    exit 0
+                fi
+                echo "Health checks passed - committing recovery flag..."
+
+                #  B2: write WAL intent BEFORE commit_recovery_flag so
+                # a crash during the mtd5 write or anywhere between here and
+                # successful clear_uboot_env leaves a replay marker. The
+                # marker is cleared only after fw_printenv confirms firstboot=0.
+                mark_firstboot_pending || \
+                    echo "  *** WARN: WAL marker write failed; continuing (split-state risk if env write also fails) ***"
+
+                if ! commit_recovery_flag; then
+                    echo "  *** ERROR: recovery flag commit failed - U-Boot will revert on next reboot ***"
+                    # Recovery flag is still 0x02; clear WAL marker since no env
+                    # commit will be attempted this boot.
+                    clear_firstboot_pending
+                    exit 1
+                fi
+                if ! clear_uboot_env; then
+                    echo "  *** ERROR: U-Boot env commit failed after recovery flag commit ***"
+                    echo "  *** WAL marker $FIRSTBOOT_PENDING_FILE retained for next-boot replay ***"
+                    exit 1
+                fi
+                # Both halves succeeded; clear the WAL marker.
+                clear_firstboot_pending
+                ;;
+            0x03)
+                # Already committed — normal boot, nothing to do.
+                exit 0
+                ;;
+            0x01)
+                # Should never see 0x01 in userspace — U-Boot writes 0x02
+                # before kernel handoff. Treat as malformed but non-fatal.
+                echo "  [WARN] recovery flag = 0x01 (INSTALLED) seen in userspace - U-Boot may not have updated it"
+                exit 0
+                ;;
+            ERR_*)
+                echo "  [WARN] could not read recovery flag ($FLAG) - skipping"
+                exit 0
+                ;;
+            *)
+                echo "  [WARN] unexpected recovery flag value: $FLAG"
+                exit 0
+                ;;
+        esac
+        ;;
+
+    stop)
+        ;;
+
+    *)
+        echo "Usage: $0 {start|stop}"
+        exit 1
+        ;;
+esac
+
+exit 0

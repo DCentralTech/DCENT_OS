@@ -1,0 +1,395 @@
+#!/bin/sh
+#
+# S82dcentrald - Start DCENTos mining daemon
+#
+# dcentrald is the Rust mining daemon providing:
+#   - ASIC hash board control via FPGA UIO
+#   - Stratum V1 pool connection with ASICBoost
+#   - Thermal management (PID fan control)
+#   - REST API + WebSocket on port 8080
+#   - Dashboard is served by S80dashboard on port 80
+#   - CGMiner-compatible API on port 4028
+#   - WebSocket live stats
+#
+# Config: /data/dcentrald.toml (persistent) or /etc/dcentrald.toml (default)
+#
+# SAFETY: If dcentrald crashes while hash boards are powered, the wrapper
+# commands the home safety fan cap (PWM 30). If hashboard power is already
+# proven cut, the wrapper leaves the parked unit at idle PWM 10. The thermal
+# PID loop inside dcentrald is the ONLY thing controlling fan speed during
+# mining. Without it, ASIC chips can overheat in seconds.
+#
+# D-Central Technologies - DCENTos v0.4.0
+#
+
+if [ -x /data/dcentrald ]; then
+    DAEMON="/data/dcentrald"
+else
+    DAEMON="/usr/local/bin/dcentrald"
+fi
+PIDFILE="/var/run/dcentrald.pid"
+CHILD_PIDFILE="/var/run/dcentrald-child.pid"
+EXPECTFILE="/tmp/dcentrald.expected_exit.pid"
+LOGFILE="/tmp/dcentrald.log"
+FAN_BASE=0x42800000
+# AM2 persistent fan-custodian pidfile (see am2_start_fan_custodian below).
+FANHOLD_PIDFILE="/var/run/dcentrald-fanhold.pid"
+DEFAULT_COMPAT="/etc/default/dcentos-compat"
+PERSISTENT_COMPAT="/data/dcentos-compat"
+API_PORT=8080
+MAX_CRASH_RESTARTS=5
+RESTART_DELAY=2
+SCRIPT="$0"
+
+# Use persistent config if available, otherwise default
+if [ -f /data/dcentrald.toml ]; then
+    CONFIG="/data/dcentrald.toml"
+else
+    CONFIG="/etc/dcentrald.toml"
+fi
+
+PLATFORM=""
+[ -r /etc/dcentos/platform ] && PLATFORM=$(cat /etc/dcentos/platform 2>/dev/null)
+BOARD_TARGET=""
+[ -r /etc/dcentos/board_target ] && BOARD_TARGET=$(cat /etc/dcentos/board_target 2>/dev/null)
+IS_AM2=0
+case "$PLATFORM" in
+    zynq-bm3-am2) IS_AM2=1 ;;
+esac
+case "$BOARD_TARGET" in
+    am2-s17|am2-s17p|am2-s17pro|am2-s17plus|am2-t17|am2-t17plus|am2-s19|am2-s19j|am2-s19jpro|am2-s19jpro-zynq|am2-s19pro|am2-t19) IS_AM2=1 ;;
+esac
+
+migrate_legacy_api_port() {
+    [ -f "$CONFIG" ] || return 0
+
+    # Rewrite legacy dcentrald API http_port 80 to 8080 so S80dashboard owns :80.
+    if ! grep -Eq '^[[:space:]]*http_port[[:space:]]*=[[:space:]]*80([[:space:]]*(#.*)?)?$' "$CONFIG" 2>/dev/null; then
+        return 0
+    fi
+
+    TMPFILE="${CONFIG}.tmp.$$"
+    if awk '
+        BEGIN { in_api = 0 }
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            in_api = ($0 ~ /^[[:space:]]*\[api\][[:space:]]*$/)
+        }
+        in_api && /^[[:space:]]*http_port[[:space:]]*=[[:space:]]*80([[:space:]]*(#.*)?)?$/ {
+            sub(/80/, "8080")
+        }
+        { print }
+    ' "$CONFIG" > "$TMPFILE" 2>/dev/null; then
+        if mv "$TMPFILE" "$CONFIG" 2>/dev/null; then
+            echo "  [MIGRATE] dcentrald API http_port 80 to 8080 in $CONFIG"
+        else
+            rm -f "$TMPFILE"
+            echo "  [WARN] Could not migrate legacy dcentrald API port in $CONFIG"
+        fi
+    else
+        rm -f "$TMPFILE"
+        echo "  [WARN] Could not inspect dcentrald API port in $CONFIG"
+    fi
+}
+
+bosminer_pic_bootstrap_enabled() {
+    BOSMINER_PIC_BOOTSTRAP=0
+    [ -f "$DEFAULT_COMPAT" ] && . "$DEFAULT_COMPAT"
+    [ -f "$PERSISTENT_COMPAT" ] && . "$PERSISTENT_COMPAT"
+
+    case "$BOSMINER_PIC_BOOTSTRAP" in
+        1|true|TRUE|yes|YES|on|ON|enabled|ENABLED)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+compat_bootstrap_model_allowed() {
+    BOSMINER_PIC_BOOTSTRAP_ALLOW_MODEL="am1-s9"
+    [ -f "$DEFAULT_COMPAT" ] && . "$DEFAULT_COMPAT"
+    [ -f "$PERSISTENT_COMPAT" ] && . "$PERSISTENT_COMPAT"
+
+    [ "$BOSMINER_PIC_BOOTSTRAP_ALLOW_MODEL" = "am1-s9" ] || return 1
+    [ -d /sys/class/uio ] || return 1
+
+    UIO_COUNT=$(ls -d /sys/class/uio/uio* 2>/dev/null | wc -l)
+    [ "$UIO_COUNT" -gt 0 ] || return 1
+    [ "$UIO_COUNT" -le 14 ] || return 1
+
+    for name_file in /sys/class/uio/*/name; do
+        [ -f "$name_file" ] || continue
+        if grep -q "board-control" "$name_file" 2>/dev/null; then
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+# Safety: command fans to the home cap. Tach/RPM is the physical noise proof.
+# PIC watchdog cuts voltage within 10-60s if dcentrald is dead.
+# NEVER PWM 127 — home mining, noise is unacceptable.
+am2_power_cut_proven() {
+    [ -r /sys/class/gpio/gpio907/value ] && [ "$(cat /sys/class/gpio/gpio907/value 2>/dev/null)" = "0" ]
+}
+
+# AUDIT FIX (2026-05-29, ):
+# On AM2 (XIL Zynq) the fan PWM is held only while a process owns the uio16 mmap
+# AND keeps re-commanding it. The old `$DAEMON --set-fan N` wrote the PWM once
+# and EXITED, so the board's fan IP drifted the fans back to full speed — a home
+# unit blasts and the documented AM2 safety remediation silently failed. The fix
+# is a BACKGROUNDED persistent custodian (`dcentrald --hold-fan N`) that stays
+# resident and re-asserts the PWM every ~5 s (mmap-hold alone is not enough). We
+# kill any prior custodian first so only one owns the mmap. AM2 ONLY ($IS_AM2);
+# S9/am1 fan registers hold via devmem so that branch is unchanged. PWM is only
+# ever driven DOWN (<= 30).
+am2_start_fan_custodian() {
+    # $1 = PWM (0..30). Kill any existing custodian, then background a new one.
+    _pwm="$1"
+    if [ -f "$FANHOLD_PIDFILE" ]; then
+        start-stop-daemon -K -q -p "$FANHOLD_PIDFILE" -x "$DAEMON" 2>/dev/null
+        rm -f "$FANHOLD_PIDFILE"
+    fi
+    if start-stop-daemon -S -b -m -p "$FANHOLD_PIDFILE" -x "$DAEMON" -- --hold-fan "$_pwm" >> $LOGFILE 2>&1; then
+        echo "$(date): SAFETY: am2 persistent fan custodian started at PWM $_pwm ($DAEMON --hold-fan $_pwm, pid $(cat "$FANHOLD_PIDFILE" 2>/dev/null))" >> $LOGFILE
+        return 0
+    fi
+    echo "$(date): WARN: am2 fan custodian (--hold-fan $_pwm) failed to start" >> $LOGFILE
+    return 1
+}
+
+fan_safety_override() {
+    if [ "$IS_AM2" = "1" ]; then
+        if [ -x "$DAEMON" ]; then
+            FAN_PWM=30
+            if am2_power_cut_proven; then
+                FAN_PWM=10
+            fi
+            # Persistent custodian, NOT the exit-immediately --set-fan one-shot.
+            am2_start_fan_custodian "$FAN_PWM"
+        else
+            echo "$(date): WARN: am2 dcentrald binary absent at $DAEMON; fan cap not applied" >> $LOGFILE
+        fi
+    elif command -v devmem > /dev/null 2>&1; then
+        devmem $((FAN_BASE + 0x10)) 32 30 2>/dev/null
+        devmem $((FAN_BASE + 0x14)) 32 30 2>/dev/null
+        echo "$(date): SAFETY: fans commanded to PWM 30 (dcentrald exited)" >> $LOGFILE
+    fi
+}
+
+case "$1" in
+    start)
+        if [ ! -x "$DAEMON" ]; then
+            echo "  [SKIP] dcentrald: binary not found at $DAEMON"
+            exit 0
+        fi
+
+        # W1.5 (2026-05-07): re-assert tight perms on /data/dcent/ + auth.json
+        # before launching the daemon. dcentrald will also auto-correct via
+        # verify_auth_file_perms() at startup, but doing it here closes the
+        # window between mount(/data) and the first daemon write — and works
+        # even if the daemon binary is being rolled back to a pre-W1.5 build.
+        if [ -d /data/dcent ]; then
+            chmod 0700 /data/dcent 2>/dev/null
+        fi
+        if [ -f /data/dcent/auth.json ]; then
+            chmod 0600 /data/dcent/auth.json 2>/dev/null
+        fi
+
+        # Reap any persistent AM2 fan custodian left resident by a prior
+        # stop/safety so the main daemon can own the uio16 fan mmap (AM2 only).
+        if [ "$IS_AM2" = "1" ] && [ -f "$FANHOLD_PIDFILE" ]; then
+            start-stop-daemon -K -q -p "$FANHOLD_PIDFILE" -x "$DAEMON" 2>/dev/null
+            rm -f "$FANHOLD_PIDFILE"
+            echo "  [OK] reaped prior am2 fan custodian before daemon launch"
+        fi
+
+        # Legacy compatibility mode only. Native DCENT_OS cold boot is the
+        # default product path, so only wait for S15pic_boot when the explicit
+        # compat bootstrap is enabled and the board is positively allowlisted.
+        if bosminer_pic_bootstrap_enabled && compat_bootstrap_model_allowed && [ -x /usr/bin/bosminer ] && [ ! -f /tmp/pic_init_done ]; then
+            echo "  [WAIT] dcentrald: waiting for legacy PIC bootstrap..."
+            for i in $(seq 1 120); do
+                [ -f /tmp/pic_init_done ] && break
+                [ -f /tmp/pic_init_failed ] && break
+                sleep 1
+            done
+            if [ -f /tmp/pic_init_done ]; then
+                :
+            elif [ -f /tmp/pic_init_failed ]; then
+                echo "  [WARN] S15pic_boot did not confirm PIC init - starting dcentrald native path"
+            else
+                echo "  [WARN] PIC init flag not found after 120s - starting anyway"
+            fi
+        fi
+
+        echo "Starting dcentrald mining daemon..."
+        migrate_legacy_api_port
+        echo "  Config: $CONFIG"
+        echo "  API: REST/WebSocket :$API_PORT"
+        echo "  Dashboard: HTTP :80 via S80dashboard"
+
+        # Do not kill all Python interpreters here.
+        # S81mcp starts immediately before us and must keep running.
+
+        # NOTE (updated 2026-03-26): dcentrald uses devmem AXI IIC bypass for I2C.
+        # It unbinds the kernel xiic-i2c driver internally on startup.
+        # The kernel driver is NOT used - devmem provides direct register access
+        # with proper clock timing (THIGH/TLOW=993 for 100kHz).
+
+        # Kill any orphaned dcentrald from previous manual runs.
+        # Expected exits are marked so the wrapper does not misclassify replacement
+        # as a crash and blast the fans.
+        ORPHAN_PIDS=$(pidof dcentrald 2>/dev/null || true)
+        [ -n "$ORPHAN_PIDS" ] && {
+            echo "  [WARN] Killing orphaned dcentrald PID(s): $ORPHAN_PIDS - waiting for graceful shutdown"
+            for ORPHAN_PID in $ORPHAN_PIDS; do
+                echo "$ORPHAN_PID" > "$EXPECTFILE"
+                kill -TERM "$ORPHAN_PID" 2>/dev/null
+            done
+            for i in $(seq 1 30); do
+                pidof dcentrald > /dev/null 2>&1 || break
+                sleep 1
+            done
+            REMAINING_PIDS=$(pidof dcentrald 2>/dev/null || true)
+            [ -n "$REMAINING_PIDS" ] && {
+                echo "  [WARN] Orphan PID(s) did not exit in 30s - force killing: $REMAINING_PIDS"
+                rm -f "$EXPECTFILE"
+                fan_safety_override
+                for ORPHAN_PID in $REMAINING_PIDS; do
+                    kill -9 "$ORPHAN_PID" 2>/dev/null
+                done
+                sleep 1
+            }
+            rm -f "$CHILD_PIDFILE"
+        }
+
+        # Start dcentrald with a wrapper that distinguishes expected replacement
+        # from a real crash.
+        start-stop-daemon -S -b -m -p "$PIDFILE" \
+            -x /bin/sh -- -c "
+                CRASH_COUNT=0
+                while true; do
+                    $DAEMON --config $CONFIG >>$LOGFILE 2>&1 &
+                    CHILD_PID=\$!
+                    echo \$CHILD_PID > $CHILD_PIDFILE
+                    wait \$CHILD_PID
+                    EXIT_CODE=\$?
+                    EXPECTED_PID=\$(cat $EXPECTFILE 2>/dev/null || true)
+                    rm -f $CHILD_PIDFILE
+
+                    if [ \"\$EXPECTED_PID\" = \"\$CHILD_PID\" ]; then
+                        rm -f $EXPECTFILE
+                        echo \"\$(date): expected dcentrald exit for PID \$CHILD_PID (code \$EXIT_CODE)\" >> $LOGFILE
+                        exit \$EXIT_CODE
+                    fi
+
+                    rm -f $EXPECTFILE
+                    if [ \$EXIT_CODE -eq 0 ]; then
+                        echo \"\$(date): dcentrald exited cleanly\" >> $LOGFILE
+                        exit 0
+                    fi
+
+                    CRASH_COUNT=\$((CRASH_COUNT + 1))
+                    echo \"\$(date): dcentrald exited with code \$EXIT_CODE (crash \$CRASH_COUNT/$MAX_CRASH_RESTARTS)\" >> $LOGFILE
+                    \"$SCRIPT\" safety
+                    if [ \$CRASH_COUNT -ge $MAX_CRASH_RESTARTS ]; then
+                        echo \"\$(date): dcentrald restart limit reached\" >> $LOGFILE
+                        exit \$EXIT_CODE
+                    fi
+                    sleep $RESTART_DELAY
+                done
+            "
+        echo "  [OK] dcentrald started (REST/WebSocket :$API_PORT, CGMiner :4028)"
+        echo "  Log: $LOGFILE"
+        ;;
+
+    stop)
+        echo "Stopping dcentrald mining daemon..."
+        # Send SIGTERM for graceful shutdown. dcentrald keeps PIC heartbeats alive
+        # while disabling voltage, then cools fans. Full sequence takes ~12s:
+        #   0.5s nonce drain + voltage disable + 2s heartbeat stop + 2s cap discharge
+        #   + 5s fan cooldown = ~12s total
+        # NEVER SIGKILL before voltage is off - kills heartbeat thread, PIC watchdog
+        # fires, corrupts I2C bus, requires PSU power cycle.
+        CHILD_PID=$(cat "$CHILD_PIDFILE" 2>/dev/null || pidof dcentrald 2>/dev/null | awk '{print $1}')
+        WRAPPER_PID=$(cat "$PIDFILE" 2>/dev/null || true)
+        [ -n "$CHILD_PID" ] && echo "$CHILD_PID" > "$EXPECTFILE"
+        [ -n "$CHILD_PID" ] && kill -TERM "$CHILD_PID" 2>/dev/null
+        # Wait up to 30 seconds for graceful shutdown.
+        # S9 shutdown can legitimately take ~18s when voltage-disable replies are slow.
+        for i in $(seq 1 30); do
+            if [ -z "$CHILD_PID" ] || ! kill -0 "$CHILD_PID" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+        TIMED_OUT=0
+        if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+            echo "  [WARN] dcentrald did not exit in 30s - force killing (I2C bus may need PSU power cycle)"
+            rm -f "$EXPECTFILE"
+            TIMED_OUT=1
+        fi
+        [ "$TIMED_OUT" -eq 1 ] && kill -9 "$CHILD_PID" 2>/dev/null
+        if [ -n "$WRAPPER_PID" ] && kill -0 "$WRAPPER_PID" 2>/dev/null; then
+            kill -TERM "$WRAPPER_PID" 2>/dev/null
+            sleep 1
+            kill -9 "$WRAPPER_PID" 2>/dev/null
+        fi
+        rm -f "$PIDFILE" "$CHILD_PIDFILE"
+        if [ "$TIMED_OUT" -eq 1 ]; then
+            fan_safety_override
+            echo "  [WARN] Forced-stop path left fans in safety mode"
+        else
+            # Clean stop on AM2: leave a PERSISTENT custodian holding idle PWM
+            # (the board reverts fans to full speed otherwise) — not the
+            # exit-immediately --set-fan one-shot.
+            #.
+            if [ "$IS_AM2" = "1" ]; then
+                if [ -x "$DAEMON" ]; then
+                    if am2_start_fan_custodian 10; then
+                        echo "  [OK] dcentrald stopped, am2 persistent fan custodian holding idle PWM 10 (--hold-fan)"
+                    else
+                        echo "  [WARN] dcentrald stopped, but am2 fan custodian failed to start"
+                    fi
+                else
+                    echo "  [WARN] dcentrald stopped but binary absent; am2 fans NOT lowered"
+                fi
+            elif command -v devmem > /dev/null 2>&1; then
+                devmem $((FAN_BASE + 0x10)) 32 10 2>/dev/null
+                devmem $((FAN_BASE + 0x14)) 32 10 2>/dev/null
+                echo "  [OK] dcentrald stopped, fans at idle"
+            else
+                echo "  [OK] dcentrald stopped"
+            fi
+        fi
+        ;;
+
+    restart)
+        $0 stop
+        sleep 2
+        $0 start
+        ;;
+
+    safety)
+        fan_safety_override
+        ;;
+
+    status)
+        if start-stop-daemon -K -p "$PIDFILE" -t -q 2>/dev/null; then
+            PID=$(cat "$PIDFILE" 2>/dev/null)
+            echo "dcentrald is running (PID $PID)"
+        else
+            echo "dcentrald is not running"
+        fi
+        ;;
+
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
+
+exit 0

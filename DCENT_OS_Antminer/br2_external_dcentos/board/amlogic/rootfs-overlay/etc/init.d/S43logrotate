@@ -1,0 +1,157 @@
+#!/bin/sh
+#
+# S43logrotate - Size-capped rotation for /tmp/dcentrald.log (and siblings)
+#
+#  STABILIZE (2026-06-05). The live audit found /tmp/dcentrald.log at
+# 7.0 MB and growing UNBOUNDED inside the 64 MB /tmp tmpfs (mounted by
+# dcentos-early-init.sh). With no rotation, a long-running unit eventually
+# fills /tmp, and once /tmp is full the daemon, dashboard, MCP server and the
+# S99upgrade health probes all start failing ENOSPC — a slow brick-by-disk on a
+# home space-heater that runs for weeks.
+#
+# This is a tiny, dependency-free, RO-rootfs-safe rotator. It backgrounds a
+# loop that, every CHECK_INTERVAL seconds, COPYTRUNCATE-rotates any watched log
+# that exceeds MAX_BYTES:
+#
+#   cp  log  log.1     (keep 1 generation of history)
+#   : > log            (truncate the original IN PLACE to zero bytes)
+#
+# Why copytruncate and NOT mv-then-recreate: the S82dcentrald wrapper launches
+# the daemon as `dcentrald ... >>$LOGFILE`, so the daemon inherits a single
+# O_APPEND fd opened on the log's INODE for its whole lifetime — it does not
+# re-resolve the path per write. If we `mv log log.1`, that fd follows the inode
+# and the daemon keeps writing into log.1 (which we'd delete on the next
+# rotation -> lost log lines, and a recreated `log` that stays empty forever).
+# `: > log` instead truncates the SAME inode the daemon holds: its next append
+# lands at offset 0 of the now-empty file, no fd churn, no lost-write window,
+# and on-disk size is hard-bounded by MAX_BYTES (live) + the size of log.1
+# (a one-shot copy, also <= MAX_BYTES) = 2*MAX_BYTES. That bound is the property
+# that matters for "/tmp can never fill". The brief copy->truncate race can drop
+# at most the few lines written between the `cp` finishing and the truncate —
+# an acceptable, bounded loss for a forensic log.
+#
+# Everything is under /tmp (and optionally /data) — never the RO squashfs root.
+#
+# POSIX shell only -- BusyBox ash, no bash. Uses only stat/cp/rm/printf, all
+# present in busybox.config.
+#
+# D-Central Technologies - DCENTos  STABILIZE
+#
+
+PIDFILE="/var/run/logrotate.pid"
+
+# Logs to watch. Space-separated absolute paths. All MUST be under /tmp or
+# /data (writable); we never touch RO-rootfs paths.
+WATCH_LOGS="/tmp/dcentrald.log /tmp/dashboard.log /tmp/mcp.log"
+
+# Rotate when a watched log exceeds this many bytes. 8 MiB keeps a generous
+# tail of forensics while bounding worst-case on-disk use to 16 MiB across the
+# active + .1 file — comfortably inside the 64 MiB /tmp tmpfs even with several
+# watched logs.
+MAX_BYTES=8388608
+
+# How often to check sizes. 60s is frequent enough that a fast-spinning crash
+# loop can't blow past ~MAX_BYTES + one minute of growth before we rotate.
+CHECK_INTERVAL=60
+
+# Allow an operator override without rebuilding the image.
+OVERRIDE="/data/logrotate.conf"
+[ -r "$OVERRIDE" ] && . "$OVERRIDE" 2>/dev/null
+
+file_size() {
+    # Echo the byte size of $1, or 0 if it doesn't exist / can't stat.
+    if [ -f "$1" ]; then
+        _s=$(stat -c %s "$1" 2>/dev/null)
+        [ -n "$_s" ] && { echo "$_s"; return; }
+    fi
+    echo 0
+}
+
+rotate_one() {
+    _log="$1"
+    # Refuse to operate on anything outside /tmp or /data (RO-rootfs safety).
+    case "$_log" in
+        /tmp/*|/data/*) : ;;
+        *)
+            echo "  [SKIP] $_log is not under /tmp or /data — refusing to rotate" \
+                > /dev/kmsg 2>/dev/null || true
+            return 0
+            ;;
+    esac
+    _sz=$(file_size "$_log")
+    [ "$_sz" -gt "$MAX_BYTES" ] 2>/dev/null || return 0
+    # COPYTRUNCATE: snapshot the current log to .1 (replacing the prior
+    # generation), then truncate the live file IN PLACE so the daemon's held
+    # O_APPEND fd keeps writing into the same now-empty inode. We never `mv` the
+    # live file (that would orphan the daemon's writes onto the renamed inode).
+    if cp "$_log" "${_log}.1" 2>/dev/null; then
+        : > "$_log" 2>/dev/null
+        echo "rotated $_log (${_sz}B > ${MAX_BYTES}B) -> ${_log}.1 (copytruncate)" > /dev/kmsg 2>/dev/null || true
+    else
+        # Copy failed (e.g. /tmp momentarily full): truncate anyway so we still
+        # bound size — losing one generation of history is preferable to letting
+        # /tmp fill. This is the safety-over-forensics fallback.
+        : > "$_log" 2>/dev/null
+        echo "rotated $_log (${_sz}B > ${MAX_BYTES}B) truncated WITHOUT .1 backup (copy failed)" > /dev/kmsg 2>/dev/null || true
+    fi
+}
+
+rotate_pass() {
+    for _l in $WATCH_LOGS; do
+        rotate_one "$_l"
+    done
+}
+
+loop() {
+    while true; do
+        rotate_pass
+        sleep "$CHECK_INTERVAL"
+    done
+}
+
+case "$1" in
+    start)
+        echo "Starting log rotator (cap ${MAX_BYTES}B, every ${CHECK_INTERVAL}s)..."
+        # Kill any stale rotator first so only one loop runs.
+        if [ -f "$PIDFILE" ]; then
+            _old=$(cat "$PIDFILE" 2>/dev/null)
+            [ -n "$_old" ] && kill "$_old" 2>/dev/null
+            rm -f "$PIDFILE"
+        fi
+        # One immediate pass at boot (catches a log left huge from a prior run
+        # that crashed without rotating), then background the loop.
+        rotate_pass
+        loop &
+        echo $! > "$PIDFILE" 2>/dev/null || true
+        echo "  [OK] log rotator running (pid $(cat "$PIDFILE" 2>/dev/null), watching: $WATCH_LOGS)"
+        ;;
+
+    stop)
+        if [ -f "$PIDFILE" ]; then
+            _p=$(cat "$PIDFILE" 2>/dev/null)
+            [ -n "$_p" ] && kill "$_p" 2>/dev/null
+            rm -f "$PIDFILE"
+            echo "Log rotator stopped"
+        else
+            echo "Log rotator not running"
+        fi
+        ;;
+
+    rotate)
+        # On-demand single pass (operator / dashboard hook).
+        rotate_pass
+        echo "Log rotation pass complete"
+        ;;
+
+    restart)
+        $0 stop
+        $0 start
+        ;;
+
+    *)
+        echo "Usage: $0 {start|stop|rotate|restart}"
+        exit 1
+        ;;
+esac
+
+exit 0

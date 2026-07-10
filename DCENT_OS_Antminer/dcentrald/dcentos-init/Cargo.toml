@@ -1,0 +1,34 @@
+[package]
+name = "dcentos-init"
+version.workspace = true  # Single source: dcentrald/Cargo.toml [workspace.package]
+edition = "2021"
+description = "Minimal PID 1 init for DCENT_OS on BraiinsOS kernel (Zynq ARM)"
+license = "GPL-3.0"
+
+# This binary replaces /sbin/init on DCENT_OS rootfs images deployed onto
+# BraiinsOS NAND slots. BraiinsOS's BusyBox lacks the init applet, and procd
+# (OpenWrt) ignores our /etc/inittab and runs its own boot chain.
+#
+# This is a ~100KB static musl binary that:
+#   1. Mounts /proc, /sys, /dev (tmpfs)
+#   2. Runs /etc/dcentos-early-init.sh (device nodes, persistent storage, GPIO)
+#   3. Runs /etc/init.d/S## scripts in order (start)
+#   4. Spawns getty on ttyPS0 (respawn on exit)
+#   5. Reaps orphan zombies (waitpid loop)
+#   6. Handles SIGTERM/SIGINT for graceful shutdown (runs S## stop + umount)
+#   7. Never exits (kernel panics if PID 1 exits)
+
+[[bin]]
+name = "dcentos-init"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+# W4.7 lint inheritance (DCENT_DevOps + DCENT_QA, 2026-05-07).
+# Small crate: ~14 unwrap/expect/panic occurrences in src/. PID 1 init binary
+# — panic-on-precondition is correct semantic in some boot paths (kernel
+# panics anyway if PID 1 exits). Inherit workspace `warn`.
+# Audit status: .
+[lints]
+workspace = true

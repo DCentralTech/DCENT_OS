@@ -1,0 +1,60 @@
+[package]
+name = "dcentrald-autotuner"
+version.workspace = true  # Single source: dcentrald/Cargo.toml [workspace.package]
+edition = "2021"
+description = "Per-chip frequency auto-tuning for DCENTos — TABS algorithm (Three-Phase Adaptive Binary Search)"
+license = "GPL-3.0"
+
+[features]
+# W13-A: opt-in surface for the runtime-command + state-injection
+# helpers used by the wave-13 integration tests (`tests/test_autotuner_runtime.rs`
+# in `dcentrald-api`). Default off so production builds do not link
+# the `tick_runtime_commands_for_test` / `force_state_for_test`
+# accessors.
+test-helpers = []
+
+[dependencies]
+dcentrald-asic = { path = "../dcentrald-asic" }
+# AT-1 (chip-rail voltage read-back spine, 2026-06-07): the autotuner's
+# measured-voltage input re-exports the pure, no-HAL `chain_voltage` resolver
+# from dcentrald-common (which also owns the 0x3A `MEASURE_VOLTAGE` decode it
+# reuses). dcentrald-common is a dependency-free leaf crate, so this adds no
+# new transitive deps and forms no workspace cycle.
+dcentrald-common = { path = "../dcentrald-common" }
+# W13.C3 (2026-05-10): wire per-SKU PVT envelope clamp into the autotuner.
+# Adds the BHB42xxx SKU enum + per-SKU `freq_voltage_table()` + `flags()` so
+# the autotuner can refuse `(freq, volt)` tuples outside the SKU's published
+# envelope (`AutoTunerError::OutsidePvt`). silicon-profiles depends only on
+# `dcentrald-api-types` (no HAL, no asic) so this does NOT form a workspace
+# dep cycle. The earlier W13-A `String` profile-id pattern was about deferring
+# this dep until W13.C — that closure now lands here.
+dcentrald-silicon-profiles = { path = "../dcentrald-silicon-profiles" }
+# Wave D (RE-002 closure, 2026-05-19): dps_governor module reuses the
+# DPS DTO catalog (DpsConfiguration, DpsScaleUpConditions, DpsMode,
+# DpsThermalProfile) from the no-HAL api-types crate. Catalog already
+# implements the documented 4-AND scale-up gate via
+# `DpsScaleUpConditions::met()`. See
+#  §RE-002.
+dcentrald-api-types = { path = "../dcentrald-api-types" }
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+# W4.7 lint inheritance + grandfather override (DCENT_DevOps + DCENT_QA, 2026-05-07).
+# ~81 grandfathered unwrap/expect/panic occurrences in src/. TABS algorithm
+# state machine has many `.unwrap()` on `Option` after explicit `is_some()`
+# checks — those are correct but trip clippy. Lints downgraded to `allow`
+# until the algorithm's pre-checked Option pattern is refactored to
+# `if let Some(...)` form. Audit status:
+# .
+# cargo 1.95+: per-crate overrides cannot coexist with `[lints] workspace = true`.
+[lints.clippy]
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+indexing_slicing = "allow"
+unwrap_in_result = "allow"

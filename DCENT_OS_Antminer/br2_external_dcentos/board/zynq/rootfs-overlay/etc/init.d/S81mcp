@@ -1,0 +1,79 @@
+#!/bin/sh
+#
+# S81mcp - Start DCENTos MCP (Model Context Protocol) server
+#
+# Allows AI assistants (Claude, ChatGPT, etc.) to interact with
+# miner hardware through the MCP standard protocol.
+#
+# Port 3000 — JSON-RPC 2.0 over HTTP
+#
+
+DAEMON="/root/web/mcp_server.py"
+PIDFILE="/var/run/dcentos-mcp.pid"
+PORT=3000
+# Security: bind to localhost only — MCP server exposes raw hardware access
+# (FPGA registers, I2C, GPIO). Must not be reachable from the network.
+# Users access MCP via SSH tunnel or the REST API on port 8080.
+BIND="127.0.0.1"
+
+# SW-05 / DEVOPS-004 (release hardening, 2026-06-02): the MCP server exposes
+# UNAUTHENTICATED raw-hardware access (FPGA register write, I2C, GPIO) on
+# port 3000. That is INTENTIONAL on a DEV/LAB image (debug-friendly, localhost
+# only). On a PRODUCTION/RELEASE image it must NOT auto-start: a release unit
+# ships with no shared root:dcentral password (root locked at defconfig), and
+# an always-on localhost raw-HW endpoint would be a credential-bypass surface
+# the moment any local foothold exists. The release-image marker is stamped by
+# scripts/lib/release_image_provision.sh when DCENT_RELEASE_IMAGE=1.
+# Operators who need MCP on a release unit can start it manually
+# (`/etc/init.d/S81mcp start`) over an authenticated SSH session.
+RELEASE_MARKER="/etc/dcentos/release-image"
+
+# POSIX (BusyBox ash) safe: a shared start routine. No bash `;&` fall-through.
+do_start() {
+    if [ -f "$DAEMON" ] && command -v python3 > /dev/null 2>&1; then
+        echo "Starting DCENTos MCP server on port $PORT..."
+        start-stop-daemon -S -b -m -p "$PIDFILE" -x /usr/bin/python3 -- "$DAEMON" --port "$PORT" --bind "$BIND"
+        echo "  [OK] MCP endpoint: http://$BIND:$PORT/mcp (localhost only)"
+    else
+        echo "  [SKIP] MCP server: python3 or mcp_server.py not found"
+    fi
+}
+
+case "$1" in
+    start)
+        if [ -f "$RELEASE_MARKER" ]; then
+            echo "  [SKIP] MCP server: PRODUCTION/RELEASE image — raw-HW MCP endpoint not auto-started (SW-05)."
+            echo "         Start manually over authenticated SSH if required: $0 start-force"
+            exit 0
+        fi
+        do_start
+        ;;
+
+    start-force)
+        # Operator escape hatch: explicitly start the raw-HW MCP endpoint even
+        # on a release image (e.g. an authenticated SSH debug session).
+        if [ -f "$RELEASE_MARKER" ]; then
+            echo "  [WARN] MCP server: release image — operator-forced start of the raw-HW MCP endpoint (localhost only)."
+        fi
+        do_start
+        ;;
+
+    stop)
+        echo "Stopping DCENTos MCP server..."
+        start-stop-daemon -K -p "$PIDFILE" -q
+        rm -f "$PIDFILE"
+        ;;
+
+    restart)
+        $0 stop
+        sleep 1
+        $0 start
+        ;;
+
+    *)
+        echo "Usage: $0 {start|start-force|stop|restart}"
+        exit 1
+        ;;
+esac
+
+exit 0

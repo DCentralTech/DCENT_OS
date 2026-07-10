@@ -1,0 +1,74 @@
+# DCENT_axe ESP-IDF Configuration
+CONFIG_IDF_TARGET="esp32s3"
+
+# Flash - 16MB typical for BitAxe
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# WiFi
+CONFIG_ESP_WIFI_SSID=""
+CONFIG_ESP_WIFI_PASSWORD=""
+
+# UART for ASIC communication
+# ESP32-S3 native USB — output logs over USB-CDC (TinyUSB)
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# FreeRTOS
+CONFIG_FREERTOS_HZ=1000
+
+# Main task stack — WiFi init + provisioning + v3 Tamagotchi OLED needs lots of stack
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
+
+# Watchdog
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=15
+# Don't crash on WDT — let the safe-mode recovery flow handle it
+# (see dcentaxe::main reset-reason path + nvs_config::wdt_* counters).
+CONFIG_ESP_TASK_WDT_PANIC=n
+
+# Panic coredump → flash (requires the `coredump` partition in partitions.csv).
+# Exposed at GET/DELETE /api/system/coredump so users can retrieve post-mortem data.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
+CONFIG_ESP_COREDUMP_LOGS=y
+CONFIG_ESP_COREDUMP_STACK_SIZE=1024
+
+# Memory — PSRAM enabled (Phase S 2026-04-25):
+# WROOM-1 N16R8 modules on every BitAxe Gamma Turbo have 8 MB octal PSRAM.
+# Enabling SPIRAM gives Rust's global allocator ~7 MB of additional heap
+# automatically (allocations > MALLOC_ALWAYSINTERNAL spill to PSRAM), which
+# eliminates the heap-fragmentation OOM cascade that no surgical fix could
+# stop (live-observed 2026-04-25: 16384 → 408 → 168 → ... → 8 byte OOMs as
+# fragmentation deepened, with total free heap stuck at ~30 KB despite no
+# leak). Runtime detection (api.rs `isPSRAMAvailable`) was already in place;
+# this enables it kernel-side. Worst case on no-PSRAM hardware: detection
+# stays at 0, no regression.
+CONFIG_ESP32S3_SPIRAM_SUPPORT=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=0
+
+# UBSan — disable in release builds. Coredump analysis (2026-04-24) traced a
+# panic to UBSan firing during pthread TLS teardown in the httpd task — a
+# known esp-idf+newlib interaction in TLS destructor cleanup, not in our code.
+# Disabling avoids release-build aborts on benign undefined behavior caught
+# during library teardown. Asserts kept silent so any *real* abort still fires.
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
+# CONFIG_COMPILER_SANITIZER_UBSAN is not set
+# CONFIG_COMPILER_UBSAN_TRAP is not set
+
+# mDNS — deferred. Enabling `CONFIG_MDNS_ENABLED=y` alone isn't enough on
+# esp-idf v5.4: the `mdns` component must also be pulled in via
+# `ESP_IDF_EXTRA_COMPONENTS` in `.cargo/config.toml` (or a `CMakeLists.txt`
+# shim), and the esp-idf-svc `mdns` feature needs to be available. Current
+# build tries to produce a second C `main()` when only the kconfig is set,
+# which breaks the Rust entrypoint. Re-enable after the build-system work
+# lands alongside live Touch hardware (see swarm::start for the runtime
+# half). Peers still enter SwarmState via POST /api/swarm/report today.
+# CONFIG_MDNS_ENABLED=y
+# CONFIG_MDNS_MAX_SERVICES=3

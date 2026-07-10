@@ -1,0 +1,14 @@
+# dcentos-compat -- legacy compatibility toggles for older field images
+#
+# Native DCENT_OS cold boot is the default product path. Legacy handoff hooks
+# stay available only when explicitly enabled here or via /data/dcentos-compat.
+
+# Enable one-shot bosminer PIC bootstrap on Zynq boot.
+# 0 = disabled (default, native dcentrald boot path)
+# 1 = enabled (legacy compatibility mode)
+BOSMINER_PIC_BOOTSTRAP=0
+
+# Positive model allowlist for the legacy PIC bootstrap path.
+# Keep this fail-closed until native-first validation is complete on every board.
+# Supported today: am1-s9 only.
+BOSMINER_PIC_BOOTSTRAP_ALLOW_MODEL="am1-s9"

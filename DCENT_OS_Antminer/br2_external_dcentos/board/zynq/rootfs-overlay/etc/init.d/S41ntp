@@ -1,0 +1,240 @@
+#!/bin/sh
+#
+# S41ntp - One-shot SNTP time sync + persisted last-good clock (no-RTC board)
+#
+#  STABILIZE (2026-06-05). The S9/Zynq control board has NO
+# battery-backed RTC, so the kernel boots the clock at the 1970 epoch. That
+# breaks the entire "1970 class" of bugs the live audit found:
+#   - every daemon log line + API wall-clock timestamp reads 1970;
+#   - share / thermal / audit forensics are anchored to 1970;
+#   - any time-based lifecycle logic (scheduled reboot, donation cycle,
+#     cooldowns, the upgrade_stage commit window) runs on a bogus wall clock.
+#
+# This script does three things, in order of cost:
+#   1. RESTORE (always, before the network is up): if /data holds a last-good
+#      timestamp from a previous boot, bump the clock forward to it. This gets
+#      the clock out of 1970 immediately even with no network, so early-boot
+#      log lines and forensics are at least monotonic-and-recent rather than
+#      1970. We only ever move the clock FORWARD past the restored mark (never
+#      backward), so a real SNTP sync that already ran can't be clobbered.
+#   2. SYNC (when eth0 has an IP): one-shot busybox `ntpd -q` against a small
+#      pool of public SNTP servers. One-shot = set the clock once and exit; we
+#      never leave an ntpd daemon resident.
+#   3. PERSIST: write the freshly-synced (or restored) wall-clock to /data so
+#      the next boot can restore it. Also re-persisted periodically by the
+#      lightweight background "ticker" so an unsynced unit still advances its
+#      saved mark roughly with real time.
+#
+# Ordering: runs as S41, immediately AFTER S40network (which backgrounds
+# udhcpc). DHCP may not have completed by S41, so the SYNC step waits a bounded
+# window for eth0 to acquire an IP, then runs ntpd in the background so it never
+# blocks the rest of rcS (S50dropbear, S80dashboard, S82dcentrald).
+#
+# Persistence file lives on the NAND-backed /data overlay (mounted by
+# dcentos-early-init.sh well before this runs). It is a tiny text file holding
+# one integer: epoch seconds. We never write to the read-only squashfs root.
+#
+# POSIX shell only -- BusyBox ash, no bash.
+#
+# D-Central Technologies - DCENTos  STABILIZE
+#
+
+INTERFACE="eth0"
+STAMP_FILE="/data/last-good-time"
+TICKER_PIDFILE="/var/run/ntp-ticker.pid"
+
+# Public SNTP servers. busybox ntpd accepts multiple -p; it queries them and
+# uses the first usable reply. Kept short and vendor-neutral. An operator can
+# override the whole list by dropping NTP_SERVERS=... into /data/ntp.conf
+# (sourced below), e.g. to point at a LAN time server on an isolated network.
+NTP_SERVERS="pool.ntp.org time.cloudflare.com time.google.com"
+NTP_CONF="/data/ntp.conf"
+[ -r "$NTP_CONF" ] && . "$NTP_CONF" 2>/dev/null
+
+# A sane lower bound for "the clock looks real" — 2025-01-01 00:00:00 UTC.
+# Anything below this is treated as the unset 1970-ish epoch. Bumping this
+# forward over time is harmless; it only gates the "do we already have a real
+# clock?" decision and the "is the restored/synced value plausible?" check.
+MIN_PLAUSIBLE_EPOCH=1735689600
+
+now_epoch() {
+    # date +%s is provided by busybox CONFIG_DATE.
+    date -u +%s 2>/dev/null
+}
+
+clock_looks_real() {
+    _n=$(now_epoch)
+    [ -n "$_n" ] || return 1
+    [ "$_n" -ge "$MIN_PLAUSIBLE_EPOCH" ] 2>/dev/null
+}
+
+persist_now() {
+    # Save the current wall-clock to /data atomically (tmp + mv) so a crash
+    # mid-write can never leave a half-written stamp. Only persist a plausible
+    # clock — never overwrite a good saved mark with a 1970 value.
+    [ -d /data ] || return 1
+    _n=$(now_epoch)
+    [ -n "$_n" ] || return 1
+    [ "$_n" -ge "$MIN_PLAUSIBLE_EPOCH" ] 2>/dev/null || return 1
+    _tmp="${STAMP_FILE}.tmp.$$"
+    if printf '%s\n' "$_n" > "$_tmp" 2>/dev/null; then
+        mv "$_tmp" "$STAMP_FILE" 2>/dev/null || { rm -f "$_tmp" 2>/dev/null; return 1; }
+        return 0
+    fi
+    rm -f "$_tmp" 2>/dev/null
+    return 1
+}
+
+restore_from_stamp() {
+    # If the current clock is below the saved last-good mark, jump forward to
+    # the mark. Never moves the clock backward (a later SYNC stays authoritative).
+    [ -r "$STAMP_FILE" ] || return 1
+    _saved=$(head -1 "$STAMP_FILE" 2>/dev/null | tr -dc '0-9')
+    [ -n "$_saved" ] || return 1
+    [ "$_saved" -ge "$MIN_PLAUSIBLE_EPOCH" ] 2>/dev/null || return 1
+    _n=$(now_epoch)
+    [ -n "$_n" ] || _n=0
+    if [ "$_n" -lt "$_saved" ] 2>/dev/null; then
+        # busybox `date -s @<epoch>` sets the clock from epoch seconds.
+        if date -s "@$_saved" >/dev/null 2>&1; then
+            echo "  [OK] clock restored from last-good /data mark ($_saved epoch)"
+            return 0
+        fi
+        # Some busybox builds want the -u flag and don't grok @epoch on -s.
+        if date -u -s "@$_saved" >/dev/null 2>&1; then
+            echo "  [OK] clock restored from last-good /data mark ($_saved epoch)"
+            return 0
+        fi
+        echo "  [WARN] could not set clock from saved mark ($_saved)"
+        return 1
+    fi
+    return 0
+}
+
+sync_once() {
+    # One-shot SNTP. busybox ntpd:
+    #   -q  quit after the clock is set
+    #   -n  do not daemonize (foreground; we background the whole call ourselves)
+    #   -d  (omitted) debug
+    #   -p  peer/server (repeatable)
+    # Returns 0 on a successful set.
+    command -v ntpd >/dev/null 2>&1 || return 1
+    _args=""
+    for _s in $NTP_SERVERS; do
+        _args="$_args -p $_s"
+    done
+    [ -n "$_args" ] || return 1
+    # shellcheck disable=SC2086
+    ntpd -q -n $_args >/dev/null 2>&1
+}
+
+wait_for_ip() {
+    # Bounded wait (default 60s) for eth0 to get an IPv4 address. S40network
+    # backgrounds udhcpc, so we cannot assume an IP is up yet.
+    _limit="${1:-60}"
+    _i=0
+    while [ "$_i" -lt "$_limit" ]; do
+        if ip addr show "$INTERFACE" 2>/dev/null | grep -q 'inet '; then
+            return 0
+        fi
+        sleep 1
+        _i=$((_i + 1))
+    done
+    return 1
+}
+
+start_ticker() {
+    # Lightweight background loop: re-persist the last-good clock every 10 min
+    # so an UNSYNCED unit (no network) still advances its saved mark roughly
+    # with real time across a long uptime — bounding the 1970-jump on the next
+    # cold boot to "since last persist" rather than "back to 1970". Cheap: one
+    # tiny atomic write every 600s. Killed/replaced on restart.
+    if [ -f "$TICKER_PIDFILE" ]; then
+        _old=$(cat "$TICKER_PIDFILE" 2>/dev/null)
+        [ -n "$_old" ] && kill "$_old" 2>/dev/null
+        rm -f "$TICKER_PIDFILE"
+    fi
+    (
+        while true; do
+            sleep 600
+            persist_now
+        done
+    ) &
+    echo $! > "$TICKER_PIDFILE" 2>/dev/null || true
+}
+
+do_sync_and_persist() {
+    # Background body: wait for the network, SNTP-sync, then persist. Detached
+    # from rcS so a slow/absent network never delays dropbear/dashboard/daemon.
+    if wait_for_ip 60; then
+        if sync_once; then
+            echo "  [OK] SNTP time sync succeeded ($(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null))" \
+                > /dev/kmsg 2>/dev/null || true
+            persist_now
+        else
+            echo "  [WARN] SNTP sync did not set the clock (servers unreachable?)" \
+                > /dev/kmsg 2>/dev/null || true
+            # Still persist whatever the clock is (restore may have advanced it).
+            persist_now
+        fi
+    else
+        echo "  [WARN] eth0 got no IP in 60s; SNTP skipped (running on restored/last-good clock)" \
+            > /dev/kmsg 2>/dev/null || true
+        persist_now
+    fi
+}
+
+case "$1" in
+    start)
+        echo "Time sync (no-RTC board): restore + SNTP..."
+
+        # 1. RESTORE first — get out of 1970 immediately, even with no network.
+        if clock_looks_real; then
+            echo "  [OK] clock already plausible ($(now_epoch) epoch); skipping restore"
+        else
+            restore_from_stamp || echo "  [..] no usable last-good mark yet (first boot or empty /data)"
+        fi
+
+        # 2 + 3. SYNC + PERSIST in the background so rcS is never blocked.
+        do_sync_and_persist &
+
+        # Background re-persist ticker for unsynced long-uptime units.
+        start_ticker
+
+        echo "  [OK] S41ntp armed (SNTP in background, last-good mark = $STAMP_FILE)"
+        ;;
+
+    stop)
+        # Persist a final mark on shutdown so reboot restores as close to real
+        # time as possible, and stop the ticker.
+        persist_now && echo "Saved last-good time to $STAMP_FILE"
+        if [ -f "$TICKER_PIDFILE" ]; then
+            _p=$(cat "$TICKER_PIDFILE" 2>/dev/null)
+            [ -n "$_p" ] && kill "$_p" 2>/dev/null
+            rm -f "$TICKER_PIDFILE"
+        fi
+        ;;
+
+    sync)
+        # Manual on-demand resync (operator / dashboard hook).
+        if sync_once; then
+            persist_now
+            echo "SNTP resync OK ($(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null))"
+        else
+            echo "SNTP resync FAILED (servers unreachable?)"
+            exit 1
+        fi
+        ;;
+
+    restart)
+        $0 stop
+        $0 start
+        ;;
+
+    *)
+        echo "Usage: $0 {start|stop|sync|restart}"
+        exit 1
+        ;;
+esac
+
+exit 0

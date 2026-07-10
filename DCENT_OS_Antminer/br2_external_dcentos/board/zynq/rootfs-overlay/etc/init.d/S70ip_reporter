@@ -1,0 +1,65 @@
+#!/bin/sh
+#
+# S70ip_reporter - DCENT_OS IP Reporter daemon
+#
+# Broadcasts the miner's IP/MAC/model on UDP 14235 (Bitmain IP Reporter
+# desktop tool format) and a richer JSON on UDP 14237 (DCENT_Toolbox
+# `dcent listen`). Triggered by SIGUSR1 from /api/dashboard/report-ip
+# in server.py, or one-shot via `ip_reporter.py --once`.
+#
+# D-Central Technologies - DCENT_OS
+
+DAEMON=/root/web/ip_reporter.py
+PIDFILE=/var/run/ip_reporter.pid
+PYTHON=/usr/bin/python3
+
+case "$1" in
+    start)
+        echo -n "Starting IP Reporter: "
+        if [ ! -x "$DAEMON" ]; then
+            echo "FAIL ($DAEMON not executable)"
+            exit 1
+        fi
+        if [ ! -x "$PYTHON" ]; then
+            echo "FAIL ($PYTHON not present)"
+            exit 1
+        fi
+        start-stop-daemon -S -b -m -p "$PIDFILE" --exec "$PYTHON" -- "$DAEMON" \
+            >/dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            echo "OK"
+        else
+            echo "FAIL"
+            exit 1
+        fi
+        ;;
+    stop)
+        echo -n "Stopping IP Reporter: "
+        start-stop-daemon -K -q -p "$PIDFILE" 2>/dev/null
+        rm -f "$PIDFILE"
+        echo "OK"
+        ;;
+    restart|reload)
+        "$0" stop
+        sleep 1
+        "$0" start
+        ;;
+    status)
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "ip_reporter running (PID $(cat "$PIDFILE"))"
+        else
+            echo "ip_reporter stopped"
+            exit 1
+        fi
+        ;;
+    broadcast)
+        # Manual one-shot from CLI: /etc/init.d/S70ip_reporter broadcast
+        "$PYTHON" "$DAEMON" --once
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status|broadcast}"
+        exit 1
+        ;;
+esac
+
+exit 0

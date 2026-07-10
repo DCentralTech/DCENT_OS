@@ -1,0 +1,52 @@
+[package]
+name = "dcentaxe-lora"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "SX1262 LoRa driver + DCENT mesh stack for DCENT_axe (scaffold — NOT yet wired into the daemon)"
+
+[dependencies]
+log = "0.4"
+# `serde` derives make the MCP tool I/O + mesh telemetry structs registration-
+# ready (JSON-RPC `/mcp`, dashboard) without bespoke serialization. Already in
+# the workspace lock (dcentaxe-bap depends on it) → adds ZERO new lock entries.
+serde = { version = "1", features = ["derive"] }
+# Owner-auth for over-the-air `$DCM` control frames: HMAC-SHA256 (RFC 2104) with
+# a `subtle`-backed constant-time verify (`Mac::verify_slice`). Both crates are
+# ALREADY in the workspace lock (dcentaxe-stratum / -v2) → ZERO new lock entries.
+# The audited RustCrypto impl replaces the scaffold's placeholder string compare.
+hmac = "0.12"
+sha2 = "0.10"
+
+# Meshtastic channel crypto (AES-128/256-CTR) — pulled in ONLY by the
+# `meshtastic-interop` feature (`dep:` below), so the cheap entry board that
+# never selects interop compiles ZERO bytes of AES and the lock delta is scoped
+# to the deliberately-heavier interop path (mirrors the crate's feature note).
+# The audited RustCrypto `aes`+`ctr` (constant-time, `no_std`) implement the
+# EXACT AES-128/256-CTR Meshtastic uses for shared-PSK channels; `Ctr128BE`
+# matches mbedtls' full-16-byte big-endian counter block. Both crates are already
+# present in the workspace registry cache → offline-buildable.
+aes = { version = "0.8", optional = true }
+ctr = { version = "0.9", optional = true }
+
+[dev-dependencies]
+# Host-test-only: prove the MCP tool I/O structs are JSON-RPC-ready. Dev-dep ⇒
+# never linked into the firmware image. Already in the workspace lock.
+serde_json = "1"
+
+[features]
+default = []
+# Real ESP32-S3 SPI3/HSPI + GPIO transport (`esp_hal` module). OFF by default so:
+#   1. host unit tests stay pure-Rust and never pull in esp-idf-sys, and
+#   2. the crate contributes ZERO bytes to a SKU image that does not select LoRa
+#      (per-board feature-gating — root + project  OTA-slot guardrail,
+#      precedent `--features bitaxe-gt`).
+esp-idf = ["dep:esp-idf-hal"]
+# Phase-2 Meshtastic-compatible framing (protobuf + AES-CTR channel crypto +
+# managed router). Gated so the RAM/OTA-heavier interop path never taxes the
+# cheap entry board; pulls the AES crates only here. See `crate::meshtastic`.
+meshtastic-interop = ["dep:aes", "dep:ctr"]
+
+[dependencies.esp-idf-hal]
+version = "0.46"
+optional = true

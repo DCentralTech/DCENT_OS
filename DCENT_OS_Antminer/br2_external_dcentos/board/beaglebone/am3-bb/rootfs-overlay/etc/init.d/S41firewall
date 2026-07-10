@@ -1,0 +1,155 @@
+#!/bin/sh
+#
+# S41firewall - DCENT_OS am3-bb netfilter hardening.
+#
+# Drops traffic to the well-known stock Bitmain `daemons` privesc port on
+# loopback AND across all interfaces, plus a few other stock attack
+# surfaces that reverse engineering of the BB rootfs found are running as
+# root in the stock image. We deliberately do not ship the offending
+# binaries (post-build.sh refuses them), but a defense-in-depth kernel
+# packet drop is cheap and protects against any sideload regression.
+#
+# Threat model reference: docs/THREAT_MODEL.md (BB-1).
+# Memory rule:             .
+#
+# Init order rationale:
+#   S40network    — eth0 link / DHCP comes up here
+#   S41firewall   — THIS script: rules in place before any listener
+#   S50dropbear   — SSH starts after rules are in place
+#   S70+          — dcentos-discovery, dashboard, dcentrald
+#
+# The script is fail-soft: if iptables is missing (e.g. lab build with the
+# package disabled) or any individual rule rejects, we log and continue.
+# The post-build.sh `daemons` binary blocklist remains the primary defense.
+
+PORTS_TCP="22322"
+PORTS_UDP="22322"
+LOGTAG="dcentos-fw"
+LOGFILE="/var/log/dcentos-firewall.log"
+
+# Log to both stderr (BusyBox init pipes this to console) and a file.
+log() {
+    msg="$*"
+    timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo timeless)"
+    line="${timestamp} ${LOGTAG}: ${msg}"
+    echo "${line}"
+    if mkdir -p /var/log >/dev/null 2>&1; then
+        echo "${line}" >> "${LOGFILE}" 2>/dev/null || true
+    fi
+}
+
+require_iptables() {
+    if ! command -v iptables >/dev/null 2>&1; then
+        log "WARN: iptables not present in image; relying on post-build binary blocklist (daemons/monitor-ipsig already excluded)"
+        return 1
+    fi
+    return 0
+}
+
+apply_rule() {
+    # apply_rule <chain> <proto> <port>
+    chain="$1"
+    proto="$2"
+    port="$3"
+
+    if iptables -C "${chain}" -p "${proto}" --dport "${port}" -j DROP >/dev/null 2>&1; then
+        log "rule already present: ${chain} ${proto}/${port}"
+        return 0
+    fi
+
+    if iptables -A "${chain}" -p "${proto}" --dport "${port}" -j DROP >/dev/null 2>&1; then
+        log "DROP added: ${chain} ${proto}/${port}"
+    else
+        log "WARN: could not add ${chain} ${proto}/${port} DROP rule"
+        return 1
+    fi
+}
+
+drop_port() {
+    # drop_port <proto> <port>
+    proto="$1"
+    port="$2"
+
+    # Block loopback first — daemons:22322 was localhost-only on stock BB.
+    apply_rule INPUT "${proto}" "${port}"
+}
+
+flush_port() {
+    proto="$1"
+    port="$2"
+
+    while iptables -C INPUT -p "${proto}" --dport "${port}" -j DROP >/dev/null 2>&1; do
+        if ! iptables -D INPUT -p "${proto}" --dport "${port}" -j DROP >/dev/null 2>&1; then
+            break
+        fi
+    done
+}
+
+start() {
+    log "starting am3-bb firewall hardening"
+
+    if ! require_iptables; then
+        # Best-effort exit OK: post-build already refuses to ship the
+        # `daemons` binary, so the privesc listener is not present.
+        return 0
+    fi
+
+    for port in ${PORTS_TCP}; do
+        drop_port tcp "${port}"
+    done
+    for port in ${PORTS_UDP}; do
+        drop_port udp "${port}"
+    done
+
+    log "am3-bb firewall hardening applied"
+    return 0
+}
+
+stop() {
+    log "removing am3-bb firewall hardening"
+    if ! require_iptables; then
+        return 0
+    fi
+
+    for port in ${PORTS_TCP}; do
+        flush_port tcp "${port}"
+    done
+    for port in ${PORTS_UDP}; do
+        flush_port udp "${port}"
+    done
+    log "am3-bb firewall hardening removed"
+    return 0
+}
+
+status() {
+    if ! require_iptables; then
+        echo "iptables not installed; defense relies on post-build blocklist"
+        return 0
+    fi
+
+    echo "am3-bb firewall rules currently in INPUT:"
+    iptables -nL INPUT 2>/dev/null | grep -E ' (22322)\b' || \
+        echo "  (no DCENT_OS firewall rules present)"
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart|reload)
+        stop
+        start
+        ;;
+    status)
+        status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

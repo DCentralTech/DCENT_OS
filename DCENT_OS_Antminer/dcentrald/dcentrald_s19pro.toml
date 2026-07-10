@@ -1,0 +1,62 @@
+# dcentrald.toml — S19 Pro
+# Passthrough mode: ride bosminer's FPGA/ASIC state
+
+[general]
+hostname = "dcentos-s19pro"
+log_level = "info"
+
+[pool]
+url = "stratum+tcp://solo.ckpool.org:3333"
+worker = ""
+password = "x"
+protocol = "sv1"
+
+[mining]
+model = "s19"
+frequency_mhz = 500
+voltage_mv = 13800
+suggest_difficulty = 256
+passthrough = true
+version_rolling = true
+version_rolling_mask = 0x1fffe000
+
+[power]
+mode = "bypass"
+target_watts = 1400
+
+[thermal]
+target_temp_c = 60
+hot_temp_c = 70
+dangerous_temp_c = 80
+fan_min_pwm = 10
+fan_max_pwm = 70
+
+[api]
+cgminer_port = 4028
+http_port = 80
+websocket = true
+auth_enabled = false
+auth_password = ""
+
+[donation]
+enabled = false
+percent = 0.0
+
+[watchdog]
+enabled = false
+
+[hash_on_disconnect]
+enabled = true
+
+[mode]
+active = "standard"
+
+[autotuner]
+enabled = false
+
+[led]
+enabled = true
+heartbeat_on_ms = 100
+heartbeat_off_ms = 900
+flash_on_accepted_share = true
+flash_on_rejected_share = true

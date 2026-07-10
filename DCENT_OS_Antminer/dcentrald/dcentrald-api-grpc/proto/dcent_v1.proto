@@ -1,0 +1,198 @@
+// DCENT_OS gRPC API v1 — Supremacy S5.1 scaffold (2026-05-15).
+//
+// 5 services scaffolded: MinerService, TunerService, PoolService,
+// FanService, LocateService. Most RPCs return Status::unimplemented in
+// the lib.rs server impl — they're placeholders until the runtime is
+// wired. The one real handler is TunerService.GetConstraints, which
+// returns voltage / fan / frequency envelopes from
+// `dcentrald-silicon-profiles` with the SUPREMACY-CONTRACT clamps
+// (voltage_mv <= 14500 am2, fan_pwm <= 30 in home mode).
+//
+// Backwards-compatibility contract: never remove or renumber a field;
+// new fields go on the end and are optional. v1 is the canonical
+// long-lived API; experimental fields land in v1alpha2 / v2 protos.
+
+syntax = "proto3";
+
+package dcent.v1;
+
+// ---------------------------------------------------------------------------
+// Shared messages
+// ---------------------------------------------------------------------------
+
+message Empty {}
+
+// Operating mode hint — informs the constraints reply about which fan /
+// voltage envelope to apply. Defaults to `MODE_UNSPECIFIED` (treated as
+// `MODE_STANDARD` by GetConstraints — see lib.rs for the resolution table).
+enum OperatingMode {
+  MODE_UNSPECIFIED = 0;
+  MODE_STANDARD = 1;
+  MODE_HOME = 2;      // Home / space-heater. Fan cap 30 PWM HARD.
+  MODE_PERFORMANCE = 3;
+  MODE_EFFICIENCY = 4;
+}
+
+// ---------------------------------------------------------------------------
+// MinerService — top-level status + lifecycle
+// ---------------------------------------------------------------------------
+
+message MinerStatus {
+  string firmware_version = 1;
+  string platform_marker = 2;       // e.g. "zynq-bm3-am2:am2-s19jpro"
+  string chip_family = 3;            // e.g. "bm1362"
+  double hashrate_ths = 4;
+  uint32 chain_count = 5;
+  uint32 chain_alive_count = 6;
+  uint64 uptime_seconds = 7;
+  string mining_state = 8;           // idle/starting/mining/stopping/error
+}
+
+message RebootResult {
+  bool acknowledged = 1;
+  string detail = 2;
+}
+
+service MinerService {
+  rpc GetStatus(Empty) returns (MinerStatus);
+  rpc Reboot(Empty) returns (RebootResult);
+}
+
+// ---------------------------------------------------------------------------
+// TunerService — autotuner + constraint advertisement
+// ---------------------------------------------------------------------------
+
+message TunerMode {
+  string mode = 1;                   // performance | power_target | hashrate_target | manual | efficiency | heater
+  uint32 power_target_watts = 2;     // populated when mode=power_target
+  double hashrate_target_ths = 3;    // populated when mode=hashrate_target
+  uint32 manual_freq_mhz = 4;        // populated when mode=manual
+  uint32 manual_voltage_mv = 5;      // populated when mode=manual
+}
+
+message SetTunerModeRequest {
+  TunerMode mode = 1;
+}
+
+message SetTunerModeResult {
+  bool acknowledged = 1;
+  string detail = 2;
+  TunerMode active_mode = 3;
+}
+
+// Frequency envelope reported by the server for the detected silicon.
+message FrequencyBand {
+  uint32 min_mhz = 1;
+  uint32 max_mhz = 2;
+  uint32 step_mhz = 3;
+}
+
+// Voltage envelope reported by the server. `max_mv <= 14500` for am2 per
+// the SUPREMACY voltage clamp; constraints.rs enforces this.
+message VoltageEnvelope {
+  uint32 min_mv = 1;
+  uint32 max_mv = 2;
+}
+
+// Fan PWM envelope. `max_pwm <= 30` when the unit reports home mode per the
+// SUPREMACY fan clamp; constraints.rs enforces this.
+message FanEnvelope {
+  uint32 min_pwm = 1;
+  uint32 max_pwm = 2;
+}
+
+message TunerConstraints {
+  string chip_family = 1;
+  FrequencyBand frequency_band = 2;
+  VoltageEnvelope voltage_envelope = 3;
+  FanEnvelope fan_envelope = 4;
+  OperatingMode mode = 5;
+  string source = 6;                 // "silicon-profiles" | "fallback" | "unknown"
+}
+
+service TunerService {
+  rpc GetTunerMode(Empty) returns (TunerMode);
+  rpc SetTunerMode(SetTunerModeRequest) returns (SetTunerModeResult);
+  rpc GetConstraints(Empty) returns (TunerConstraints);
+}
+
+// ---------------------------------------------------------------------------
+// PoolService — pool config read/write
+// ---------------------------------------------------------------------------
+
+message Pool {
+  string url = 1;
+  string worker = 2;
+  string password = 3;
+  uint32 priority = 4;               // 0=primary, 1=failover-1, 2=failover-2
+}
+
+message PoolList {
+  repeated Pool pools = 1;
+}
+
+message SetPoolsRequest {
+  repeated Pool pools = 1;
+}
+
+message SetPoolsResult {
+  bool acknowledged = 1;
+  string detail = 2;
+}
+
+service PoolService {
+  rpc GetPools(Empty) returns (PoolList);
+  rpc SetPools(SetPoolsRequest) returns (SetPoolsResult);
+}
+
+// ---------------------------------------------------------------------------
+// FanService — fan state + manual override
+// ---------------------------------------------------------------------------
+
+message Fan {
+  uint32 index = 1;
+  uint32 rpm = 2;
+  uint32 pwm = 3;
+  bool failed = 4;
+}
+
+message FanState {
+  repeated Fan fans = 1;
+  string control_mode = 2;           // auto / manual / safety
+  uint32 home_cap_pwm = 3;           // 30 when home mode active
+}
+
+message SetFanModeRequest {
+  string mode = 1;                   // auto / manual
+  uint32 manual_pwm = 2;             // 0..100; capped at 30 in home mode by server
+}
+
+message SetFanModeResult {
+  bool acknowledged = 1;
+  string detail = 2;
+  uint32 applied_pwm = 3;
+}
+
+service FanService {
+  rpc GetFanState(Empty) returns (FanState);
+  rpc SetFanMode(SetFanModeRequest) returns (SetFanModeResult);
+}
+
+// ---------------------------------------------------------------------------
+// LocateService — physical-find LED blink
+// ---------------------------------------------------------------------------
+
+message LocateRequest {
+  uint32 duration_seconds = 1;       // 0 == off
+  bool off = 2;                      // explicit stop
+}
+
+message LocateResult {
+  bool acknowledged = 1;
+  string detail = 2;
+  string led_state = 3;              // on / off / blinking
+}
+
+service LocateService {
+  rpc LocateDevice(LocateRequest) returns (LocateResult);
+}

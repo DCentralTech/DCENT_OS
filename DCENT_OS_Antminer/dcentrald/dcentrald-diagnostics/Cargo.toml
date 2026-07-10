@@ -1,0 +1,27 @@
+[package]
+name = "dcentrald-diagnostics"
+version.workspace = true  # Single source: dcentrald/Cargo.toml [workspace.package]
+edition = "2021"
+description = "Diagnostic test orchestration and report generation for dcentrald"
+license = "GPL-3.0"
+
+[dependencies]
+dcentrald-hal = { path = "../dcentrald-hal" }
+dcentrald-asic = { path = "../dcentrald-asic" }
+dcentrald-thermal = { path = "../dcentrald-thermal" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+askama.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio-util.workspace = true
+
+# W4.7 lint inheritance (DCENT_DevOps + DCENT_QA, 2026-05-07).
+# CLEAN CRATE: zero unwrap/expect/panic in src/ at audit time. Inherit the
+# workspace `warn` and treat this crate as the model — the audit ladder
+# can promote to `deny` here first. Any new offender will warn loudly.
+# Audit status: .
+[lints]
+workspace = true

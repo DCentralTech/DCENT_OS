@@ -1,0 +1,291 @@
+#!/bin/sh
+#
+# S82dcentrald - DCENT_OS mining daemon (platform-aware: Zynq + serial SoCs)
+#
+# dcentrald owns REST/WebSocket on :8080. The dashboard owns :80.
+#
+
+DAEMON="/usr/local/bin/dcentrald"
+CONFIG="/etc/dcentrald/dcentrald.toml"
+[ -f /data/dcentrald.toml ] && CONFIG="/data/dcentrald.toml"
+[ ! -f "$CONFIG" ] && [ -f /etc/dcentrald.toml ] && CONFIG="/etc/dcentrald.toml"
+LOGFILE="/tmp/dcentrald.log"
+PIDFILE="/var/run/dcentrald.pid"
+CHILD_PIDFILE="/var/run/dcentrald-child.pid"
+EXPECTFILE="/tmp/dcentrald.expected_exit.pid"
+API_PORT=8080
+MAX_CRASH_RESTARTS=5
+RESTART_DELAY=2
+SCRIPT="$0"
+
+detect_platform() {
+    if [ -e /dev/uio0 ]; then
+        echo "zynq"
+    elif grep -qiE 'AM33XX|AM335x|TI AM335' /proc/cpuinfo 2>/dev/null || [ -e /dev/ttyO1 ]; then
+        echo "beaglebone"
+    elif [ -e /dev/ttyS1 ] || [ -e /dev/ttyS2 ]; then
+        echo "amlogic"
+    else
+        echo "unknown"
+    fi
+}
+
+migrate_legacy_api_port() {
+    [ -f "$CONFIG" ] || return 0
+
+    # Rewrite legacy dcentrald API http_port 80 to 8080 so the dashboard owns :80.
+    if ! grep -Eq '^[[:space:]]*http_port[[:space:]]*=[[:space:]]*80([[:space:]]*(#.*)?)?$' "$CONFIG" 2>/dev/null; then
+        return 0
+    fi
+
+    TMPFILE="${CONFIG}.tmp.$$"
+    if awk '
+        BEGIN { in_api = 0 }
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            in_api = ($0 ~ /^[[:space:]]*\[api\][[:space:]]*$/)
+        }
+        in_api && /^[[:space:]]*http_port[[:space:]]*=[[:space:]]*80([[:space:]]*(#.*)?)?$/ {
+            sub(/80/, "8080")
+        }
+        { print }
+    ' "$CONFIG" > "$TMPFILE" 2>/dev/null; then
+        if mv "$TMPFILE" "$CONFIG" 2>/dev/null; then
+            echo "  [MIGRATE] dcentrald API http_port 80 to 8080 in $CONFIG"
+        else
+            rm -f "$TMPFILE"
+            echo "  [WARN] Could not migrate legacy dcentrald API port in $CONFIG"
+        fi
+    else
+        rm -f "$TMPFILE"
+        echo "  [WARN] Could not inspect dcentrald API port in $CONFIG"
+    fi
+}
+
+fan_safety_override() {
+    FAN_PLATFORM=${PLATFORM:-$(detect_platform)}
+    fan_detail="fans commanded to safe PWM (dcentrald exited)"
+    case "$FAN_PLATFORM" in
+        amlogic)
+            if [ -d /sys/class/pwm/pwmchip0/pwm0 ]; then
+                # Amlogic A113D sysfs PWM: period=100000ns (10kHz). PWM 30 of 100
+                # is duty=30000ns. Matches Rust runtime helper
+                # amlogic_pwm_percent_to_duty_ns(pwm=30, period=100000) = 30000.
+                # NEVER above PWM 30 — /
+                # .
+                echo 30000 > /sys/class/pwm/pwmchip0/pwm0/duty_cycle 2>/dev/null
+                echo 30000 > /sys/class/pwm/pwmchip0/pwm1/duty_cycle 2>/dev/null
+            fi
+            ;;
+        beaglebone)
+            # AM335x BB carrier (S19j Pro 3-board variant) — 4 fans on sysfs PWM.
+            # Stock S70cgminer drove all groups in lockstep; we mirror the same
+            # PWM=30 (30000ns / 100000ns period) across every exported channel.
+            # Both LuxOS/DCENT_OS pwmchip0+pwmchip2 paths and Bitmain stock
+            # legacy pwm1/pwm2 are tolerated.
+            for p in /sys/class/pwm/pwmchip0/pwm0/duty_cycle \
+                     /sys/class/pwm/pwmchip0/pwm1/duty_cycle \
+                     /sys/class/pwm/pwmchip2/pwm0/duty_cycle; do
+                [ -e "$p" ] && echo 30000 > "$p" 2>/dev/null
+            done
+            for p in /sys/class/pwm/pwm1/duty_ns /sys/class/pwm/pwm2/duty_ns; do
+                [ -e "$p" ] && echo 30000 > "$p" 2>/dev/null
+            done
+            ;;
+        zynq)
+            # AM2/XIL fan-control is UIO-bound; devmem writes are stale/no-op.
+            # NOTE: this is the amlogic+beaglebone overlay; detect_platform here
+            # returns "amlogic"/"beaglebone", so this zynq arm is a defensive
+            # branch that does NOT execute on these boards. The canonical AM2
+            # fan-hold fix (persistent `dcentrald --hold-fan` custodian, since a
+            # bare --set-fan one-shot lets the AM2 board revert fans to full
+            # speed — ) lives
+            # in the board/zynq/* overlays that actually ship to AM2 units. This
+            # branch is intentionally left as the simple one-shot because it is
+            # unreachable on this overlay; do not duplicate the custodian helper
+            # here.
+            if [ -x "$DAEMON" ]; then
+                if "$DAEMON" --set-fan 30 >/tmp/s82dcentrald-fan-safety.log 2>&1; then
+                    fan_detail="AM2 fans commanded to PWM 30 via dcentrald UIO (one-shot; AM2 hold lives in board/zynq/*)"
+                else
+                    fan_detail="WARN: AM2 fan safety command failed; see /tmp/s82dcentrald-fan-safety.log"
+                fi
+            else
+                fan_detail="WARN: AM2 fan safety command skipped; $DAEMON missing"
+            fi
+            ;;
+    esac
+    echo "$(date): SAFETY: $fan_detail" >> "$LOGFILE"
+}
+
+case "$1" in
+    start)
+        [ -x "$DAEMON" ] || { echo "  [SKIP] $DAEMON not found"; exit 0; }
+        [ -f "$CONFIG" ] || { echo "  [SKIP] $CONFIG not found"; exit 0; }
+
+        # W1.5 (2026-05-07): re-assert tight perms on /data/dcent/ + auth.json
+        # before launching the daemon. dcentrald will also auto-correct via
+        # verify_auth_file_perms() at startup, but doing it here closes the
+        # window between mount(/data) and the first daemon write.
+        if [ -d /data/dcent ]; then
+            chmod 0700 /data/dcent 2>/dev/null
+        fi
+        if [ -f /data/dcent/auth.json ]; then
+            chmod 0600 /data/dcent/auth.json 2>/dev/null
+        fi
+
+        PLATFORM=$(detect_platform)
+        ARGS="--config $CONFIG"
+        case "$PLATFORM" in
+            amlogic|beaglebone) ARGS="--serial-mining $ARGS" ;;
+        esac
+
+        migrate_legacy_api_port
+        fan_safety_override
+
+        ORPHAN_PIDS=$(pidof dcentrald 2>/dev/null || true)
+        [ -n "$ORPHAN_PIDS" ] && {
+            echo "  [WARN] Killing orphaned dcentrald PID(s): $ORPHAN_PIDS"
+            for ORPHAN_PID in $ORPHAN_PIDS; do
+                echo "$ORPHAN_PID" > "$EXPECTFILE"
+                kill -TERM "$ORPHAN_PID" 2>/dev/null
+            done
+            for i in $(seq 1 30); do
+                pidof dcentrald > /dev/null 2>&1 || break
+                sleep 1
+            done
+            REMAINING_PIDS=$(pidof dcentrald 2>/dev/null || true)
+            [ -n "$REMAINING_PIDS" ] && {
+                rm -f "$EXPECTFILE"
+                fan_safety_override
+                for ORPHAN_PID in $REMAINING_PIDS; do
+                    kill -9 "$ORPHAN_PID" 2>/dev/null
+                done
+                sleep 1
+            }
+            rm -f "$CHILD_PIDFILE"
+        }
+
+        echo "  Starting dcentrald (platform=$PLATFORM)..."
+        echo "  Config: $CONFIG"
+        echo "  API: REST/WebSocket :$API_PORT"
+        echo "  Dashboard: HTTP :80 via S80dashboard"
+        start-stop-daemon -S -b -m -p "$PIDFILE" \
+            -x /bin/sh -- -c "
+                CRASH_COUNT=0
+                while true; do
+                    $DAEMON $ARGS >>$LOGFILE 2>&1 &
+                    CHILD_PID=\$!
+                    echo \$CHILD_PID > $CHILD_PIDFILE
+                    wait \$CHILD_PID
+                    EXIT_CODE=\$?
+                    EXPECTED_PID=\$(cat $EXPECTFILE 2>/dev/null || true)
+                    rm -f $CHILD_PIDFILE
+
+                    if [ \"\$EXPECTED_PID\" = \"\$CHILD_PID\" ]; then
+                        rm -f $EXPECTFILE
+                        echo \"\$(date): expected dcentrald exit for PID \$CHILD_PID (code \$EXIT_CODE)\" >> $LOGFILE
+                        exit \$EXIT_CODE
+                    fi
+
+                    rm -f $EXPECTFILE
+                    if [ \$EXIT_CODE -eq 0 ]; then
+                        echo \"\$(date): dcentrald exited cleanly\" >> $LOGFILE
+                        exit 0
+                    fi
+
+                    CRASH_COUNT=\$((CRASH_COUNT + 1))
+                    echo \"\$(date): dcentrald exited with code \$EXIT_CODE (crash \$CRASH_COUNT/$MAX_CRASH_RESTARTS)\" >> $LOGFILE
+                    \"$SCRIPT\" safety
+                    if [ \$CRASH_COUNT -ge $MAX_CRASH_RESTARTS ]; then
+                        echo \"\$(date): dcentrald restart limit reached\" >> $LOGFILE
+                        exit \$EXIT_CODE
+                    fi
+                    sleep $RESTART_DELAY
+                done
+            "
+
+        sleep 3
+        if pidof dcentrald > /dev/null 2>&1; then
+            echo "  [OK] dcentrald running (PID $(pidof dcentrald), REST/WebSocket :$API_PORT)"
+        else
+            echo "  [FAIL] dcentrald not started"
+            fan_safety_override
+        fi
+        ;;
+
+    stop)
+        echo "  Stopping dcentrald..."
+        CHILD_PID=$(cat "$CHILD_PIDFILE" 2>/dev/null || pidof dcentrald 2>/dev/null | awk '{print $1}')
+        WRAPPER_PID=$(cat "$PIDFILE" 2>/dev/null || true)
+        [ -n "$CHILD_PID" ] && echo "$CHILD_PID" > "$EXPECTFILE"
+        [ -n "$CHILD_PID" ] && kill -TERM "$CHILD_PID" 2>/dev/null
+
+        for i in $(seq 1 30); do
+            if [ -z "$CHILD_PID" ] || ! kill -0 "$CHILD_PID" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+
+        TIMED_OUT=0
+        if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+            echo "  [WARN] dcentrald did not exit in 30s - force killing"
+            rm -f "$EXPECTFILE"
+            TIMED_OUT=1
+            kill -9 "$CHILD_PID" 2>/dev/null
+        fi
+
+        if [ -n "$WRAPPER_PID" ] && kill -0 "$WRAPPER_PID" 2>/dev/null; then
+            kill -TERM "$WRAPPER_PID" 2>/dev/null
+            sleep 1
+            kill -9 "$WRAPPER_PID" 2>/dev/null
+        fi
+
+        rm -f "$PIDFILE" "$CHILD_PIDFILE"
+        if [ "$TIMED_OUT" -eq 1 ]; then
+            fan_safety_override
+        fi
+        echo "  [OK] dcentrald stopped"
+        ;;
+
+    restart)
+        $0 stop
+        sleep 2
+        $0 start
+        ;;
+
+    safety)
+        # G22 (no-brick safety, gap-swarm 2026-05-28): the emergency safety response
+        # must CUT HASH POWER, not just cap fans. Delegate to the daemon's audited
+        # per-platform one-shot `--safe-off` (amlogic -> disable PSU via GPIO437, then
+        # quiet fans — cut-hash-before-noise) instead of hardcoding the contested GPIO437
+        # polarity here. Falls back to the fan-only override if the binary is absent or
+        # the cut fails.
+        if [ -x "$DAEMON" ]; then
+            if "$DAEMON" --safe-off >> $LOGFILE 2>&1; then
+                echo "$(date): SAFETY: --safe-off completed (hash power cut + fans quiet) via $DAEMON" >> $LOGFILE
+            else
+                echo "$(date): WARN: $DAEMON --safe-off failed (rc=$?) — falling back to fan-only safety override" >> $LOGFILE
+                fan_safety_override
+            fi
+        else
+            echo "$(date): WARN: $DAEMON absent — PSU cut unavailable, fan-only safety override" >> $LOGFILE
+            fan_safety_override
+        fi
+        ;;
+
+    status)
+        if pidof dcentrald > /dev/null 2>&1; then
+            echo "dcentrald: running (PID $(pidof dcentrald), REST/WebSocket :$API_PORT)"
+        else
+            echo "dcentrald: stopped"
+        fi
+        ;;
+
+    *)
+        echo "Usage: $0 {start|stop|restart|status|safety}"
+        exit 1
+        ;;
+esac
+
+exit 0

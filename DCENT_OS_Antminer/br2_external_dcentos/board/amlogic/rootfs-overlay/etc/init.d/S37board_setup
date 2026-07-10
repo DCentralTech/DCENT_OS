@@ -1,0 +1,160 @@
+#!/bin/sh
+#
+# S37board_setup - Amlogic A113D GPIO + PWM pinmux for DCENT_OS
+#
+# Shared across am3-aml platforms (S21, S19K Pro, S19 XP). Verbatim port from
+# the .78 (S19K Pro NoPic) BraiinsOS+ live capture, refactored for POSIX/ash:
+#
+#
+# GPIO map (Amlogic A113D, kernel 4.9.113):
+#   437  PWR_CONTROL          (out)        — APW PSU enable, active LOW (0=ON)
+#   438  GPIO_LED_RED         (out)
+#   439  CH0_PLUG             (in,  pulldown)  hashboard 0 detect
+#   440  CH1_PLUG             (in,  pulldown)  hashboard 1 detect
+#   441  CH2_PLUG             (in,  pulldown)  hashboard 2 detect
+#   445  GPIO_IP_GET          (in,  rising)    IP Reporter button
+#   446  GPIO_RECOVERY        (in,  rising)    Recovery button
+#   447  FAN_FRONT_SPEED0     (in,  falling)   front fan #0 tach
+#   448  FAN_FRONT_SPEED1     (in,  falling)   front fan #1 tach
+#   449  FAN_REAR_SPEED0      (in,  falling)   rear fan  #0 tach
+#   450  FAN_REAR_SPEED1      (in,  falling)   rear fan  #1 tach
+#   453  GPIO_LED_GREEN       (out)
+#   454  CH0_RST              (out)            hashboard 0 reset (active LOW)
+#   455  CH1_RST              (out)            hashboard 1 reset (active LOW)
+#   456  CH2_RST              (out)            hashboard 2 reset (active LOW)
+#   476  i2c-1 SDA pinmux fix (out, HIGH)
+#   477  i2c-1 SCL pinmux fix (out, HIGH)
+#
+# PWM:
+#   pwmchip0/pwm0  — rear fan group  (FAN2 + FAN4)
+#   pwmchip0/pwm1  — front fan group (FAN1 + FAN3)
+# Both shipped at 100000 ns period / 100000 ns duty (=100% duty, fail-safe
+# loud) until dcentrald takes ownership and runs the thermal PID loop.
+#
+
+export_gpio() {
+    GPIO="$1"
+    [ -d "/sys/class/gpio/gpio${GPIO}" ] && return 0
+    echo "${GPIO}" > /sys/class/gpio/export 2>/dev/null
+}
+
+set_dir() {
+    GPIO="$1"
+    DIR="$2"
+    [ -d "/sys/class/gpio/gpio${GPIO}" ] || return 1
+    echo "${DIR}" > "/sys/class/gpio/gpio${GPIO}/direction" 2>/dev/null
+}
+
+set_edge() {
+    GPIO="$1"
+    EDGE="$2"
+    [ -e "/sys/class/gpio/gpio${GPIO}/edge" ] || return 0
+    echo "${EDGE}" > "/sys/class/gpio/gpio${GPIO}/edge" 2>/dev/null
+}
+
+set_pull() {
+    GPIO="$1"
+    PULL="$2"
+    [ -e "/sys/class/gpio/gpio${GPIO}/pull" ] || return 0
+    echo "${PULL}" > "/sys/class/gpio/gpio${GPIO}/pull" 2>/dev/null
+}
+
+set_value() {
+    GPIO="$1"
+    VAL="$2"
+    [ -e "/sys/class/gpio/gpio${GPIO}/value" ] || return 1
+    echo "${VAL}" > "/sys/class/gpio/gpio${GPIO}/value" 2>/dev/null
+}
+
+mem_info() {
+    MEM_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null)
+    echo "  Board memory: ${MEM_KB} KB"
+}
+
+pinmux_init() {
+    # Buttons (level-triggered rising)
+    for G in 446 445; do
+        export_gpio "$G"
+        set_dir "$G" in
+        set_edge "$G" rising
+    done
+
+    # Hashboard plug-detect (active HIGH, pulldown for safety when unplugged)
+    for G in 439 440 441; do
+        export_gpio "$G"
+        set_dir "$G" in
+        set_pull "$G" down
+    done
+
+    # Hashboard reset lines (active LOW; default direction out, value
+    # untouched so dcentrald can hold or release per platform recovery).
+    for G in 454 455 456; do
+        export_gpio "$G"
+        set_dir "$G" out
+    done
+
+    # PSU enable (PWR_CONTROL). Leave value alone — dcentrald drives it.
+    export_gpio 437
+    set_dir 437 out
+
+    # Status LEDs
+    for G in 453 438; do
+        export_gpio "$G"
+        set_dir "$G" out
+    done
+
+    # Fan tachometers (4 fans, falling-edge counters)
+    for G in 447 448 449 450; do
+        export_gpio "$G"
+        set_dir "$G" in
+        set_edge "$G" falling
+    done
+
+    # i2c-1 pinmux fix — must be exported BEFORE any /dev/i2c-1 access.
+    # Drives the SDA/SCL lines HIGH so the in-SoC pinmux selects i2c
+    # function over alt-function GPIO. Required on AML A113D per O.3.
+    for G in 476 477; do
+        export_gpio "$G"
+        set_dir "$G" out
+        set_value "$G" 1
+    done
+
+    # PWM rear fans (FAN2 + FAN4) on pwmchip0/pwm0
+    if [ ! -d /sys/class/pwm/pwmchip0/pwm0 ]; then
+        echo 0 > /sys/class/pwm/pwmchip0/export 2>/dev/null
+    fi
+    if [ -d /sys/class/pwm/pwmchip0/pwm0 ]; then
+        echo 100000 > /sys/class/pwm/pwmchip0/pwm0/period 2>/dev/null
+        echo 100000 > /sys/class/pwm/pwmchip0/pwm0/duty_cycle 2>/dev/null
+        echo 1      > /sys/class/pwm/pwmchip0/pwm0/enable 2>/dev/null
+    fi
+
+    # PWM front fans (FAN1 + FAN3) on pwmchip0/pwm1
+    if [ ! -d /sys/class/pwm/pwmchip0/pwm1 ]; then
+        echo 1 > /sys/class/pwm/pwmchip0/export 2>/dev/null
+    fi
+    if [ -d /sys/class/pwm/pwmchip0/pwm1 ]; then
+        echo 100000 > /sys/class/pwm/pwmchip0/pwm1/period 2>/dev/null
+        echo 100000 > /sys/class/pwm/pwmchip0/pwm1/duty_cycle 2>/dev/null
+        echo 1      > /sys/class/pwm/pwmchip0/pwm1/enable 2>/dev/null
+    fi
+}
+
+case "$1" in
+    start|"")
+        echo "  Initializing Amlogic A113D board (GPIO + PWM)..."
+        mem_info
+        pinmux_init
+        echo "  [OK] board_setup complete"
+        ;;
+    stop)
+        # No teardown — GPIO state is owned by dcentrald during runtime.
+        :
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

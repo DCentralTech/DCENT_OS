@@ -1,0 +1,435 @@
+:root {
+  --dcfx-mode-color: var(--accent);
+  --dcfx-mode-color-2: var(--accent-deep);
+}
+
+.dcfx-contained {
+  contain: layout paint;
+}
+
+.dcfx-kpi-underline {
+  position: absolute;
+  right: 14px;
+  bottom: 10px;
+  left: 14px;
+  height: 2px;
+  border-radius: var(--radius-pill);
+  background: linear-gradient(90deg, transparent, var(--dcfx-mode-color), var(--dcfx-mode-color-2));
+  opacity: 0;
+  transform: scaleX(0);
+  transform-origin: left center;
+  pointer-events: none;
+}
+
+.dcfx-share-reject .dcfx-kpi-underline {
+  background: linear-gradient(90deg, transparent, var(--red), rgba(239, 68, 68, 0.35));
+}
+
+.dcfx-chain-sweep {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(110deg, transparent 0%, rgba(250, 165, 0, 0) 36%, rgba(250, 165, 0, 0.24) 50%, rgba(250, 165, 0, 0) 64%, transparent 100%);
+  opacity: 0;
+  transform: translateX(-28%);
+  pointer-events: none;
+}
+
+.dcfx-chain-shimmer {
+  position: relative;
+  overflow: hidden;
+}
+
+.dcfx-work-fresh {
+  border-color: var(--dcfx-mode-color);
+}
+
+.dcfx-footer-digit {
+  display: inline-block;
+}
+
+.dcfx-pool-ring {
+  border-color: var(--dcfx-mode-color);
+}
+
+.dcfx-live-breathe {
+  transform-origin: center;
+}
+
+.dcfx-record-caption {
+  position: fixed;
+  right: 18px;
+  bottom: 72px;
+  z-index: 1200;
+  max-width: min(320px, calc(100vw - 36px));
+  padding: 8px 12px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-sm);
+  background: rgba(7, 7, 16, 0.88);
+  color: var(--fg-primary);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  contain: layout paint;
+}
+
+.dcfx-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 1190;
+  overflow: hidden;
+  pointer-events: none;
+  contain: layout paint;
+}
+
+.dcfx-moment {
+  position: absolute;
+  top: clamp(88px, 16vh, 156px);
+  left: 50%;
+  display: grid;
+  gap: 8px;
+  width: min(420px, calc(100vw - 32px));
+  padding: 12px 14px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-md);
+  background: rgba(7, 7, 16, 0.9);
+  color: var(--fg-primary);
+  opacity: 0;
+  transform: translateX(-50%) translateY(8px) scale(0.98);
+  box-shadow: 0 0 0 1px rgba(250, 165, 0, 0.06);
+  contain: layout paint;
+}
+
+.dcfx-moment-title {
+  font-family: var(--font-heading);
+  font-size: 1.05rem;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.dcfx-moment-detail {
+  color: var(--fg-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.dcfx-moment-lucky {
+  border-color: var(--dcfx-mode-color);
+}
+
+.dcfx-moment-first {
+  border-color: var(--green);
+}
+
+.dcfx-moment-record {
+  border-color: var(--dcfx-glow-record);
+}
+
+.dcfx-asic-active {
+  contain: layout paint;
+  transform-origin: center;
+}
+
+.dcfx-asic-cell-active {
+  opacity: 1;
+  transform: scale(var(--dcfx-asic-scale));
+  transform-origin: center;
+  transform-box: fill-box;
+}
+
+.dcfx-first-share-watch {
+  display: grid;
+  gap: 14px;
+  margin-bottom: 18px;
+  border-color: rgba(250, 165, 0, 0.26);
+  contain: layout paint;
+}
+
+.dcfx-first-share-watch-pills,
+.dcfx-first-share-watch-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.dcfx-watch-ladder {
+  display: grid;
+  gap: 8px;
+}
+
+.dcfx-watch-step {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--fg-secondary);
+}
+
+.dcfx-watch-step-dot {
+  width: 9px;
+  height: 9px;
+  margin-top: 4px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.dcfx-watch-step strong {
+  display: block;
+  color: var(--fg-primary);
+  font-size: 0.86rem;
+}
+
+.dcfx-watch-step span:last-child {
+  display: block;
+  margin-top: 2px;
+  font-size: 0.74rem;
+}
+
+.dcfx-watch-step.is-done {
+  border-color: rgba(52, 211, 153, 0.34);
+}
+
+.dcfx-watch-step.is-done .dcfx-watch-step-dot {
+  background: var(--green);
+}
+
+.dcfx-watch-step.is-current {
+  border-color: rgba(250, 165, 0, 0.34);
+  background: rgba(250, 165, 0, 0.055);
+}
+
+.dcfx-watch-step.is-current .dcfx-watch-step-dot {
+  background: var(--dcfx-mode-color);
+}
+
+.dcfx-first-share-watch-note {
+  margin: 0;
+  color: var(--fg-secondary);
+  font-size: 0.82rem;
+}
+
+.dcfx-first-share-watch-success {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border: 1px solid rgba(52, 211, 153, 0.34);
+  border-radius: var(--radius-sm);
+  background: rgba(52, 211, 153, 0.08);
+  color: var(--fg-primary);
+}
+
+.dcfx-first-share-watch-success span {
+  color: var(--fg-secondary);
+  font-size: 0.76rem;
+}
+
+.dcfx-particles {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  border-radius: inherit;
+}
+
+.dcfx-dot {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--dcfx-mode-color);
+  opacity: 0;
+  transform: rotate(var(--dcfx-angle)) translateX(0) scale(0.8);
+}
+
+.dcfx-dot:nth-child(1) { --dcfx-angle: 0deg; }
+.dcfx-dot:nth-child(2) { --dcfx-angle: 30deg; }
+.dcfx-dot:nth-child(3) { --dcfx-angle: 60deg; }
+.dcfx-dot:nth-child(4) { --dcfx-angle: 90deg; }
+.dcfx-dot:nth-child(5) { --dcfx-angle: 120deg; }
+.dcfx-dot:nth-child(6) { --dcfx-angle: 150deg; }
+.dcfx-dot:nth-child(7) { --dcfx-angle: 180deg; }
+.dcfx-dot:nth-child(8) { --dcfx-angle: 210deg; }
+.dcfx-dot:nth-child(9) { --dcfx-angle: 240deg; }
+.dcfx-dot:nth-child(10) { --dcfx-angle: 270deg; }
+.dcfx-dot:nth-child(11) { --dcfx-angle: 300deg; }
+.dcfx-dot:nth-child(12) { --dcfx-angle: 330deg; }
+
+.mode-hacker.dcfx-layer,
+.mode-hacker.dcfx-record-caption {
+  --dcfx-mode-color: var(--term-green);
+  --dcfx-mode-color-2: rgba(0, 255, 65, 0.28);
+}
+
+.mode-basic.dcfx-layer,
+.mode-basic.dcfx-record-caption {
+  --dcfx-mode-color: #FFD27A;
+  --dcfx-mode-color-2: var(--accent-deep);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .dcfx-share-flash .dcfx-kpi-underline,
+  .dcfx-share-reject .dcfx-kpi-underline {
+    animation: dcfx-underline 600ms var(--ease-standard) both;
+  }
+
+  .dcfx-share-reject .dcfx-kpi-underline {
+    animation-duration: 400ms;
+  }
+
+  .dcfx-chain-shimmer .dcfx-chain-sweep {
+    animation: dcfx-chain-sweep 500ms var(--ease-standard) both;
+  }
+
+  .dcfx-work-fresh {
+    animation: dcfx-border-blip var(--dcfx-duration-micro) var(--ease-standard) both;
+  }
+
+  .dcfx-footer-digit {
+    animation: dcfx-digit-roll 600ms var(--ease-standard) both;
+  }
+
+  .dcfx-pool-ring {
+    animation: dcfx-border-blip 800ms var(--ease-standard) both;
+  }
+
+  .dcfx-live-breathe {
+    animation: dcfx-breathe 4s var(--ease-standard) infinite;
+  }
+
+  .dcfx-moment {
+    animation: dcfx-moment var(--dcfx-duration-moment) var(--ease-standard) both;
+  }
+
+  .dcfx-moment-record {
+    animation-name: dcfx-moment, dcfx-record-halo;
+  }
+
+  .dcfx-moment-lucky .dcfx-dot {
+    animation: dcfx-dot-sweep 1400ms var(--ease-standard) both;
+  }
+
+  .dcfx-asic-active {
+    animation: dcfx-asic-ripple 500ms var(--ease-standard) both;
+  }
+}
+
+:where(html[data-page-hidden='true']) .dcfx-live-breathe,
+:where(html[data-page-hidden='true']) .dcfx-moment,
+:where(html[data-page-hidden='true']) .dcfx-dot,
+:where(html[data-page-hidden='true']) .dcfx-asic-cell-active {
+  animation-play-state: paused;
+}
+
+:where(html[data-vitality='calm']) .dcfx-share-flash .dcfx-kpi-underline,
+:where(html[data-vitality='calm']) .dcfx-share-reject .dcfx-kpi-underline {
+  opacity: 0.85;
+  transform: scaleX(1);
+}
+
+:where(html[data-vitality='calm']) .dcfx-chain-sweep,
+:where(html[data-vitality='calm']) .dcfx-particles,
+:where(html[data-vitality='calm']) .dcfx-live-breathe {
+  animation: none;
+  opacity: 0;
+  transform: none;
+}
+
+:where(html[data-vitality='calm']) .dcfx-asic-active {
+  animation: none;
+  transform: none;
+}
+
+:where(html[data-vitality='calm']) .dcfx-asic-active .dcfx-asic-cell-active {
+  opacity: 1;
+  transform: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dcfx-share-flash .dcfx-kpi-underline,
+  .dcfx-share-reject .dcfx-kpi-underline {
+    opacity: 0.85;
+    transform: scaleX(1);
+  }
+
+  .dcfx-chain-sweep,
+  .dcfx-particles,
+  .dcfx-live-breathe {
+    animation: none;
+    opacity: 0;
+    transform: none;
+  }
+
+  .dcfx-asic-active {
+    animation: none;
+    transform: none;
+  }
+
+  .dcfx-asic-active .dcfx-asic-cell-active {
+    opacity: 1;
+    transform: none;
+  }
+
+  .dcfx-moment {
+    opacity: 1;
+    transform: translateX(-50%);
+  }
+}
+
+@keyframes dcfx-underline {
+  0% { opacity: 0; transform: scaleX(0); }
+  18% { opacity: 1; transform: scaleX(1); }
+  100% { opacity: 0; transform: scaleX(1); }
+}
+
+@keyframes dcfx-chain-sweep {
+  0% { opacity: 0; transform: translateX(-28%); }
+  18% { opacity: var(--dcfx-intensity); }
+  100% { opacity: 0; transform: translateX(28%); }
+}
+
+@keyframes dcfx-border-blip {
+  0% { border-color: var(--border-glass); }
+  40% { border-color: var(--dcfx-mode-color); }
+  100% { border-color: var(--border-glass); }
+}
+
+@keyframes dcfx-digit-roll {
+  0% { opacity: 0.65; transform: translateY(4px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes dcfx-breathe {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.012); }
+}
+
+@keyframes dcfx-moment {
+  0% { opacity: 0; transform: translateX(-50%) translateY(8px) scale(0.98); }
+  16% { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
+  82% { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
+  100% { opacity: 0; transform: translateX(-50%) translateY(-4px) scale(1.01); }
+}
+
+@keyframes dcfx-record-halo {
+  0% { box-shadow: 0 0 0 1px rgba(250, 165, 0, 0.06); }
+  45% { box-shadow: 0 0 32px var(--dcfx-glow-record); }
+  100% { box-shadow: 0 0 0 1px rgba(250, 165, 0, 0.06); }
+}
+
+@keyframes dcfx-dot-sweep {
+  0% { opacity: 0; transform: rotate(var(--dcfx-angle)) translateX(0) scale(0.7); }
+  20% { opacity: 1; }
+  100% { opacity: 0; transform: rotate(var(--dcfx-angle)) translateX(156px) scale(1); }
+}
+
+@keyframes dcfx-asic-ripple {
+  0% { transform: scale(1); }
+  38% { transform: scale(var(--dcfx-asic-scale)); }
+  100% { transform: scale(1); }
+}

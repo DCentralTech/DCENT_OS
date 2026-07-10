@@ -1,0 +1,111 @@
+# DCENTos Buildroot defconfig — Antminer S17 / S17 Pro (Zynq am2-s17 variant).
+# D-Central Technologies, 2026.
+#
+#  Phase 2E (2026-05-15) — clone of
+# dcentos_am2_s19jpro_defconfig adjusted for the BM1397 / S17 Pro hashboard
+# family. Same Xilinx Zynq 7007S Cortex-A9 + Linaro 7.2.1 toolchain as the
+# am2-s19jpro and S9 variants; ONLY the per-product identity, baked dcentrald
+# config, and chip family differ.
+#
+# Target: Xilinx Zynq-7010/7007S (ARM Cortex-A9, dual core).
+# Chip:   BM1397 (S17 Pro: 3x48 chips, BM139x "S17/S19-class" family).
+#         BM1396 (S17 / S17+): NAMED-ONLY in the catalog (Mujina ref). The
+#         catalog implies BM1396 is register-identical to BM1397 except
+#         CHIP_ID, but THIS IS UNCONFIRMED — see ## UNCONFIRMED below and the
+#         board README. The chip-driver dispatch (BM1396 vs BM1397) is a known
+#         v2 open question feeding the R11 RE handoff.
+# FPGA:   Braiins s9-io-am2 bitstream (2022-12-08) — same bitstream the
+#         am2-s19jpro variant ships (4 chain regions, fan-control 0x42800000,
+#         board-control 0x42810000, glitch-monitor 0x43D00000).
+#
+# Per-product OVERRIDE layer. Shared content lives in:
+#   dcentos-common.fragment   (workspace-wide package set + identity)
+#
+# Sibling of dcentos_am2_s19jpro_defconfig and dcentos_s9_defconfig — same
+# Cortex-A9 + Linaro 7.2.1 toolchain. Arch / toolchain bits stay inline
+# because S9/am2 are the only Zynq targets and S9's inline copy uses
+# BR2_ARM_FPU_VFPV3D16 with ext4 dual-output, which would conflict with a
+# shared armv7 fragment.
+#
+# ## RUNTIME-ONLY — NO COLD-BOOT PROOF ########################################
+# There is NO live Antminer S17 / S17 Pro on the D-Central fleet. Every S17
+# protocol detail (dsPIC fw revision, voltage envelope, fan-control IP
+# layout, UIO naming, BM1396-vs-BM1397 chip-driver dispatch) is code-only and
+# tagged `// XXX: confirm against live S17` in the dcentrald HAL. This variant
+# builds clean and produces a sysupgrade tarball for pipeline / package-
+# validator regression coverage ONLY. Do NOT claim cold-boot proof, do NOT
+# register a `supported` toolbox install route, and do NOT flash a live unit
+# until a bench S17 / S17 Pro is acquired and accepted-share + sysupgrade
+# round-trip proof is captured. See:
+#
+#     §2.2 (am2-s17pro row) + §7.3 item 10
+#
+#     §3.1-3.3 (S17 / S17 Pro cells: code-only routing, no live unit)
+#
+#     §4.6 (BM1397) + §4.10 (BM1396)
+#
+# ## UNCONFIRMED (v2 open question → R11) #####################################
+# S17 ships BM1396; S17 Pro ships BM1397. The chip-survey catalog implies the
+# two are register-identical except CHIP_ID, but Mujina cites BM1396
+# SEPARATELY and we have NO live unit of either to byte-confirm dispatch.
+# `dcentrald-asic::drivers::{bm1396,bm1397}` both exist as scaffolds; the
+# routing layer (`ZynqVariant::S17`) treats both through the same am2-s17
+# variant and is expected to dispatch via ChipID. THIS HAS NEVER RUN LIVE for
+# either chip. Treat the BM1396/BM1397 distinction as an open RE question
+# until a bench unit lands.
+#############################################################################
+
+# =============================================================================
+# Target Architecture — same as S9 / am2-s19jpro (Zynq Cortex-A9).
+# =============================================================================
+BR2_arm=y
+BR2_cortex_a9=y
+BR2_ARM_ENABLE_NEON=y
+BR2_ARM_ENABLE_VFP=y
+BR2_ARM_FPU_VFPV3D16=y
+
+# =============================================================================
+# Toolchain — Linaro GCC 7.2.1-2017.11 (same as S9 / am2-s19jpro, matches
+# BraiinsOS kernel).
+# =============================================================================
+BR2_TOOLCHAIN_EXTERNAL=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM=y
+BR2_TOOLCHAIN_EXTERNAL_DOWNLOAD=y
+BR2_TOOLCHAIN_EXTERNAL_URL="https://releases.linaro.org/components/toolchain/binaries/7.2-2017.11/arm-linux-gnueabihf/gcc-linaro-7.2.1-2017.11-x86_64_arm-linux-gnueabihf.tar.xz"
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_PREFIX="arm-linux-gnueabihf"
+BR2_TOOLCHAIN_EXTERNAL_GCC_7=y
+BR2_TOOLCHAIN_EXTERNAL_HEADERS_4_10=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_GLIBC=y
+BR2_TOOLCHAIN_EXTERNAL_CXX=y
+BR2_TOOLCHAIN_EXTERNAL_FORTRAN=y
+BR2_TOOLCHAIN_EXTERNAL_OPENMP=y
+
+# =============================================================================
+# Filesystem — squashfs primary (sysupgrade), ext4 secondary (research).
+# Identical to am2-s19jpro.
+# =============================================================================
+BR2_TARGET_ROOTFS_SQUASHFS=y
+BR2_TARGET_ROOTFS_SQUASHFS4_XZ=y
+BR2_TARGET_ROOTFS_EXT2=y
+BR2_TARGET_ROOTFS_EXT2_4=y
+BR2_TARGET_ROOTFS_EXT2_SIZE="128M"
+
+# =============================================================================
+# Per-product identity.
+# =============================================================================
+BR2_TARGET_GENERIC_HOSTNAME="dcentos-s17p"
+BR2_TARGET_GENERIC_ISSUE="DCENTos for S17 / S17 Pro (am2-s17, BM1397) — RUNTIME-ONLY, NO COLD-BOOT PROOF — D-Central Technologies"
+
+# =============================================================================
+# Overlay-on-overlay — shared zynq overlay first, am2-s17pro identity last.
+# Buildroot applies overlays left-to-right so per-board files win.
+# =============================================================================
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/am2-s17pro/rootfs-overlay"
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/am2-s17pro/post-build.sh"
+BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/am2-s17pro/post-image.sh"
+
+# =============================================================================
+# Zynq-tuned BusyBox config (shared with S9 / am2-s19jpro — same FPGA
+# register applets).
+# =============================================================================
+BR2_PACKAGE_BUSYBOX_CONFIG="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/busybox.config"

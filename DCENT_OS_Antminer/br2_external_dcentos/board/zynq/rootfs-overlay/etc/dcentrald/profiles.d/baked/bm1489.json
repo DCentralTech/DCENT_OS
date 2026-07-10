@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "miner_model": "antminer_l7",
+  "hashboard": "BHB-L7-generic",
+  "chip": "bm1489",
+  "source": {
+    "vendor": "dcent-baked",
+    "firmware_version": "dcentrald-silicon-profiles 0.1.0",
+    "extracted_from_sha256": "n/a",
+    "extraction_date": "2026-05-03",
+    "extracted_by": "scripts/migrate-baked-profiles.py"
+  },
+  "source_class": "operator_confirmed",
+  "presets": [
+    {
+      "step": -2,
+      "freq_mhz": 320,
+      "voltage_v": 12.5,
+      "wall_watts": 2700,
+      "hashrate_ths": 0.0076,
+      "source": "reconstructed"
+    },
+    {
+      "step": -1,
+      "freq_mhz": 380,
+      "voltage_v": 12.8,
+      "wall_watts": 3050,
+      "hashrate_ths": 0.0085,
+      "source": "reconstructed"
+    },
+    {
+      "step": 0,
+      "freq_mhz": 425,
+      "voltage_v": 13.0,
+      "wall_watts": 3425,
+      "hashrate_ths": 0.0095,
+      "source": "operator_confirmed"
+    },
+    {
+      "step": 1,
+      "freq_mhz": 470,
+      "voltage_v": 13.2,
+      "wall_watts": 3850,
+      "hashrate_ths": 0.0104,
+      "source": "reconstructed"
+    },
+    {
+      "step": 2,
+      "freq_mhz": 510,
+      "voltage_v": 13.4,
+      "wall_watts": 4300,
+      "hashrate_ths": 0.0112,
+      "source": "reconstructed"
+    }
+  ],
+  "metadata": {
+    "vnish_hotelfee_devfee_present": false,
+    "secure_boot_set_seen": false,
+    "hashcore_root_hash_seen": false,
+    "atlas_ssh_key_present": false,
+    "notes": "Migrated from DCENT_OS_Antminer/dcentrald/dcentrald-silicon-profiles/src/bm1489.rs by scripts/migrate-baked-profiles.py (Wave 5 W5-D)."
+  }
+}

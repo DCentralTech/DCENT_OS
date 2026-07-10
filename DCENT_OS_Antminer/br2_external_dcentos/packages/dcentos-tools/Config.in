@@ -1,0 +1,9 @@
+config BR2_PACKAGE_DCENTOS_TOOLS
+	bool "dcentos-tools"
+	depends on BR2_PACKAGE_PYTHON3
+	help
+	  DCENTos Hacker Shell research and diagnostic tools.
+	  Includes: register scanner, ASIC enumerator, PSU probe,
+	  temperature finder, assumption verifier, and test suite.
+
+	  https://d-central.tech/

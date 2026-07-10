@@ -1,0 +1,2 @@
+2026-07-05T12:00:00Z INFO dcentrald::platform: board_target=am2-s17p sku=S17 controller=dsPIC33EP
+2026-07-05T12:00:02Z INFO dcentrald::chain: enumerated 144 chips across 3 chains (48/48/48)

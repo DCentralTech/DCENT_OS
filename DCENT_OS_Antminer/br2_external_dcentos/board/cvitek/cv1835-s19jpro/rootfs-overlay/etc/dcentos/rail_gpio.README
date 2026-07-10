@@ -1,0 +1,15 @@
+CV1835 rail-enable GPIO -- TBD until bench unit lands.
+
+The current rail_gpio file is intentionally empty. S99verify's V5 (rail-enable
+GPIO) check reads this file via read_config_str(); if empty, V5 skips with
+detail "rail GPIO unknown -- capture from bench (skipped, non-blocking)".
+
+Once a bench CV1835 unit is acquired and the rail-enable GPIO line is
+captured (likely via the cv183x_base.ko SoC GPIO controller; see
+), update rail_gpio with the integer
+GPIO number and delete this README.
+
+References:
+
+  -  (bench CV1835 carrier)
+  -  (R4-1)

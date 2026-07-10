@@ -1,0 +1,173 @@
+/* -------------------------------------------------------------------------
+   DCENT_OS - Light appearance overrides (UINAV-7)
+
+   An ADDITIVE, opt-in light surface palette. It is ORTHOGONAL to the
+   basic/standard/advanced operating-mode skins: this file only changes how
+   light/dark the surfaces are, never which mode you're in. The toggle lives
+   under Settings then Appearance and persists to the store + localStorage; the
+   pre-paint side-effect in theme/appearance.ts stamps data-appearance=light on
+   the html element (so absence-of-attribute == today's dark rendering,
+   byte-identical - backward-compatible by construction).
+
+   Why this is a SEPARATE file (and why it does not break the S1 drift
+   validator): the token-drift validator (styles/tokens.drift.test.ts) reads
+   ONLY styles/tokens.css for the canonical shared role VALUES and walks all
+   src light-dot-css for the legacy Bitcoin-orange accent wrong-fallback. This
+   file does NOT live in tokens.css and never edits its :root shared values, it
+   contains no var(--accent ...) inline fallback at all, and it leaves the
+   --accent family entirely UNCHANGED (brand orange is preserved on light too).
+   So both validator gates stay green.
+
+   IMPORTANT - comment hygiene: this file must NOT contain CSS braces or
+   backticks INSIDE comments. The esbuild CSS minifier (Vite's transformer)
+   mis-parses a brace inside a comment and then DROPS the following rule. The
+   original S4 light theme silently did nothing because its tier-1 token rule
+   followed a comment that quoted a braced selector. Keep comments ASCII and
+   brace-free.
+
+   Why the light token rebind is scoped to the .mode-* APP-SHELL wrapper (and
+   the body element), NOT a bare :root data-appearance light selector: the app
+   renders inside a div.mode-standard.app (or .mode-advanced) which is the
+   ancestor of the entire chrome - sidebar, topbar, content - so rebinding the
+   surface tokens THERE inherits to every painted surface. A descendant-
+   combinator rule under the light prefix is also the form that reliably
+   survives the build transform, and it is exactly the scope the S1 drift
+   validator leaves untouched (it pins the dark tokens.css :root values, which
+   we never edit).
+
+   Identity / keep-unique guardrails: we deliberately light-theme ONLY the
+   neutral operational shells (.mode-standard + .mode-advanced) + the shared
+   body floor. We do NOT add a .mode-hacker or .mode-basic light block: Hacker
+   stays phosphor-on-black (terminal identity) and Basic stays warm-on-dark
+   (space-heater identity) by their own mode rebinds. The toggle still persists
+   across all modes; it just only visibly transforms the neutral shells. The
+   --accent family is untouched everywhere so the D-Central brand orange carries
+   to light.
+
+   Coverage (Tiers A-E below): the shell (sidebar/topbar/floor), the Standard
+   inner panels, the form inputs, and the CANONICAL overlay (.ds-overlay-panel /
+   .ds-glass-strong, the OverlayDialog used by ~13 modal call sites) are all
+   repointed to light. ACCEPTED RESIDUAL: a few BESPOKE modals that ship their
+   own hardcoded dark literals (e.g. the block-detail overlay's bm-section /
+   current-block-detail-row) keep their own styling under light mode - they stay
+   internally READABLE (light text on a dark panel), just not light-themed; and
+   the Hacker (phosphor) / Basic (heater) signature skins stay dark by their own
+   mode rebinds. Note: a body-level token rebind was deliberately NOT used to
+   catch the bespoke modals - .mode-hacker rebinds the alias tokens but not the
+   canonical --fg-primary/--surface-glass-panel, so a body-scoped rebind would
+   leak light INTO the phosphor skin's content. Modal-class scoping is the
+   keep-unique-safe form.
+   ------------------------------------------------------------------------- */
+
+/* Tier A: the neutral app-shell wrappers - full surface/text/border light
+   palette. .mode-standard / .mode-advanced wrap the ENTIRE app, so these custom
+   properties inherit to the sidebar, topbar, cards, and every shared-chrome
+   surface that reads them. The --accent family is omitted on purpose. */
+:root[data-appearance="light"] .mode-standard,
+:root[data-appearance="light"] .mode-advanced {
+  /* Canonical / shared surface ladder (tokens.css :root names) */
+  --bg-void:    #eef0f4;   /* deepest floor */
+  --bg-base:    #f4f5f8;   /* body alt */
+  --bg-subtle:  #ffffff;   /* card default (solid fallback) */
+  --bg-raised:  #ffffff;   /* elevated panels */
+  --bg-overlay: #ffffff;   /* modals, dropdowns */
+
+  /* Glass surfaces - light translucent panes (sidebar/topbar/cards read these) */
+  --surface-glass-panel:   rgba(255, 255, 255, 0.78);
+  --surface-glass-card:    rgba(255, 255, 255, 0.86);
+  --surface-glass-sidebar: rgba(248, 249, 251, 0.92);
+  --surface-glass-topbar:  rgba(255, 255, 255, 0.85);
+
+  /* global.css operational surfaces (shared chrome reads these) */
+  --surface-operational:       rgba(255, 255, 255, 0.92);
+  --surface-operational-hover: rgba(244, 245, 248, 0.96);
+
+  /* Text scale - dark ink on light surfaces (was light-on-dark) */
+  --fg-primary:   #15151b;
+  --fg-secondary: #3f3f4a;
+  --fg-dim:       #5c5c68;   /* WCAG-AA-comfortable dim on light */
+  --text:           #15151b;
+  --text-secondary: #3f3f4a;
+  --text-dim:       #5c5c68;
+
+  /* Borders - dark hairlines on light (was light hairlines on dark) */
+  --border:         rgba(0, 0, 0, 0.12);
+  --border-strong:  rgba(0, 0, 0, 0.20);
+  --border-subtle:  rgba(0, 0, 0, 0.07);
+  --border-glass:   rgba(0, 0, 0, 0.10);
+
+  /* Softer ambient surface shadow for a light page (was deep black drop). */
+  --shadow-surface: 0 10px 30px rgba(15, 23, 42, 0.10);
+  --shadow-card:    0 4px 24px rgba(15, 23, 42, 0.08);
+
+  /* design-system.css .mode-standard rebinds these consumed aliases to dark
+     literals; re-point them to the light palette (accent aliases left alone). */
+  --bg:           #eef0f4;
+  --card-bg:      rgba(255, 255, 255, 0.92);
+  --card-bg-solid:#ffffff;
+  --card-hover:   rgba(244, 245, 248, 0.96);
+  --card-shadow:  var(--shadow-surface);
+  --fg-muted:     var(--text-dim);
+}
+
+/* Tier B: the shared body floor itself. canonical.css hardcodes a dark literal
+   on the body background (a literal, not a token), so a token rebind cannot
+   reach it - repoint the element directly. This light-prefixed body selector
+   (0,2,1) beats the bare body (0,0,1) and survives the build transform. */
+:root[data-appearance="light"] body {
+  background: #eef0f4;
+}
+:root[data-appearance="light"] body::before {
+  /* The ambient warm-orange aurora reads as muddy on a light floor - soften it. */
+  opacity: 0.35;
+}
+
+/* Tier C: form inputs. handoff-skin-components.css hardcodes a near-black input
+   background (a literal, not a token) while the text color is var(--fg-primary)
+   - which flips to dark ink under light - so without this the user types dark
+   text onto a near-black field (unreadable, worst on Settings/Pool/wizard where
+   the toggle lives). Scoped globally (inputs in portaled modals are outside
+   .mode-standard too); the selector set mirrors the dark rule exactly so it does
+   not touch checkbox/radio/range inputs. */
+:root[data-appearance="light"] :is(
+  .ds-input, .input,
+  input[type="text"], input[type="search"], input[type="number"],
+  input[type="password"], input[type="url"], input[type="email"],
+  select, textarea
+) {
+  background: #ffffff;
+  color: #15151b;
+  border-color: rgba(0, 0, 0, 0.14);
+}
+
+/* Tier D: the Standard overview's inner panels. handoff-skin-standard.css paints
+   these with hardcoded near-black rgba literals that read no token, so the
+   token rebind cannot reach them - they would stay dark (with now-dark text)
+   inside the light shell. Repoint each to a translucent light card. Scoped to
+   .mode-standard so the Hacker/Basic signature dark panels are untouched. */
+:root[data-appearance="light"] .mode-standard :is(
+  .chain-card, .kpi-card, .chart-wrap, .metric-card, .shares-table-wrap,
+  .pool-live-card, .pool-live-list > *, .template-grid > *, .template-card,
+  .profile-card, .log-viewer, .thermal-summary-card, .tf-group
+) {
+  background: rgba(255, 255, 255, 0.72);
+}
+
+/* Tier E: portaled overlays. The canonical modal (.ds-overlay-panel, ~13 call
+   sites via createPortal to document.body) and .ds-glass-strong render OUTSIDE
+   .mode-standard, so they resolve --surface-glass-panel from the dark :root.
+   Rebind the surface + text tokens ON the panel element so the whole modal
+   subtree inherits light, and drop the dark diagonal glass tint. Scoped to the
+   overlay classes only - cannot leak into Hacker/Basic dashboard content. */
+:root[data-appearance="light"] :is(.ds-overlay-panel, .ds-glass-strong) {
+  --surface-glass-panel: rgba(255, 255, 255, 0.94);
+  --fg-primary:   #15151b;
+  --fg-secondary: #3f3f4a;
+  --fg-muted:     #5c5c68;
+  --text:           #15151b;
+  --text-secondary: #3f3f4a;
+  --text-dim:       #5c5c68;
+  --border-glass: rgba(0, 0, 0, 0.10);
+  background: rgba(255, 255, 255, 0.94);
+  color: #15151b;
+}

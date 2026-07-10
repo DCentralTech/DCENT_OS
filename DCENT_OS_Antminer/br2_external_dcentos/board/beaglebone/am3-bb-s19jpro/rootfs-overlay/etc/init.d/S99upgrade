@@ -1,0 +1,100 @@
+#!/bin/sh
+#
+# S99upgrade - am3-bb-s19jpro safe readiness marker.
+#
+# This image is an AM335x BeagleBone S19j Pro SD-card/rootfs payload. It does
+# not commit U-Boot env, NAND, or fw_env state. It reports management reachability
+# so a faulted dcentrald is still diagnosable through SSH and MCP.
+
+BOARD_TARGET_FILE=/etc/dcentos/board_target
+EXPECTED_BOARD=am3-bb-s19jpro
+
+port_listening() {
+    PORT="$1"
+    netstat -tln 2>/dev/null | grep -q ":${PORT} "
+}
+
+wait_for_http() {
+    NAME="$1"
+    URL="$2"
+    LIMIT="${3:-20}"
+
+    if ! command -v wget >/dev/null 2>&1; then
+        echo "  [INFO] wget unavailable; skipping $NAME readiness probe"
+        return 0
+    fi
+
+    echo "  Checking $NAME readiness (up to ${LIMIT}s)..."
+    i=1
+    while [ "$i" -le "$LIMIT" ]; do
+        if wget -q -T 2 -O /dev/null "$URL" 2>/dev/null; then
+            echo "  [OK] $NAME reachable"
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+
+    echo "  [WARN] $NAME not reachable yet"
+    return 0
+}
+
+report_readiness() {
+    if [ -r "$BOARD_TARGET_FILE" ]; then
+        board_target=$(cat "$BOARD_TARGET_FILE" 2>/dev/null || echo unknown)
+    else
+        board_target=unknown
+    fi
+
+    if [ "$board_target" != "$EXPECTED_BOARD" ]; then
+        echo "S99upgrade am3-bb-s19jpro: board_target=$board_target; no upgrade commit action"
+        return 0
+    fi
+
+    echo "S99upgrade am3-bb-s19jpro: SD/rootfs payload; no NAND recovery flag or fw_env commit"
+
+    if ip addr show eth0 2>/dev/null | grep -q 'inet '; then
+        echo "  [OK] eth0 has an IPv4 address"
+    else
+        echo "  [INFO] eth0 IPv4 address not present at S99"
+    fi
+
+    if port_listening 22; then
+        echo "  [OK] SSH management port is listening"
+    else
+        echo "  [WARN] SSH management port is not listening"
+    fi
+
+    if port_listening 3000; then
+        echo "  [OK] MCP localhost port 3000 is listening"
+    else
+        echo "  [WARN] MCP localhost port 3000 is not listening"
+    fi
+
+    if port_listening 80; then
+        echo "  [OK] dashboard port 80 is listening"
+    else
+        echo "  [INFO] dashboard port 80 is not listening"
+    fi
+
+    if pidof dcentrald >/dev/null 2>&1; then
+        echo "  [OK] dcentrald process is running"
+        wait_for_http "dcentrald API" "http://127.0.0.1:8080/api/status" 20
+    else
+        echo "  [WARN] dcentrald process is not running; SSH/MCP should remain available for recovery"
+    fi
+}
+
+case "$1" in
+    start)
+        report_readiness
+        ;;
+    stop)
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}"
+        exit 1
+        ;;
+esac
+
+exit 0

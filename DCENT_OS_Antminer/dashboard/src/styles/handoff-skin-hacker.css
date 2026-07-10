@@ -1,0 +1,1539 @@
+/* ═════════════════════════════════════════════════════════════════════════
+   DCENT_OS — Claude-Design handoff visual recreation · HACKER MODE (VR4)
+   Loaded LAST in main.tsx, AFTER handoff-skin.css + advanced.css. Pure
+   look/feel reskin.
+
+   Goal: production '.mode-hacker' must LOOK like the handoff kit's
+   'ui_kits/hacker' glass-mono workstation. The canonical 'hk-*' spec lives
+   in the bundle's 'ui_kits/dashboard/styles.css' "HACKER MODE v3" block
+   (lines 1876-2464); base tokens in 'colors_and_type.css'. This file is
+   pixel-calibrated against those EXACT values.
+
+   What this ports, 1:1 from the kit:
+     · phosphor-green mono floor + radial green ambient + subtle CRT scanline
+     · glass-mono panels with the green hairline top-edge ('hk-panel')
+     · shell header (logo glow + status chips + exit), 3-col body grid feel
+     · left nav as the kit's 'hk-nav' (mono, eyebrow groups, accent active bar)
+     · tool tiles styled as the kit's CLI buttons / dense admin grid ('hk-cli')
+     · the kit's table / pre / chip-map / hex / KV / stat grammar
+     · bottom Console + CommandBar styled as the kit's 'hk-console'
+     · production's '.console-prompt' row == kit's 'hk-console-input'
+     · the Wave-8 '.hacker-cli-hint' set to the kit's 'hk-cli-hint' look
+
+   STRICT: this file changes ONLY visuals. Every production class name is the
+   real DOM that AdvancedDashboard.tsx + the 32 tools + Console + CommandBar
+   already render (verified against source). No structure, store, api, or
+   contract is touched. The accent stays phosphor-green (the kit's hacker
+   identity); VR1's aurora-damp in hacker is preserved (no orange wash).
+
+   Faithful approximations (documented, not regressions):
+     · production keeps its fixed-sidebar + sticky-CommandBar shell (the
+       shipped structure); the kit's right telemetry rail is production's
+       StatusStrip — both reskinned to the same glass-mono grammar. We do
+       not restructure the DOM to literally rebuild the kit's 3-column grid.
+     · CRT is the kit's single low-intensity scanline layer, calibrated to
+       the kit's exact values (.02 alpha, 1px/3px period, screen blend,
+       .55 opacity).
+   ───────────────────────────────────────────────────────────────────────── */
+
+/* ─── Kit token bridge: canonical 'hk-*' palette (kit styles.css :root) ─────
+   Scoped to .mode-hacker so nothing leaks to other modes. Mirrors the kit
+   verbatim. NOTE: advanced.css:33-34 re-declares '--radius-sm: 4px' /
+   '--radius: 8px' under .mode-hacker, which would shrink every kit panel
+   corner. The kit's 'hk-panel' uses --radius-md (12px) and 'hk-cli'/'hk-stat'
+   use --radius-sm (kit/tokens.css = 8px). We re-pin both to the kit values
+   so panel/tile radii match the kit pixel-for-pixel. */
+.mode-hacker {
+  --hk-bg:            #040a05;
+  --hk-bg-deep:       #020503;
+  --hk-fg:            #B6FFB6;            /* softer mono primary (kit) */
+  --hk-fg-bright:     #00FF41;            /* signature green (kit) */
+  --hk-fg-dim:        rgba(0, 255, 65, 0.42);
+  --hk-fg-muted:      rgba(0, 255, 65, 0.62);
+  --hk-border:        rgba(0, 255, 65, 0.16);
+  --hk-border-strong: rgba(0, 255, 65, 0.32);
+  --hk-card-bg:       linear-gradient(180deg, rgba(6, 28, 14, 0.78), rgba(4, 18, 9, 0.72));
+  --hk-card-bg-hover: linear-gradient(180deg, rgba(8, 36, 18, 0.82), rgba(4, 22, 11, 0.78));
+  --hk-amber:         #FAA500;            /* kit --accent (D-Central) */
+  --hk-amber-deep:    #FA6700;            /* kit --accent-deep */
+  --hk-blue:          #7DD3FC;            /* kit hk-panel-blue / sv2-in */
+  --hk-red:           #EF4444;            /* kit --red */
+  --hk-yellow:        #FBBF24;            /* kit warn (hk-cli.warn) */
+
+  /* kit radii (override advanced.css's 4px shrink — see note above) */
+  --radius-sm: 8px;
+  --radius-md: 12px;
+
+  /* Re-point production's own scale at the kit floor so generic cards/panels
+     that aren't individually re-skinned still read as the kit. */
+  --bg:          var(--hk-bg);
+  --bg-subtle:   #04140a;
+  --card-bg:     var(--hk-card-bg);
+  --card-bg-solid: #051a0c;
+  --card-hover:  var(--hk-card-bg-hover);
+  --border:      var(--hk-border);
+  --border-glass: var(--hk-border);
+  --text:        var(--hk-fg);
+  --text-secondary: var(--hk-fg-muted);
+  --text-dim:    var(--hk-fg-dim);
+  --accent-border: var(--hk-border-strong);
+  --green:       var(--hk-fg-bright);
+  --red:         var(--hk-red);
+  --yellow:      var(--hk-yellow);
+
+  /* kit '.hk-shell' floor: same two radial green ambients + base, kit-exact */
+  font-family: var(--font-mono);
+  font-size: 0.82rem;                     /* kit '.hk-shell' font-size */
+  background:
+    radial-gradient(ellipse 80% 60% at 0% 0%,    rgba(0, 255, 65, 0.06), transparent 55%),
+    radial-gradient(ellipse 70% 50% at 100% 100%, rgba(0, 255, 65, 0.04), transparent 55%),
+    var(--hk-bg);
+}
+
+/* ─── CRT scanline (kit '.hk-crt') — single low-intensity overlay over the
+   whole shell. Kit values verbatim: rgba(0,255,65,.02) at 0px→1px, transparent
+   1px→3px, screen blend, opacity .55. Production has no '.hk-crt' element so
+   we hang it off the root ::before (non-interactive, beneath the chrome).
+   advanced.css scopes its phosphor texture to '.console-output::after'; this
+   root layer is the kit's whole-shell CRT and does not double it. */
+.mode-hacker::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  background: repeating-linear-gradient(
+    0deg,
+    rgba(0, 255, 65, 0.02) 0px,
+    rgba(0, 255, 65, 0.02) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+  mix-blend-mode: screen;
+  opacity: 0.55;
+}
+@media (prefers-reduced-motion: reduce) {
+  /* static layer, no animation — kept for parity intent with advanced.css's
+     reduced-motion console-output::after at .15 (the kit's CRT is static). */
+  .mode-hacker::before { opacity: 0.4; }
+}
+
+/* Keep VR1's hacker aurora-damp (don't fight phosphor with the orange wash).
+   The kit's hacker screen also drops the orange aurora for its terminal floor. */
+.mode-hacker body::before,
+body:has(.mode-hacker)::before { opacity: 0.22; }
+
+/* ════════════════════════════════════════════════════════════════════════
+   SIDEBAR  →  kit '.hk-nav'  (mono, eyebrow groups, accent ACTIVE bar)
+   Kit fidelity: nav bg gradient rgba(2,12,6,.75→.55), 14px 0 18px padding,
+   eyebrow .58rem .15em uppercase, item .82rem grid[22px 1fr] gap 10px pad
+   6px 16px, hover bg rgba(0,255,65,.04), ACTIVE = AMBER (kit '.hk-nav-item
+   .active' is var(--accent)/rgba(250,165,0,.07) + amber text-shadow + amber
+   2px bar), key chip 20px rounded 4px.
+   ════════════════════════════════════════════════════════════════════════ */
+.mode-hacker .sidebar {
+  background: linear-gradient(180deg, rgba(2, 12, 6, 0.75), rgba(2, 12, 6, 0.55));
+  border-right: 1px solid var(--hk-border);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+@supports not (backdrop-filter: blur(1px)) {
+  .mode-hacker .sidebar { background: rgba(3, 14, 7, 0.98); }
+}
+
+.mode-hacker .hacker-sidebar-brand {
+  border-bottom: 1px solid var(--hk-border);
+  padding-bottom: 12px;
+}
+.mode-hacker .hacker-sidebar-brand-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;                              /* kit '.hk-brand' gap */
+}
+.mode-hacker .sidebar .brand h1,
+.mode-hacker .hacker-sidebar-brand h1 {
+  font-family: var(--font-heading);       /* kit '.hk-brand-name' */
+  font-weight: 800;
+  font-size: 1.3rem;                      /* kit 1.3rem (was 1.25) */
+  color: var(--hk-fg-bright);
+  letter-spacing: -0.005em;
+  text-shadow: 0 0 12px rgba(0, 255, 65, 0.4);
+}
+.mode-hacker .hacker-sidebar-prompt {
+  color: var(--hk-fg-dim);                /* kit '.hk-brand-tag' family */
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.14em;                 /* kit .14em (was .06) */
+  text-transform: uppercase;
+}
+.mode-hacker .hacker-sidebar-version {
+  color: var(--hk-fg-muted);
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+}
+
+/* kit '.hk-nav-eyebrow' — .58rem .15em uppercase, padding 8px 16px 6px */
+.mode-hacker .hacker-sidebar-section-label {
+  font-family: var(--font-mono);
+  font-size: 0.58rem;
+  color: var(--hk-fg-dim);
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  font-weight: 700;
+  padding: 8px 16px 6px;                  /* kit 8/16/6 (was 12/16/6) */
+}
+
+/* kit '.hk-nav-item' — grid 22px/1fr gap 10px, pad 6px 16px, .82rem mono */
+.mode-hacker .hacker-sidebar-nav .nav-item,
+.mode-hacker .sidebar .nav-item {
+  position: relative;
+  display: grid;
+  grid-template-columns: 22px 1fr;
+  gap: 10px;
+  align-items: center;
+  padding: 6px 16px;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  color: var(--hk-fg-muted);
+  border-radius: 0;
+  background: transparent;
+  text-align: left;
+  transition: all 0.15s var(--ease-standard);
+}
+.mode-hacker .sidebar .nav-item.collapsed,
+.mode-hacker .sidebar.collapsed .nav-item {
+  grid-template-columns: 1fr;             /* collapsed rail: icon only */
+}
+.mode-hacker .nav-item-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  color: var(--hk-fg-muted);
+}
+.mode-hacker .nav-item-body {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+.mode-hacker .hacker-sidebar-nav .nav-item:hover,
+.mode-hacker .sidebar .nav-item:hover {
+  background: rgba(0, 255, 65, 0.04);     /* kit .04 (was .05) */
+  color: var(--hk-fg);
+}
+.mode-hacker .hacker-sidebar-nav .nav-item:hover .nav-item-icon,
+.mode-hacker .sidebar .nav-item:hover .nav-item-icon { color: var(--hk-fg); }
+/* kit '.hk-nav-item.active' is AMBER, not green (the green-active was a
+   divergence). Active = var(--accent) text + rgba(250,165,0,.07) bg +
+   amber glow text-shadow. */
+.mode-hacker .sidebar .nav-item.active,
+.mode-hacker .hacker-sidebar-nav .nav-item.active {
+  color: var(--hk-amber);
+  background: rgba(250, 165, 0, 0.07);
+  text-shadow: 0 0 6px rgba(250, 103, 0, 0.5);
+}
+.mode-hacker .sidebar .nav-item.active .nav-item-icon { color: var(--hk-amber); }
+/* kit '.hk-nav-bar' — 2px amber bar, left:0 top/bottom 6px, amber glow */
+.mode-hacker .sidebar .nav-item.active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 6px;
+  bottom: 6px;
+  width: 2px;
+  background: var(--hk-amber);
+  border-radius: 0;
+  box-shadow: 0 0 8px var(--hk-amber);
+}
+/* kit '.hk-nav-key' — 20x20 rounded 4px, .68rem 700, dim, bg rgba(0,0,0,.25) */
+.mode-hacker .nav-item-shortcut {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: var(--hk-fg-dim);
+  border: 1px solid var(--hk-border);
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 4px;
+  padding: 0 5px;
+}
+/* kit '.hk-nav-item.active .hk-nav-key' — amber */
+.mode-hacker .nav-item.active .nav-item-shortcut {
+  color: var(--hk-amber);
+  border-color: var(--accent-border);
+  background: rgba(250, 165, 0, 0.08);
+}
+
+.mode-hacker .hacker-sidebar-search input,
+.mode-hacker .hacker-sidebar-search input[type="search"] {
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--hk-border);
+  color: var(--hk-fg);
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  border-radius: 4px;
+}
+.mode-hacker .hacker-sidebar-search input::placeholder { color: var(--hk-fg-dim); }
+.mode-hacker .hacker-sidebar-search input:focus-visible {
+  border-color: var(--hk-fg-bright);
+  outline: none;
+  box-shadow: 0 0 0 1px rgba(0, 255, 65, 0.3);
+}
+.mode-hacker .hacker-sidebar-nav-empty {
+  color: var(--hk-fg-dim);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+}
+.mode-hacker .hacker-sidebar-foot { border-top: 1px solid var(--hk-border); }
+.mode-hacker .adv-mode-cycle-glyph {
+  font-family: var(--font-mono);
+  color: var(--hk-fg-muted);
+  letter-spacing: 0.08em;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   SHELL HEADER (production '.hacker-banner')  →  kit '.hk-shell-header'
+   Kit fidelity: header bg linear-gradient(180deg, rgba(4,18,9,.85)→.55→
+   transparent), blur 12px, border-bottom hk-border, padding 12px 22px.
+   Production banner is one inline row (model @ ip · state · clock + chips);
+   we map model→kit '.hk-brand-name' (heading, green glow), seps→'.hk-sep',
+   the chips→'.hk-chip', the live LED→kit '.hk-chip-live .hk-dot'.
+   ════════════════════════════════════════════════════════════════════════ */
+.mode-hacker .hacker-banner {
+  background: linear-gradient(180deg, rgba(4, 18, 9, 0.85) 0%, rgba(4, 18, 9, 0.55) 60%, transparent);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--hk-border);
+  font-family: var(--font-mono);
+  padding: 12px 22px;                     /* kit 12/22 (was 12/22 already) */
+  gap: 10px;
+}
+.mode-hacker .hacker-banner-host {
+  font-family: var(--font-heading);       /* kit '.hk-brand-name' */
+  font-weight: 800;
+  font-size: 1.05rem;
+  color: var(--hk-fg-bright);
+  text-shadow: 0 0 10px rgba(0, 255, 65, 0.35);
+  letter-spacing: 0;
+}
+.mode-hacker .hacker-banner-ip { color: var(--hk-fg-muted); }
+/* kit '.hk-breadcrumb .hk-sep' — dim, 6px margin */
+.mode-hacker .hacker-banner-sep {
+  color: var(--hk-fg-dim);
+  opacity: 1;
+  margin: 0 2px;
+}
+/* kit '.hk-chip' state pill grammar — pill, hk-border, rgba(0,255,65,.04) */
+.mode-hacker .hacker-banner-state {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  color: var(--hk-fg-muted);
+  border: 1px solid var(--hk-border);
+  background: rgba(0, 255, 65, 0.04);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-weight: 600;
+}
+.mode-hacker .hacker-banner-state.success,
+.mode-hacker .hacker-banner-state.good {
+  color: var(--hk-fg-bright);
+  border-color: rgba(0, 255, 65, 0.4);
+  background: rgba(0, 255, 65, 0.08);     /* kit '.hk-chip-live' */
+}
+.mode-hacker .hacker-banner-state.warning {
+  color: var(--hk-yellow);
+  border-color: rgba(251, 191, 36, 0.4);
+  background: rgba(251, 191, 36, 0.08);
+}
+.mode-hacker .hacker-banner-state.danger {
+  color: var(--hk-red);
+  border-color: rgba(239, 68, 68, 0.45);
+  background: rgba(239, 68, 68, 0.08);
+}
+.mode-hacker .hacker-banner-state.info {
+  color: var(--hk-fg-muted);
+  border-color: var(--hk-border);
+  background: rgba(0, 255, 65, 0.04);
+}
+.mode-hacker .hacker-banner-state.neutral {
+  color: var(--hk-fg-muted);
+  border-color: var(--hk-border);
+  background: rgba(0, 255, 65, 0.04);
+}
+/* kit '.hk-dot' — 6x6, green, 6px glow; pulse 1.6s when live (is-on) */
+.mode-hacker .hacker-banner-led {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+.mode-hacker .hacker-banner-led.is-on {
+  background: var(--hk-fg-bright);
+  box-shadow: 0 0 6px var(--hk-fg-bright);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+.mode-hacker .hacker-banner-led.is-off {
+  background: var(--hk-fg-dim);
+  box-shadow: none;
+}
+.mode-hacker .hacker-banner-flex { flex: 1; }
+/* kit '.hk-chip' — clock as a chip (pill, hk-border, rgba(0,255,65,.04)) */
+.mode-hacker .hacker-banner-clock {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--hk-fg-muted);
+  border: 1px solid var(--hk-border);
+  background: rgba(0, 255, 65, 0.04);
+  border-radius: 999px;
+  padding: 5px 10px;                      /* kit '.hk-chip' 5/10 */
+  font-variant-numeric: tabular-nums;
+  text-shadow: none;
+}
+/* kit '.hk-exit' — transparent, hk-border, amber hover */
+.mode-hacker .hacker-mobile-menu-btn {
+  color: var(--hk-fg-muted);
+  border: 1px solid var(--hk-border);
+  background: transparent;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  transition: all 0.15s var(--ease-standard);
+}
+.mode-hacker .hacker-mobile-menu-btn:hover {
+  border-color: var(--hk-amber);
+  color: var(--hk-amber);
+  background: rgba(250, 165, 0, 0.06);
+}
+
+/* Status chips in the banner (BTU pill, mode pill, donating) → kit '.hk-chip'.
+   kit: pill, 5/10 pad, hk-border, rgba(0,255,65,.04), .68rem mono muted;
+   'strong' inside = hk-fg 700. */
+.mode-hacker .hacker-banner .ds-chip {
+  border: 1px solid var(--hk-border);
+  background: rgba(0, 255, 65, 0.04);
+  color: var(--hk-fg-muted);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  border-radius: 999px;
+  padding: 5px 10px;
+}
+.mode-hacker .hacker-banner .ds-chip strong { color: var(--hk-fg); font-weight: 700; }
+
+/* ════════════════════════════════════════════════════════════════════════
+   CONTEXT BAR (production '.hacker-context-bar')  →  kit panel-head + breadcrumb
+   grammar (mono title + green glow + copy).
+   ════════════════════════════════════════════════════════════════════════ */
+.mode-hacker .hacker-context-bar {
+  border-bottom: 1px solid var(--hk-border);
+  background: linear-gradient(90deg, rgba(0, 255, 65, 0.03), transparent);
+}
+/* kit '.hk-panel-title' — .78rem 700 .04em, green, 0 0 6px green glow */
+.mode-hacker .hacker-context-title {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 0.95rem;
+  letter-spacing: 0.04em;
+  color: var(--hk-fg-bright);
+  text-shadow: 0 0 6px rgba(0, 255, 65, 0.4);
+}
+.mode-hacker .hacker-context-copy {
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--hk-fg-muted);
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   TOOL TABBAR (production '.hacker-tool-tabbar')  →  kit nav-item / tab grammar
+   ════════════════════════════════════════════════════════════════════════ */
+.mode-hacker .hacker-tool-tabbar {
+  border-bottom: 1px solid var(--hk-border);
+  background: rgba(2, 12, 6, 0.4);
+}
+.mode-hacker .hacker-tool-tab {
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--hk-fg-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  transition: all 0.12s var(--ease-standard);
+}
+.mode-hacker .hacker-tool-tab:hover {
+  color: var(--hk-fg);
+  background: rgba(0, 255, 65, 0.04);     /* kit hover .04 */
+  border-color: var(--hk-border);
+}
+/* kit active = amber (matches '.hk-nav-item.active') */
+.mode-hacker .hacker-tool-tab.is-active {
+  color: var(--hk-amber);
+  background: rgba(250, 165, 0, 0.07);
+  border-color: rgba(250, 165, 0, 0.32);
+  text-shadow: 0 0 6px rgba(250, 103, 0, 0.5);
+}
+.mode-hacker .hacker-tool-tab.is-active .hacker-tool-tab-icon { color: var(--hk-amber); }
+.mode-hacker .hacker-tool-tab-icon { color: var(--hk-fg-dim); }
+.mode-hacker .hacker-tool-tab.is-search-empty {
+  color: var(--hk-fg-dim);
+  font-family: var(--font-mono);
+}
+.mode-hacker .hacker-tool-tabbar-search input,
+.mode-hacker .hacker-tool-tabbar-search input[type="search"] {
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--hk-border);
+  color: var(--hk-fg);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  border-radius: 4px;
+}
+.mode-hacker .hacker-tool-tabbar-search input::placeholder { color: var(--hk-fg-dim); }
+.mode-hacker .hacker-tool-tabbar-search input:focus-visible {
+  border-color: var(--hk-fg-bright);
+  outline: none;
+}
+
+/* Inline sub-tabs inside a tabbed page (sv2 / voltage / diagnostics) →
+   kit '.hk-table' head-row tab grammar. */
+.mode-hacker .hacker-inline-tab-bar { border-bottom: 1px solid var(--hk-border); }
+.mode-hacker .hacker-inline-tab-bar .tab {
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--hk-fg-muted);
+}
+.mode-hacker .hacker-inline-tab-bar .tab:hover { color: var(--hk-fg); }
+.mode-hacker .hacker-inline-tab-bar .tab.active {
+  color: var(--hk-amber);
+  border-color: rgba(250, 165, 0, 0.4);
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   PAGE REGION + PANELS  →  kit '.hk-main' + '.hk-panel'
+   Kit '.hk-panel': var(--hk-card-bg), 1px hk-border, --radius-md (12px),
+   overflow hidden, ::before = full-width 1px green hairline gradient
+   (transparent→rgba(0,255,65,.45)@50%→transparent) opacity .6, hover
+   border→hk-border-strong. Kit '.hk-main' padding 18px 22px 12px gap 14px.
+   ════════════════════════════════════════════════════════════════════════ */
+.mode-hacker .hacker-page-region {
+  background: transparent;
+}
+
+.mode-hacker .glass-card,
+.mode-hacker .card,
+.mode-hacker .section,
+.mode-hacker .adv-card,
+.mode-hacker .advanced-scroll-card,
+.mode-hacker .register-inspector,
+.mode-hacker .ds-glass-card,
+.mode-hacker .ds-glass-panel {
+  position: relative;
+  background: var(--hk-card-bg);
+  border: 1px solid var(--hk-border);
+  border-radius: var(--radius-md);        /* kit hk-panel = --radius-md 12px */
+  overflow: hidden;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.mode-hacker .glass-card::before,
+.mode-hacker .card::before,
+.mode-hacker .section::before,
+.mode-hacker .adv-card::before,
+.mode-hacker .register-inspector::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent 0%, rgba(0, 255, 65, 0.45) 50%, transparent 100%);
+  opacity: 0.6;
+  z-index: 1;
+}
+.mode-hacker .glass-card:hover,
+.mode-hacker .card:hover,
+.mode-hacker .section:hover,
+.mode-hacker .adv-card:hover,
+.mode-hacker .register-inspector:hover {
+  border-color: var(--hk-border-strong);
+}
+
+/* kit '.hk-panel-head' / '.hk-panel-title'. Real production hooks: every
+   advanced tool renders '.adv-card-title' (RegisterInspector, I2cScanner,
+   PidTuner, VoltageControl, AsicCommander, JobDeclarationPanel…) and
+   '.section-title' (Console, ApiExplorer, Sv2). kit '.hk-panel-title' =
+   .78rem 700 .04em green + 0 0 6px green glow. There is no '.hk-panel-dot'
+   element in production (noted below). */
+.mode-hacker .hacker-section-head { border-bottom: 1px solid var(--hk-border); }
+.mode-hacker .adv-card-title,
+.mode-hacker .section-title {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--hk-fg-bright);
+  text-shadow: 0 0 6px rgba(0, 255, 65, 0.4);
+}
+.mode-hacker .adv-card-title.is-danger {
+  color: var(--hk-red);
+  text-shadow: 0 0 6px rgba(239, 68, 68, 0.4);
+}
+
+/* kit '.hk-nav-eyebrow' / section eyebrow (overview // instruments etc.) */
+.mode-hacker .hacker-section-eyebrow,
+.mode-hacker .ds-section-eyebrow {
+  font-family: var(--font-mono);
+  font-size: 0.58rem;
+  color: var(--hk-fg-dim);
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  font-weight: 700;
+}
+.mode-hacker .hacker-section-meta {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--hk-fg-muted);
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   TOOL GRID + TILE (production '.hacker-tool-tile')  →  kit '.hk-cli' button
+   Kit '.hk-cli': rgba(0,255,65,.05) bg, 1px rgba(0,255,65,.3) border,
+   --radius-sm, green text, .76rem 600 mono .02em; hover bg rgba(0,255,65,.12)
+   border rgba(0,255,65,.55) + 0 0 10px rgba(0,255,65,.32) glow. Kit hint
+   = '.hk-cli-hint'.
+   ════════════════════════════════════════════════════════════════════════ */
+.mode-hacker .hacker-tool-tile {
+  position: relative;
+  background: rgba(0, 255, 65, 0.05);
+  border: 1px solid rgba(0, 255, 65, 0.3);
+  border-radius: var(--radius-sm);
+  color: var(--hk-fg-bright);
+  font-family: var(--font-mono);
+  transition: all 0.12s var(--ease-standard);
+}
+.mode-hacker .hacker-tool-tile:hover {
+  background: rgba(0, 255, 65, 0.12);
+  border-color: rgba(0, 255, 65, 0.55);
+  box-shadow: 0 0 10px rgba(0, 255, 65, 0.32);   /* kit 10px/.32 (was 12/.3) */
+}
+.mode-hacker .hacker-tool-tile-icon { color: var(--hk-fg-bright); }
+.mode-hacker .hacker-tool-tile-label {
+  font-family: var(--font-mono);
+  font-weight: 600;                       /* kit '.hk-cli' 600 */
+  font-size: 0.82rem;
+  color: var(--hk-fg-bright);
+  letter-spacing: 0.02em;
+}
+/* kit '.hk-cli-hint' — dim, .64rem mono .02em */
+.mode-hacker .hacker-tool-tile-blurb {
+  font-family: var(--font-mono);
+  font-size: 0.64rem;
+  color: var(--hk-fg-dim);
+  letter-spacing: 0.02em;
+}
+/* kit '.hk-nav-key' chip grammar for the tile shortcut */
+.mode-hacker .hacker-tool-tile-shortcut {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  color: var(--hk-fg-dim);
+  border: 1px solid var(--hk-border);
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 4px;
+  padding: 0 5px;
+}
+.mode-hacker .hacker-tool-tile-chevron { color: var(--hk-fg-dim); }
+.mode-hacker .hacker-tool-tile:hover .hacker-tool-tile-chevron { color: var(--hk-fg-bright); }
+
+/* Chain status grid → kit '.hk-subpanel' (rgba(0,0,0,.28), hk-border,
+   --radius-sm, pad 10px 12px). */
+.mode-hacker .hacker-chain-row {
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid var(--hk-border);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+}
+.mode-hacker .hacker-chain-row.is-alive { border-color: rgba(0, 255, 65, 0.28); }
+.mode-hacker .hacker-chain-row.is-dead { opacity: 0.7; }
+/* kit '.hk-subpanel-head' — .72rem 700 green .04em */
+.mode-hacker .hacker-chain-id {
+  color: var(--hk-fg-bright);
+  font-weight: 700;
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+}
+.mode-hacker .hacker-chain-data { color: var(--hk-fg-muted); font-size: 0.78rem; }
+
+.mode-hacker .hacker-overview-footer {
+  border-top: 1px solid var(--hk-border);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--hk-fg-dim);
+}
+.mode-hacker .hacker-overview-footer kbd {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  color: var(--hk-fg-muted);
+  border: 1px solid var(--hk-border);
+  background: rgba(0, 0, 0, 0.25);        /* kit '.hk-nav-key' bg .25 */
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   BUTTONS  →  kit '.hk-cli' variants
+   Kit secondary/ghost = the base '.hk-cli' (green). Kit '.hk-cli.primary' =
+   amber gradient(135deg, rgba(250,165,0,.16)→rgba(250,103,0,.10)) + amber
+   border + 0 0 0 1px rgba(250,165,0,.18). Kit '.hk-cli.danger' =
+   rgba(239,68,68,.08) + rgba(239,68,68,.55) border.
+   ════════════════════════════════════════════════════════════════════════ */
+.mode-hacker .btn,
+.mode-hacker .ds-btn {
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  border-radius: var(--radius-sm);
+  transition: all 0.12s var(--ease-standard);
+}
+.mode-hacker .btn-secondary,
+.mode-hacker .ds-btn--secondary,
+.mode-hacker .ds-btn--ghost {
+  background: rgba(0, 255, 65, 0.05);
+  border: 1px solid rgba(0, 255, 65, 0.3);
+  color: var(--hk-fg-bright);
+}
+.mode-hacker .btn-secondary:hover,
+.mode-hacker .ds-btn--secondary:hover,
+.mode-hacker .ds-btn--ghost:hover {
+  background: rgba(0, 255, 65, 0.12);
+  border-color: rgba(0, 255, 65, 0.55);
+  box-shadow: 0 0 10px rgba(0, 255, 65, 0.32);
+}
+.mode-hacker .btn-primary,
+.mode-hacker .ds-btn--primary {
+  background: linear-gradient(135deg, rgba(250, 165, 0, 0.16), rgba(250, 103, 0, 0.1));
+  border: 1px solid var(--hk-amber);
+  color: var(--hk-amber);
+  box-shadow: 0 0 0 1px rgba(250, 165, 0, 0.18);
+}
+.mode-hacker .btn-primary:hover,
+.mode-hacker .ds-btn--primary:hover {
+  background: linear-gradient(135deg, rgba(250, 165, 0, 0.28), rgba(250, 103, 0, 0.16));
+  box-shadow: 0 0 14px rgba(250, 103, 0, 0.5);
+}
+.mode-hacker .btn-danger,
+.mode-hacker .ds-btn--danger {
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.55);
+  color: var(--hk-red);
+}
+.mode-hacker .btn-danger:hover,
+.mode-hacker .ds-btn--danger:hover {
+  background: rgba(239, 68, 68, 0.16);
+  box-shadow: 0 0 10px rgba(239, 68, 68, 0.5);
+}
+/* (kit '.hk-cli.warn' yellow variant has no production button hook — see
+   no-hook note at end of file.)
+   kit '.hk-cli.pressed' — amber inset glow (production aria-pressed toggles) */
+.mode-hacker .advanced-toggle-button[aria-pressed="true"] {
+  background: rgba(250, 165, 0, 0.18);
+  border-color: var(--hk-amber);
+  color: var(--hk-amber);
+  box-shadow: inset 0 0 8px rgba(250, 103, 0, 0.3), 0 0 8px rgba(250, 165, 0, 0.18);
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   TABLES / PRE / HEX / INPUTS  →  kit '.hk-table' / '.hk-pre' / mono fields
+   Kit '.hk-table' th: .68rem .08em uppercase dim, border-b hk-border, pad
+   6px 10px. td: pad 6px 10px, border-b 1px dashed hk-border, mono.
+   Kit '.hk-pre': rgba(0,0,0,.32), border-LEFT 2px hk-border-strong, radius
+   0 sm sm 0, .76rem mono, line-height 1.55.
+   ════════════════════════════════════════════════════════════════════════ */
+.mode-hacker table th {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--hk-fg-dim);
+  border-bottom: 1px solid var(--hk-border);
+  padding: 6px 10px;                      /* kit 6/10 */
+}
+.mode-hacker table td {
+  font-family: var(--font-mono);
+  border-bottom: 1px dashed var(--hk-border);
+  color: var(--hk-fg);
+  padding: 6px 10px;
+}
+.mode-hacker table tbody tr:hover { background: rgba(0, 255, 65, 0.04); }
+
+/* kit '.hk-pre' — left-rule pre block (the kit's signature pre, not boxed) */
+.mode-hacker pre {
+  margin: 0;
+  padding: 8px 10px;
+  background: rgba(0, 0, 0, 0.32);
+  border: none;
+  border-left: 2px solid var(--hk-border-strong);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  color: var(--hk-fg);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+/* hex/json keep the boxed look (they read as data panels, kit '.hk-regs') */
+.mode-hacker .hex-dump,
+.mode-hacker .json-response {
+  background: rgba(0, 0, 0, 0.32);
+  border: 1px solid var(--hk-border);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;                     /* kit '.hk-regs' .72rem */
+  color: var(--hk-fg);
+}
+.mode-hacker .hex-dump .addr { color: var(--hk-fg-dim); }
+.mode-hacker .hex-dump .byte { color: var(--hk-fg-bright); }
+.mode-hacker .hex-dump .ascii { color: var(--hk-amber); }
+
+.mode-hacker input[type="text"],
+.mode-hacker input[type="number"],
+.mode-hacker input[type="password"],
+.mode-hacker input[type="search"],
+.mode-hacker textarea,
+.mode-hacker select,
+.mode-hacker .ds-input {
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--hk-border);
+  color: var(--hk-fg);
+  font-family: var(--font-mono);
+  border-radius: 4px;
+}
+.mode-hacker input::placeholder,
+.mode-hacker textarea::placeholder,
+.mode-hacker .ds-input::placeholder { color: var(--hk-fg-dim); }
+.mode-hacker input:focus,
+.mode-hacker textarea:focus,
+.mode-hacker select:focus,
+.mode-hacker .ds-input:focus,
+.mode-hacker input:focus-visible {
+  border-color: var(--hk-fg-bright);
+  outline: none;
+  box-shadow: 0 0 0 1px rgba(0, 255, 65, 0.3);
+}
+
+/* Chip-map cells → kit '.hk-chip' (chip-map variant): 20px, .56rem 700,
+   radius 2px; hover translateY(-1px) scale(1.5) + 0 0 12px rgba(0,255,65,.5)
+   + #fff border + z-index. */
+.mode-hacker .chip-cell {
+  border-radius: 2px;
+  font-family: var(--font-mono);
+  font-size: 0.56rem;
+  font-weight: 700;
+  transition: transform 0.12s, box-shadow 0.12s;
+}
+.mode-hacker .chip-cell:hover {
+  transform: translateY(-1px) scale(1.5);
+  box-shadow: 0 0 12px rgba(0, 255, 65, 0.5);
+  border-color: #fff;
+  z-index: 4;
+}
+
+/* Sliders → kit '.hk-slider' (rgba(0,255,65,.15) 5px track, 16px amber thumb
+   2px #04140A border + 0 0 12px amber glow). */
+.mode-hacker .voltage-slider,
+.mode-hacker input[type="range"] {
+  height: 5px;
+  background: rgba(0, 255, 65, 0.15);
+  border-radius: 999px;
+}
+.mode-hacker .voltage-slider::-webkit-slider-thumb,
+.mode-hacker input[type="range"]::-webkit-slider-thumb {
+  width: 16px;
+  height: 16px;
+  background: var(--hk-amber);
+  border: 2px solid #04140A;
+  box-shadow: 0 0 12px var(--hk-amber);
+}
+.mode-hacker input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  background: var(--hk-amber);
+  border: 2px solid #04140A;
+  box-shadow: 0 0 12px var(--hk-amber);
+}
+
+/* Status-strip telemetry rail → kit '.hk-tele' row grammar.
+   kit '.hk-tele': gradient(rgba(2,12,6,.75)→.65) + border-left hk-border;
+   '.hk-tele-row span' = dim label, 'strong' = hk-fg tabular 600. */
+.mode-hacker .hacker-status-strip-wrap,
+.mode-hacker .status-strip,
+.mode-hacker .advanced-status-strip {
+  font-family: var(--font-mono);
+}
+.mode-hacker .status-strip-item strong,
+.mode-hacker .advanced-status-strip-item strong {
+  color: var(--hk-fg);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   CONSOLE (Console.tsx)  →  kit '.hk-console' (bottom typeable terminal)
+   Kit '.hk-console': linear-gradient(180deg, rgba(4,18,9,.96)→rgba(2,10,5,
+   .98)) + border-top hk-border-strong. '.hk-console-bar': pad 8px 18px,
+   border-b hk-border, bg linear(90deg, rgba(0,255,65,.04)→transparent).
+   '.hk-console-log': .78rem mono line-height 1.55. '.hk-console-input':
+   border-top hk-border, bg rgba(0,255,65,.03), pad 9px 18px; input
+   transparent .84rem, caret amber; '.hk-prompt' = amber 700.
+   ════════════════════════════════════════════════════════════════════════ */
+.mode-hacker .console {
+  background: linear-gradient(180deg, rgba(4, 18, 9, 0.96), rgba(2, 10, 5, 0.98));
+  border: 1px solid var(--hk-border-strong);
+  border-radius: var(--radius-md);
+  font-family: var(--font-mono);
+}
+.mode-hacker .console-toolbar {
+  border-bottom: 1px solid var(--hk-border);
+  background: linear-gradient(90deg, rgba(0, 255, 65, 0.04), transparent);
+  padding: 8px 18px;                      /* kit '.hk-console-bar' 8/18 */
+}
+.mode-hacker .console-toolbar input {
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--hk-border);
+  color: var(--hk-fg);
+  font-family: var(--font-mono);
+}
+.mode-hacker .console-output {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  line-height: 1.55;
+  color: var(--hk-fg-muted);              /* kit '.hk-console-line.out' */
+}
+.mode-hacker .console-output .log-error { color: var(--hk-red); }
+.mode-hacker .console-output .log-warn { color: var(--hk-yellow); }
+.mode-hacker .console-output .log-info { color: var(--hk-amber); }
+.mode-hacker .console-output .log-debug { color: var(--hk-fg-dim); }
+.mode-hacker .console-line-ts { color: var(--hk-fg-dim); }
+.mode-hacker .console-output-empty { color: var(--hk-fg-dim); }
+/* kit '.hk-console-hint .hk-em' = amber 700 */
+.mode-hacker .console-output-empty .hk-em,
+.mode-hacker .console-header-title { color: var(--hk-fg-bright); }
+
+/*  CLI-echo command row == kit '.hk-console-input'. PRESERVE the echo
+   look: amber '$' sigil + transparent input + blinking amber cursor. The
+   prior skin only touched '.hacker-command-bar-*' and missed THIS row (the
+   actual in-Console prompt). Now bound kit-faithfully. */
+.mode-hacker .console-prompt {
+  border-top: 1px solid var(--hk-border);
+  background: rgba(0, 255, 65, 0.03);     /* kit '.hk-console-input' bg */
+  padding: 9px 18px;                      /* kit 9/18 (was 8/12) */
+  gap: 6px;                               /* kit '.hk-console-input' gap */
+}
+.mode-hacker .console-prompt-sigil {
+  color: var(--hk-amber);                 /* kit '.hk-prompt' amber 700 */
+  font-family: var(--font-mono);
+  font-weight: 700;
+}
+.mode-hacker .console-prompt-input {
+  background: transparent;
+  border: none;
+  color: var(--hk-fg);                    /* kit input is hk-fg, not accent */
+  font-family: var(--font-mono);
+  font-size: 0.84rem;                     /* kit '.hk-console-input input' */
+  caret-color: var(--hk-amber);
+}
+.mode-hacker .console-prompt-input::placeholder { color: var(--hk-fg-dim); }
+/* kit '.hk-console-caret' — amber block, step-end blink (the  cursor) */
+.mode-hacker .console-prompt-cursor {
+  color: var(--hk-amber);
+  font-family: var(--font-mono);
+  font-weight: 700;
+}
+/* kit '.hk-console-toggle' — transparent, hk-border, amber hover */
+.mode-hacker .console-pause-btn,
+.mode-hacker .console-autoscroll-pill {
+  font-family: var(--font-mono);
+}
+.mode-hacker .console-autoscroll-pill {
+  background: rgba(0, 255, 65, 0.08);
+  color: var(--hk-fg-bright);
+  border: 1px solid rgba(0, 255, 65, 0.3);
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   COMMAND BAR (CommandBar.tsx)  →  kit '.hk-console-input' row + dropdown
+   Production's CommandBar is a SEPARATE sticky bottom bar (not in the kit's
+   single 'hk-console'). Reskinned to the same kit grammar so the two
+   terminals read identically.
+   ════════════════════════════════════════════════════════════════════════ */
+.mode-hacker .hacker-command-bar {
+  background: linear-gradient(180deg, rgba(4, 18, 9, 0.96), rgba(2, 10, 5, 0.98));
+  border-top: 1px solid var(--hk-border-strong);
+}
+.mode-hacker .hacker-command-bar-row {
+  background: rgba(0, 255, 65, 0.03);     /* kit '.hk-console-input' bg */
+  border-top: 1px solid var(--hk-border);
+  font-family: var(--font-mono);
+}
+.mode-hacker .hacker-command-bar-prompt {
+  color: var(--hk-amber);                 /* kit '.hk-prompt' */
+  font-weight: 700;
+}
+.mode-hacker .hacker-command-bar-input {
+  background: transparent;
+  border: none;
+  color: var(--hk-fg);
+  font-family: var(--font-mono);
+  font-size: 0.84rem;                     /* kit input .84rem */
+  caret-color: var(--hk-amber);
+}
+.mode-hacker .hacker-command-bar-input::placeholder { color: var(--hk-fg-dim); }
+.mode-hacker .hacker-command-bar-caret { color: var(--hk-amber); }
+.mode-hacker .hacker-command-bar-hint {
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  color: var(--hk-fg-dim);
+}
+.mode-hacker .hacker-command-bar-hint kbd {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  color: var(--hk-fg-muted);
+  border: 1px solid var(--hk-border);
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 4px;
+  padding: 0 5px;
+}
+.mode-hacker .hacker-command-bar-hint:hover { color: var(--hk-amber); }
+.mode-hacker .hacker-command-bar-sep { color: var(--hk-fg-dim); }
+/* kit '.hk-help' overlay grammar — gradient(rgba(6,28,14,.96)→rgba(4,18,9,
+   .98)) + border-strong + blur */
+.mode-hacker .hacker-command-bar-dropdown {
+  background: linear-gradient(180deg, rgba(6, 28, 14, 0.96), rgba(4, 18, 9, 0.98));
+  border: 1px solid var(--hk-border-strong);
+  border-radius: var(--radius-sm);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+.mode-hacker .hacker-command-bar-option {
+  font-family: var(--font-mono);
+  color: var(--hk-fg-muted);
+}
+.mode-hacker .hacker-command-bar-option:hover,
+.mode-hacker .hacker-command-bar-option.is-active {
+  background: rgba(0, 255, 65, 0.08);
+  color: var(--hk-fg-bright);
+}
+.mode-hacker .hacker-command-bar-cat {
+  color: var(--hk-amber);
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.mode-hacker .hacker-command-bar-label { color: var(--hk-fg); }
+.mode-hacker .hacker-command-bar-desc { color: var(--hk-fg-dim); }
+.mode-hacker .hacker-command-bar-match {
+  background: transparent;
+  color: var(--hk-amber);
+  font-weight: 700;
+}
+.mode-hacker .hacker-command-bar-shortcut {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  color: var(--hk-fg-dim);
+  border: 1px solid var(--hk-border);
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 4px;
+  padding: 0 5px;
+}
+.mode-hacker .hacker-command-bar-empty {
+  color: var(--hk-fg-dim);
+  font-family: var(--font-mono);
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   CLI HINT (Wave 8 — CliHint.tsx)  →  kit '.hk-cli-hint'
+   DOM: <code.hacker-cli-hint><span.hacker-cli-hint-sigil>$</span>
+        <span.hacker-cli-hint-cmd>dcent (cmd)</span></code>
+   Kit '.hk-cli-hint': dim, .64rem mono, .02em, user-select:text, ellipsis.
+   ════════════════════════════════════════════════════════════════════════ */
+.mode-hacker .hacker-cli-hint {
+  font-family: var(--font-mono);
+  font-size: 0.64rem;
+  letter-spacing: 0.02em;
+  color: var(--hk-fg-dim);
+  user-select: text;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+  opacity: 1;
+}
+.mode-hacker .hacker-cli-hint:hover,
+.mode-hacker .hacker-cli-hint:focus-visible {
+  color: var(--hk-fg-bright);
+  opacity: 1;
+}
+/* Kit hint sigil is dim inline '$ ' — production splits it into its own
+   span; keep it amber so the CLI sigil reads as a prompt (matches the
+   kit's amber '.hk-prompt' family for command surfaces). */
+.mode-hacker .hacker-cli-hint-sigil {
+  color: var(--hk-amber);
+  font-weight: 700;
+}
+.mode-hacker .hacker-cli-hint-cmd { color: inherit; }
+
+/* ════════════════════════════════════════════════════════════════════════
+   OVERLAYS  →  kit '.hk-help' / modal grammar (gate, shortcuts, palette)
+   Kit '.hk-help': gradient(rgba(6,28,14,.96)→rgba(4,18,9,.98)) + 1px amber
+   border + box-shadow 0 24px 60px rgba(0,0,0,.5), 0 0 40px rgba(250,103,0,
+   .25). '.hk-help-title' = amber 800 1rem. '.hk-help-eyebrow' = .62rem
+   .15em uppercase amber 800. '.hk-help-row' = grid[120px 1fr] .78rem muted.
+   ════════════════════════════════════════════════════════════════════════ */
+.mode-hacker .adv-modal-danger,
+.mode-hacker .adv-modal-pad {
+  background: linear-gradient(180deg, rgba(6, 28, 14, 0.96), rgba(4, 18, 9, 0.98));
+}
+.mode-hacker .adv-modal-title {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 1rem;
+  color: var(--hk-amber);                 /* kit '.hk-help-title' amber */
+  text-shadow: 0 0 6px rgba(250, 165, 0, 0.45);
+}
+.mode-hacker .adv-modal-title.is-danger {
+  color: var(--hk-red);
+  text-shadow: 0 0 6px rgba(239, 68, 68, 0.45);
+}
+.mode-hacker .adv-modal-body { color: var(--hk-fg-muted); font-family: var(--font-mono); }
+/* (kit '.hk-help-eyebrow' has no production hook — ShortcutHelpPanel renders
+   a flat title + rows, no per-group eyebrow. See no-hook note at end.)
+   kit '.hk-help-row' — keys cell + desc */
+.mode-hacker .adv-shortcut-keys,
+.mode-hacker .adv-shortcut-row .adv-shortcut-keys {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--hk-fg-bright);
+}
+.mode-hacker .adv-shortcut-desc {
+  color: var(--hk-fg-muted);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+}
+
+/* Tooltip/InfoDot already have a .mode-hacker green treatment upstream; we
+   leave that intact (kit-faithful: green, no change needed here).
+
+   ─── Kit elements with NO production hook (noted, NOT faked) ──────────────
+   The kit's 'hk-*' workstation has several primitives the shipped DOM never
+   renders, so there is nothing to skin (faking them would mean inventing
+   markup, which the brief forbids):
+     · '.hk-breadcrumb' (~/page) — production's banner is a flat
+       model@ip·state row + a separate '.hacker-context-bar'; there is no
+       breadcrumb element. (Closest analogues skinned above.)
+     · '.hk-panel-dot' (the 7px pulsing dot beside every panel title) — no
+       production panel renders a title dot element.
+     · '.hk-stat' / '.hk-stat-value' heading-number tiles, '.hk-tele-kpi'
+       big KPI rail, '.hk-tele-progress'/'.hk-tele-temp' bars — production's
+       StatusStrip uses its own 'status-strip-item' markup (reskinned to the
+       kit row grammar, but not the kit's heading-number stat tiles).
+     · '.hk-i2c-grid' / '.hk-regs-row' / '.hk-sv2-row' / '.hk-beat-stream' /
+       '.hk-flight-row' exact grid templates — each production tool ships its
+       own table/grid DOM; they inherit the kit table/pre/mono palette above
+       but not the kit's bespoke per-tool grid-template-columns.
+     · '.hk-console-caret' step-end block animation — production uses the
+       shared '.ds-cursor-blink' class on its cursor span; color is
+       kit-matched (amber) but the blink keyframe is the production one.
+     · '.hk-cli.warn' (yellow CLI button variant) — production ships only
+       btn-secondary/primary/danger; no warn button class is rendered.
+     · '.hk-help-eyebrow' (per-group amber eyebrow in the shortcuts modal) —
+       production's ShortcutHelpPanel renders a flat title + flat
+       keys/desc rows, with no grouped eyebrow element.
+     · '.hk-nav-meta' (kit nav footer meta line) — production's sidebar foot
+       is a ModeSwitch + collapse button, not a kit meta block.
+   These are faithful-approximation boundaries, identical in intent to the
+   file-header "Faithful approximations" list. */
+
+/* ════════════════════════════════════════════════════════════════════════
+   PHASE 3 / K1 — PANE-LEVEL PIXEL FIDELITY (appended; tightens, never
+   rewrites the working blocks above). Loaded LAST, so these win over
+   advanced.css's base hacker-inspector / adv-kv / adv-section-eyebrow.
+
+   Largest gap closed here: the per-tool PANEL HEADER. 26 of the 32 tools
+   render the '.hacker-inspector*' chrome (header/eyebrow/title/status/
+   help/refresh/footer/stats), NOT '.adv-card-title'/'.section-title' (those
+   are inner sub-card titles). advanced.css gives the inspector title 1rem
+   #c8ffd8 UPPERCASE no-glow + a .62rem .08em lowercase eyebrow + a flat
+   green status — all divergent from the kit. The kit's panel grammar is
+   '.hk-panel-head' (border-bottom divider, padding 11/16/9) + '.hk-panel-
+   title' (.78rem 700 .04em #00FF41 + 0 0 6px green glow, NOT uppercase) +
+   '.hk-nav-eyebrow' (.58rem .15em uppercase dim) + '.hk-pill' (status) +
+   '.hk-cli' (the header buttons) + '.hk-panel-right' (footer meta).
+   Production keeps its filled sub-card header shell (a documented
+   faithful-approximation — kit head is a divider, not a fill); we re-pin
+   the TYPOGRAPHY + chip/button grammar to the kit's exact values, which is
+   the high-leverage fidelity win on every tool pane.
+   ════════════════════════════════════════════════════════════════════════ */
+
+/* kit '.hk-panel-head' — border-bottom divider, pad 11px 16px 9px, hk-border.
+   We keep production's sub-card fill (faithful approx) but pin the padding +
+   border to the kit so the head reads at the kit's rhythm. */
+.mode-hacker .hacker-inspector-header {
+  padding: 11px 16px 9px;
+  border: 1px solid var(--hk-border);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 255, 65, 0.04);
+}
+/* kit '.hk-nav-eyebrow' — .58rem .15em uppercase dim. Production renders the
+   text as '// register inspector' (already kit-styled '//' prefix); pin the
+   metrics to the kit. Kept lowercase: the literal '//tool' text is the kit's
+   own eyebrow convention, so forcing uppercase would FIGHT the kit copy. */
+.mode-hacker .hacker-inspector-eyebrow {
+  font-family: var(--font-mono);
+  font-size: 0.58rem;
+  color: var(--hk-fg-dim);
+  letter-spacing: 0.15em;
+  text-transform: none;
+  font-weight: 700;
+}
+/* kit '.hk-panel-title' — .78rem 700 .04em #00FF41 + 0 0 6px green glow.
+   advanced.css had 1rem #c8ffd8 UPPERCASE no-glow (the biggest single
+   per-pane divergence). NOT uppercase in the kit. */
+.mode-hacker .hacker-inspector-title {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--hk-fg-bright);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  text-shadow: 0 0 6px rgba(0, 255, 65, 0.4);
+}
+.mode-hacker .hacker-inspector-subtitle {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--hk-fg-muted);
+}
+/* kit '.hk-pill' — pill, rgba(0,255,65,.08) bg, rgba(0,255,65,.3) border,
+   #00FF41 text, .68rem mono .04em. (advanced.css used --accent amber + a
+   square radius-xs — the kit status pill is green + 999px.) */
+.mode-hacker .hacker-inspector-status {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.04em;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(0, 255, 65, 0.3);
+  background: rgba(0, 255, 65, 0.08);
+  color: var(--hk-fg-bright);
+}
+.mode-hacker .hacker-inspector-status.warning {
+  border-color: rgba(251, 191, 36, 0.4);
+  background: rgba(251, 191, 36, 0.08);
+  color: var(--hk-yellow);
+}
+.mode-hacker .hacker-inspector-status.danger {
+  border-color: rgba(239, 68, 68, 0.45);
+  background: rgba(239, 68, 68, 0.08);
+  color: var(--hk-red);
+}
+.mode-hacker .hacker-inspector-status.neutral {
+  border-color: var(--hk-border);
+  background: rgba(0, 255, 65, 0.04);
+  color: var(--hk-fg-muted);
+}
+/* kit '.hk-cli' base (green) — the inspector header buttons. .76rem 600
+   .02em, rgba(0,255,65,.05), 1px rgba(0,255,65,.3); hover bg .12 / border
+   .55 / 0 0 10px rgba(0,255,65,.32). */
+.mode-hacker .hacker-inspector-help,
+.mode-hacker .hacker-inspector-refresh {
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(0, 255, 65, 0.3);
+  background: rgba(0, 255, 65, 0.05);
+  color: var(--hk-fg-bright);
+  transition: all 0.12s var(--ease-standard);
+}
+.mode-hacker .hacker-inspector-help:hover,
+.mode-hacker .hacker-inspector-refresh:hover {
+  background: rgba(0, 255, 65, 0.12);
+  border-color: rgba(0, 255, 65, 0.55);
+  box-shadow: 0 0 10px rgba(0, 255, 65, 0.32);
+}
+/* kit '.hk-panel-right' — .7rem mono muted, inline gap-6 (footer meta row). */
+.mode-hacker .hacker-inspector-footer {
+  border-top: 1px solid var(--hk-border);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--hk-fg-muted);
+}
+.mode-hacker .hacker-inspector-stats { color: var(--hk-fg-muted); }
+.mode-hacker .hacker-inspector-stats > span + span::before {
+  color: var(--hk-fg-dim);
+  opacity: 1;
+}
+.mode-hacker .hacker-inspector-toolbar {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--hk-fg-muted);
+}
+
+/* kit '.hk-nav-eyebrow' — generic in-panel section eyebrow. advanced.css
+   had .8rem .08em uppercase ACCENT (amber); the kit eyebrow is .58rem .15em
+   uppercase DIM green. (Distinct from '.hacker-section-eyebrow'/'.ds-section-
+   eyebrow' already pinned above — this is the advanced-tool variant.) */
+.mode-hacker .adv-section-eyebrow {
+  font-family: var(--font-mono);
+  font-size: 0.58rem;
+  color: var(--hk-fg-dim);
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  font-weight: 700;
+}
+
+/* kit '.hk-kv' row — '.hk-kv-k' = .68rem .08em uppercase dim 700;
+   '.hk-kv-v' = hk-fg tabular (NOT accent — advanced.css colored every value
+   amber, which over-saturates a dense KV panel). is-orange/is-red opt-ins
+   keep their semantic color. */
+.mode-hacker .adv-kv-k {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--hk-fg-dim);
+  font-weight: 700;
+}
+.mode-hacker .adv-kv-v {
+  color: var(--hk-fg);
+  font-variant-numeric: tabular-nums;
+}
+.mode-hacker .adv-kv-v.is-orange { color: var(--hk-amber); }
+.mode-hacker .adv-kv-v.is-red { color: var(--hk-red); }
+
+/* ── SV2 protocol inspector → kit '.hk-sv2-row' grammar ──────────────────
+   kit '.hk-sv2-row': .76rem, border-bottom 1px dashed hk-border, baseline
+   grid. '.hk-sv2-dir.in' = #7DD3FC, '.out' = #00FF41 — but production sets
+   the row color via an inline 'style=((color:getRowColor()))' (JS), so the
+   per-direction tint is a NO-HOOK for CSS (documented; not faked). What we
+   CAN pin: ts (dim), size (right/muted), tag (amber), field keys (dim
+   uppercase), the header row, and the message-list mono floor. */
+.mode-hacker .sv2-msglist {
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+}
+.mode-hacker .sv2-row-msg,
+.mode-hacker .sv2-row-arrow {
+  font-family: var(--font-mono);
+}
+.mode-hacker .sv2-row-ts { color: var(--hk-fg-dim); }
+.mode-hacker .sv2-row-size,
+.mode-hacker .sv2-col-right {
+  color: var(--hk-fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+.mode-hacker .sv2-row-tag {
+  color: var(--hk-amber);
+  font-weight: 700;
+}
+.mode-hacker .sv2-colhead {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--hk-fg-dim);
+  border-bottom: 1px solid var(--hk-border);
+}
+.mode-hacker .sv2-field-k {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--hk-fg-dim);
+  font-weight: 700;
+}
+.mode-hacker .sv2-field-name { color: var(--hk-fg-bright); }
+.mode-hacker .sv2-c-sent { color: var(--hk-fg-bright); }
+.mode-hacker .sv2-c-recv { color: var(--hk-blue); }
+.mode-hacker .sv2-expanded {
+  background: rgba(0, 0, 0, 0.32);
+  border-left: 2px solid var(--hk-border-strong);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--hk-fg-muted);
+}
+.mode-hacker .sv2-ctl-btn,
+.mode-hacker .sv2-inactive-action {
+  font-family: var(--font-mono);
+}
+.mode-hacker .sv2-inactive-title { color: var(--hk-fg-bright); }
+.mode-hacker .sv2-inactive-err { color: var(--hk-red); }
+
+/* ── I2C scanner → kit '.hk-i2c-cell' / '.hk-table' grammar ──────────────
+   kit '.hk-i2c-cell.on' = var(--accent) bg + #0A0A0A text 800 + 0 0 8px
+   rgba(250,103,0,.6). Production's I2cScanner is a '.hk-table'-style table
+   (i2c-table / i2c-th-* / i2c-td-*), not the kit's 28px+16col cell grid
+   (NO-HOOK for the literal grid). Pin the cell/td palette to the kit:
+   accent = the active/answered address, dim = passthrough/empty. */
+.mode-hacker .i2c-table th,
+.mode-hacker .i2c-th-right {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--hk-fg-dim);
+  border-bottom: 1px solid var(--hk-border);
+}
+.mode-hacker .i2c-table td,
+.mode-hacker .i2c-td-mono {
+  font-family: var(--font-mono);
+  border-bottom: 1px dashed var(--hk-border);
+}
+.mode-hacker .i2c-td-accent { color: var(--hk-fg-bright); }
+.mode-hacker .i2c-td-dim,
+.mode-hacker .i2c-td-empty { color: var(--hk-fg-dim); }
+.mode-hacker .i2c-td-right { text-align: right; font-variant-numeric: tabular-nums; }
+/* kit '.hk-i2c-cell.on' — the answered-address status badge reads as the
+   kit's amber "on" cell. */
+.mode-hacker .i2c-status {
+  font-family: var(--font-mono);
+  color: var(--hk-amber);
+  font-weight: 700;
+}
+.mode-hacker .i2c-status.i2c-td-dim { color: var(--hk-fg-dim); font-weight: 400; }
+.mode-hacker .i2c-pic-decode {
+  background: rgba(0, 0, 0, 0.32);
+  border-left: 2px solid var(--hk-border-strong);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--hk-fg);
+}
+.mode-hacker .i2c-tx-row {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  border-bottom: 1px dashed var(--hk-border);
+}
+.mode-hacker .i2c-tx-ts,
+.mode-hacker .i2c-tx-ms { color: var(--hk-fg-dim); }
+.mode-hacker .i2c-tx-dir,
+.mode-hacker .i2c-tx-addr { color: var(--hk-fg-bright); }
+.mode-hacker .i2c-tx-data { color: var(--hk-fg); }
+.mode-hacker .i2c-tx-bus { color: var(--hk-fg-muted); }
+
+/* ── PID tuner → kit '.hk-stat' / telemetry grammar ─────────────────────
+   kit '.hk-stat-value' = heading 800 1.5rem #00FF41; '.hk-stat-label' =
+   .58rem .14em uppercase dim 700. PID setpoint/term blocks read as the
+   kit's stat tiles + term bars. */
+.mode-hacker .pid-chart-card,
+.mode-hacker .pid-state {
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid var(--hk-border);
+  border-radius: var(--radius-sm);
+}
+.mode-hacker .pid-chart-title,
+.mode-hacker .pid-params-title {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--hk-fg-bright);
+  text-shadow: 0 0 6px rgba(0, 255, 65, 0.4);
+}
+.mode-hacker .pid-sp-label,
+.mode-hacker .pid-param-head {
+  font-family: var(--font-mono);
+  font-size: 0.58rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--hk-fg-dim);
+  font-weight: 700;
+}
+.mode-hacker .pid-sp-value,
+.mode-hacker .pid-param-val {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  color: var(--hk-fg-bright);
+  font-variant-numeric: tabular-nums;
+}
+.mode-hacker .pid-sp-actual { color: var(--hk-amber); }
+.mode-hacker .pid-term-head { color: var(--hk-fg-dim); font-family: var(--font-mono); }
+.mode-hacker .pid-term-val {
+  color: var(--hk-fg);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.mode-hacker .pid-term-track {
+  background: rgba(0, 255, 65, 0.1);
+  border-radius: 3px;
+}
+.mode-hacker .pid-term-bar {
+  background: linear-gradient(90deg, var(--hk-fg-bright), var(--hk-amber));
+  box-shadow: 0 0 8px var(--hk-amber);
+}
+.mode-hacker .pid-legend {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--hk-fg-muted);
+}
+
+/* ── Console header / tab bar → kit '.hk-console-bar' grammar ────────────
+   The Console.tsx header row ('console-header*' + 'console-tab-bar') is the
+   production analogue of the kit '.hk-console-bar' (.72rem mono, the
+   '.hk-em' accent count). The Wave-8 '.console-prompt*' echo row is pinned
+   above (line ~934) and is NOT touched here — preserved verbatim. */
+.mode-hacker .console-header,
+.mode-hacker .console-tab-bar {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  border-bottom: 1px solid var(--hk-border);
+  background: linear-gradient(90deg, rgba(0, 255, 65, 0.04), transparent);
+}
+.mode-hacker .console-header-title {
+  color: var(--hk-fg-bright);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+.mode-hacker .console-header-meta { color: var(--hk-fg-dim); }
+.mode-hacker .console-header-count { color: var(--hk-fg-muted); }
+.mode-hacker .console-header-count-err { color: var(--hk-red); }
+.mode-hacker .console-header-count-warn { color: var(--hk-yellow); }
+.mode-hacker .console-line-level { font-family: var(--font-mono); font-weight: 700; }
+.mode-hacker .console-severity-group { border-color: var(--hk-border); }
+.mode-hacker .console-output-shell { background: transparent; }
+
+/* kit '.hk-subpanel' — the BeatLab / generic register-inspector inner mini
+   card already inherits the .glass-card/.register-inspector skin above;
+   pin its head text to the kit '.hk-subpanel-head' (.72rem 700 green .04em)
+   where tools render an '.adv-card-title.is-sm' inside a sub-card. */
+.mode-hacker .adv-card-title.is-sm,
+.mode-hacker .adv-card-title.is-sm-tight {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--hk-fg-bright);
+}
+
+/* ─── PHASE 3 / K1 — Kit elements with NO production hook (noted, NOT faked) ─
+     · '.hk-sv2-dir.in/.out' direction tint — Sv2ProtocolInspector sets the
+       row color via an inline 'style=((color:getRowColor(...)))' (JS), so
+       the per-message blue/green direction tint cannot be themed from CSS
+       without fighting an inline style. The ts/size/tag/field/header/list
+       grammar IS pinned; the dynamic dir color is left to the component.
+     · '.hk-i2c-grid' (28px + 16-col address matrix) — I2cScanner ships a
+       '.hk-table'-style row table (i2c-table/i2c-td-*), not the kit's CSS
+       grid matrix. The cell/td PALETTE is pinned to the kit (accent = on,
+       dim = passthrough); the literal grid-template is component DOM.
+     · '.hk-stat-value' heading-number tiles & '.hk-tele-kpi' big KPI rail —
+       PID/telemetry tools reuse their own pid- and status-strip markup; pinned
+       to the kit stat/label palette but not the kit's bespoke tile DOM.
+     · '.hk-beat-stream' 8-col nonce grid & '.hk-flight-row' / '.hk-regs-row'
+       exact grid-template-columns — each tool ships its own grid DOM; they
+       inherit the kit table/pre/mono palette but not the kit grid templates.
+   Same faithful-approximation contract as the file-header + the first
+   no-hook block: skin the real DOM to the kit's exact palette/type, never
+   invent markup to match a kit primitive production does not render. */

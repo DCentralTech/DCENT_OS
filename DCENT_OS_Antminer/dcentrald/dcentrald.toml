@@ -1,0 +1,176 @@
+# dcentrald.toml — DCENTos Mining Daemon Configuration
+# Home mining config — s9 at 203.0.113.106
+
+[general]
+hostname = "dcentral-s9"
+log_level = "info"
+
+[pool]
+url = "stratum+tcp://solo.ckpool.org:3333"
+sv2_url = "stratum2+tcp://v2.stratum.braiins.com:3333"
+# SV2 Standard Channels cause nonce exhaustion on S9 (~2.5s to exhaust 4×2^32 search space).
+# Until Extended Channels or per-job merkle diversification is implemented, use V1.
+protocol = "sv1"
+worker = ""
+password = "x"
+# Failover-robustness knobs (operator-settable since 2026-06-09; unset keeps
+# the shipped defaults shown below -- behavior byte-identical to prior builds):
+# primary_return_stability_secs = 900   # anti-flap cool-down before re-preferring the primary; 0 = legacy round-robin
+# no_notify_failover_secs = 300         # no new job for this long -> fail the session into failover; 0 = disabled
+# reject_rate_failover_pct = 0          # 0 = DISABLED (highest flap risk; opt-in, 1-100)
+# reject_rate_failover_min_samples = 100  # min post-handshake shares before reject-rate failover may act
+
+[mining]
+# Home mining: 500 MHz keeps 3-chain S9 under 1000W
+# S9 at 500 MHz ≈ ~750W with 3 boards, ~10 TH/s
+enabled = false
+frequency_mhz = 500
+voltage_mv = 9100
+suggest_difficulty = 8192
+passthrough = false
+version_rolling = true
+version_rolling_mask = 0x1fffe000
+
+# HLA-10 degraded-hashrate ALERT floor (GH/s). When > 0 and the miner has hashed
+# at least once, a sustained total hashrate below this floor (but above zero —
+# a degradation, not a full stop, which the existing mining_stopped alert covers)
+# fires a `hashrate_degraded` webhook/notification. DETECTION ONLY — it never
+# throttles, reboots, or touches hardware. 0 = DISABLED (default). Example: a
+# ~26 TH/s S19j Pro might set 20000 to be alerted if it drops below ~20 TH/s.
+# degraded_hashrate_alert_floor_ghs = 0.0
+#
+# Or, the VNish/LuxOS-matching %-form (preferred — you need not know your exact
+# GH/s): alert below this PERCENT of the miner's rated nominal hashrate. When
+# > 0 it takes precedence over the absolute floor above. 0 = DISABLED. Example:
+# 80 = alert when sustained below 80% of rated nameplate.
+# degraded_hashrate_alert_pct = 0.0
+
+#  W1 — work-table stale-age eviction divisor.
+# Threshold = work_id_space / stale_age_divisor.
+# Default 4 (= 64-cycle threshold for BM1387 / BM1397 / BM1398 8-bit ring).
+# Set to 1 to revert to legacy `>= work_id_space` behavior if a regression
+# appears post-flash.
+# for the RE evidence behind this default.
+stale_age_divisor = 4
+
+[power]
+target_watts = 1000  # Hard cap for home use
+
+[thermal]
+# Quiet home mining — lower target temp = lower fan speed
+target_temp_c = 60
+hot_temp_c = 70
+dangerous_temp_c = 80
+fan_min_pwm = 10
+fan_max_pwm = 30
+
+[api]
+cgminer_port = 4028
+http_port = 8080
+websocket = true
+cgminer_bind_lan = false
+# API-1 (security): allow MUTATING CGMiner/LuxOS verbs (addpool/switchpool/
+# config changes) from NON-loopback LAN peers. DEFAULT = false (fail closed):
+# even with cgminer_bind_lan=true, remote mutating verbs stay blocked unless
+# this is ALSO true (loopback writes always work). Reads/monitoring are
+# unaffected. Set true ONLY on a fully trusted/isolated LAN.
+cgminer_lan_writes = false
+# Prometheus /metrics auth. DEFAULT = true (fail closed): the exposition leaks
+# hashrate, pool URL, worker, and per-pool share counts, so a vanilla
+# unauthenticated scrape is rejected with 401. Scrape it with a bearer session
+# token (POST /api/auth/session) — see docs/PROMETHEUS_SCRAPE.md for the
+# Prometheus `authorization` + remote_write recipe. Set false ONLY on a
+# trusted/isolated monitoring LAN to allow anonymous scrapes.
+metrics_require_auth = true
+
+[donation]
+# Voluntary 2% donation — supports open-source firmware development.
+# Our autotuner saves more than 2% in energy — the donation pays for itself.
+# Adjust 0-5% or set enabled = false to disable entirely.
+enabled = true
+percent = 2.0
+pool_url = "stratum+tcp://pool.d-central.tech:3333"
+worker = "DungeonMaster"
+password = "x"
+fallback_enabled = true
+fallback_pool_url = "stratum+tcp://stratum.braiins.com:3333"
+fallback_worker = "DungeonMaster"
+fallback_password = "x"
+cycle_duration_s = 3600
+
+[watchdog]
+enabled = false
+kick_interval_s = 5
+
+[hash_on_disconnect]
+# Keep ASICs running with last job when pool disconnects
+# Prevents thermal shock from sudden stop
+enabled = true
+
+[mode]
+active = "standard"
+
+[autotuner]
+# Per-chip frequency auto-tuning (TABS algorithm)
+# DCENTos tunes all 63 chips in parallel in ~15 seconds
+# VNish takes 3-6 hours doing it one chip at a time
+enabled = false
+preset = "balanced_home"
+target_mode = "hashrate"         # hashrate | power | efficiency
+measurement_window_s = 3         # seconds per binary search step
+verification_window_s = 15       # seconds to verify stability
+error_threshold_pct = 0.5        # max HW error rate per chip
+safety_margin_pct = 5.0          # headroom below max stable freq
+min_freq_mhz = 200               # floor (below = chip is dead)
+max_freq_mhz = 750               # ceiling (safety clamp, conservative for home mining)
+background_interval_s = 60       # background health check interval
+# circuit_capacity_watts = 1350   # Real-time power cap (watts). Throttles freq if wall power
+                                  # exceeds this limit. 1350 = 120V/15A with 25% safety margin.
+                                  # Omit or set to null to disable enforcement.
+
+[led]
+# LED status indicators on front panel
+enabled = true
+heartbeat_on_ms = 100              # green LED on-time during mining heartbeat
+heartbeat_off_ms = 900             # green LED off-time (1Hz cycle = 100+900)
+locate_pattern = "imperial_march"  # default "Find My Miner" blink pattern
+locate_duration_s = 30             # how long locate plays before auto-stop
+flash_on_accepted_share = true     # brief green flash on accepted share
+flash_on_rejected_share = true     # brief red flash on rejected share
+night_mode_disable = false         # turn off LEDs during thermal night mode hours
+celebration_on_lucky_share = true  # celebrate shares 10x+ above target difficulty
+chain_status_blink_codes = true    # flash green N times when chain N comes online
+
+[mode.home]
+# Home mode settings (not active while mode.active = "standard")
+target_watts = 800
+
+[mode.home.night_mode]
+enabled = false
+start_hour = 22
+end_hour = 7
+
+# ── MQTT / Home Assistant integration (P2-10) ────────────────────────────────
+# Publishes miner stats to an MQTT broker with Home Assistant auto-discovery, and
+# (when enabled) subscribes to a command topic so HA can set a few SAFE setpoints
+# (fan PWM, target watts, target chip temp). Every commanded value is re-clamped
+# to the existing safety caps before it touches hardware (fan PWM <= 30 in home
+# mode; target temp <= 60 C; watts to the configured envelope) — a remote command
+# can never bypass a safety gate. Ships DISABLED. Observe state at GET /api/mqtt/status.
+[mqtt]
+enabled = false                       # master switch for the MQTT publisher + subscriber
+broker = "mqtt://203.0.113.100:1883"  # broker URL (mqtt:// or mqtts://)
+topic_prefix = "dcentrald"            # base topic; entities live under <prefix>/<name>
+discovery = true                      # publish HA MQTT-discovery configs on connect
+# username = "homeassistant"          # optional broker credentials
+# password = "secret"
+publish_interval_s = 10               # stats publish cadence (seconds)
+
+# ── Webhook event notifications (P2-10) ──────────────────────────────────────
+# POSTs JSON on mining/pool/lucky-share/OTA events (e.g. to a Discord/Slack relay
+# or a home automation hook). Ships DISABLED. `events = []` means "all events".
+[webhook]
+enabled = false
+url = "https://example.com/dcentos-hook"
+# events = ["mining_started", "pool_failover", "lucky_share", "share_milestone", "ota"]
+miner_name = "dcentos"                # label included in every payload

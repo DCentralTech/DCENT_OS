@@ -1,0 +1,62 @@
+/* ──────────────────────────────────────────────────────────────────────────
+   block-tile.css — Rich Block Modal (extracted Phase 2.A)
+   Plus generic chip-detail variant (.bm.bm-chip) reused for the
+   ASIC chip drill-down in Phase 2.F.
+   ────────────────────────────────────────────────────────────────────────── */
+.bm-backdrop{position:fixed;inset:0;z-index:1000;background:rgba(5,8,14,.75);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);display:none;align-items:center;justify-content:center;padding:40px 20px;animation:bmFade .2s ease-out}
+.bm-backdrop.show{display:flex}
+@keyframes bmFade{from{opacity:0}to{opacity:1}}
+.bm{background:linear-gradient(180deg,#141c28 0%,#0b1018 100%);border:1px solid rgba(247,147,26,.32);border-radius:16px;padding:28px 32px;max-width:720px;width:100%;max-height:90vh;overflow:auto;position:relative;box-shadow:0 24px 80px rgba(0,0,0,.7),0 0 80px rgba(247,147,26,.14),inset 0 1px 0 rgba(255,255,255,.05);animation:bmPop .28s cubic-bezier(.34,1.56,.64,1)}
+@keyframes bmPop{from{opacity:0;transform:translateY(10px) scale(.96)}to{opacity:1;transform:none}}
+.bm-x{position:absolute;top:14px;right:16px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:8px;width:32px;height:32px;color:var(--text);font-size:20px;line-height:1;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;transition:all var(--dur-fast)}
+.bm-x:hover{background:rgba(248,113,113,.12);border-color:rgba(248,113,113,.35);color:#f87171}
+.bm-head{display:grid;grid-template-columns:1fr auto;gap:22px;padding-bottom:18px;border-bottom:1px dashed rgba(255,255,255,.08)}
+@media(max-width:600px){.bm-head{grid-template-columns:1fr}}
+.bm-eyebrow{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:center}
+.bm-brand{width:26px;height:26px;flex-shrink:0;color:var(--accent);filter:drop-shadow(0 0 8px var(--glow));margin-right:4px}
+.bm-brand .hl{fill:rgba(255,238,200,.82)}
+.bm-title{font-family:var(--font);font-size:26px;font-weight:700;color:var(--text);letter-spacing:-.4px;display:flex;align-items:baseline;gap:10px;margin-bottom:10px;flex-wrap:wrap}
+.bm-title b{font-family:var(--mono);font-weight:800;color:var(--accent);font-variant-numeric:tabular-nums}
+.bm-glyph{font-size:22px;color:var(--accent);filter:drop-shadow(0 0 8px rgba(247,147,26,.6))}
+.bm-full{display:flex;flex-direction:column;gap:4px;font-family:var(--mono)}
+.bm-full .k{color:var(--dim);text-transform:uppercase;letter-spacing:1.3px;font-size:9px;font-weight:700}
+.bm-full code{color:var(--text);font-size:11px;word-break:break-all;background:rgba(0,0,0,.4);padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,.05)}
+.bm-reward{text-align:right;font-family:var(--mono);display:flex;flex-direction:column;gap:4px;min-width:180px}
+.bm-reward .k{color:var(--dim);font-size:9px;text-transform:uppercase;letter-spacing:1.5px;font-weight:700}
+.bm-reward b{color:var(--text);font-weight:700}
+.bm-reward .v{font-family:var(--mono);font-size:28px;font-weight:800;letter-spacing:-.8px;line-height:1;color:var(--accent);text-shadow:0 0 14px rgba(247,147,26,.35);margin:2px 0;font-variant-numeric:tabular-nums}
+@media(max-width:600px){.bm-reward{text-align:left;min-width:0}}
+.bm-section{margin-top:22px}
+.bm-section-h{font-family:var(--mono);font-size:10px;color:var(--accent);letter-spacing:1.8px;font-weight:700;margin-bottom:12px;text-transform:uppercase}
+.bm-contribution{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+@media(max-width:600px){.bm-contribution{grid-template-columns:repeat(2,1fr)}}
+.bm-cb{background:rgba(255,255,255,.022);border:1px solid rgba(255,255,255,.05);border-radius:10px;padding:10px 12px}
+.bm-cb .k{font-family:var(--mono);font-size:8.5px;color:var(--dim);letter-spacing:1.4px;font-weight:700;margin-bottom:4px}
+.bm-cb .v{font-family:var(--mono);font-size:18px;font-weight:800;font-variant-numeric:tabular-nums;letter-spacing:-.3px;color:var(--text)}
+.bm-cb .v.hot{color:var(--accent);text-shadow:0 0 10px rgba(247,147,26,.3)}
+.bm-cb .v.sm{font-size:12px;font-weight:700;letter-spacing:0;word-break:break-all}
+.bm-cb .v.lg{font-size:22px}
+.bm-tbl{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11.5px}
+.bm-tbl td{padding:7px 0;border-bottom:1px dashed rgba(255,255,255,.05)}
+.bm-tbl tr:last-child td{border-bottom:0}
+.bm-tbl td:first-child{color:var(--dim);text-transform:uppercase;letter-spacing:1.1px;font-size:9.5px;width:42%;font-weight:700}
+.bm-tbl td:last-child{color:var(--text);font-variant-numeric:tabular-nums}
+.bm-tbl b{color:var(--accent);font-weight:700}
+.bm-tbl code{background:rgba(0,0,0,.35);padding:2px 8px;border-radius:4px;color:var(--accent);border:1px solid rgba(255,255,255,.05);font-size:11px}
+.bm-tbl .dim{color:var(--muted);font-style:italic}
+.bm-hrow{display:flex;flex-direction:column;gap:4px;font-family:var(--mono);background:rgba(0,0,0,.3);padding:8px 10px;border-radius:8px;border:1px solid rgba(255,255,255,.04);margin-bottom:8px}
+.bm-hrow .k{color:var(--dim);font-size:9px;letter-spacing:1.3px;text-transform:uppercase;font-weight:700}
+.bm-hrow code{color:var(--text);font-size:11px;word-break:break-all}
+.bm-foot{display:flex;justify-content:flex-end;gap:10px;margin-top:22px;padding-top:18px;border-top:1px dashed rgba(255,255,255,.08);flex-wrap:wrap}
+.bm-foot .btn{font-family:var(--font);font-size:12px;font-weight:600;padding:8px 14px;border-radius:8px;border:1px solid var(--border);background:var(--s-raised);color:var(--text);cursor:pointer;display:inline-flex;align-items:center;gap:6px;text-decoration:none;transition:all var(--dur-fast) var(--ease-out)}
+.bm-foot .btn:hover{border-color:rgba(247,147,26,.28);background:#17202c;transform:translateY(-1px)}
+.bm-foot .btn.primary{background:var(--accent);color:#000;border-color:transparent;box-shadow:0 0 0 1px rgba(255,255,255,.1) inset,0 6px 20px rgba(247,147,26,.30)}
+.bm-foot .btn.primary:hover{background:#ffb040}
+
+/* ── Generic chip-detail panel (Phase 2.F — reuses .bm shell) ──────── */
+.bm.bm-chip{max-width:560px}
+.bm-chip-svg-wrap{display:flex;justify-content:center;margin:6px 0 18px}
+.bm-chip-svg-wrap svg{width:240px;height:240px;filter:drop-shadow(0 0 24px var(--chip-glow,var(--glow)))}
+.bm-chip-meta{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:14px}
+@media(max-width:600px){.bm-chip-meta{grid-template-columns:repeat(2,1fr)}}
+.bm-chip-board-note{margin-top:14px;padding:10px 12px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.04);border-radius:8px;font-family:var(--mono);font-size:11px;color:var(--dim);line-height:1.55}

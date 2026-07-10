@@ -1,0 +1,207 @@
+#!/bin/sh
+#
+# S82dcentrald — Start DCENTos mining daemon on CV1835 (Antminer S19j Pro
+# Cvitek control board variant).
+#
+# Status: runtime-only / no fleet unit. The CV1835 carrier is not yet on
+# any bench, so this init script is shipped as the daemon entry point but
+# every safety value here is conservative. Live bring-up MUST gate on
+# `/etc/dcentos/board_status` showing `runtime-only-no-fleet-unit` and
+# explicit operator approval.
+#
+# CV1835 differences from the Zynq am1-s9 / am2 init:
+#   - No FPGA UIO devices to wait for (all ASIC comms via DevmemUart at
+#     0x0500D000-0x05010000 — see W10.3 cv183x register base extension).
+#   - eMMC-only persistence: /data is mmcblk0p5 (mounted as /config in
+#     stock layout, remounted /data here for parity).
+#   - PWM fan controller is the Cvitek cv183x_pwm IP at /sys/class/pwm/
+#     pwmchip0/pwm0 — no devmem AXI fan register.
+#
+# The wrapper still does fan safety on crash, but uses the sysfs PWM path
+# instead of devmem.
+#
+# D-Central Technologies — DCENTos.
+
+if [ -x /data/dcentrald ]; then
+    DAEMON="/data/dcentrald"
+else
+    DAEMON="/usr/local/bin/dcentrald"
+fi
+PIDFILE="/var/run/dcentrald.pid"
+CHILD_PIDFILE="/var/run/dcentrald-child.pid"
+EXPECTFILE="/tmp/dcentrald.expected_exit.pid"
+LOGFILE="/tmp/dcentrald.log"
+PWM_PATH="/sys/class/pwm/pwmchip0/pwm0"
+API_PORT=8080
+MAX_CRASH_RESTARTS=5
+RESTART_DELAY=2
+SCRIPT="$0"
+
+# Use persistent config if available, otherwise default
+if [ -f /data/dcentrald.toml ]; then
+    CONFIG="/data/dcentrald.toml"
+else
+    CONFIG="/etc/dcentrald.toml"
+fi
+
+# Safety: cap fan to home-mining ceiling on crash (PWM 30 / 100 = 30 %).
+# The PIC1704 watchdog cuts voltage within ~10-60 s if dcentrald is dead,
+# so the fan only has to keep cores from cooking in the gap. NEVER ramp
+# above PWM 30 here home mining caps
+# fans at 30 %.
+fan_safety_override() {
+    if [ -d "$PWM_PATH" ]; then
+        # Cvitek PWM uses ns period/duty_cycle. Period 1 ms (1_000_000 ns),
+        # duty 300 us (300_000 ns) ~= 30 % home-safe ceiling.
+        echo 1000000 > "$PWM_PATH/period" 2>/dev/null
+        echo  300000 > "$PWM_PATH/duty_cycle" 2>/dev/null
+        echo 1 > "$PWM_PATH/enable" 2>/dev/null
+        echo "$(date): SAFETY: fan PWM clamped to 30% (dcentrald exited)" >> $LOGFILE
+    fi
+}
+
+case "$1" in
+    start)
+        if [ ! -x "$DAEMON" ]; then
+            echo "  [SKIP] dcentrald: binary not found at $DAEMON"
+            exit 0
+        fi
+
+        if [ -d /data/dcent ]; then
+            chmod 0700 /data/dcent 2>/dev/null
+        fi
+        if [ -f /data/dcent/auth.json ]; then
+            chmod 0600 /data/dcent/auth.json 2>/dev/null
+        fi
+
+        echo "Starting dcentrald mining daemon (cv1835-s19jpro)..."
+        echo "  Config: $CONFIG"
+        echo "  API:    REST/WebSocket :$API_PORT"
+
+        ORPHAN_PIDS=$(pidof dcentrald 2>/dev/null || true)
+        [ -n "$ORPHAN_PIDS" ] && {
+            echo "  [WARN] Killing orphaned dcentrald PID(s): $ORPHAN_PIDS"
+            for ORPHAN_PID in $ORPHAN_PIDS; do
+                echo "$ORPHAN_PID" > "$EXPECTFILE"
+                kill -TERM "$ORPHAN_PID" 2>/dev/null
+            done
+            for i in $(seq 1 30); do
+                pidof dcentrald > /dev/null 2>&1 || break
+                sleep 1
+            done
+            REMAINING_PIDS=$(pidof dcentrald 2>/dev/null || true)
+            [ -n "$REMAINING_PIDS" ] && {
+                echo "  [WARN] Force killing remaining: $REMAINING_PIDS"
+                rm -f "$EXPECTFILE"
+                fan_safety_override
+                for ORPHAN_PID in $REMAINING_PIDS; do
+                    kill -9 "$ORPHAN_PID" 2>/dev/null
+                done
+                sleep 1
+            }
+            rm -f "$CHILD_PIDFILE"
+        }
+
+        start-stop-daemon -S -b -m -p "$PIDFILE" \
+            -x /bin/sh -- -c "
+                CRASH_COUNT=0
+                while true; do
+                    $DAEMON --config $CONFIG >>$LOGFILE 2>&1 &
+                    CHILD_PID=\$!
+                    echo \$CHILD_PID > $CHILD_PIDFILE
+                    wait \$CHILD_PID
+                    EXIT_CODE=\$?
+                    EXPECTED_PID=\$(cat $EXPECTFILE 2>/dev/null || true)
+                    rm -f $CHILD_PIDFILE
+
+                    if [ \"\$EXPECTED_PID\" = \"\$CHILD_PID\" ]; then
+                        rm -f $EXPECTFILE
+                        echo \"\$(date): expected dcentrald exit (code \$EXIT_CODE)\" >> $LOGFILE
+                        exit \$EXIT_CODE
+                    fi
+
+                    rm -f $EXPECTFILE
+                    if [ \$EXIT_CODE -eq 0 ]; then
+                        echo \"\$(date): dcentrald exited cleanly\" >> $LOGFILE
+                        exit 0
+                    fi
+
+                    CRASH_COUNT=\$((CRASH_COUNT + 1))
+                    echo \"\$(date): dcentrald crash \$CRASH_COUNT/$MAX_CRASH_RESTARTS (code \$EXIT_CODE)\" >> $LOGFILE
+                    \"$SCRIPT\" safety
+                    if [ \$CRASH_COUNT -ge $MAX_CRASH_RESTARTS ]; then
+                        echo \"\$(date): dcentrald restart limit reached\" >> $LOGFILE
+                        exit \$EXIT_CODE
+                    fi
+                    sleep $RESTART_DELAY
+                done
+            "
+        echo "  [OK] dcentrald started"
+        echo "  Log: $LOGFILE"
+        ;;
+
+    stop)
+        echo "Stopping dcentrald mining daemon..."
+        CHILD_PID=$(cat "$CHILD_PIDFILE" 2>/dev/null || pidof dcentrald 2>/dev/null | awk '{print $1}')
+        WRAPPER_PID=$(cat "$PIDFILE" 2>/dev/null || true)
+        [ -n "$CHILD_PID" ] && echo "$CHILD_PID" > "$EXPECTFILE"
+        [ -n "$CHILD_PID" ] && kill -TERM "$CHILD_PID" 2>/dev/null
+        for i in $(seq 1 30); do
+            if [ -z "$CHILD_PID" ] || ! kill -0 "$CHILD_PID" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+        TIMED_OUT=0
+        if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+            echo "  [WARN] dcentrald did not exit in 30s — force killing"
+            rm -f "$EXPECTFILE"
+            TIMED_OUT=1
+        fi
+        [ "$TIMED_OUT" -eq 1 ] && kill -9 "$CHILD_PID" 2>/dev/null
+        if [ -n "$WRAPPER_PID" ] && kill -0 "$WRAPPER_PID" 2>/dev/null; then
+            kill -TERM "$WRAPPER_PID" 2>/dev/null
+            sleep 1
+            kill -9 "$WRAPPER_PID" 2>/dev/null
+        fi
+        rm -f "$PIDFILE" "$CHILD_PIDFILE"
+        if [ "$TIMED_OUT" -eq 1 ]; then
+            fan_safety_override
+            echo "  [WARN] Forced-stop path left fans in safety mode"
+        else
+            if [ -d "$PWM_PATH" ]; then
+                # Idle PWM 10 (~10% duty)
+                echo 1000000 > "$PWM_PATH/period" 2>/dev/null
+                echo  100000 > "$PWM_PATH/duty_cycle" 2>/dev/null
+                echo 1 > "$PWM_PATH/enable" 2>/dev/null
+            fi
+            echo "  [OK] dcentrald stopped, fans at idle"
+        fi
+        ;;
+
+    restart)
+        $0 stop
+        sleep 2
+        $0 start
+        ;;
+
+    safety)
+        fan_safety_override
+        ;;
+
+    status)
+        if start-stop-daemon -K -p "$PIDFILE" -t -q 2>/dev/null; then
+            PID=$(cat "$PIDFILE" 2>/dev/null)
+            echo "dcentrald is running (PID $PID)"
+        else
+            echo "dcentrald is not running"
+        fi
+        ;;
+
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,224 @@
+# DCENT_OS dcentrald BAKED DEFAULT config — S19j Pro am2 (Zynq am2)
+# D-Central Technologies, 2026-05-15
+#
+# Phase 4B (EE Finding 5 #6 + Finding 1) — this is the default config baked
+# into `/etc/dcentrald.toml` on every Buildroot-built am2-s19jpro image. It
+# is derived from `dcentrald_s19jpro_xil.toml` (the milestone-proven config
+# that produced the 2026-05-15 first-accepted-shares run on `a lab unit`) but
+# sanitized for first-boot safety on ANY am2 unit:
+#
+#   * mining.enabled = false   — operator configures pool first via dashboard
+#                                or `/data/dcentrald.toml` before mining starts
+#   * pool.url / pool.worker   — empty; operator fills in
+#   * watchdog.enabled = true  — hardware watchdog ON by default (S82dcentrald
+#                                already kicks it; unattended panic must reset)
+#   * donation.enabled = true  — 2% donation default ( production
+#                                policy; XIL bring-up config has this off)
+#   * api.cgminer_port = 4028  — clean image owns :4028; XIL bring-up uses 4027
+#                                to avoid BraiinsOS BOSer collision on an
+#                                overlay-deploy
+#
+# Safety invariants that MUST NEVER change from baked defaults (EE Finding 5):
+#
+#   * mining.voltage_mv = 13_700      — chip-rail target, hard-clamped <=14_500
+#                                       by `DcentraldConfig::validate()` on
+#                                       am2 platforms (Phase 4C, commit 747947e4)
+#   * thermal.fan_max_pwm = 30        — home-quiet ceiling
+#
+#   * thermal.dangerous_temp_c = 80   — fail-closed threshold for Am2ThermalSupervisor
+#   * thermal.hot_temp_c = 70         — fan-step / hash-throttle threshold
+#   * hash_on_disconnect.enabled = false — home/unattended safety
+#   * mining.am2_no_nonce_timeout_s = 90 — home hard-stop trigger
+#
+# /data/dcentrald.toml takes precedence on every boot, so operator overrides
+# are safe and non-destructive. Per-unit Loki-vs-stock-APW12 differs only by
+# the [power.psu_override] block:
+#
+#   * Stock am2 unit (APW12 in chassis): leave [power.psu_override].enabled =
+#     false. The am2 hybrid Phase 0 will probe APW121215a on bus 0 @ 0x10 and
+#     bring up the rail via the smart-PSU path.
+#   * Loki-removed am2 unit (APW3 wired to gpio907): set
+#     [power.psu_override].enabled = true, model = "APW3", voltage_v = 12.8.
+#     The hybrid path skips the APW I²C probe, asserts PWR_CONTROL, and runs
+#     the dsPIC + BM1362 init unchanged. See:
+#       *
+#       *
+#       *
+#
+# NEVER-VIOLATE rules baked in:
+#   * MiscCtrl triple-write with 5 ms spacing
+#   * Deferred voltage gate on 5 stable heartbeat ticks
+#   * Board-temp I2C NACK → XADC die-temp fallback
+#   * PIC RESET NEVER sent on S19j Pro
+#   * AXI IIC unbind/SOFTR NEVER on am2
+#   * PSU I2C bit-bang PROBE disabled on am2;
+#     framed heartbeat/watchdog writes on bus 0 @ 0x10 are legal.
+#   * Fan ceiling PWM 30 for home mining ( /
+#     )
+#   * EEPROM 0x50..0x57 HAL write-denylist registered at am2 platform init
+#     (.74 hb2 incident 2026-04-29)
+
+[general]
+hostname = "dcentos-s19jpro"
+log_level = "info"
+
+[pool]
+# Operator MUST configure this via the dashboard or by editing
+# /data/dcentrald.toml before mining starts. Empty pool/worker keeps the
+# daemon in idle/API-only mode (see `has_configured_pool()` in config.rs).
+url = ""
+worker = ""
+password = "x"
+protocol = "sv1"
+
+[mining]
+# Idle-first default. Operator flips this to true (and configures pool above)
+# after first-boot SSH/MCP manageability is confirmed.
+enabled = false
+
+# Proven am2 BM1362 chip-rail target (the dsPIC regulates the 15.2 V PSU rail
+# down to this value). Hard-clamped to <=14_500 mV by validate() on am2.
+voltage_mv = 13700
+
+# RE-traced BM1362 am2 PLL condition; matches the 2026-05-15 milestone run.
+frequency_mhz = 525
+am2_pll_ramp = false
+
+# Home/lab safety guard: force PWR_CONTROL low after first work dispatch if
+# the FPGA never returns a nonce. Prevents overnight PWR-high stalls.
+am2_no_nonce_timeout_s = 90
+
+# Low-difficulty accepted-share proof target for first runs. Operator can
+# raise this once mining is stable.
+suggest_difficulty = 256
+
+# Cold-boot init path (NOT passthrough — passthrough on am2 post-bosminer
+# produces zero RX; proven on .139 Phase 13/14).
+passthrough = false
+
+# ASIC-side version rolling stays DISABLED on the hybrid FPGA dispatch path.
+version_rolling = false
+
+serial_device = "/dev/ttyS1"
+serial_chip_count = 126
+serial_chip_type = "BM1362"
+
+fpga_chain_base = "0x43C00000"
+fpga_chain_id = 1
+
+# Force the BM1362 MinerProfile, bypassing chip auto-detect.
+model = "s19jpro"
+
+skip_fifo_reset = false
+skip_board_temp = false
+
+[power]
+# psu_bypass (the daemon-path PSU bypass) stays off; the am2 hybrid path uses
+# [power.psu_override] (below) for the Loki bypass instead.
+psu_bypass = false
+
+# Conservative ceiling for a stock am2 chassis. Operator may raise for
+# higher-bin SKUs once they confirm the unit's PSU + ambient envelope.
+max_watts = 1200
+
+circuit_capacity_watts = 4800
+circuit_voltage_v = 240
+circuit_amperage_a = 20
+
+# --- PSU OVERRIDE ("Loki bypass") -------------------------------------------
+# DISABLED by default — the baked image assumes stock APW12 in chassis. The
+# am2 hybrid Phase 0 will probe APW121215a on bus 0 @ 0x10.
+#
+# If the unit was Loki-modded and the operator pulls the Loki board, they
+# rewire the chassis PWR_CONTROL (gpio907) → APW3 REMOTE_ON per
+#  and set:
+#     enabled   = true
+#     model     = "APW3"
+#     voltage_v = 12.8     # APW3 OUTPUT rail (NOT the ~13.7 V chip rail)
+[power.psu_override]
+enabled = false
+model = "APW3"
+voltage_v = 12.8
+
+[psu]
+# APW121215a rail params (consumed only when [power.psu_override].enabled =
+# false). When override is enabled, this whole block is bypassed.
+voltage_mv = 15200
+heartbeat_hz = 1
+watchdog_enabled = true
+i2c_address = 0x10
+transport = "gpio_bitbang"
+pwr_control_gpio = "gpio:907"
+
+[thermal]
+target_temp_c = 60
+hot_temp_c = 70
+dangerous_temp_c = 80
+
+# Home-quiet fan ceiling. NEVER raise above 30 from a baked default. Hot
+# operators may opt into a hacker mode that lifts the cap explicitly.
+fan_min_pwm = 10
+fan_max_pwm = 30
+
+pid_interval_s = 2.0
+hysteresis_c = 3
+
+[thermal.supervisor]
+# Dormant unless the operator or a validated platform-default gate enables it.
+# am2 chassis are four-fan systems; one working tach is never enough once the
+# supervisor is active.
+enabled = false
+min_fans = 3
+
+[api]
+# Production am2 image owns :4028 cgminer-compat (no BraiinsOS BOSer on a
+# native boot). HTTP on 8080.
+cgminer_port = 4028
+http_port = 8080
+websocket = true
+cgminer_bind_lan = false
+metrics_require_auth = true
+
+[donation]
+# production donation policy: transparent 2% default, fully
+# disableable by the operator. Empty pool_url/worker keeps it inert until
+# the daemon's donation defaults are populated at runtime.
+enabled = true
+percent = 2.0
+pool_url = "stratum+tcp://pool.d-central.tech:3333"
+worker = "DungeonMaster"
+password = "x"
+fallback_enabled = true
+fallback_pool_url = "stratum+tcp://stratum.braiins.com:3333"
+fallback_worker = "DungeonMaster"
+fallback_password = "x"
+cycle_duration_s = 3600
+
+[watchdog]
+# Hardware watchdog ENABLED by default on a baked image. A panicked or hung
+# daemon must reset the SoC instead of leaving chains powered with no thermal
+# supervision (per workspace SAFETY rule, default_watchdog_enabled test).
+enabled = true
+kick_interval_s = 5
+
+[hash_on_disconnect]
+# Home/unattended safety: never continue hashing stale work during a
+# pool/control failure. Default OFF for am2 home units (BB `a lab unit` carryover
+# rule).
+enabled = false
+
+[mode]
+active = "standard"
+
+[autotuner]
+# Disabled by default on baked images until first own-dispatch nonce is
+# operator-confirmed on the unit. Operator can enable via dashboard after
+# stable mining is proven.
+enabled = false
+
+[led]
+enabled = true
+heartbeat_on_ms = 100
+heartbeat_off_ms = 900
+flash_on_accepted_share = true
+flash_on_rejected_share = true

@@ -1,0 +1,1789 @@
+/* ═════════════════════════════════════════════════════════════════════════
+   DCENT_OS — Claude-Design handoff visual recreation
+   VR5: Standard / TUNING surface — pixel-faithful port of 'ui_kits/tuning'.
+
+   The Tuning page (StandardDashboard 'case 'tuning'') currently inherits the
+   generic Standard skin (handoff-skin-standard.css). The kit ships a
+   DEDICATED tuning design — the 'tu2-*' system: a priority-tile picker, a
+   scope switch, per-priority configurators, a sticky before→after EFFECT
+   PREVIEW panel with delta arrows, a draggable fan-curve editor, a silicon-
+   profiles list, and a per-chip override grid.
+
+   This file maps production's REAL tuning DOM ('.tuning-priority*',
+   '.silicon-profiles'/'.sp-*', '.per-chip*'/'.pco-*', the FanCurveEditor
+   outer wrapper, AutotunerCard hero strip) onto the kit's 'tu2-*' VISUAL
+   treatment, BY SELECTOR — no JSX, no contract, no store/api change. Every
+   data binding, truth-contract string, ARIA hook and Wave-3/5/6 wiring is
+   untouched; this is a pure paint job.
+
+   SCOPE: every rule is prefixed '.mode-standard .standard-tuning-surface'
+   (the Tuning page root in StandardDashboard.tsx:839) so it can ONLY ever
+   affect Standard's Tuning surface and can never leak to other modes,
+   other Standard pages, or the dashboard overview.
+
+   LOAD ORDER: this file MUST be imported AFTER handoff-skin-standard.css in
+   main.tsx so its more-specific '.standard-tuning-surface' selectors win
+   the cascade over the generic Standard skin for the tuning page only.
+
+   Tokens are 1:1 with the kit (production tokens.css was sourced from the
+   same design bundle: --bg-void, --surface-glass-card, --accent,
+   --accent-gradient, --accent-border, --border-glass, --border-subtle,
+   --fg-primary/secondary/dim, --radius-*, --font-*, --ease-standard,
+   --green/red/blue/yellow/indigo all resolve identically). The Wave-1
+   accent engine still recolors everything; orange literals appear ONLY
+   where the kit itself hard-codes them as the brand signature (gradient
+   thumb/CTA glows, the delta-good/bad accents) exactly as the kit does.
+
+   'APPROX:' marks faithful approximations. 'NO-HOOK:' marks kit elements
+   with no production DOM hook (documented, never faked).
+   ───────────────────────────────────────────────────────────────────── */
+
+/* ═════════════════════════════════════════════════════════════════════════
+   0. SHELL — '.standard-tuning-surface' → kit '.tu2-shell'
+   Production stacks the tuning sections in a plain flex column with the
+   'standard-stagger' entrance. The kit's '.tu2-shell' is a centered
+   max-width column with a generous 22px rhythm. Keep production's stagger.
+   ═════════════════════════════════════════════════════════════════════════ */
+.mode-standard .standard-tuning-surface {
+  max-width: 1240px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  padding: 4px 2px 60px;
+}
+
+/* The kit gives each block its own glass card / section; production's
+   '.section' wrappers map onto the kit's '.tu2-section'/'.tu2-conf-shell'
+   below. Reset production's default section chrome so the kit treatment
+   reads cleanly inside the tuning surface only. */
+.mode-standard .standard-tuning-surface .section {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+  margin: 0;
+}
+
+/* Section eyebrow/title — kit '.tu2-section-head h2' */
+.mode-standard .standard-tuning-surface .section > .section-title {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 1.3rem;
+  letter-spacing: -0.005em;
+  color: var(--fg-primary);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 12px;
+  padding: 0;
+  border: none;
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   1. AUTOTUNER HERO — AutotunerCard '.page-hero-strip' + '.hero-kpi'
+   APPROX: the kit has no standalone autotuner card; its closest analogue is
+   the '.tu2-header' stat strip (mono micro-labels + big accent numerals on
+   a hairline-divided baseline). Re-skin the production hero strip into that
+   calm header aesthetic instead of the heavy gradient overview hero.
+   ═════════════════════════════════════════════════════════════════════════ */
+.mode-standard .standard-tuning-surface .page-hero-strip {
+  background: var(--surface-glass-card);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-lg);
+  padding: 20px 24px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 32px;
+  flex-wrap: wrap;
+}
+
+.mode-standard .standard-tuning-surface .page-hero-eyebrow {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.mode-standard .standard-tuning-surface .page-hero-title {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: clamp(1.7rem, 1.4rem + 1vw, 2.4rem);
+  letter-spacing: -0.018em;
+  color: var(--fg-primary);
+  margin-top: 2px;
+}
+
+.mode-standard .standard-tuning-surface .page-hero-stat {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 1.5rem;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+.mode-standard .standard-tuning-surface .page-hero-substat {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--fg-secondary);
+  margin-top: 4px;
+}
+
+/* KPI strip → kit header-stat columns */
+.mode-standard .standard-tuning-surface .hero-kpi-strip {
+  display: flex;
+  gap: 24px;
+  flex-wrap: wrap;
+}
+
+.mode-standard .standard-tuning-surface .hero-kpi {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 96px;
+}
+
+.mode-standard .standard-tuning-surface .hero-kpi .kpi-label {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.mode-standard .standard-tuning-surface .hero-kpi .kpi-value {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 1.7rem;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.mode-standard .standard-tuning-surface .hero-kpi .kpi-sub {
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  color: var(--fg-secondary);
+}
+
+/* AutotunerCard body card → kit conf-shell glass */
+.mode-standard .standard-tuning-surface .ds-glass-card {
+  background: var(--surface-glass-card);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-lg);
+}
+
+.mode-standard .standard-tuning-surface .autotuner-card-policy-grid {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-sm);
+  margin-bottom: 14px;
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   2. PRIORITY CONFIGURATOR — '.tuning-priority' → kit '.tu2-conf-shell'
+   The whole TuningPriorityConfigurator section becomes the kit's glass
+   configurator shell (priority grid + conf head + conf grid live inside).
+   ═════════════════════════════════════════════════════════════════════════ */
+.mode-standard .standard-tuning-surface .tuning-priority {
+  background: var(--surface-glass-card);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-lg);
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* '.section-title' "Tune by priority" → kit '.tu2-header h1' + eyebrow.
+   The kit eyebrow is synthesised from a ::before so production keeps its
+   single title node (no JSX change). */
+.mode-standard .standard-tuning-surface .tuning-priority > .section-title {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  font-size: clamp(1.7rem, 1.5rem + 1vw, 2.2rem);
+  font-weight: 800;
+  letter-spacing: -0.018em;
+  margin: 0;
+}
+
+.mode-standard .standard-tuning-surface .tuning-priority > .section-title::before {
+  content: 'Tuning';
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.mode-standard .standard-tuning-surface .tuning-priority-intro {
+  color: var(--fg-secondary);
+  font-size: 0.92rem;
+  line-height: 1.5;
+  max-width: 70ch;
+  margin: -6px 0 0;
+}
+
+.mode-standard .standard-tuning-surface .tuning-priority-intro strong {
+  color: var(--fg-primary);
+  font-weight: 700;
+}
+
+/* ── Priority tiles (6) — '.tuning-priority-grid'/'-tile' → kit
+   '.tu2-priority-grid'/'-tile'. Production passes '--pri-color' per tile;
+   the kit reads '--priority-color'. Alias it so the kit's color-mix glow
+   works with the production custom property unchanged. ── */
+.mode-standard .standard-tuning-surface .tuning-priority-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 12px;
+}
+
+.mode-standard .standard-tuning-surface .tuning-priority-tile {
+  --priority-color: var(--pri-color, var(--accent));
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 18px 16px 16px;
+  border-radius: var(--radius-md);
+  background: var(--surface-glass-card);
+  border: 1.5px solid var(--border-glass);
+  color: var(--fg-primary);
+  cursor: pointer;
+  font-family: var(--font-ui);
+  text-align: left;
+  overflow: hidden;
+  transition: transform 0.2s var(--ease-standard),
+              border-color 0.2s var(--ease-standard),
+              box-shadow 0.2s var(--ease-standard),
+              background 0.2s var(--ease-standard);
+}
+
+.mode-standard .standard-tuning-surface .tuning-priority-tile::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 2px;
+  pointer-events: none;
+  background: var(--priority-color);
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.mode-standard .standard-tuning-surface .tuning-priority-tile:hover {
+  border-color: var(--priority-color);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+}
+
+.mode-standard .standard-tuning-surface .tuning-priority-tile.is-active {
+  border-color: var(--priority-color);
+  background: linear-gradient(
+    180deg,
+    color-mix(in oklab, var(--priority-color) 12%, var(--surface-glass-card)),
+    var(--surface-glass-card)
+  );
+  box-shadow: 0 0 24px color-mix(in oklab, var(--priority-color) 20%, transparent);
+}
+
+.mode-standard .standard-tuning-surface .tuning-priority-tile.is-active::before {
+  opacity: 1;
+}
+
+.mode-standard .standard-tuning-surface .tuning-priority-tile-icon {
+  color: var(--priority-color);
+}
+
+.mode-standard
+  .standard-tuning-surface
+  .tuning-priority-tile:not(.is-active)
+  .tuning-priority-tile-icon {
+  color: var(--fg-secondary);
+}
+
+.mode-standard .standard-tuning-surface .tuning-priority-tile-name {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1rem;
+  letter-spacing: -0.005em;
+}
+
+.mode-standard
+  .standard-tuning-surface
+  .tuning-priority-tile.is-active
+  .tuning-priority-tile-name {
+  color: var(--priority-color);
+}
+
+.mode-standard .standard-tuning-surface .tuning-priority-tile-sub {
+  font-size: 0.76rem;
+  color: var(--fg-secondary);
+  line-height: 1.4;
+}
+
+.mode-standard .standard-tuning-surface .tuning-priority-tile-active {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  font-family: var(--font-mono);
+  font-size: 0.56rem;
+  letter-spacing: 0.14em;
+  font-weight: 800;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--priority-color);
+  color: #1a0f00;
+}
+
+/* ── Configurator shell head + grid — '.tuning-priority-conf*' → kit
+   '.tu2-conf-shell'/'-head'/'-grid' ── */
+.mode-standard .standard-tuning-surface .tuning-priority-conf {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.mode-standard .standard-tuning-surface .tuning-priority-conf-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.mode-standard .standard-tuning-surface .tuning-priority-conf-head h3 {
+  margin: 0;
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 1.5rem;
+  letter-spacing: -0.01em;
+  color: var(--fg-primary);
+}
+
+.mode-standard .standard-tuning-surface .tuning-priority-conf-grid {
+  display: grid;
+  grid-template-columns: 1fr 380px;
+  gap: 22px;
+}
+
+.mode-standard .standard-tuning-surface .tuning-priority-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* ── Scope switch — '.tuning-scope'/'-btn.is-active' → kit
+   '.tu2-scope'/'-btn.active' ── */
+.mode-standard .standard-tuning-surface .tuning-scope {
+  display: inline-flex;
+  padding: 3px;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--border-glass);
+  border-radius: 999px;
+}
+
+.mode-standard .standard-tuning-surface .tuning-scope-btn {
+  background: transparent;
+  border: none;
+  padding: 6px 14px;
+  border-radius: 999px;
+  color: var(--fg-secondary);
+  font-family: var(--font-ui);
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s var(--ease-standard);
+}
+
+.mode-standard .standard-tuning-surface .tuning-scope-btn.is-active {
+  background: var(--accent-gradient);
+  color: #1a0f00;
+  box-shadow: 0 2px 8px rgba(250, 103, 0, 0.4);
+}
+
+/* ── Conf rows — '.tuning-conf-row'/'-val'/'-meta' → kit
+   '.tu2-conf-row'/'-val'/'-meta'. Kit column rhythm is EXACTLY
+   140px 1fr auto (styles.css:134); match it verbatim. ── */
+.mode-standard .standard-tuning-surface .tuning-conf-row {
+  display: grid;
+  grid-template-columns: 140px 1fr auto;
+  gap: 18px;
+  align-items: center;
+  padding: 8px 0;
+}
+
+.mode-standard .standard-tuning-surface .tuning-conf-row > label {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  font-weight: 700;
+}
+
+.mode-standard .standard-tuning-surface .tuning-conf-val {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 1.9rem;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  text-shadow: 0 0 12px rgba(250, 103, 0, 0.35);
+  min-width: 130px;
+  text-align: right;
+}
+
+.mode-standard .standard-tuning-surface .tuning-conf-val small {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  font-size: 0.72rem;
+  color: var(--fg-secondary);
+  margin-left: 4px;
+}
+
+.mode-standard .standard-tuning-surface .tuning-conf-meta {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  color: var(--fg-secondary);
+}
+
+.mode-standard .standard-tuning-surface .tuning-conf-meta strong {
+  color: var(--fg-primary);
+  font-weight: 600;
+}
+
+/* ── Range slider — '.tuning-slider' → kit '.tu2-slider' (track + thumb) ── */
+.mode-standard .standard-tuning-surface .tuning-slider {
+  appearance: none;
+  -webkit-appearance: none;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  width: 100%;
+}
+
+.mode-standard
+  .standard-tuning-surface
+  .tuning-slider::-webkit-slider-thumb {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--accent-gradient);
+  border: 3px solid var(--bg-void);
+  box-shadow: 0 0 14px rgba(250, 103, 0, 0.6);
+  cursor: pointer;
+}
+
+.mode-standard .standard-tuning-surface .tuning-slider::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 3px solid var(--bg-void);
+  box-shadow: 0 0 14px rgba(250, 103, 0, 0.6);
+  cursor: pointer;
+}
+
+/* ── Noise presets — '.tuning-noise-presets'/'-tile.is-active' → kit
+   '.tu2-noise-presets'/'-tile.active'. NO-HOOK: the kit's '.tu2-noise-bars'
+   4-bar glyph has no production element (production renders text-only
+   preset tiles); the kit visual collapses gracefully to the tile chrome
+   without the bars — not faked. ── */
+.mode-standard .standard-tuning-surface .tuning-noise-presets {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+
+.mode-standard .standard-tuning-surface .tuning-noise-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 14px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.02);
+  border: 1.5px solid var(--border-glass);
+  cursor: pointer;
+  text-align: left;
+  font-family: var(--font-ui);
+  transition: all 0.15s var(--ease-standard);
+}
+
+.mode-standard .standard-tuning-surface .tuning-noise-tile:hover {
+  border-color: var(--accent-border);
+}
+
+.mode-standard .standard-tuning-surface .tuning-noise-tile.is-active {
+  border-color: var(--accent);
+  background: rgba(250, 165, 0, 0.06);
+  box-shadow: 0 0 14px rgba(250, 103, 0, 0.18);
+}
+
+.mode-standard .standard-tuning-surface .tuning-noise-tile strong {
+  font-size: 1.05rem;
+  color: var(--fg-primary);
+  font-weight: 700;
+}
+
+.mode-standard .standard-tuning-surface .tuning-noise-tile.is-active strong {
+  color: var(--accent);
+}
+
+.mode-standard .standard-tuning-surface .tuning-noise-tile span {
+  font-size: 0.76rem;
+  color: var(--fg-secondary);
+  font-family: var(--font-mono);
+}
+
+/* ── Static configurators (Max / Best efficiency) — '.tuning-conf-static'
+   → kit '.tu2-static-card' ── */
+.mode-standard .standard-tuning-surface .tuning-conf-static {
+  padding: 18px 20px;
+  background: linear-gradient(
+    135deg,
+    rgba(250, 165, 0, 0.08),
+    rgba(250, 103, 0, 0.04)
+  );
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-md);
+}
+
+.mode-standard .standard-tuning-surface .tuning-conf-static > strong {
+  display: block;
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 1.2rem;
+  color: var(--accent);
+  margin-bottom: 8px;
+  letter-spacing: -0.005em;
+}
+
+.mode-standard .standard-tuning-surface .tuning-conf-static p {
+  margin: 0 0 12px;
+  font-size: 0.88rem;
+  color: var(--fg-primary);
+  line-height: 1.55;
+}
+
+.mode-standard .standard-tuning-surface .tuning-conf-static ul {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.mode-standard .standard-tuning-surface .tuning-conf-static li {
+  font-size: 0.82rem;
+  color: var(--fg-secondary);
+  line-height: 1.6;
+}
+
+.mode-standard .standard-tuning-surface .tuning-conf-static li strong {
+  display: inline;
+  font-size: inherit;
+  color: var(--fg-primary);
+  margin: 0;
+  font-weight: 700;
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   3. EFFECT PREVIEW — '.tuning-priority-impact' → kit '.tu2-impact'
+   The sticky before→after panel with delta arrows. This is the signature
+   tu2 surface; map it 1:1 including the good/bad/flat delta accents.
+   ═════════════════════════════════════════════════════════════════════════ */
+.mode-standard .standard-tuning-surface .tuning-priority-impact {
+  background: var(--bg-void);
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-md);
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  position: sticky;
+  top: 24px;
+  align-self: start;
+}
+
+.mode-standard .standard-tuning-surface .tuning-impact-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.mode-standard .standard-tuning-surface .tuning-impact-head > span:first-child {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 1rem;
+  color: var(--fg-primary);
+}
+
+.mode-standard .standard-tuning-surface .tuning-impact-meta {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  font-weight: 700;
+}
+
+.mode-standard .standard-tuning-surface .tuning-impact-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Production wraps each row in a Tooltip — the actual row is
+   '.tuning-impact-row'. The grid matches the kit's
+   90/76/16/76/1fr column rhythm. */
+.mode-standard .standard-tuning-surface .tuning-impact-row {
+  display: grid;
+  grid-template-columns: 90px 76px 16px 76px 1fr;
+  gap: 8px;
+  align-items: baseline;
+  padding: 4px 0;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+}
+
+.mode-standard .standard-tuning-surface .tuning-impact-label {
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  font-weight: 700;
+}
+
+.mode-standard .standard-tuning-surface .tuning-impact-before {
+  color: var(--fg-secondary);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.mode-standard .standard-tuning-surface .tuning-impact-before small {
+  color: var(--fg-dim);
+  font-size: 0.68rem;
+  margin-left: 2px;
+}
+
+.mode-standard .standard-tuning-surface .tuning-impact-arrow {
+  color: var(--fg-dim);
+  text-align: center;
+}
+
+.mode-standard .standard-tuning-surface .tuning-impact-after {
+  color: var(--fg-primary);
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  text-align: right;
+}
+
+.mode-standard .standard-tuning-surface .tuning-impact-after small {
+  color: var(--fg-dim);
+  font-size: 0.68rem;
+  margin-left: 2px;
+  font-weight: 400;
+}
+
+.mode-standard .standard-tuning-surface .tuning-impact-delta {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.76rem;
+  font-weight: 700;
+}
+
+/* Production delta classes '.is-good'/'.is-bad'/'.is-flat'
+   → kit '.good'/'.bad'/'.flat' accents */
+.mode-standard .standard-tuning-surface .tuning-impact-delta.is-good {
+  color: var(--green);
+}
+
+.mode-standard .standard-tuning-surface .tuning-impact-delta.is-bad {
+  color: var(--red);
+}
+
+.mode-standard .standard-tuning-surface .tuning-impact-delta.is-flat {
+  color: var(--fg-dim);
+}
+
+/* Over-circuit-cap warning — '.tuning-impact-warn' → kit '.tu2-impact-warn'.
+   Production renders the "!" glyph as a bare span; kit gives it a round
+   red chip. The first child span IS the glyph. */
+.mode-standard .standard-tuning-surface .tuning-impact-warn {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: rgba(239, 68, 68, 0.06);
+  border: 1px solid rgba(239, 68, 68, 0.32);
+  font-size: 0.8rem;
+  color: var(--fg-primary);
+  line-height: 1.5;
+}
+
+.mode-standard .standard-tuning-surface .tuning-impact-warn > span:first-child {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: rgba(239, 68, 68, 0.2);
+  color: var(--red);
+  font-weight: 800;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mode-standard .standard-tuning-surface .tuning-impact-warn strong {
+  color: var(--red);
+  font-weight: 700;
+}
+
+/* No-baseline note — production-only honest empty state (no kit element).
+   APPROX: render in the kit's muted-note voice so it sits naturally below
+   the preview rows. NO-HOOK: kit has no analogue; styled as a calm note,
+   never as a faked metric. */
+.mode-standard .standard-tuning-surface .tuning-impact-note {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px dashed var(--border-glass);
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  color: var(--fg-secondary);
+  line-height: 1.5;
+}
+
+/* Apply CTA — production renders <ActionButton variant="primary"> which
+   emits a BARE '<button class="btn btn-primary ds-btn primary">' as a
+   DIRECT child of '.tuning-priority-impact' (ActionButton is a Fragment —
+   there is NO '.action-button' wrapper element in the live DOM, so any
+   '.action-button > button' selector is dead). Target the real direct-child
+   primary button and override its '.ds-btn.primary' chrome so the kit
+   '.tu2-apply' paint wins cleanly (styles.css:348-361). */
+.mode-standard
+  .standard-tuning-surface
+  .tuning-priority-impact
+  > .btn-primary,
+.mode-standard
+  .standard-tuning-surface
+  .tuning-priority-impact
+  > button.btn-primary,
+.mode-standard
+  .standard-tuning-surface
+  .tuning-priority-impact
+  > .btn.ds-btn.primary {
+  margin-top: 8px;
+  width: 100%;
+  padding: 12px;
+  background: var(--accent-gradient);
+  color: #1a0f00;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-ui);
+  font-weight: 700;
+  font-size: 1rem;
+  letter-spacing: 0;
+  text-transform: none;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(250, 103, 0, 0.4),
+              inset 0 1px 0 rgba(255, 255, 255, 0.3);
+  transition: transform 0.15s var(--ease-standard),
+              box-shadow 0.15s var(--ease-standard);
+}
+
+.mode-standard
+  .standard-tuning-surface
+  .tuning-priority-impact
+  > .btn-primary:hover:not(:disabled),
+.mode-standard
+  .standard-tuning-surface
+  .tuning-priority-impact
+  > button.btn-primary:hover:not(:disabled),
+.mode-standard
+  .standard-tuning-surface
+  .tuning-priority-impact
+  > .btn.ds-btn.primary:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 24px rgba(250, 103, 0, 0.5),
+              inset 0 1px 0 rgba(255, 255, 255, 0.3),
+              0 0 32px rgba(250, 165, 0, 0.3);
+}
+
+.mode-standard
+  .standard-tuning-surface
+  .tuning-priority-impact
+  > .btn-primary:disabled,
+.mode-standard
+  .standard-tuning-surface
+  .tuning-priority-impact
+  > button.btn-primary:disabled,
+.mode-standard
+  .standard-tuning-surface
+  .tuning-priority-impact
+  > .btn.ds-btn.primary:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  box-shadow: none;
+  transform: none;
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   4. PER-CHAIN STRIP — NO-HOOK
+   The kit's 'ChainStrip' ('.tu2-chains'/'.tu2-chain-card') is a PREDICTED
+   per-chain breakdown rendered INSIDE the kit's TuningPage. Production's
+   tuning surface does NOT include a per-chain predicted strip on this page
+   (the live per-chain telemetry lives on the Temp/Fans page via a
+   different component, intentionally not duplicated here). Documented, not
+   faked — no production selector exists to attach the '.tu2-chain-card'
+   treatment to on the tuning surface.
+   ═════════════════════════════════════════════════════════════════════════ */
+
+/* ═════════════════════════════════════════════════════════════════════════
+   5. FAN CURVE EDITOR — FanCurveEditor (inline-styled) → kit '.tu2-fan'
+   FanCurveEditor.tsx renders its OUTER container with inline styles (no
+   stable class), and its SVG/points/labels are inline-styled too — those
+   internals cannot be reached by CSS. The only classed hook is the preset
+   buttons ('.time-tab'). It sits as the 4th child of the tuning surface
+   (after AutotunerCard, AutotunerEvidencePanel, TuningPriorityConfigurator).
+   APPROX: re-skin the preset buttons into the kit '.tu2-btn.ghost' look so
+   the editor's controls match the tu2 grammar; the inline-styled canvas
+   chrome stays as production paints it (already accent/void aligned). The
+   SVG curve/points are NO-HOOK by construction (inline attrs).
+   ═════════════════════════════════════════════════════════════════════════ */
+.mode-standard .standard-tuning-surface .time-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--fg-secondary);
+  font-family: var(--font-ui);
+  font-size: 0.74rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s var(--ease-standard);
+  white-space: nowrap;
+}
+
+.mode-standard .standard-tuning-surface .time-tab:hover {
+  background: rgba(250, 165, 0, 0.04);
+  color: var(--accent);
+}
+
+.mode-standard .standard-tuning-surface .time-tab.active {
+  background: rgba(250, 165, 0, 0.14);
+  border-color: var(--accent);
+  color: var(--accent);
+  box-shadow: 0 0 10px rgba(250, 103, 0, 0.2);
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   6. TUNING PROFILES (presets + per-chain custom) — TuningProfiles.tsx
+   This component carries the preset profile cards + custom per-chain
+   sliders. Map the preset cards onto the kit's profile-tile grammar and
+   the custom sliders onto '.tu2-slider'.
+   ═════════════════════════════════════════════════════════════════════════ */
+.mode-standard .standard-tuning-surface .profile-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  border-radius: var(--radius-md);
+  background: var(--surface-glass-card);
+  border: 1.5px solid var(--border-glass);
+  color: var(--fg-primary);
+  cursor: pointer;
+  text-align: left;
+  font-family: var(--font-ui);
+  transition: transform 0.18s var(--ease-standard),
+              border-color 0.18s var(--ease-standard),
+              box-shadow 0.18s var(--ease-standard);
+}
+
+.mode-standard .standard-tuning-surface .profile-card:hover {
+  border-color: var(--accent-border);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+}
+
+.mode-standard .standard-tuning-surface .profile-card.active {
+  border-color: var(--accent);
+  background: linear-gradient(
+    180deg,
+    rgba(250, 165, 0, 0.08),
+    var(--surface-glass-card)
+  );
+  box-shadow: 0 0 20px rgba(250, 103, 0, 0.18);
+}
+
+.mode-standard .standard-tuning-surface .profile-card-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1rem;
+  color: var(--fg-primary);
+}
+
+.mode-standard .standard-tuning-surface .profile-card.active .profile-card-header {
+  color: var(--accent);
+}
+
+.mode-standard .standard-tuning-surface .profile-card-badge {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 0.56rem;
+  letter-spacing: 0.14em;
+  font-weight: 800;
+  background: var(--accent-gradient);
+  color: #1a0f00;
+  padding: 2px 7px;
+  border-radius: 999px;
+}
+
+.mode-standard .standard-tuning-surface .profile-card-copy {
+  font-size: 0.8rem;
+  color: var(--fg-secondary);
+  line-height: 1.45;
+}
+
+.mode-standard .standard-tuning-surface .profile-card-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 12px;
+  margin-top: 4px;
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--fg-secondary);
+}
+
+.mode-standard .standard-tuning-surface .profile-card-stat.full {
+  grid-column: 1 / -1;
+}
+
+.mode-standard .standard-tuning-surface .profile-card-stat-label {
+  color: var(--fg-dim);
+}
+
+.mode-standard .standard-tuning-surface .profile-card-stats .metric-value {
+  color: var(--fg-primary);
+  font-weight: 700;
+}
+
+/* Per-chain custom section title → kit section-head */
+.mode-standard .standard-tuning-surface .tuning-pending-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: rgba(250, 165, 0, 0.06);
+  border: 1px solid var(--accent-border);
+  font-size: 0.82rem;
+  color: var(--fg-primary);
+}
+
+.mode-standard .standard-tuning-surface .tuning-pending-bar strong {
+  color: var(--accent);
+}
+
+/* Custom per-chain frequency/voltage range inputs (TuningProfiles renders
+   these as bare 'type=range' with inline width:100% — match by element
+   within the tuning surface so they pick up the kit slider). */
+.mode-standard
+  .standard-tuning-surface
+  input[type='range']:not(.tuning-slider) {
+  appearance: none;
+  -webkit-appearance: none;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  width: 100%;
+}
+
+.mode-standard
+  .standard-tuning-surface
+  input[type='range']:not(.tuning-slider)::-webkit-slider-thumb {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--accent-gradient);
+  border: 3px solid var(--bg-void);
+  box-shadow: 0 0 12px rgba(250, 103, 0, 0.55);
+  cursor: pointer;
+}
+
+.mode-standard
+  .standard-tuning-surface
+  input[type='range']:not(.tuning-slider)::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 3px solid var(--bg-void);
+  box-shadow: 0 0 12px rgba(250, 103, 0, 0.55);
+  cursor: pointer;
+}
+
+.mode-standard .standard-tuning-surface .field-label {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  font-weight: 700;
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   7. SILICON PROFILES — SiliconProfilesPanel '.silicon-profiles'/'.sp-*'
+   → kit 'ProfileSharing' ('.tu2-profiles'/'-head'/'-list'/'-row'/'-import').
+   ═════════════════════════════════════════════════════════════════════════ */
+.mode-standard .standard-tuning-surface .silicon-profiles {
+  background: var(--surface-glass-card);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-lg);
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.mode-standard .standard-tuning-surface .silicon-profiles > .section-title {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1.05rem;
+  margin: 0 0 2px;
+}
+
+.mode-standard .standard-tuning-surface .sp-title-help {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border-glass);
+  color: var(--fg-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  font-weight: 700;
+  cursor: help;
+}
+
+.mode-standard .standard-tuning-surface .sp-intro {
+  font-size: 0.8rem;
+  color: var(--fg-secondary);
+  line-height: 1.5;
+}
+
+.mode-standard .standard-tuning-surface .sp-intro strong {
+  color: var(--fg-primary);
+  font-weight: 600;
+}
+
+.mode-standard .standard-tuning-surface .sp-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Each '.sp-card' → kit '.tu2-profile-row' */
+.mode-standard .standard-tuning-surface .sp-card {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 14px;
+  align-items: center;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--border-subtle);
+  font-size: 0.82rem;
+  transition: border-color 0.15s;
+}
+
+.mode-standard .standard-tuning-surface .sp-card:hover {
+  border-color: var(--accent-border);
+}
+
+.mode-standard .standard-tuning-surface .sp-card.is-active {
+  background: rgba(250, 165, 0, 0.06);
+  border-color: var(--accent-border);
+}
+
+.mode-standard .standard-tuning-surface .sp-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mode-standard .standard-tuning-surface .sp-name {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1rem;
+  color: var(--fg-primary);
+}
+
+.mode-standard .standard-tuning-surface .sp-badge-active {
+  font-family: var(--font-mono);
+  font-size: 0.56rem;
+  letter-spacing: 0.14em;
+  font-weight: 800;
+  background: var(--accent-gradient);
+  color: #1a0f00;
+  padding: 2px 7px;
+  border-radius: 999px;
+}
+
+/* Origin badges → kit '.tu2-profile-origin-*' (this-miner=green,
+   d-central=accent, community=cyan) */
+.mode-standard .standard-tuning-surface .sp-badge-origin {
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 700;
+}
+
+.mode-standard .standard-tuning-surface .sp-origin-this-miner {
+  background: rgba(34, 197, 94, 0.12);
+  color: var(--green);
+  border: 1px solid rgba(34, 197, 94, 0.32);
+}
+
+.mode-standard .standard-tuning-surface .sp-origin-d-central {
+  background: rgba(250, 165, 0, 0.12);
+  color: var(--accent);
+  border: 1px solid var(--accent-border);
+}
+
+.mode-standard .standard-tuning-surface .sp-origin-community {
+  background: rgba(125, 211, 252, 0.12);
+  color: #7dd3fc;
+  border: 1px solid rgba(125, 211, 252, 0.32);
+}
+
+.mode-standard .standard-tuning-surface .sp-card-stats {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 18px;
+  flex-wrap: wrap;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--fg-secondary);
+}
+
+.mode-standard .standard-tuning-surface .sp-stat-label {
+  color: var(--fg-dim);
+  margin-right: 4px;
+}
+
+.mode-standard .standard-tuning-surface .sp-stat-val {
+  color: var(--fg-primary);
+  font-weight: 700;
+}
+
+/* Profile action buttons → kit '.tu2-btn' / '.tu2-btn.ghost' */
+.mode-standard .standard-tuning-surface .sp-card-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.mode-standard .standard-tuning-surface .sp-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-glass);
+  color: var(--fg-primary);
+  font-family: var(--font-ui);
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s var(--ease-standard);
+  white-space: nowrap;
+}
+
+.mode-standard .standard-tuning-surface .sp-btn:hover:not(:disabled) {
+  border-color: var(--accent-border);
+  color: var(--accent);
+  background: rgba(250, 165, 0, 0.06);
+}
+
+.mode-standard .standard-tuning-surface .sp-btn-primary {
+  background: rgba(250, 165, 0, 0.14);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.mode-standard .standard-tuning-surface .sp-btn-ghost {
+  background: transparent;
+  border-color: transparent;
+  padding: 5px 10px;
+  font-size: 0.74rem;
+}
+
+.mode-standard .standard-tuning-surface .sp-btn-ghost:hover:not(:disabled) {
+  background: rgba(250, 165, 0, 0.04);
+}
+
+.mode-standard .standard-tuning-surface .sp-btn:disabled,
+.mode-standard .standard-tuning-surface .sp-btn.is-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Honest disabled stubs (import / community) → kit '.tu2-profiles-import' */
+.mode-standard .standard-tuning-surface .sp-extra {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--border-glass);
+}
+
+.mode-standard .standard-tuning-surface .sp-extra-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.mode-standard .standard-tuning-surface .sp-extra-note {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--fg-dim);
+}
+
+/* Profiles loading / error / empty states → calm kit notes */
+.mode-standard .standard-tuning-surface .sp-state {
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px dashed var(--border-glass);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--fg-secondary);
+  line-height: 1.5;
+}
+
+.mode-standard .standard-tuning-surface .sp-state-error {
+  border-color: rgba(239, 68, 68, 0.32);
+  background: rgba(239, 68, 68, 0.06);
+  color: var(--fg-primary);
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   8. PER-CHIP OVERRIDE — PerChipOverridePanel '.per-chip-override'/'.pco-*'
+   → kit 'PerChipOverride' ('.tu2-perchip'/'-head'/'-bar'/'-tabs'/'-legend'/
+   '-grid'/'-cell'/'-inspect').
+   ═════════════════════════════════════════════════════════════════════════ */
+.mode-standard .standard-tuning-surface .per-chip-override {
+  background: var(--surface-glass-card);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-lg);
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* Disclosure header → kit '.tu2-perchip-head' + expand button */
+.mode-standard .standard-tuning-surface .pco-disclosure {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+  color: var(--fg-primary);
+  font-family: var(--font-ui);
+}
+
+.mode-standard .standard-tuning-surface .pco-disclosure-caret {
+  color: var(--accent);
+  font-size: 0.8rem;
+}
+
+.mode-standard .standard-tuning-surface .pco-disclosure-title {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1.05rem;
+  color: var(--fg-primary);
+}
+
+.mode-standard .standard-tuning-surface .pco-disclosure-sub {
+  font-size: 0.8rem;
+  color: var(--fg-secondary);
+}
+
+.mode-standard .standard-tuning-surface .pco-disclosure-count {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--fg-dim);
+}
+
+.mode-standard .standard-tuning-surface .pco-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.mode-standard .standard-tuning-surface .pco-intro {
+  font-size: 0.8rem;
+  color: var(--fg-secondary);
+  line-height: 1.45;
+}
+
+.mode-standard .standard-tuning-surface .pco-intro strong {
+  color: var(--fg-primary);
+  font-weight: 600;
+}
+
+/* Toolbar + legend → kit '.tu2-perchip-bar' + '.tu2-perchip-legend' */
+.mode-standard .standard-tuning-surface .pco-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.mode-standard .standard-tuning-surface .pco-legend {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--fg-secondary);
+}
+
+.mode-standard .standard-tuning-surface .pco-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.mode-standard .standard-tuning-surface .pco-legend-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+
+.mode-standard .standard-tuning-surface .pco-legend-count {
+  color: var(--fg-dim);
+}
+
+.mode-standard .standard-tuning-surface .pco-toolbar-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--fg-secondary);
+}
+
+/* Chain tabs → kit '.tu2-perchip-tabs'/'-tab.active' */
+.mode-standard .standard-tuning-surface .pco-tabs {
+  display: inline-flex;
+  gap: 4px;
+  padding: 3px;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-sm);
+  align-self: flex-start;
+  flex-wrap: wrap;
+}
+
+.mode-standard .standard-tuning-surface .pco-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 4px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--fg-secondary);
+  transition: all 0.15s;
+}
+
+.mode-standard .standard-tuning-surface .pco-tab.is-active {
+  background: rgba(250, 165, 0, 0.14);
+  color: var(--accent);
+}
+
+.mode-standard .standard-tuning-surface .pco-tab-count {
+  color: var(--fg-dim);
+}
+
+/* Split layout: chip grid + inspector */
+.mode-standard .standard-tuning-surface .pco-split {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  gap: 16px;
+  align-items: start;
+}
+
+/* Chip grid → kit '.tu2-perchip-grid' (9-up dense grid on a void tray) */
+.mode-standard .standard-tuning-surface .pco-grid {
+  display: grid;
+  grid-template-columns: repeat(9, 1fr);
+  gap: 4px;
+  padding: 8px;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: var(--radius-sm);
+}
+
+/* Chip cell → kit '.tu2-perchip-cell'. Production passes the grade color
+   via '--cell-color'; paint the cell background from it so A/B/C/X read
+   exactly like the kit's grade fills.
+   NO-HOOK: the kit cell renders TWO glyphs — '.num' (the index, 0.55rem)
+   AND '.g' (the grade letter, 0.78rem). Production renders ONLY the index
+   ('.pco-cell-idx'); there is no grade-letter element to attach the kit's
+   '.g' treatment to (the grade is conveyed by the cell fill colour + the
+   tooltip + the inspector instead). Not faked. '.pco-cell-idx' is matched
+   1:1 to the kit's '.num' (0.55rem / opacity .7) below. */
+.mode-standard .standard-tuning-surface .pco-cell {
+  position: relative;
+  padding: 6px 4px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 0.68rem;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  line-height: 1;
+  color: #0a1a0a;
+  background: var(--cell-color, rgba(255, 255, 255, 0.06));
+  transition: transform 0.12s, box-shadow 0.12s;
+}
+
+.mode-standard .standard-tuning-surface .pco-cell:hover {
+  transform: translateY(-1px) scale(1.06);
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.4);
+  z-index: 2;
+}
+
+.mode-standard .standard-tuning-surface .pco-cell.is-selected {
+  border-color: #fff;
+  box-shadow: 0 0 0 1px #fff;
+  z-index: 3;
+}
+
+.mode-standard .standard-tuning-surface .pco-cell.is-masked {
+  color: var(--fg-dim);
+  background: repeating-linear-gradient(
+    45deg,
+    rgba(255, 255, 255, 0.06),
+    rgba(255, 255, 255, 0.06) 2px,
+    transparent 2px,
+    transparent 5px
+  );
+}
+
+.mode-standard .standard-tuning-surface .pco-cell-idx {
+  font-size: 0.55rem;
+  opacity: 0.7;
+}
+
+/* Inspector → kit '.tu2-perchip-inspect' */
+.mode-standard .standard-tuning-surface .pco-inspector {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--accent-border);
+  font-family: var(--font-mono);
+}
+
+.mode-standard .standard-tuning-surface .pco-inspector-empty-title {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 0.95rem;
+  color: var(--fg-primary);
+}
+
+.mode-standard .standard-tuning-surface .pco-inspector-empty-sub,
+.mode-standard .standard-tuning-surface .pco-inspector-chainstat {
+  font-size: 0.72rem;
+  color: var(--fg-secondary);
+  line-height: 1.45;
+}
+
+.mode-standard .standard-tuning-surface .pco-inspector-chainstat strong {
+  color: var(--fg-primary);
+}
+
+.mode-standard .standard-tuning-surface .pco-inspector-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.mode-standard .standard-tuning-surface .pco-inspector-grade {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.12em;
+  font-weight: 800;
+  padding: 3px 8px;
+  border-radius: 999px;
+  color: #0a1a0a;
+  background: var(--cell-color, var(--accent));
+}
+
+.mode-standard .standard-tuning-surface .pco-inspector-title {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 0.95rem;
+  color: var(--fg-primary);
+}
+
+.mode-standard .standard-tuning-surface .pco-inspector-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 14px;
+}
+
+.mode-standard .standard-tuning-surface .pco-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.mode-standard .standard-tuning-surface .pco-stat-label {
+  font-size: 0.62rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+
+.mode-standard .standard-tuning-surface .pco-stat-val {
+  font-size: 0.9rem;
+  color: var(--fg-primary);
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.mode-standard .standard-tuning-surface .pco-inspector-note,
+.mode-standard .standard-tuning-surface .pco-actions-note {
+  font-size: 0.7rem;
+  color: var(--fg-secondary);
+  line-height: 1.45;
+}
+
+.mode-standard .standard-tuning-surface .pco-inspector-note strong {
+  color: var(--fg-primary);
+}
+
+.mode-standard .standard-tuning-surface .pco-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.mode-standard .standard-tuning-surface .pco-action-disabled {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.mode-standard .standard-tuning-surface .pco-action-disabled-tag {
+  font-family: var(--font-mono);
+  font-size: 0.58rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+
+/* Per-chip generic .btn (secondary) inside the panel → kit '.tu2-btn' */
+.mode-standard .standard-tuning-surface .pco-body .btn-secondary,
+.mode-standard .standard-tuning-surface .pco-actions .btn,
+.mode-standard .standard-tuning-surface .pco-state-actions .btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-glass);
+  color: var(--fg-primary);
+  font-family: var(--font-ui);
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s var(--ease-standard);
+}
+
+.mode-standard .standard-tuning-surface .pco-body .btn-secondary:hover:not(:disabled),
+.mode-standard .standard-tuning-surface .pco-actions .btn:hover:not(:disabled),
+.mode-standard .standard-tuning-surface .pco-state-actions .btn:hover:not(:disabled) {
+  border-color: var(--accent-border);
+  color: var(--accent);
+  background: rgba(250, 165, 0, 0.06);
+}
+
+.mode-standard .standard-tuning-surface .pco-body .btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.mode-standard .standard-tuning-surface .pco-state {
+  padding: 14px 16px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px dashed var(--border-glass);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--fg-secondary);
+  line-height: 1.5;
+}
+
+.mode-standard .standard-tuning-surface .pco-state-error {
+  border-color: rgba(239, 68, 68, 0.32);
+  background: rgba(239, 68, 68, 0.06);
+  color: var(--fg-primary);
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   9. AUTOTUNER EVIDENCE PANEL — AutotunerEvidencePanel
+   It is the 2nd child of the tuning surface and uses production's generic
+   '.section'/'.ds-glass-card' chrome (already neutralised in §0 / §1). No
+   bespoke tu2 element exists for an evidence ledger; it inherits the kit
+   glass-card calm. NO-HOOK for any further bespoke styling.
+   ═════════════════════════════════════════════════════════════════════════ */
+
+/* ═════════════════════════════════════════════════════════════════════════
+   10. RESPONSIVE — mirror the kit's exact breakpoints (priority grid 6→3→2,
+   conf grid → single column, noise presets 4→2, perchip split → stacked).
+   ═════════════════════════════════════════════════════════════════════════ */
+@media (max-width: 1100px) {
+  .mode-standard .standard-tuning-surface .tuning-priority-grid {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
+@media (max-width: 980px) {
+  .mode-standard .standard-tuning-surface .tuning-priority-conf-grid {
+    grid-template-columns: 1fr;
+  }
+  .mode-standard .standard-tuning-surface .tuning-priority-impact {
+    position: static;
+  }
+}
+
+@media (max-width: 860px) {
+  .mode-standard .standard-tuning-surface .pco-split {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 720px) {
+  .mode-standard .standard-tuning-surface .tuning-noise-presets {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .mode-standard .standard-tuning-surface .profile-card-stats {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .mode-standard .standard-tuning-surface .tuning-priority-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .mode-standard .standard-tuning-surface .tuning-conf-row {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+  .mode-standard .standard-tuning-surface .tuning-conf-val {
+    text-align: left;
+    min-width: 0;
+  }
+  .mode-standard .standard-tuning-surface .pco-grid {
+    grid-template-columns: repeat(6, 1fr);
+  }
+  .mode-standard .standard-tuning-surface .pco-inspector-stats,
+  .mode-standard .standard-tuning-surface .sp-card {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   11. REDUCED MOTION — drop the kit's transform/lift/glow transitions for
+   users who request it (kit polish.js / styles.css honour the same).
+   ═════════════════════════════════════════════════════════════════════════ */
+@media (prefers-reduced-motion: reduce) {
+  .mode-standard .standard-tuning-surface .tuning-priority-tile,
+  .mode-standard .standard-tuning-surface .tuning-priority-tile:hover,
+  .mode-standard .standard-tuning-surface .profile-card,
+  .mode-standard .standard-tuning-surface .profile-card:hover,
+  .mode-standard .standard-tuning-surface .pco-cell,
+  .mode-standard .standard-tuning-surface .pco-cell:hover,
+  .mode-standard .standard-tuning-surface .tuning-scope-btn,
+  .mode-standard .standard-tuning-surface .tuning-noise-tile,
+  .mode-standard .standard-tuning-surface .sp-btn,
+  .mode-standard .standard-tuning-surface .time-tab,
+  .mode-standard .standard-tuning-surface .pco-body .btn-secondary,
+  .mode-standard .standard-tuning-surface .pco-actions .btn,
+  .mode-standard
+    .standard-tuning-surface
+    .tuning-priority-impact
+    > .btn-primary,
+  .mode-standard
+    .standard-tuning-surface
+    .tuning-priority-impact
+    > .btn.ds-btn.primary {
+    transition: none;
+    transform: none;
+  }
+}

@@ -1,0 +1,16 @@
+# Grafana provisioned dashboard provider for DCENT_OS.
+# Copy to /etc/grafana/provisioning/dashboards/dcentos.yml
+# and place dcentos-*.json under the `path` below.
+apiVersion: 1
+
+providers:
+  - name: dcentos
+    orgId: 1
+    folder: DCENT_OS
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards/dcentos
+      foldersFromFilesStructure: false

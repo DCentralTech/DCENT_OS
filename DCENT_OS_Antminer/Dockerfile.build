@@ -1,0 +1,49 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# DEVOPS-005: FORCE_UNSAFE_CONFIGURE is deliberately NOT set as a global image
+# ENV. It disables a Buildroot/autoconf safety check (the "you should not run
+# ./configure as root" abort that some host/target packages — e.g. the
+# gettext/glibc family — emit when built as uid 0), so it must only be in scope
+# for the one step that actually runs Buildroot's `make` (which drives those
+# package ./configure scripts). A global ENV would silently leak the override
+# into every other layer and every `docker run`/`docker exec` against this image
+# (toolchain download, `nproc` probes, tarball packaging/signing, debug shells),
+# weakening the check far beyond where it is needed. It is instead passed
+# narrowly via `docker run -e FORCE_UNSAFE_CONFIGURE=1` on the Phase 6 Buildroot
+# `make` invocation in scripts/build_in_docker.sh — the only step that requires
+# it. Do not re-add it here.
+
+# Buildroot build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    git \
+    wget \
+    curl \
+    cpio \
+    unzip \
+    rsync \
+    bc \
+    python3 \
+    python3-pip \
+    file \
+    libncurses-dev \
+    libssl-dev \
+    device-tree-compiler \
+    u-boot-tools \
+    squashfs-tools \
+    gzip \
+    bzip2 \
+    xz-utils \
+    patch \
+    perl \
+    sed \
+    gawk \
+    diffutils \
+    findutils \
+    tar \
+    debianutils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build

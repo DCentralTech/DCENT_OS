@@ -1,0 +1,167 @@
+/* ─────────────────────────────────────────────────────────────────────────
+   DCENT_OS — Theme Studio (Dashboard UI/UX Wave 9, ZONE C)
+
+   The headline new feature: a curated palette-pack gallery + live preview +
+   custom builder layered on top of the Wave-1 accent engine
+   ('src/theme/accent.ts'). This file owns ONLY the studio chrome — the
+   pack gallery cards, the live-preview stage, and the custom-builder color
+   input. The shared '.accent-picker-*' grammar (head, custom row, hint,
+   reset link) lives in common.css and is reused as-is.
+
+   Loaded after the accent engine import in main.tsx. The default D-Central
+   pack injects nothing, so on a fresh app this file styles a studio whose
+   accent is the byte-faithful shipped orange.
+
+   Every value here is a design token that rebinds per '.mode-*', so the
+   studio chrome itself recolors with the chosen accent — exactly like the
+   picker it grew from. Any animation is guarded by reduced-motion + print.
+   ───────────────────────────────────────────────────────────────────────── */
+
+/* The studio shares the .accent-picker grid; this is just a hook for scoping. */
+.theme-studio {
+  /* inherits .accent-picker ( display: grid; gap: 14px ) */
+}
+
+/* ── Pack gallery ─────────────────────────────────────────────────────── */
+.theme-studio-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.theme-studio-pack {
+  display: grid;
+  grid-template-rows: auto auto auto;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md, 12px);
+  border: 1px solid var(--border, var(--border-subtle));
+  background: var(--card-bg, var(--bg-subtle));
+  color: var(--text, var(--fg-primary));
+  cursor: pointer;
+  text-align: left;
+  transition:
+    border-color 0.15s var(--ease-standard, ease),
+    transform 0.15s var(--ease-standard, ease),
+    box-shadow 0.15s var(--ease-standard, ease);
+}
+.theme-studio-pack:hover {
+  transform: translateY(-1px);
+  border-color: var(--accent-border);
+}
+.theme-studio-pack:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-border);
+}
+.theme-studio-pack.is-active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-border), 0 0 16px var(--accent-glow);
+}
+
+.theme-studio-pack-swatch {
+  height: 26px;
+  border-radius: var(--radius-sm, 8px);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.18);
+}
+.theme-studio-pack-label {
+  font-size: 0.84rem;
+  font-weight: 700;
+  line-height: 1.2;
+}
+.theme-studio-pack-blurb {
+  font-size: 0.66rem;
+  line-height: 1.35;
+  /* WCAG AA: --text-dim (#6E6E80) on the pack-card bg (~#121318) is only 3.7:1
+     for 0.66rem small text. #8a8a9c clears AA (~5.5:1). */
+  color: #8a8a9c;
+}
+
+/* ── Live preview ─────────────────────────────────────────────────────── */
+.theme-studio-preview {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border-radius: var(--radius-md, 12px);
+  border: 1px dashed var(--border, var(--border-subtle));
+  background:
+    linear-gradient(135deg, var(--accent-tint-08, transparent), transparent);
+}
+.theme-studio-preview-eyebrow {
+  font-size: 0.58rem;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-dim, var(--fg-dim));
+}
+.theme-studio-preview-stage {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+/* The sample button must read as a real filled primary using the AA-guarded
+   ink var (falls back to near-black so it's correct even before any override). */
+.theme-studio-preview-btn {
+  pointer-events: none;
+  color: var(--accent-ink, #1a0f00);
+}
+.theme-studio-preview-pill {
+  pointer-events: none;
+}
+.theme-studio-preview-dot {
+  /* inherits .ds-dot-live pulse; reduced-motion handled by motion.css */
+}
+
+/* ── Custom builder ───────────────────────────────────────────────────── */
+.theme-studio-custom-row {
+  align-items: stretch;
+  max-width: 360px;
+}
+.theme-studio-color-input {
+  flex: 0 0 auto;
+  width: 40px;
+  padding: 0;
+  border: 1px solid var(--border, var(--border-subtle));
+  border-radius: var(--radius-sm, 8px);
+  background: transparent;
+  cursor: pointer;
+}
+/* Normalize the native swatch chrome across engines. */
+.theme-studio-color-input::-webkit-color-swatch-wrapper {
+  padding: 3px;
+}
+.theme-studio-color-input::-webkit-color-swatch {
+  border: none;
+  border-radius: 5px;
+}
+.theme-studio-color-input::-moz-color-swatch {
+  border: none;
+  border-radius: 5px;
+}
+
+/* ── Responsive ───────────────────────────────────────────────────────── */
+@media (max-width: 479.98px) {
+  .theme-studio-gallery {
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  }
+  .theme-studio-custom-row {
+    max-width: none;
+  }
+}
+
+/* No bespoke animation defined here (the live dot reuses .ds-dot-live, which
+   carries its own reduced-motion guard in motion.css). This block documents
+   that intent + future-proofs against an accidental unguarded keyframe. */
+@media (prefers-reduced-motion: reduce) {
+  .theme-studio-pack {
+    transition: none;
+  }
+}
+
+@media print {
+  .theme-studio-preview {
+    background: none;
+  }
+}

@@ -1,0 +1,107 @@
+#!/bin/sh
+#
+# S10hardware - Verify UIO devices and hardware access for FPGA communication
+#
+# DCENTos uses the UIO (Userspace I/O) approach instead of kernel modules.
+# The FPGA bitstream (loaded by FSBL during boot) creates UIO devices that
+# map FPGA registers directly into userspace. No kernel modules needed.
+#
+# This is the same UIO approach used by modern DCENT_OS Zynq bring-up and other
+# proven Zynq mining stacks.
+# Benefits over kernel modules:
+#   - No kernel ABI dependency (works with any kernel version)
+#   - Pure userspace code (easier to develop, debug, update)
+#   - No binary blob .ko files to extract from stock firmware
+#
+# UIO device counts by platform:
+#   S9 (am1-s9):      14 UIO — chain6-8 (3 chains x 4 FIFOs) + fan + glitch
+#   S19 Pro (am2-s17): 19 UIO — chain1-4 (4 chains x 4 FIFOs) + fan + board-control + glitch
+#
+# All Zynq platforms share fan-control @ 0x42800000 and chains @ 0x43Cx0000.
+# S19 Pro uses chain1-4 naming (not chain6-8) and adds board-control @ 0x42810000.
+
+PASS_COUNT=0
+FAIL_COUNT=0
+WARN_COUNT=0
+
+check_pass() { PASS_COUNT=$((PASS_COUNT + 1)); echo "  [OK] $1"; }
+check_fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); echo "  [FAIL] $1"; }
+check_warn() { WARN_COUNT=$((WARN_COUNT + 1)); echo "  [WARN] $1"; }
+
+case "$1" in
+    start)
+        echo "Verifying hardware access (UIO + devmem)..."
+        echo ""
+
+        # Check for UIO devices
+        UIO_COUNT=$(ls -d /sys/class/uio/uio* 2>/dev/null | wc -l)
+        if [ "$UIO_COUNT" -gt 0 ]; then
+            check_pass "Found $UIO_COUNT UIO devices"
+        else
+            check_fail "No UIO devices found — FPGA bitstream may not be loaded"
+        fi
+
+        # Check for devmem
+        if command -v devmem > /dev/null 2>&1; then
+            check_pass "devmem available"
+        else
+            check_fail "devmem not found — install devmem2 package"
+        fi
+
+        # Check FPGA version register
+        if [ "$UIO_COUNT" -gt 0 ]; then
+            FPGA_VER=$(devmem 0x43C00000 32 2>/dev/null)
+            if [ -n "$FPGA_VER" ] && [ "$FPGA_VER" != "0x00000000" ]; then
+                check_pass "FPGA version: $FPGA_VER"
+            else
+                check_warn "Cannot read FPGA version register"
+            fi
+        fi
+
+        # Check for i2c-tools
+        if command -v i2cdetect > /dev/null 2>&1; then
+            check_pass "i2c-tools available"
+        else
+            check_warn "i2c-tools not found"
+        fi
+
+        # Detect board type by UIO device names
+        if ls /sys/class/uio/uio*/name 2>/dev/null | xargs cat 2>/dev/null | grep -q "board-control"; then
+            check_pass "Board type: S17/S19 (has board-control UIO)"
+        elif [ "$UIO_COUNT" -ge 14 ]; then
+            check_pass "Board type: S9 (14 UIO devices)"
+        elif [ "$UIO_COUNT" -gt 0 ]; then
+            check_warn "Unknown board type ($UIO_COUNT UIO devices)"
+        fi
+
+        # List UIO devices
+        echo ""
+        echo "  UIO Device Map:"
+        for u in /sys/class/uio/uio*; do
+            if [ -d "$u" ]; then
+                name=$(cat "$u/name" 2>/dev/null || echo "unknown")
+                addr=$(cat "$u/maps/map0/addr" 2>/dev/null || echo "?")
+                echo "    $(basename $u): $name @ $addr"
+            fi
+        done
+
+        echo ""
+        echo "Hardware check: $PASS_COUNT passed, $FAIL_COUNT failed, $WARN_COUNT warnings"
+        ;;
+
+    stop)
+        echo "Nothing to unload (UIO devices managed by kernel/devicetree)."
+        ;;
+
+    restart)
+        $0 stop
+        $0 start
+        ;;
+
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac
+
+exit 0

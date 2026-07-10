@@ -1,0 +1,78 @@
+[general]
+hostname = "dcentos-s19jpro-chain4-native"
+log_level = "info"
+
+[pool]
+url = "stratum+tcp://btc.global.luxor.tech:700"
+worker = "DCentralTech.s19jpro-am2-chain4"
+password = "x"
+protocol = "sv1"
+
+[mining]
+enabled = true
+frequency_mhz = 400
+voltage_mv = 13600
+suggest_difficulty = 8192
+passthrough = false
+version_rolling = false
+serial_device = "/dev/ttyS3"
+serial_chip_count = 126
+serial_chip_type = "BM1362"
+fpga_chain_base = "0x43C30000"
+fpga_chain_id = 4
+model = "s19jpro"
+skip_fifo_reset = false
+skip_board_temp = false
+
+[power]
+psu_bypass = false
+max_watts = 1200
+circuit_capacity_watts = 4800
+circuit_voltage_v = 240
+circuit_amperage_a = 20
+
+[psu]
+voltage_mv = 15200
+heartbeat_hz = 1
+watchdog_enabled = true
+i2c_address = 0x10
+transport = "gpio_bitbang"
+pwr_control_gpio = "gpio:907"
+
+[thermal]
+target_temp_c = 60
+hot_temp_c = 70
+dangerous_temp_c = 85
+fan_min_pwm = 10
+fan_max_pwm = 30
+pid_interval_s = 2.0
+hysteresis_c = 3
+
+[api]
+cgminer_port = 4028
+http_port = 8080
+websocket = true
+cgminer_bind_lan = false
+metrics_require_auth = true
+
+[donation]
+enabled = false
+
+[watchdog]
+enabled = false
+
+[hash_on_disconnect]
+enabled = true
+
+[mode]
+active = "standard"
+
+[autotuner]
+enabled = false
+
+[led]
+enabled = true
+heartbeat_on_ms = 100
+heartbeat_off_ms = 900
+flash_on_accepted_share = true
+flash_on_rejected_share = true

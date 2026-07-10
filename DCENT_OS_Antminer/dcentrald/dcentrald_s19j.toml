@@ -1,0 +1,32 @@
+# dcentrald configuration for S19j Pro (BM1362, 126 chips)
+# Serial UART mining path — bypasses FPGA work FIFOs
+# Usage: dcentrald --serial-mining --config /tmp/dcentrald_s19j.toml
+
+[general]
+hostname = "s19jpro-dcent"
+log_level = "info"
+
+[pool]
+url = "stratum+tcp://public-pool.io:21496"
+worker = ""
+password = "x"
+
+[mining]
+frequency_mhz = 500
+voltage_mv = 320
+suggest_difficulty = 512
+passthrough = false
+serial_device = "/dev/ttyS2"
+serial_chip_count = 126
+serial_chip_type = "BM1362"
+
+[thermal]
+target_temp_c = 55
+hot_temp_c = 65
+dangerous_temp_c = 75
+
+[watchdog]
+enabled = false
+
+[hash_on_disconnect]
+enabled = true

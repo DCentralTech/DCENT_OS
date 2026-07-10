@@ -1,0 +1,549 @@
+#!/bin/sh
+#
+# S99upgrade - Clear U-Boot upgrade_stage after VERIFIED successful boot
+#
+# When sysupgrade writes a new firmware to the inactive slot, it sets
+# upgrade_stage=0 in U-Boot env. On lanes where the platform U-Boot
+# recovery behavior has been proven, that flag participates in recovery:
+#   - First boot:  U-Boot increments upgrade_stage to 1, continues boot
+#   - Second boot: If upgrade_stage=1, U-Boot REVERTS to other firmware slot
+#   - Cleared:     Normal boot (no recovery check)
+#
+# CRITICAL: This script must ONLY clear upgrade_stage after verifying the
+# system is actually healthy. If any check fails, upgrade_stage stays set, the
+# slot remains uncommitted, and recovery follows the platform runbook (serial/SD
+# boundary unless that platform's U-Boot rollback has been proven).
+#
+# ============================================================================
+# BOOT-SUCCESS CONTRACT (W8 parity hardening, 2026-06-02)
+# ============================================================================
+# A fresh A/B-slot boot is committed as "good" (upgrade_stage cleared) ONLY
+# after the daemon reaches a REAL, SUSTAINED running state — not merely the
+# instant it binds a socket. Parity with BraiinsOS/LuxOS A/B auto-rollback:
+# they require the management plane to *stay up* before committing.
+#
+# A slot is committed only when ALL of these hold:
+#   (1) network up + SSH manageable (or a documented policy-locked soft-pass);
+#   (2) dcentrald is RUNNING (pidof);
+#   (3) dashboard(:80) + dcentrald API(:8080) answer HTTP;
+#   (4) the daemon's REAL health endpoint /api/system/health parses AND
+#       reports a positive daemon.uptime_s — i.e. the daemon genuinely
+#       reached a steady running state, not just opened a listen socket;
+#   (5) BOOT-SUCCESS WINDOW: after a settle of MIN_HEALTHY_UPTIME_S, the
+#       daemon is STILL the same running process (catches bind-then-crash
+#       loops, where the API answers once but the daemon then dies and the
+#       S82dcentrald wrapper restarts a fresh PID).
+#
+# BRICK-SAFETY (load-bearing — bias toward keeping the known-good slot):
+#   - The PREVIOUS slot is known-good. A *too-strict* gate that needlessly
+#     leaves upgrade_stage set only costs the new upgrade (U-Boot reverts to
+#     the previous slot) — that is the lower-risk failure. The dangerous
+#     failure is the opposite: committing a BROKEN slot too early (the exact
+#     W8 "defeated by S99" bug). So the real-health + window gates are added
+#     as ADDITIONAL evidence of failure, and only ever make the gate
+#     *stricter*, never looser.
+#   - Where the new evidence is merely ABSENT (health tool/endpoint missing,
+#     not a positive failure signal), we degrade to the prior behavior so a
+#     unit the old logic would have committed is NOT newly reverted. Absence
+#     of proof is treated as a soft-pass; only a POSITIVE failure signal
+#     (daemon died inside the window, health endpoint reachable but reports a
+#     dead/zero-uptime daemon) blocks the commit.
+#   - S99upgrade is the SOLE authority that clears upgrade_stage on the
+#     healthy path. S99verify (the V1..V14 proof matrix) is report-only and
+#     defers to this gate (it never commits a slot that S99upgrade declared
+#     unhealthy). The shared marker /tmp/dcentos-upgrade-committed records
+#     this decision for S99verify to observe.
+# ============================================================================
+
+HEALTH_OK=true
+
+# Boot-success window: minimum sustained healthy uptime (seconds) the daemon
+# must accumulate before the slot is committed. Tunable via U-Boot-independent
+# env file for lab/CI; default is conservative so a slow-but-fine boot is not
+# false-failed. Kept well inside S99upgrade's overall ~5 min wall-clock budget.
+MIN_HEALTHY_UPTIME_S=${DCENTOS_BOOT_SUCCESS_WINDOW_S:-25}
+
+# Single-source commit-decision marker. Written by THIS script so S99verify
+# (same S99 priority, runs after S99upgrade) can observe the committed/blocked
+# decision instead of re-deriving it. Lives in /tmp (per-boot, intentionally
+# not persistent — the U-Boot upgrade_stage env is the durable truth).
+UPGRADE_COMMIT_MARKER=${DCENTOS_UPGRADE_COMMIT_MARKER:-/tmp/dcentos-upgrade-committed}
+
+# Test hooks default to the production locations. Host-side rollback tests use
+# them to run the real start path without touching /dev or /etc.
+MTD4_NODE=${DCENTOS_MTD4_NODE:-/dev/mtd4}
+FW_ENV_CONFIG=${DCENTOS_FW_ENV_CONFIG:-/etc/fw_env.config}
+DCENTRALD_BIN=${DCENTOS_DCENTRALD_BIN:-/usr/local/bin/dcentrald}
+DCENTOS_CONFIG_DIR=${DCENTOS_CONFIG_DIR:-/etc/dcentos}
+DROPBEAR_DEFAULTS=${DCENTOS_DROPBEAR_DEFAULTS:-/etc/default/dropbear}
+ROOT_AUTHORIZED_KEYS=${DCENTOS_ROOT_AUTHORIZED_KEYS:-/root/.ssh/authorized_keys}
+DATA_AUTHORIZED_KEYS=${DCENTOS_DATA_AUTHORIZED_KEYS:-/data/keys/dropbear/authorized_keys}
+
+wait_for_http() {
+    LABEL="$1"
+    URL="$2"
+    LIMIT="$3"
+    [ -n "$LIMIT" ] || LIMIT=30
+
+    echo "  Waiting for $LABEL HTTP health (up to ${LIMIT}s)..."
+    for i in $(seq 1 "$LIMIT"); do
+        if command -v wget > /dev/null 2>&1; then
+            if wget -q -T 2 -O /dev/null "$URL" 2>/dev/null; then
+                echo "  [OK] $LABEL HTTP health"
+                return 0
+            fi
+        fi
+        sleep 1
+    done
+
+    echo "  [FAIL] $LABEL HTTP health did not respond at $URL"
+    return 1
+}
+
+# Fetch /api/system/health and decide a three-state verdict on stdout:
+#   "healthy"     - endpoint answered AND reports a positive daemon.uptime_s
+#                   (daemon genuinely reached a steady running state).
+#   "unhealthy"   - endpoint answered but reports a dead / zero-uptime daemon
+#                   (POSITIVE failure signal -> block the commit).
+#   "unknown"     - endpoint or wget unreachable, no positive signal either
+#                   way (brick-safe: treat as soft-pass, do NOT newly fail a
+#                   unit the prior socket-bind logic would have committed).
+#
+# jq-free: extract daemon.uptime_s with a tolerant sed that handles the
+# pretty-printed JSON this endpoint emits ("uptime_s": <int>). If the field
+# can't be parsed but the body is non-empty, we still treat a present body as
+# "unknown" rather than "unhealthy" (parse fragility must not revert a good
+# unit).
+daemon_real_health_verdict() {
+    URL="http://127.0.0.1:8080/api/system/health"
+    if ! command -v wget > /dev/null 2>&1; then
+        echo "unknown"
+        return 0
+    fi
+    BODY=$(wget -q -T 4 -O - "$URL" 2>/dev/null)
+    if [ -z "$BODY" ]; then
+        echo "unknown"
+        return 0
+    fi
+    # daemon.uptime_s is the first uptime_s in the daemon block. Grab the first
+    # integer-valued uptime_s in the document (the daemon block precedes any
+    # other uptime in this endpoint's shape).
+    UPTIME=$(printf '%s' "$BODY" \
+        | tr ',' '\n' \
+        | sed -n 's/.*"uptime_s"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        | head -1)
+    if [ -z "$UPTIME" ]; then
+        # Body present but uptime not parseable: don't claim failure.
+        echo "unknown"
+        return 0
+    fi
+    if [ "$UPTIME" -gt 0 ] 2>/dev/null; then
+        echo "healthy"
+    else
+        # Endpoint reachable AND explicitly says the daemon has zero uptime
+        # (just (re)started / not steady) -> positive not-yet-healthy signal.
+        echo "unhealthy"
+    fi
+    return 0
+}
+
+check_health() {
+    # S40network runs udhcpc in background, so DHCP may not complete before S99.
+    echo "  Waiting for network (up to 60s)..."
+    for i in $(seq 1 60); do
+        if ip addr show eth0 2>/dev/null | grep -q 'inet '; then
+            break
+        fi
+        sleep 1
+    done
+
+    # Check 1: Network interface has an IP.
+    if ! ip addr show eth0 2>/dev/null | grep -q 'inet '; then
+        echo "  [FAIL] eth0 has no IP address after 60s"
+        HEALTH_OK=false
+        return
+    fi
+    echo "  [OK] Network interface has IP"
+
+    # Check 2: SSH server is listening on port 22.
+    #
+    # DevOps Q1 finding 4K (2026-05-15): On a fresh first-boot install,
+    # S50dropbear is gated on the dashboard wizard completing (per the W1.1
+    # default-credential lockdown). The lockdown is correct for steady-state
+    # but produces a circular failure on the FIRST boot of a flashed image:
+    # S50dropbear refuses to start -> SSH:22 check fails -> upgrade_stage
+    # stays set -> next reboot triggers U-Boot auto-recovery -> firmware
+    # slot reverts. The fix is the `/etc/dcentos/first-boot-grace` marker
+    # baked into the install image by post-image.sh; S50dropbear consumes
+    # it on first boot and stamps `.ssh-enabled` so dropbear comes up. If
+    # the marker existed at boot time, we accept dropbear being mid-startup
+    # as a soft pass — the dashboard wizard remains the operator's hard
+    # security gate.
+    if ! netstat -tln 2>/dev/null | grep -q ':22 '; then
+        # If first-boot grace was used this boot, dropbear may still be
+        # mid-startup or might be intentionally disabled per the gate; in
+        # that case do NOT block upgrade-stage commit on SSH alone.
+        if [ -f "$DCENTOS_CONFIG_DIR/first-boot-grace-consumed" ] || \
+           [ -f "$DCENTOS_CONFIG_DIR/first-boot-grace" ]; then
+            echo "  [SOFT-PASS] SSH:22 not listening yet (first-boot grace active)"
+        elif [ -f "$DCENTOS_CONFIG_DIR/release-image" ]; then
+            # On a RELEASE image S50dropbear is intentionally locked-by-policy
+            # (locked-release-image) until the operator sets a credential via the
+            # LAN dashboard, so SSH-down is a HEALTHY state, not a failed flash.
+            # Manageability is still hard-proven by the dashboard(:80) + API(:8080)
+            # checks below — so do NOT block the upgrade_stage commit (and trigger
+            # a U-Boot auto-revert of a fresh slot) purely on policy-locked SSH.
+            echo "  [SOFT-PASS] SSH:22 locked by release-image policy; dashboard(:80)+API(:8080) checks below prove manageability"
+        else
+            echo "  [FAIL] SSH server not listening on port 22"
+            HEALTH_OK=false
+            return
+        fi
+    else
+        echo "  [OK] SSH server listening"
+    fi
+
+    # Check 2b: SSH is not locked by key-only mode without authorized_keys.
+    if grep -q '\-s' "$DROPBEAR_DEFAULTS" 2>/dev/null; then
+        if [ ! -s "$ROOT_AUTHORIZED_KEYS" ] && [ ! -s "$DATA_AUTHORIZED_KEYS" ]; then
+            if [ -f "$DCENTOS_CONFIG_DIR/first-boot-grace" ] || \
+               [ -f "$DCENTOS_CONFIG_DIR/first-boot-grace-consumed" ]; then
+                echo "  [SOFT-PASS] SSH key-only mode without keys (first-boot grace; operator finishes wizard via dashboard)"
+            elif [ -f "$DCENTOS_CONFIG_DIR/release-image" ]; then
+                echo "  [SOFT-PASS] SSH key-only mode without keys on release image (locked by policy; dashboard/API prove manageability)"
+            else
+                echo "  [FAIL] SSH key-only mode (-s) but no authorized_keys - locked out!"
+                HEALTH_OK=false
+                return
+            fi
+        fi
+    fi
+    echo "  [OK] SSH access verified"
+
+    # Check 3: dcentrald process is running.
+    if ! pidof dcentrald > /dev/null 2>&1; then
+        if [ ! -x "$DCENTRALD_BIN" ]; then
+            echo "  [FAIL] dcentrald binary not found at $DCENTRALD_BIN"
+            HEALTH_OK=false
+            return
+        fi
+
+        echo "  [WAIT] dcentrald not running yet - waiting up to 30s"
+        for i in $(seq 1 30); do
+            if pidof dcentrald > /dev/null 2>&1; then
+                echo "  [OK] dcentrald started after ${i}s"
+                break
+            fi
+            sleep 1
+        done
+    fi
+
+    if ! pidof dcentrald > /dev/null 2>&1; then
+        echo "  [FAIL] dcentrald did not start within 30s"
+        HEALTH_OK=false
+        return
+    fi
+    echo "  [OK] dcentrald is running"
+
+    # Check 4: dashboard owns port 80 and serves the local health endpoint.
+    if ! wait_for_http "dashboard" "http://127.0.0.1/api/dashboard/health" 30; then
+        HEALTH_OK=false
+        return
+    fi
+
+    # Check 5: dcentrald REST API owns port 8080 and responds before commit.
+    if ! wait_for_http "dcentrald API" "http://127.0.0.1:8080/api/status" 45; then
+        HEALTH_OK=false
+        return
+    fi
+
+    # Check 6 (W8 parity): REAL health endpoint, not just a socket-bind probe.
+    # /api/status answering proves the HTTP server bound; it does NOT prove the
+    # daemon reached a steady running state. /api/system/health reports the
+    # daemon's own uptime, so a positive uptime is real "the daemon is alive
+    # and has been for a moment" evidence. Brick-safe three-state:
+    #   healthy   -> proceed
+    #   unhealthy -> POSITIVE failure signal: block the commit (revert is safe;
+    #                old slot is known-good)
+    #   unknown   -> no signal either way: soft-pass (do NOT revert a unit the
+    #                prior socket-bind gate would have committed)
+    HEALTH_VERDICT=$(daemon_real_health_verdict)
+    case "$HEALTH_VERDICT" in
+        healthy)
+            echo "  [OK] /api/system/health reports a live daemon with positive uptime"
+            ;;
+        unhealthy)
+            echo "  [FAIL] /api/system/health reachable but reports a dead/zero-uptime daemon"
+            HEALTH_OK=false
+            return
+            ;;
+        *)
+            echo "  [SOFT-PASS] /api/system/health gave no decisive signal (endpoint or wget unavailable); not blocking commit on its absence"
+            ;;
+    esac
+
+    # Check 7 (W8 parity): BOOT-SUCCESS WINDOW. Require the daemon to stay up
+    # for MIN_HEALTHY_UPTIME_S as the SAME process. This catches the
+    # bind-then-crash-loop: /api/status answers the instant the socket binds,
+    # but if the daemon then dies the S82dcentrald wrapper restarts a fresh PID.
+    # Committing such a slot is exactly the W8 "defeated by S99" hole. We snap
+    # the current PID, sleep the window, and re-confirm the SAME PID is alive.
+    START_PID=$(pidof dcentrald 2>/dev/null | awk '{print $1}')
+    if [ -z "$START_PID" ]; then
+        # Lost the daemon between Check 3 and here -> positive failure.
+        echo "  [FAIL] dcentrald PID disappeared before the boot-success window"
+        HEALTH_OK=false
+        return
+    fi
+    echo "  Boot-success window: confirming dcentrald PID $START_PID stays up ${MIN_HEALTHY_UPTIME_S}s..."
+    WINDOW_LEFT=$MIN_HEALTHY_UPTIME_S
+    while [ "$WINDOW_LEFT" -gt 0 ]; do
+        # Probe in short steps so an early death is caught fast (and surfaced
+        # as a positive failure, not a timeout).
+        sleep 1
+        WINDOW_LEFT=$((WINDOW_LEFT - 1))
+        if ! kill -0 "$START_PID" 2>/dev/null; then
+            echo "  [FAIL] dcentrald PID $START_PID died inside the boot-success window (crash-loop)"
+            HEALTH_OK=false
+            return
+        fi
+    done
+    NOW_PID=$(pidof dcentrald 2>/dev/null | awk '{print $1}')
+    if [ "$NOW_PID" != "$START_PID" ]; then
+        echo "  [FAIL] dcentrald PID changed during the window ($START_PID -> ${NOW_PID:-none}); wrapper restarted it (crash-loop)"
+        HEALTH_OK=false
+        return
+    fi
+    echo "  [OK] dcentrald survived the ${MIN_HEALTHY_UPTIME_S}s boot-success window as PID $START_PID"
+}
+
+case "$1" in
+    start)
+        # Check if upgrade_stage needs clearing.
+        if [ ! -e "$MTD4_NODE" ]; then
+            exit 0
+        fi
+
+        # Detect whether U-Boot has upgrade_stage set, using the redundant-env-
+        # aware fw_printenv (the clear/verify path already uses it) instead of a
+        # raw single-copy `dd if=/dev/mtd4 count=1` that reads ONLY redundant copy
+        # A and can miss/misread the active copy B on weak-ECC mtd4 (A1d-4). Fail
+        # SAFE: if fw_printenv / fw_env.config is unavailable, do NOT exit early —
+        # fall through to the health gate (a needless run just finds upgrade_stage
+        # already absent and is harmless), never silently skip the gate.
+        if command -v fw_printenv >/dev/null 2>&1; then
+            if ! fw_printenv upgrade_stage >/dev/null 2>&1; then
+                # fw_printenv ran and upgrade_stage is not present -> normal boot.
+                exit 0
+            fi
+            # upgrade_stage present -> run health checks below.
+        fi
+        # (tooling absent OR upgrade_stage present) -> run the health gate.
+
+        echo "Upgrade detected (upgrade_stage set) - running health checks before committing..."
+        check_health
+
+        if [ "$HEALTH_OK" != "true" ]; then
+            echo "  *** HEALTH CHECK FAILED - NOT clearing upgrade_stage ***"
+            echo "  *** slot remains uncommitted; use the platform recovery runbook ***"
+            echo "  *** (serial/SD boundary unless rollback is proven for this lane) ***"
+            # Record the blocked decision for S99verify (same S99 priority,
+            # runs after us). S99verify is report-only and must not commit a
+            # slot S99upgrade declared unhealthy.
+            echo "blocked" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
+            exit 0
+        fi
+
+        echo "Health checks passed - clearing upgrade_stage (making current firmware permanent)..."
+
+        # libubootenv is mandatory in defconfig. The python+nandwrite fallback
+        # raced with U-Boot env redundancy and caused brick-back on .139.
+        if ! command -v fw_setenv > /dev/null 2>&1; then
+            echo "  *** ERROR: fw_setenv missing - libubootenv-tools not installed ***"
+            echo "  *** upgrade_stage NOT cleared - slot remains uncommitted ***"
+            echo "  *** Add BR2_PACKAGE_LIBUBOOTENV{,_TOOLS}=y to defconfig and rebuild ***"
+            echo "blocked" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
+            exit 0
+        fi
+        if ! command -v fw_printenv > /dev/null 2>&1; then
+            echo "  *** ERROR: fw_printenv missing - cannot verify the clear ***"
+            echo "blocked" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
+            exit 0
+        fi
+        if [ ! -f "$FW_ENV_CONFIG" ]; then
+            echo "  *** ERROR: /etc/fw_env.config missing - fw_setenv has no MTD map ***"
+            echo "blocked" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
+            exit 0
+        fi
+
+        # ====================================================================
+        # COMMIT THE SLOT — clear upgrade_stage (and first_boot) reliably.
+        #
+        # BUG 2 ROOT CAUSE (live .100 S9, 2026-06-05): the previous code ran
+        # TWO separate `fw_setenv` calls (`upgrade_stage` then `first_boot`)
+        # and read back only ONCE. On the weak-ECC pl35x-nand mtd4 (the kernel
+        # warns "ECC too weak") this failed two ways:
+        #   (a) Two-call sequence resurrects the var. Each fw_setenv is a full
+        #       read-modify-erase-write-flip of a redundant copy. If the FIRST
+        #       call's freshly-written copy reads back CRC-bad (weak ECC can't
+        #       correct the new page), libubootenv silently falls back to the
+        #       OTHER (older) copy on the next access. The SECOND call
+        #       (`first_boot`) then reads that stale copy — which STILL has
+        #       upgrade_stage — edits first_boot, and re-persists it.
+        #       fw_setenv returned 0 both times, so the old "OK: committed"
+        #       message printed, yet the read-back showed upgrade_stage present.
+        #   (b) A single bad block / transient weak-ECC write lands corrupt and
+        #       is dropped on read.
+        #
+        # FIX (NEVER raw nandwrite mtd4 — load-bearing
+        # ): mirror the PROVEN
+        # sysupgrade write path —
+        #   1. clear each var with the BARE form `fw_setenv <key>` (no value,
+        #      NO --script). See BUG 4 below: on this libubootenv build the
+        #      `--script -` here-doc with a bare key does NOT delete the var —
+        #      it sets `upgrade_stage=0`, which is NOT permanent (U-Boot
+        #      auto_recovery increments 0 -> 1 -> revert on the next two power
+        #      cycles). Only the bare `fw_setenv upgrade_stage` form actually
+        #      DELETES the key (proven live), and an ABSENT key is what makes a
+        #      slot permanent.
+        #   2. SETTLE + sync first — the early-boot NAND is still under
+        #      concurrent flash I/O when S99 runs; a fw_setenv issued into that
+        #      contention lands corrupt on weak-ECC mtd4 and the verify fails.
+        #      The same write succeeds once the bus is idle (proven live). So we
+        #      `sync` and pause before the first attempt and back off between
+        #      retries.
+        #   3. RETRY the whole clear up to N times with increasing backoff — a
+        #      weak-ECC write that lands in a bad page often succeeds on a later
+        #      attempt (libubootenv erases + rewrites the obsolete copy each
+        #      time);
+        #   4. VERIFY with a FRESH fw_printenv after EACH attempt; success only
+        #      when upgrade_stage is actually ABSENT (grep for `^upgrade_stage=`
+        #      finds NOTHING — a remaining `upgrade_stage=0` line is a FAILURE,
+        #      not a success) AND the env is CRC-valid;
+        #   5. FAIL LOUDLY + write the `blocked` marker if every attempt fails,
+        #      so U-Boot safely reverts to the known-good slot rather than the
+        #      install falsely advertising a committed (but not-cleared) slot.
+        # The env offsets (0x0 / 0x20000) and ENV_SIZE (0x20000) are confirmed
+        # correct against a real mtd4 dump (CRC32 over data[5:0x20000] matches
+        # both redundant copies) — the failure was the write/verify logic, not
+        # the geometry.
+        #
+        # BUG 4 ROOT CAUSE ( STABILIZE, 2026-06-05): the previous code used
+        # `fw_setenv --script -` with bare keys `upgrade_stage` / `first_boot`.
+        # In --script mode a line that is JUST a key (no whitespace, no value)
+        # is interpreted by this libubootenv as "set key to empty", and on the
+        # readback the var serializes as `upgrade_stage=0` (U-Boot reads the
+        # empty/zero value), NOT as absent. The old verify only grepped for
+        # `^upgrade_stage=` to detect a STILL-FULL value, so `upgrade_stage=0`
+        # ALSO matched and was (correctly) treated as failure — but the script
+        # had no path that ever produced an ABSENT key, so commits looped to the
+        # retry cap and `blocked` even when the write "worked". The bare-form
+        # `fw_setenv upgrade_stage` (no --script) is the documented delete and
+        # leaves the key ABSENT, which is what U-Boot needs to skip auto-recovery
+        # permanently.
+        # ====================================================================
+        FW_COMMIT_RETRIES=${DCENTOS_FW_COMMIT_RETRIES:-5}
+        # Settle the NAND before the first write and back off between retries so
+        # the env flip lands after early-boot flash I/O quiets (proven live).
+        FW_COMMIT_SETTLE_S=${DCENTOS_FW_COMMIT_SETTLE_S:-3}
+
+        # Pre-flight: refuse to write into an already-broken env. If the current
+        # env reads Bad CRC / default, a write could land in an indeterminate
+        # state; fail closed and let U-Boot revert to the known-good slot.
+        PRECHK=$(fw_printenv 2>&1)
+        case "$PRECHK" in
+            *"Bad CRC"*|*"bad CRC"*|*"using default environment"*)
+                echo "  *** ERROR: current U-Boot env reads Bad CRC / default ***"
+                echo "  *** Refusing to fw_setenv into a broken env - next ***"
+                echo "  *** power cycle reverts to the known-good slot.      ***"
+                echo "blocked" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
+                exit 0
+                ;;
+        esac
+
+        # Let early-boot NAND I/O drain before the first env flip. `sync` flushes
+        # any pending writeback; the settle pause lets the controller go idle so
+        # the weak-ECC env page write is not racing concurrent flash traffic.
+        sync 2>/dev/null || true
+        echo "  Settling NAND ${FW_COMMIT_SETTLE_S}s before env flip (weak-ECC mtd4)..."
+        sleep "$FW_COMMIT_SETTLE_S"
+
+        COMMIT_OK=0
+        ATTEMPT=1
+        while [ "$ATTEMPT" -le "$FW_COMMIT_RETRIES" ]; do
+            # BARE form (NO --script): `fw_setenv <key>` with no value DELETES
+            # the key, leaving it ABSENT in the redundant copies. This is the
+            # only form proven to make the slot permanent (BUG 4 above). Clear
+            # upgrade_stage FIRST (the one U-Boot acts on), then first_boot.
+            # Each call is its own redundant-copy flip; we re-verify from a
+            # FRESH read after BOTH so a stale-copy fallback can't hide a
+            # remaining upgrade_stage.
+            fw_setenv upgrade_stage 2>/dev/null
+            SET_RC_A=$?
+            fw_setenv first_boot 2>/dev/null
+            SET_RC_B=$?
+            SET_RC=$(( SET_RC_A | SET_RC_B ))
+
+            # Flush + brief settle so the verify reads the just-written pages,
+            # not cached state.
+            sync 2>/dev/null || true
+
+            # Verify the clear directly from flash (re-reads + re-validates the
+            # redundant copies, exactly as U-Boot does on the next boot). Success
+            # requires upgrade_stage to be ABSENT — a lingering `upgrade_stage=0`
+            # is NOT permanent and counts as failure.
+            VERIFY=$(fw_printenv 2>&1)
+            STILL_PRESENT=1
+            case "$VERIFY" in
+                *"Bad CRC"*|*"bad CRC"*|*"using default environment"*)
+                    # Env unreadable after the write - treat as failure, retry.
+                    STILL_PRESENT=1
+                    ;;
+                *)
+                    # Match the key whether it carries a value (`upgrade_stage=1`)
+                    # OR is the non-permanent zero/empty form (`upgrade_stage=0`,
+                    # `upgrade_stage=`). ANY surviving `upgrade_stage=` line means
+                    # the key is still present and the slot is NOT committed.
+                    if printf '%s\n' "$VERIFY" | grep -q '^upgrade_stage='; then
+                        STILL_PRESENT=1
+                    else
+                        STILL_PRESENT=0
+                    fi
+                    ;;
+            esac
+
+            if [ "$SET_RC" -eq 0 ] && [ "$STILL_PRESENT" -eq 0 ]; then
+                COMMIT_OK=1
+                echo "  OK: firmware committed via fw_setenv bare-delete (attempt ${ATTEMPT}/${FW_COMMIT_RETRIES}, CRC-valid env, upgrade_stage ABSENT)"
+                break
+            fi
+
+            echo "  [retry] fw_setenv clear not yet confirmed (attempt ${ATTEMPT}/${FW_COMMIT_RETRIES}: set_rc=${SET_RC}, upgrade_stage_still_present=${STILL_PRESENT}) - weak-ECC mtd4 retry"
+            ATTEMPT=$((ATTEMPT + 1))
+            # Backoff grows with the attempt number so a busy NAND gets more
+            # idle time on each retry.
+            sync 2>/dev/null || true
+            sleep "$ATTEMPT"
+        done
+
+        if [ "$COMMIT_OK" -eq 1 ]; then
+            echo "committed" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
+        else
+            echo "  *** ERROR: upgrade_stage could NOT be cleared after ${FW_COMMIT_RETRIES} fw_setenv attempts ***"
+            echo "  *** (weak-ECC pl35x-nand mtd4 - DO NOT raw-nandwrite, load-bearing rule) ***"
+            echo "  *** Slot remains uncommitted. Use the platform recovery runbook; ***"
+            echo "  *** do not assume automatic rollback unless proven for this lane. ***"
+            echo "blocked" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
+        fi
+        ;;
+
+    stop)
+        ;;
+
+    *)
+        echo "Usage: $0 {start|stop}"
+        exit 1
+        ;;
+esac
+
+exit 0

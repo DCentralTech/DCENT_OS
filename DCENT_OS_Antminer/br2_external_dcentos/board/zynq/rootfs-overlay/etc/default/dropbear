@@ -1,0 +1,8 @@
+# DCENTos dropbear SSH configuration
+#
+# Password auth is enabled during development. The setup wizard will
+# configure SSH keys and can disable password auth after initial setup.
+#
+# To disable password auth (SSH key only):
+#   DROPBEAR_ARGS="-s"
+DROPBEAR_ARGS=""

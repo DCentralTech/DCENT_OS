@@ -1,0 +1,26 @@
+#!/bin/sh
+#
+# Compatibility entry point for stock Bitmain/LuxOS naming.
+#
+# DCENT_OS keeps the real Amlogic pinmux in S37board_setup. Some extracted
+# stock/LuxOS trees refer to S37bitmainer_setup, so this wrapper delegates to
+# the canonical script when called manually or by an init runner.
+
+case "$1" in
+    start|"")
+        if [ -x /etc/init.d/S37board_setup ]; then
+            /etc/init.d/S37board_setup start
+        fi
+        ;;
+    stop)
+        if [ -x /etc/init.d/S37board_setup ]; then
+            /etc/init.d/S37board_setup stop
+        fi
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,24 @@
+[package]
+name = "dcentrald-common"
+version.workspace = true  # Single source: dcentrald/Cargo.toml [workspace.package]
+edition = "2021"
+description = "Shared no-HAL contract utilities for dcentrald (wallet masking, log sanitization, etc.)"
+license = "GPL-3.0"
+
+# This crate is intentionally HAL-free, OS-free, and async-runtime-free, in the
+# same spirit as `dcentrald-api-types`. It must compile cleanly on Windows host
+# for fast unit-test cycles.
+
+[dependencies]
+# No external deps. Wallet-mask scanners are hand-rolled to avoid pulling in
+# `regex` (~500KB compiled, ~6s build cost) just for ~7 character-class checks.
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+# W4.7 lint inheritance (DCENT_DevOps + DCENT_QA, 2026-05-07).
+# Near-clean crate: ~1 unwrap occurrence in src/. Inherit workspace `warn`
+# directly — this crate is the easiest first promote-to-`deny` candidate.
+# Audit status: .
+[lints]
+workspace = true

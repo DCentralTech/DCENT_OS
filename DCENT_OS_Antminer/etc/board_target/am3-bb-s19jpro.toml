@@ -1,0 +1,59 @@
+# DCENT_OS board-target config for the AM335x BeagleBone S19j Pro on S19J_IO_BOARD_V2_0.
+# Loaded by dcentrald-hal::platform::beaglebone at runtime from
+# /etc/dcentos/board_target/am3-bb-s19jpro.toml (falls back to hardcoded defaults).
+#
+# These are default starting values; adjust per your hardware. The gpio59
+# polarity, the APW12 voltage values, and the APW12 UART-tunnel opcodes in
+# particular are conservative defaults — tune them for your board. The
+# structure / field names mirror the `BeagleBoneBoardTarget` serde struct in
+# dcentrald-hal/src/platform/beaglebone.rs.
+
+[platform]
+board_target = "am3-bb-s19jpro"
+soc = "am335x"
+cpu = "cortex-a8"
+io_board = "S19J_IO_BOARD_V2_0"
+voltage_controller = "dspic33ep-fw89"  # LuxOS ftrace: hashboard controllers at 0x20/0x21/0x22
+
+[gpio]
+board_enable = 59             # DTS label "enable" — gates hashboard power
+board_enable_active = "high"  # default; tune for your board
+asic_rst = [49, 60, 27, 22]   # rst0/rst1/rst2/rst3 (chain3=gpio22 unpopulated on this 3-chain unit)
+plug_detect = [51, 48, 47, 46]  # default; tune for your board
+fan_tach = [7, 20, 110, 112]
+led = [23, 45]
+
+[uart]
+# chain index -> kernel device + MMIO base (DevmemUart mmaps the base; 8250-class, base_baud 3M, no DLF)
+chains = [
+  { index = 0, device = "/dev/ttyS1", base_addr = 0x48022000, base_baud = 3000000 },
+  { index = 1, device = "/dev/ttyS2", base_addr = 0x48024000, base_baud = 3000000 },
+  { index = 2, device = "/dev/ttyS4", base_addr = 0x481a8000, base_baud = 3000000 },
+]
+chain_count = 3
+mining_baud = 3000000         # fast-baud target after BM1362 0x28 handoff; exact AM335x divisor-1 "3 Mbaud"
+
+[i2c]
+eeprom_bus = 0                # HW OMAP I2C, hashboard EEPROMs
+eeprom_addrs = [0x50, 0x51, 0x52]
+eeprom_write_deny = true      # HAL refuses writes 0x50-0x57
+psu_bus = 1                   # bit-banged i2c-gpio (gpio4=SDA/gpio5=SCL)
+psu_addr = 0x10
+psu_kind = "apw12-uart-tunnel"
+
+[cold_boot]
+enable_pic1704_dc_dc = false  # This carrier uses fw=0x89 dsPICs, not PIC1704.
+run_pic_heartbeat = false     # PIC1704 heartbeat disabled; AM3 BB mining owns dsPIC heartbeat.
+run_miscctrl_triple_write = true  # 0x18=0x00C100B0 ×3 — chip-side BM1362, used on this carrier
+apw12_rail_open_core_mv = 15000   # ~15.0V during open-core; default, tune for your board
+apw12_rail_steady_mv = 13800      # ~13.8V steady; default, tune for your board
+gpio59_settle_ms = 3000
+asic_rst_stagger_ms = 10
+asic_rst_settle_ms = 1100
+asic_rst_retry_chain = 1       # LuxOS ftrace: retry chain1 after initial release
+asic_rst_retry_pulses = 2
+asic_rst_retry_assert_ms = 200
+asic_rst_retry_release_ms = 100
+initial_freq_mhz = 400        # conservative — matches LuxOS default
+fan_boot_pwm = 10
+fan_max_pwm = 30

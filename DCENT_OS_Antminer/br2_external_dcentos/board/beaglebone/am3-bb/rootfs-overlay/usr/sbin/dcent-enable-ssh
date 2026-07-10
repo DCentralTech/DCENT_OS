@@ -1,0 +1,61 @@
+#!/bin/sh
+#
+# /usr/sbin/dcent-enable-ssh -- DCENT_OS SSH gate flip + start dropbear.
+#
+# Called by dcentrald (or the first-boot wizard) to release the dropbear
+# gate established by the W1.1 default-credential lockdown:
+#   1. Marks /data/dcent/.ssh-enabled (the gate flag).
+#   2. Optionally records *which* path enabled SSH (wizard vs. keys) for
+#      operator visibility.
+#   3. Starts dropbear via /etc/init.d/S50dropbear if it isn't running.
+#
+# Idempotent. Safe to call from any auth-enabled API mutation. Logs each
+# transition via `logger` so the dashboard log tail surfaces it.
+#
+# Exit codes:
+#   0 -- SSH is enabled and dropbear is (or already was) running.
+#   1 -- could not write the gate flag.
+#   2 -- gate flag is set but dropbear failed to start.
+#
+# POSIX shell only -- BusyBox ash, no bash.
+
+set -u
+
+DATA_DIR=/data/dcent
+GATE_FILE="${DATA_DIR}/.ssh-enabled"
+AUTHORIZED_KEYS="${DATA_DIR}/authorized_keys"
+INIT_SCRIPT=/etc/init.d/S50dropbear
+
+REASON="${1:-wizard}"   # wizard | keys
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "unknown")
+
+mkdir -p "$DATA_DIR" 2>/dev/null
+if ! printf 'reason=%s\nat=%s\n' "$REASON" "$TIMESTAMP" > "$GATE_FILE.tmp"; then
+    echo "dcent-enable-ssh: failed to write $GATE_FILE.tmp" >&2
+    exit 1
+fi
+if ! mv "$GATE_FILE.tmp" "$GATE_FILE"; then
+    echo "dcent-enable-ssh: failed to install $GATE_FILE" >&2
+    rm -f "$GATE_FILE.tmp" 2>/dev/null || true
+    exit 1
+fi
+chmod 0644 "$GATE_FILE" 2>/dev/null || true
+
+if command -v logger >/dev/null 2>&1; then
+    logger -t dcent-ssh -p auth.notice \
+        "DCENT_OS: SSH gate flipped (reason=${REASON}, keys_present=$([ -s "$AUTHORIZED_KEYS" ] && echo yes || echo no))"
+fi
+
+# Bring up dropbear without reinventing start/stop. The init script
+# checks the gate flag and only starts dropbear when the gate allows it.
+if [ -x "$INIT_SCRIPT" ]; then
+    if ! "$INIT_SCRIPT" status >/dev/null 2>&1; then
+        if ! "$INIT_SCRIPT" start; then
+            echo "dcent-enable-ssh: $INIT_SCRIPT start failed" >&2
+            exit 2
+        fi
+    fi
+fi
+
+echo "dcent-enable-ssh: SSH enabled (reason=$REASON)"
+exit 0

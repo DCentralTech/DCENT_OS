@@ -1,0 +1,137 @@
+#!/bin/sh
+#
+# S50dropbear - DCENT_OS gated dropbear SSH service
+#
+# W1.1 Default-credential lockdown (DCENT_Security):
+#   On a fresh DCENT_OS image, dropbear MUST NOT start until either
+#     (a) the first-boot wizard has completed (Argon2id password set in
+#         /data/dcent/auth.json) AND /data/dcent/.ssh-enabled exists, or
+#     (b) the operator has uploaded an authorized_keys file via dashboard
+#         and the dashboard has stamped /data/dcent/.ssh-enabled.
+#
+#   This replaces the Buildroot dropbear package's default S50dropbear,
+#   which would start sshd on every boot regardless of credential state
+#   and leave the LAN one default-password guess from full root.
+#
+# Helper: /usr/sbin/dcent-enable-ssh (called by the API on wizard
+# completion or after authorized_keys upload).
+#
+# POSIX shell only -- BusyBox ash, no bash.
+
+NAME=dropbear
+DAEMON=/usr/sbin/dropbear
+PIDFILE=/var/run/dropbear.pid
+DROPBEAR_DEFAULTS=/etc/default/dropbear
+
+# Auth files written by dcentrald during first-boot wizard.
+DCENT_AUTH_FILE=/data/dcent/auth.json
+DCENT_SSH_ENABLED=/data/dcent/.ssh-enabled
+DCENT_AUTHORIZED_KEYS=/data/dcent/authorized_keys
+# Phase 4J (2026-05-15): explicit operator opt-out. When this file exists on
+# the persistent /data overlay, S50dropbear skips startup regardless of all
+# other gates. When absent, S50dropbear enables-by-default after the
+# wizard/keys gates have been evaluated and emits one WARN line.
+DCENT_SSH_DISABLED=/data/dcent/.ssh-disabled
+
+DROPBEAR_ARGS=""
+[ -r "$DROPBEAR_DEFAULTS" ] && . "$DROPBEAR_DEFAULTS"
+
+# Always make sure dropbear's host-key dir exists so the daemon can lazy
+# generate a key when SSH is finally enabled. Persistent overlay is
+# managed by S45persistent on Zynq; on other boards /etc/dropbear is
+# tmpfs-backed via /run.
+mkdir -p /etc/dropbear 2>/dev/null || true
+
+ssh_gate_state() {
+    # Echo one of: disabled-by-opt-out | enabled-by-wizard | enabled-by-keys |
+    # enabled-by-default
+    # Phase 4J: explicit operator opt-out beats everything.
+    if [ -f "$DCENT_SSH_DISABLED" ]; then
+        echo "disabled-by-opt-out"
+        return
+    fi
+    if [ -s "$DCENT_AUTHORIZED_KEYS" ]; then
+        echo "enabled-by-keys"
+        return
+    fi
+    if [ -f "$DCENT_AUTH_FILE" ]; then
+        echo "enabled-by-wizard"
+        return
+    fi
+    # Phase 4J: enable-by-default. Operator creates /data/dcent/.ssh-disabled
+    # to opt out. WARN emitted at start() so the operator knows.
+    echo "enabled-by-default"
+}
+
+start_disabled_msg() {
+    MSG="DCENT_OS: SSH disabled by operator (/data/dcent/.ssh-disabled present)"
+    if command -v logger >/dev/null 2>&1; then
+        logger -t dcent-ssh -p auth.warning "$MSG"
+    fi
+    echo "$MSG"
+}
+
+start_default_warn() {
+    # Phase 4J: one-line WARN on the enable-by-default path.
+    MSG="DCENT_OS: first-boot SSH enabled by default; create /data/dcent/.ssh-disabled to opt out"
+    if command -v logger >/dev/null 2>&1; then
+        logger -t dcent-ssh -p auth.warning "$MSG"
+    fi
+    echo "$MSG"
+}
+
+start() {
+    STATE=$(ssh_gate_state)
+    if [ "$STATE" = "disabled-by-opt-out" ]; then
+        printf 'Starting %s: BLOCKED (gate=%s)\n' "$NAME" "$STATE"
+        start_disabled_msg
+        return 0
+    fi
+    if [ "$STATE" = "enabled-by-default" ]; then
+        start_default_warn
+    fi
+    printf 'Starting %s: ' "$NAME"
+    # -R = generate host keys lazily on first connection (avoids early
+    #      boot entropy block; see CHANGELOG_v0.2.7.md).
+    # Append -R only if not already present in DROPBEAR_ARGS.
+    case " $DROPBEAR_ARGS " in
+        *" -R "*) ;;
+        *) DROPBEAR_ARGS="$DROPBEAR_ARGS -R" ;;
+    esac
+    # shellcheck disable=SC2086
+    start-stop-daemon -S -q -p "$PIDFILE" --exec "$DAEMON" -- $DROPBEAR_ARGS \
+        && echo "OK (gate=$STATE)" || { echo "FAIL"; return 1; }
+}
+
+stop() {
+    printf 'Stopping %s: ' "$NAME"
+    start-stop-daemon -K -q -p "$PIDFILE" 2>/dev/null && echo "OK" || echo "not running"
+}
+
+restart() {
+    stop
+    sleep 1
+    start
+}
+
+status() {
+    STATE=$(ssh_gate_state)
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+        echo "$NAME: running (gate=$STATE)"
+        return 0
+    fi
+    echo "$NAME: stopped (gate=$STATE)"
+    return 3
+}
+
+case "$1" in
+    start) start ;;
+    stop) stop ;;
+    restart|reload) restart ;;
+    status) status ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
+exit $?

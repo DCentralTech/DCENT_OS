@@ -1,0 +1,163 @@
+[workspace]
+resolver = "2"
+members = [
+    "dcentrald",
+    "dcentrald-hal",
+    "dcentrald-asic",
+    "dcentrald-stratum",
+    "dcentrald-thermal",
+    "dcentrald-diagnostics",
+    "dcentrald-api-types",
+    "dcentrald-api",
+    "dcentrald-autotuner",
+    "dcentrald-common",
+    "dcentrald-silicon-profiles",
+    # A44 (Knowledge Goldmine 2026-06-10): pure no-HAL chip-health math
+    # (Laplacian gradient / cross-slot z-score / nonce-deficit). Precursor
+    # crate — no other member depends on it yet (B26 autotuner integration
+    # is a separate review-gated follow-up).
+    "dcentrald-chip-analysis",
+    "dcentrald-re-catalog",
+    "dcentrald-api-grpc",
+    "dcentrald-bridge",
+    "pic-recovery",
+    "dcentos-init",
+]
+default-members = [
+    "dcentrald",
+    "dcentrald-hal",
+    "dcentrald-asic",
+    "dcentrald-stratum",
+    "dcentrald-thermal",
+    "dcentrald-diagnostics",
+    "dcentrald-api-types",
+    "dcentrald-api",
+    "dcentrald-autotuner",
+    "dcentrald-common",
+    "dcentrald-silicon-profiles",
+    "dcentrald-chip-analysis",
+    "dcentrald-re-catalog",
+    "dcentrald-api-grpc",
+    "dcentrald-bridge",
+    "dcentos-init",
+]
+
+
+# Single source of truth for the DCENT_OS daemon stack version.
+# Propagated to all member crates via `version.workspace = true` in their
+# `[package]` sections and surfaced at runtime via `env!("CARGO_PKG_VERSION")`
+# in CGMiner-compat (cgminer.rs:43), Stratum V1 USER_AGENT, Stratum V2 firmware
+# field, and dcentos-init splash. The /etc/dcentos-version overlay file at
+# `br2_external_dcentos/board/zynq/rootfs-overlay/etc/dcentos-version` is bumped
+# in lockstep so REST `/api/system/health` (rest.rs:7305 reads from disk) agrees.
+[workspace.package]
+version = "0.9.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "2"
+anyhow = "1"
+# DCENT Expansion Pack bridge-client HMAC. Pairs with `sha2` 0.10 (both on the
+# `digest` 0.10 trait family) — used by `dcentrald-bridge` for /pair, OTA, and
+# WS signature computation.
+hmac = "0.12"
+nix = { version = "0.29", features = ["mman", "ioctl", "fs", "term"] }
+sha2 = "0.10"
+axum = { version = "0.7", features = ["multipart", "ws"] }
+tokio-tungstenite = "0.24"
+bytes = "1"
+askama = "0.12"
+uuid = { version = "1", features = ["v4", "serde"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+# default-features = false drops rumqttc's `use-rustls` default feature, which
+# linked an ENTIRE second rustls stack (rustls 0.22 + rustls-webpki 0.102 +
+# tokio-rustls 0.25 + rustls-pemfile + rustls-native-certs) alongside the
+# rustls 0.23 stack used by reqwest/dcentrald-stratum. No workspace code
+# constructs `rumqttc::Transport::Tls` — every call site uses plain-TCP
+# `MqttOptions::new(client_id, host, port)`, and `dcentrald-api::mqtt` FAILS
+# CLOSED on `mqtts://` brokers with "this build has no MQTT TLS" (the guard at
+# mqtt.rs `broker_requires_tls()` predates this trim and already documented the
+# build as "rumqttc WITHOUT a TLS transport"). Re-adding the feature without
+# wiring Transport::Tls + removing that fail-closed guard would only re-bloat
+# the binary. Binary-size sweep 2026-07-09.
+rumqttc = { version = "0.24", default-features = false }
+proptest = "1"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+# opt-level = "z" optimizes for minimum binary size (binary-size sweep
+# 2026-07-09, rootfs ~1 MB over its NAND partition). Purely a codegen-size
+# knob — no correctness impact. The daemon's CPU work is I/O-bound control
+# plane (serial/UART, I2C, REST); actual hashing happens on the ASICs, and
+# 3.125 Mbaud chain UART is ~312 KB/s worst case — trivial even at -Oz on a
+# Cortex-A9. The one measurable hot loop (SHA-256 midstate computation +
+# per-nonce share-difficulty double-SHA) is kept at opt-level 3 via the
+# [profile.release.package.sha2] override below. If a live soak ever shows
+# control-plane CPU regression, fall back to "s" before touching anything else.
+# opt-level = "z"  # DEFERRED 2026-07-09: opt-z + fat-LTO too slow for interactive builds; re-enable in CI (Agent-2 binary-size rec). Default opt-3 + rustls-dedup ships now.
+# debug/overflow-checks are the release-profile defaults; pinned explicitly so
+# a future profile edit can't silently regress binary size or hot-path perf.
+debug = false
+overflow-checks = false
+# panic = "abort" drops Rust unwinding tables (~5-15% binary reduction).
+# Measured on Linux rust:1.86 release build: 20,218,560 bytes vs
+# 22,758,080 bytes with unwinding, saving 2,539,520 bytes (~11.2%).
+# Release binaries do not rely on unwinding for recovery; panics are already
+# fatal in mining control paths, so abort matches existing runtime semantics.
+#
+# CI gate: `.github/workflows/dcentos-offline-gates.yml` and
+# `scripts/ci_offline_gates.sh` both assert this line is present. Removing
+# `panic = "abort"` from this `[profile.release]` block grows S9 rootfs.squashfs
+# past the 21 MB UBI volume —.
+# NOTE: the ci_offline_gates.sh awk extractor treats the NEXT `[` header as the
+# end of this block — `panic = "abort"` must stay ABOVE any
+# `[profile.release.package.*]` section added below.
+panic = "abort"
+
+# Keep the SHA-256 hot loop at full speed under the workspace-wide
+# opt-level = "z" (see above). sha2 computes every work item's midstates and
+# the per-nonce double-SHA share-difficulty check — the only genuinely
+# compute-bound inner loop in the daemon. With fat LTO, the per-package
+# opt-level still holds: functions codegen'd without the `minsize` attribute
+# stay speed-optimized through the LTO link. Size cost is a few tens of KB.
+[profile.release.package.sha2]
+opt-level = 3
+
+# W4.7 (DCENT_DevOps + DCENT_QA, 2026-05-07): workspace-wide clippy lints for
+# panic-vs-result discipline. The lints fire as warnings (not deny) so the
+# existing 1,991 grandfathered occurrences across 13 crates do not break the
+# build today. Per-crate `[lints]` sections (see each member Cargo.toml)
+# inherit this policy via `workspace = true` and may override individual
+# lints to `allow` while the audit ladder is climbed. The grandfather list
+# and per-crate audit status live in
+# .
+#
+# These lints intentionally cover the four "panicking-side-effects" patterns
+# that have bitten DCENT_OS in production:
+#   - `unwrap_used`     — bare `.unwrap()` on `Result`/`Option`
+#   - `expect_used`     — `.expect("msg")` (same panic semantics, just typed)
+#   - `panic`           — `panic!`/`unreachable!`/`todo!`/`unimplemented!`
+#   - `indexing_slicing`— `arr[idx]` / `slice[r..]` that can panic on OOB
+#   - `unwrap_in_result`— functions returning `Result<...>` should `?` not
+#                          `.unwrap()` (regression-pin for the wave-15 stratum
+#                          fix that re-introduced unwraps in fallible paths).
+#
+# To climb the audit ladder for a specific crate, flip its override from
+# `allow` -> `warn` -> (eventually) `deny` and walk the warnings to zero.
+[workspace.lints.clippy]
+# Workspace lints declared with priority = -1 so per-crate
+# [lints.clippy] override blocks naturally win (cargo 1.84+ requires
+# explicit priority when crate-level overrides are present, otherwise
+# builds fail with "cannot override workspace.lints in lints").
+unwrap_used = { level = "warn", priority = -1 }
+expect_used = { level = "warn", priority = -1 }
+panic = { level = "warn", priority = -1 }
+indexing_slicing = { level = "warn", priority = -1 }
+unwrap_in_result = { level = "warn", priority = -1 }

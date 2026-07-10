@@ -1,0 +1,94 @@
+# DCENT_OS dcentrald config for Antminer S21 Pro (Amlogic A113D)
+# BUILD-CLEAN SCAFFOLD (Wave I Lane B, 2026-05-19) — NO live BM1370 unit on the
+# bench. This variant exists so a future S21 Pro lands on the BM1370 silicon
+# profile (bm1370.rs: 3 nm, 195 chips) instead of falling through to the base
+# S21 route, which bakes the BM1368 5 nm table. The chip identity below is the
+# load-bearing fix; the cold-boot freq/voltage are the BM1370 sweet-spot
+# (Step -2: 480 MHz / 13.4 V ≈ 14 J/TH) per dcentrald-silicon-profiles::bm1370.
+# Platform: Amlogic A113D (aarch64), NoPic (TAS5782M DAC, kernel-managed).
+#
+# Fresh images stay dashboard-ready and idle until mining is explicitly enabled.
+
+[general]
+hostname = "dcent-s21pro"
+log_level = "info"
+
+[pool]
+url = ""
+worker = ""
+password = "x"
+protocol = "sv1"
+
+[mining]
+enabled = false
+model = "s21pro"
+# BM1370 sweet-spot cold-boot defaults (bm1370.rs Step -2). The autotuner ramps
+# toward nameplate (Step 0: 525 MHz / 13.8 V / 234 TH/s) when opted in.
+frequency_mhz = 480
+voltage_mv = 13400
+version_rolling = true
+passthrough = false
+suggest_difficulty = 8192
+serial_device = "/dev/ttyS2"
+serial_chip_count = 195
+serial_chip_type = "BM1370"
+
+[power]
+mode = "bypass"
+target_watts = 3000
+
+[power.psu_override]
+enabled = true
+model = "APW12"
+voltage_v = 14.0
+
+[thermal]
+target_temp_c = 60
+hot_temp_c = 70
+dangerous_temp_c = 80
+fan_min_pwm = 10
+fan_max_pwm = 30
+
+[api]
+cgminer_port = 4028
+http_port = 8080
+websocket = true
+auth_enabled = false
+auth_password = ""
+
+[donation]
+enabled = false
+percent = 2.0
+pool_url = ""
+worker = ""
+password = "x"
+cycle_duration_s = 3600
+
+[watchdog]
+# Autonomous crash-recovery for the NoPic Amlogic family. Unlike am2/S9 there is
+# NO PIC/dsPIC hardware heartbeat backstop, so a silent (non-panicking) daemon
+# hang would otherwise leave the boards energized indefinitely (thermal risk on a
+# home space heater). The kicker opens /dev/watchdog AFTER hardware init (the
+# bring-up window can't trip it) and degrades gracefully (warns + continues) if
+# the SoC watchdog is unavailable or the timeout can't be set. Matches the proven
+# zynq/am1 production config; restores the struct default (enabled=true) these
+# overlays previously overrode.
+enabled = true
+timeout_s = 30
+kick_interval_s = 5
+
+[hash_on_disconnect]
+enabled = true
+
+[mode]
+active = "standard"
+
+[autotuner]
+enabled = false
+min_freq_mhz = 400
+max_freq_mhz = 585
+
+[led]
+enabled = true
+heartbeat_on_ms = 100
+heartbeat_off_ms = 900

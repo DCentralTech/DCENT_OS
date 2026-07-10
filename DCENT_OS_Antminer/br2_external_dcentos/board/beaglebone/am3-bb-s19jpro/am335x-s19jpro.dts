@@ -1,0 +1,681 @@
+/*
+ * am335x-s19jpro.dts - DCENT_OS Antminer S19j Pro AM335x BeagleBone Black
+ *
+ * Provenance:
+ *   Reconstructed from Bitmain stock S19j Pro BB control-board firmware
+ *   (Linux 3.8.13+, version 2026-04-14-0-912d084c-26.04-plus). Copied from
+ *   the dev-kit reconstruction `PORTING_PLAN.md` section 1.5 (the fuller
+ *   tree) rather than the 167-line `DTS/am335x-s19jpro.dts` sketch in the
+ *   same dev-kit, because PORTING_PLAN.md ships the full pinmux, all six
+ *   UARTs, ePWM/eCAP fan controllers, five TMP75 hashboard sensors, GPIO
+ *   reset controller, ethernet, USB, RTC, and capemgr nodes the sketch
+ *   was missing.
+ *
+ *   Source dev-kit:
+ *     DCENT_OS_DEVELOPMENT_KIT_FROMRE1/PORTING_PLAN.md (1.5, lines 139-735)
+ *     DCENT_OS_DEVELOPMENT_KIT_FROMRE1/DCENT_OS_DEVELOPMENT_KIT/DTS/am335x-s19jpro.dts (sketch only, NOT used)
+ *
+ * Wave reference: AGENT B3 wave W10.x (am3-bb-s19jpro variant split-out
+ *   from am3-bb base, 2026-05-09).
+ *
+ * ASIC:        BM1362 on BHB42xxx hashboards (AM335x carrier of the S19j
+ *              Pro). Up to 4 chains supported per gpio-leds plug3 / rst3.
+ * Console:     UART1 (ttyO0) at 115200 8N1 (omap2plus default).
+ * Hashboard:   UART2/3/5/6 (ttyO1..ttyO5) — DCENT_OS routes ASIC traffic
+ *              through dcentrald userspace over kernel ttyS devices (NOT through
+ *              the dev-kit's reconstructed uart_trans.ko, which is stub
+ *              quality and conflicts with  decision #2 "UIO
+ *              approach, NOT kernel modules").
+ * I2C3:        Hashboard temp sensors (TMP75 @ 0x48-0x4c).
+ * Fans:        eHRPWM0 (front fan), eCAP2 (rear fan).
+ *
+ * NOTE: The original Bitmain stock model name is preserved verbatim
+ * ("TI AM335x BeagleBone") so the kernel's machine compatibility check
+ * matches stock during SD-card bring-up. DCENT_OS userspace identifies
+ * the carrier via /etc/dcentos/board_target = "am3-bb-s19jpro".
+ */
+
+/dts-v1/;
+
+/ {
+    model = "TI AM335x BeagleBone";
+    compatible = "ti,am335x-bone", "ti,am33xx";
+    #address-cells = <1>;
+    #size-cells = <1>;
+    interrupt-parent = <&intc>;
+
+    memory {
+        device_type = "memory";
+        reg = <0x80000000 0x10000000>;  /* 256MB */
+    };
+
+    chosen { };
+
+    aliases {
+        serial0 = &uart1;
+        serial1 = &uart2;
+        serial2 = &uart3;
+        serial3 = &uart4;
+        serial4 = &uart5;
+        serial5 = &uart6;
+    };
+
+    cpus {
+        cpu@0 {
+            compatible = "arm,cortex-a8";
+            operating-points = <1000000 1300000   /* MHz uV */
+                                800000  1350000
+                                720000  1300000
+                                600000  1300000
+                                500000  1300000
+                                300000  1300000
+                                275000  1300000>;
+            voltage-tolerance = <2>;
+            clock-latency = <300000>;
+            cpu0-supply = <&cpu0_reg>;
+        };
+    };
+
+    soc {
+        compatible = "ti,omap-infra";
+
+        mpu {
+            compatible = "ti,omap3-mpu";
+            ti,hwmods = "mpu";
+        };
+
+        pinmux@44e10800 {
+            compatible = "pinctrl-single";
+            reg = <0x44E10800 0x238>;
+            #address-cells = <1>;
+            #size-cells = <0>;
+            pinctrl-single,register-width = <32>;
+            pinctrl-single,function-mask = <0x7f>;
+            pinctrl-names = "default";
+            pinctrl-0 = <&pinctrl_default>;
+
+            pinctrl_default: pinmux_default_pins {
+                pinctrl-single,pins = <
+                    0x00 0x30 0x04 0x30 0x08 0x30 0x0c 0x30
+                    0x10 0x30 0x14 0x30 0x18 0x30 0x1c 0x30
+                    0x70 0x30 0x74 0x37 0x7c 0x08 0x90 0x08
+                    0x94 0x08 0x98 0x08 0x9c 0x08
+                >;
+            };
+
+            user_leds_pins: pinmux_userled_pins {
+                pinctrl-single,pins = <
+                    0x24 0x27 0x34 0x27 0x8c 0x37
+                    0x158 0x27 0x15c 0x27 0x20 0x27
+                    0x78 0x27 0x44 0x27 0x2c 0x27
+                    0x28 0x37 0x38 0x37 0x4c 0x27
+                    0x40 0x27 0x3c 0x27 0x30 0x27
+                    0x198 0x27 0x190 0x27 0x164 0x27
+                    0x1b4 0x27
+                >;
+            };
+
+            i2c3_pins: pinmux_i2c3_pins {
+                pinctrl-single,pins = <0x178 0x73 0x17C 0x73>;
+            };
+
+            mmc1_pins: pinmux_mmc1_pins {
+                pinctrl-single,pins = <0x160 0x2F>;
+            };
+
+            uart2_pins: pinmux_bb_uart2_pins {
+                pinctrl-single,pins = <0x180 0x30 0x184 0x0>;
+            };
+
+            uart3_pins: pinmux_bb_uart3_pins {
+                pinctrl-single,pins = <0x150 0x31 0x154 0x1>;
+            };
+
+            uart5_pins: pinmux_bb_uart5_pins {
+                pinctrl-single,pins = <0x168 0x31 0x16C 0x1>;
+            };
+
+            uart6_pins: pinmux_bb_uart6_pins {
+                pinctrl-single,pins = <0xC4 0x34 0xC0 0x4>;
+            };
+
+            ehrpwm0_front_fan_pins: pinmux_bb_ehrpwm0_front_fan_pins {
+                pinctrl-single,pins = <0x194 0x1>;
+            };
+
+            ecappwm_rear_fan_pins: pinmux_bb_ecappwm_rear_fan_pins {
+                pinctrl-single,pins = <0x19C 0x24>;
+            };
+
+            emmc2_pins: pinmux_emmc2_pin {
+                pinctrl-single,pins = <
+                    0x80 0x32 0x84 0x32 0x00 0x31 0x04 0x31
+                    0x08 0x31 0x0c 0x31 0x10 0x31 0x14 0x31
+                    0x18 0x31 0x1c 0x31
+                >;
+            };
+
+            rstctl_pins: pinmux_rstctl_pins {
+                pinctrl-single,pins = <0x50 0x17>;
+            };
+        };
+
+        ocp {
+            compatible = "simple-bus";
+            #address-cells = <1>;
+            #size-cells = <1>;
+            ranges;
+            ti,hwmods = "l3_main";
+
+            /* Interrupt Controller */
+            intc: interrupt-controller@48200000 {
+                compatible = "ti,omap2-intc";
+                interrupt-controller;
+                #interrupt-cells = <1>;
+                ti,intc-size = <128>;
+                reg = <0x48200000 0x1000>;
+            };
+
+            /* EDMA */
+            edma: edma@49000000 {
+                compatible = "ti,edma3";
+                ti,hwmods = "tpcc", "tptc0", "tptc1", "tptc2";
+                reg = <0x49000000 0x10000>,
+                      <0x44E10F90 0x40>;
+                interrupt-parent = <&intc>;
+                interrupts = <12 13 14>;
+                #dma-cells = <1>;
+                dma-channels = <64>;
+                ti,edma-regions = <4>;
+                ti,edma-slots = <256>;
+                ti,edma-queue-tc-map = <0 0 0 0 0 1 0 1 0 2 0 2>;
+                ti,edma-queue-priority-map = <0 0 0 0 0 1 0 1 0 2 0 2>;
+                ti,edma-default-queue = <1>;
+                ti,edma-xbar-event-map = <0x20 12 0x1E 20>;
+            };
+
+            /* GPIO0
+             *
+             * W13.C4: gpio-line-names per R4 bmminer_init_trace_am335x.md
+             * §1.1c-d + am2_gpiod_bcm_table.md (renamed
+             * am335x_gpiod_bcm_table.md by W13.A6). bosminer gpiod_get()
+             * consumers need these to resolve PWR_CONTROL/HBx_RESET. The
+             * Bitmain stock bosminer calls `gpiod_chip_find_line(chip,
+             * "PWR_CONTROL")` and friends; without `gpio-line-names`
+             * libgpiod returns -ENOENT and the PSU init prints
+             * "P1/P3/P4 errors" before bailing.
+             *
+             * Indexed at GPIO0 hwmod ("gpio1" = first AM335x GPIO bank).
+             * Named lines (32-entry array, others left as ""):
+             *   4  = HB1_RESET
+             *   5  = HB0_RESET
+             *   22 = HB3_RESET
+             *   23 = GREEN_LED
+             *   26 = PWR_CONTROL
+             *   27 = HB2_RESET
+             */
+            gpio0: gpio@44e07000 {
+                compatible = "ti,omap4-gpio";
+                ti,hwmods = "gpio1";
+                gpio-controller;
+                #gpio-cells = <2>;
+                interrupt-controller;
+                #interrupt-cells = <1>;
+                reg = <0x44E07000 0x1000>;
+                interrupts = <96>;
+                gpio-line-names =
+                    "", "", "", "",
+                    "HB1_RESET", "HB0_RESET", "", "",
+                    "", "", "", "",
+                    "", "", "", "",
+                    "", "", "", "",
+                    "", "", "HB3_RESET", "GREEN_LED",
+                    "", "", "PWR_CONTROL", "HB2_RESET",
+                    "", "", "", "";
+            };
+
+            /* GPIO1
+             *
+             * W13.C4: gpio-line-names per R4 bmminer_init_trace_am335x.md
+             * §1.1c-d + am2_gpiod_bcm_table.md. See gpio0 comment above
+             * for full rationale. Indexed at GPIO1 hwmod ("gpio2" = second
+             * AM335x GPIO bank).
+             *
+             * Named lines (20-entry array, others left as ""):
+             *   12 = PLUG3
+             *   13 = RED_LED
+             *   14 = RECOVERY_BTN
+             *   15 = PLUG2
+             *   16 = PLUG1
+             *   19 = PLUG0
+             */
+            gpio1: gpio@4804c000 {
+                compatible = "ti,omap4-gpio";
+                ti,hwmods = "gpio2";
+                gpio-controller;
+                #gpio-cells = <2>;
+                interrupt-controller;
+                #interrupt-cells = <1>;
+                reg = <0x4804C000 0x1000>;
+                interrupts = <98>;
+                gpio-line-names =
+                    "", "", "", "",
+                    "", "", "", "",
+                    "", "", "", "",
+                    "PLUG3", "RED_LED", "RECOVERY_BTN", "PLUG2",
+                    "PLUG1", "", "", "PLUG0";
+            };
+
+            /* GPIO2 */
+            gpio2: gpio@481ac000 {
+                compatible = "ti,omap4-gpio";
+                ti,hwmods = "gpio3";
+                gpio-controller;
+                #gpio-cells = <2>;
+                interrupt-controller;
+                #interrupt-cells = <1>;
+                reg = <0x481AC000 0x1000>;
+                interrupts = <32>;
+            };
+
+            /* GPIO3 */
+            gpio3: gpio@481ae000 {
+                compatible = "ti,omap4-gpio";
+                ti,hwmods = "gpio4";
+                gpio-controller;
+                #gpio-cells = <2>;
+                interrupt-controller;
+                #interrupt-cells = <1>;
+                reg = <0x481AE000 0x1000>;
+                interrupts = <62>;
+            };
+
+            /* Reset Controller (GPIO-based) */
+            rstctl: rstctl@0 {
+                status = "okay";
+                compatible = "gpio-rtctl";
+                pinctrl-names = "default";
+                pinctrl-0 = <&rstctl_pins>;
+                #reset-cells = <2>;
+                gpios = <&gpio1 20 0>;  /* GPIO1_20 = GPIO 52 = EMMC_RSTn */
+                gpio-names = "EMMC_RSTn";
+            };
+
+            /* UART1 (console) */
+            uart1: serial@44e09000 {
+                compatible = "ti,omap3-uart";
+                ti,hwmods = "uart1";
+                clock-frequency = <48000000>;
+                reg = <0x44E09000 0x2000>;
+                interrupts = <72>;
+                status = "okay";
+            };
+
+            /* UART2 (hash board control) */
+            uart2: serial@48022000 {
+                compatible = "ti,omap3-uart";
+                ti,hwmods = "uart2";
+                clock-frequency = <48000000>;
+                reg = <0x48022000 0x2000>;
+                interrupts = <73>;
+                status = "okay";
+                pinctrl-names = "default";
+                pinctrl-0 = <&uart2_pins>;
+            };
+
+            /* UART3 */
+            uart3: serial@48024000 {
+                compatible = "ti,omap3-uart";
+                ti,hwmods = "uart3";
+                clock-frequency = <48000000>;
+                reg = <0x48024000 0x2000>;
+                interrupts = <74>;
+                status = "okay";
+                pinctrl-names = "default";
+                pinctrl-0 = <&uart3_pins>;
+            };
+
+            /* UART4 */
+            uart4: serial@481a6000 {
+                compatible = "ti,omap3-uart";
+                ti,hwmods = "uart4";
+                clock-frequency = <48000000>;
+                reg = <0x481A6000 0x2000>;
+                interrupts = <44>;
+                status = "disabled";
+            };
+
+            /* UART5 */
+            uart5: serial@481a8000 {
+                compatible = "ti,omap3-uart";
+                ti,hwmods = "uart5";
+                clock-frequency = <48000000>;
+                reg = <0x481A8000 0x2000>;
+                interrupts = <45>;
+                status = "okay";
+                pinctrl-names = "default";
+                pinctrl-0 = <&uart5_pins>;
+            };
+
+            /* UART6 */
+            uart6: serial@481aa000 {
+                compatible = "ti,omap3-uart";
+                ti,hwmods = "uart6";
+                clock-frequency = <48000000>;
+                reg = <0x481AA000 0x2000>;
+                interrupts = <46>;
+                status = "okay";
+                pinctrl-names = "default";
+                pinctrl-0 = <&uart6_pins>;
+            };
+
+            /* I2C3 (hash board sensors) */
+            i2c3: i2c@4819c000 {
+                compatible = "ti,omap4-i2c";
+                #address-cells = <1>;
+                #size-cells = <0>;
+                ti,hwmods = "i2c3";
+                reg = <0x4819C000 0x1000>;
+                interrupts = <30>;
+                status = "okay";
+                pinctrl-names = "default";
+                pinctrl-0 = <&i2c3_pins>;
+                clock-frequency = <100000>;
+
+                /* Hash board temperature sensors */
+                tmp75@48 {
+                    compatible = "ti,tmp75";
+                    reg = <0x48>;
+                };
+                tmp75@49 {
+                    compatible = "ti,tmp75";
+                    reg = <0x49>;
+                };
+                tmp75@4a {
+                    compatible = "ti,tmp75";
+                    reg = <0x4a>;
+                };
+                tmp75@4b {
+                    compatible = "ti,tmp75";
+                    reg = <0x4b>;
+                };
+                tmp75@4c {
+                    compatible = "ti,tmp75";
+                    reg = <0x4c>;
+                };
+            };
+
+            /* MMC1 (SD card) */
+            mmc1: mmc@48060000 {
+                compatible = "ti,omap3-hsmmc";
+                ti,hwmods = "mmc1";
+                ti,dual-volt;
+                ti,needs-special-reset;
+                ti,needs-special-hs-handling;
+                dmas = <&edma 24 0x19>;
+                dma-names = "tx", "rx";
+                status = "okay";
+                pinctrl-names = "default";
+                pinctrl-0 = <&mmc1_pins>;
+                cd-gpios = <&gpio0 6 0>;
+                cd-inverted;
+                vmmc-supply = <&vmmcsd_fixed>;
+                ti,vcc-aux-disable-is-sleep;
+            };
+
+            /* PWM0 (eHRPWM0) - Front Fan */
+            epwmss0: epwmss@48300000 {
+                compatible = "ti,am33xx-pwmss";
+                reg = <0x48300000 0x10>;
+                ti,hwmods = "epwmss0";
+                #address-cells = <1>;
+                #size-cells = <1>;
+                status = "okay";
+                ranges = <0x48300100 0x48300100 0x80
+                          0x48300180 0x48300180 0x80
+                          0x48300200 0x48300200 0x80>;
+
+                ecap0: ecap@48300100 {
+                    compatible = "ti,am33xx-ecap";
+                    #pwm-cells = <3>;
+                    reg = <0x48300100 0x80>;
+                    ti,hwmods = "ecap0";
+                    status = "disabled";
+                };
+
+                ehrpwm0: ehrpwm@48300200 {
+                    compatible = "ti,am33xx-ehrpwm";
+                    #pwm-cells = <3>;
+                    reg = <0x48300200 0x60>;
+                    ti,hwmods = "ehrpwm0";
+                    status = "okay";
+                    pinctrl-names = "default";
+                    pinctrl-0 = <&ehrpwm0_front_fan_pins>;
+                };
+            };
+
+            /* PWM2 (ECAP2) - Rear Fan */
+            epwmss2: epwmss@48304000 {
+                compatible = "ti,am33xx-pwmss";
+                reg = <0x48304000 0x10>;
+                ti,hwmods = "epwmss2";
+                #address-cells = <1>;
+                #size-cells = <1>;
+                status = "okay";
+                ranges = <0x48304100 0x48304100 0x80
+                          0x48304180 0x48304180 0x80
+                          0x48304200 0x48304200 0x80>;
+
+                ecap2: ecap@48304100 {
+                    compatible = "ti,am33xx-ecap";
+                    #pwm-cells = <3>;
+                    reg = <0x48304100 0x80>;
+                    interrupts = <61>;
+                    interrupt-names = "ecap2";
+                    ti,hwmods = "ecap2";
+                    pinctrl-names = "default";
+                    pinctrl-0 = <&ecappwm_rear_fan_pins>;
+                    status = "okay";
+                };
+
+                ehrpwm2: ehrpwm@48304200 {
+                    compatible = "ti,am33xx-ehrpwm";
+                    #pwm-cells = <3>;
+                    reg = <0x48304200 0x80>;
+                    ti,hwmods = "ehrpwm2";
+                    status = "disabled";
+                };
+            };
+
+            /* Ethernet */
+            mac: ethernet@4a100000 {
+                compatible = "ti,cpsw";
+                ti,hwmods = "cpgmac0";
+                cpdma_channels = <8>;
+                ale_entries = <1024>;
+                bd_ram_size = <8192>;
+                no_bd_ram;
+                rx_descs = <64>;
+                mac_control = <32>;
+                slaves = <1>;
+                cpts_active_slave = <0>;
+                cpts_clock_mult = <0x80000000>;
+                cpts_clock_shift = <29>;
+                reg = <0x4A100000 0x800 0x4A101200 0x100>;
+                #address-cells = <1>;
+                #size-cells = <1>;
+                interrupt-parent = <&intc>;
+                interrupts = <40 41 42 43>;
+                ranges;
+                disable-napi;
+
+                mdio: mdio@4a101000 {
+                    compatible = "ti,davinci_mdio";
+                    #address-cells = <1>;
+                    #size-cells = <0>;
+                    ti,hwmods = "davinci_mdio";
+                    bus_freq = <1000000>;
+                    reg = <0x4A101000 0x100>;
+                };
+
+                slave0: slave@4a100200 {
+                    mac-address = [00 00 00 00 00 00];
+                    phy_id = <&mdio 0>;
+                };
+            };
+
+            /* USB */
+            usb: usb@47400000 {
+                compatible = "ti,musb-am33xx";
+                reg = <0x47400000 0x1000
+                       0x47401000 0x800
+                       0x47401800 0x800>;
+                interrupts = <17 18 19>;
+                multipoint = <1>;
+                num-eps = <16>;
+                ram-bits = <12>;
+                port0-mode = <3>;
+                port1-mode = <1>;
+                power = <250>;
+                ti,hwmods = "usb_otg_hs";
+                status = "okay";
+                interface_type = <1>;
+            };
+
+            /* RTC */
+            rtc@44e3e000 {
+                compatible = "ti,da830-rtc";
+                reg = <0x44E3E000 0x1000>;
+                interrupts = <75 76>;
+                ti,hwmods = "rtc";
+                ti,system-power-controller;
+            };
+
+            /* GPIO LEDs for mining control */
+            gpio-leds {
+                compatible = "gpio-leds";
+                pinctrl-names = "default";
+                pinctrl-0 = <&user_leds_pins>;
+
+                led0 {
+                    label = "Green";
+                    gpios = <&gpio0 23 1>;  /* GPIO45 - GREEN LED */
+                    default-state = "on";
+                };
+
+                led1 {
+                    label = "Red";
+                    gpios = <&gpio1 13 1>;  /* GPIO23 - RED LED */
+                    default-state = "on";
+                };
+
+                rst0 {
+                    label = "rst0";
+                    gpios = <&gpio0 5 1>;   /* GPIO49 - Hash board 0 reset */
+                    default-state = "on";
+                };
+
+                rst1 {
+                    label = "res1";
+                    gpios = <&gpio0 4 1>;   /* GPIO60 - Hash board 1 reset */
+                    default-state = "on";
+                };
+
+                rst2 {
+                    label = "rst2";
+                    gpios = <&gpio0 27 1>;  /* GPIO27 - Hash board 2 reset */
+                    default-state = "on";
+                };
+
+                rst3 {
+                    label = "rst3";
+                    gpios = <&gpio0 22 1>;  /* GPIO22 - Hash board 3 reset */
+                    default-state = "on";
+                };
+
+                ip_sig {
+                    label = "ip_sig";
+                    gpios = <&gpio0 26 1>;  /* GPIO26 - IP signal/interrupt */
+                    default-state = "on";
+                };
+
+                recovery {
+                    label = "recovery";
+                    gpios = <&gpio1 14 1>;  /* GPIO46 - Recovery button input */
+                    default-state = "on";
+                };
+
+                /* PLUG detection for hash boards */
+                plug0 {
+                    label = "plug0";
+                    gpios = <&gpio1 19 1>;  /* GPIO51 - Hash board 0 detect */
+                    default-state = "on";
+                };
+
+                plug1 {
+                    label = "plug1";
+                    gpios = <&gpio1 16 1>;  /* GPIO48 - Hash board 1 detect */
+                    default-state = "on";
+                };
+
+                plug2 {
+                    label = "plug2";
+                    gpios = <&gpio1 15 1>;  /* GPIO47 - Hash board 2 detect */
+                    default-state = "on";
+                };
+
+                plug3 {
+                    label = "plug3";
+                    gpios = <&gpio1 12 1>;  /* GPIO44 - Hash board 3 detect */
+                    default-state = "on";
+                };
+
+                /* Fan tachometer inputs */
+                fan_speed0 {
+                    label = "fan_speed0";
+                    gpios = <&gpio3 16 1>;  /* GPIO112 - Front fan tach */
+                    default-state = "on";
+                };
+
+                fan_speed1 {
+                    label = "fan_speed1";
+                    gpios = <&gpio3 14 1>;  /* GPIO110 - Front fan tach */
+                    default-state = "on";
+                };
+            };
+
+            /* GPIO keyboard for recovery */
+            gpio_keys {
+                compatible = "gpio-keys";
+                #address-cells = <1>;
+                #size-cells = <0>;
+
+                button@0 {
+                    label = "recovery";
+                    linux,code = <116>;  /* KEY_POWER */
+                    gpios = <&gpio1 14 1>;  /* GPIO46 */
+                    gpio-key,wakeup;
+                };
+            };
+        };
+
+        /* Fixed regulator for MMC/SD */
+        vmmcsd_fixed: fixedregulator@0 {
+            compatible = "regulator-fixed";
+            regulator-name = "vmmcsd_fixed";
+            regulator-min-microvolt = <3300000>;
+            regulator-max-microvolt = <3300000>;
+        };
+    };
+
+    bone_capemgr {
+        compatible = "ti,bone-capemgr";
+        status = "okay";
+        eeprom = <&cape_eeprom>;
+        /* ... capemgr slots omitted for brevity ... */
+    };
+
+    __symbols__ {
+        pinctrl_ecap2 = "/pinmux@44e10800/pinmux_bb_ecappwm_rear_fan_pins";
+    };
+};

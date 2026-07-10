@@ -1,0 +1,78 @@
+/* ──────────────────────────────────────────────────────────────────────────
+   stats.css — Glassmorphic floating stat tiles (Phase 4a)
+   ──────────────────────────────────────────────────────────────────────────
+   <dcent-stat> tiles: BEST DIFF / POWER / FAN / UPTIME — uniform dark
+   glass, no orange-fill. State colors via [data-state] resolving to
+   --state-* tokens defined in tokens.css.
+   ────────────────────────────────────────────────────────────────────────── */
+
+.dcent-stat{
+  position:relative;
+  display:flex;flex-direction:column;gap:var(--sp-2);
+  padding:var(--sp-5) var(--sp-5);
+  border-radius:14px;
+  background:linear-gradient(180deg,rgba(16,24,32,.78),rgba(10,14,20,.7));
+  border:1px solid var(--border);
+  box-shadow:var(--shadow-card);
+  min-height:120px;
+  transition:transform var(--dur-fast) var(--ease-out),
+             border-color var(--dur-fast),
+             box-shadow var(--dur-fast);
+}
+.dcent-stat:hover{
+  transform:translateY(-2px);
+  border-color:var(--border-hi);
+  box-shadow:var(--shadow-hover);
+}
+
+.dcent-stat .stat-head{
+  display:flex;justify-content:space-between;align-items:flex-start;
+  color:var(--dim);
+}
+.dcent-stat .stat-eyebrow{
+  font-family:var(--mono);font-size:9.5px;font-weight:700;
+  letter-spacing:1.6px;text-transform:uppercase;
+}
+.dcent-stat .stat-icon{
+  width:18px;height:18px;
+  color:var(--state-idle);
+  transition:color .25s;
+  flex-shrink:0;
+}
+.dcent-stat .stat-icon svg{width:100%;height:100%;display:block;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+
+.dcent-stat .stat-value{
+  font-family:var(--mono);font-weight:800;
+  font-size:32px;line-height:1.1;letter-spacing:-0.8px;
+  font-variant-numeric:tabular-nums;
+  color:var(--text);
+  display:flex;align-items:baseline;gap:4px;
+}
+.dcent-stat .stat-value .u{
+  font-size:13px;color:var(--dim);font-weight:600;
+}
+
+.dcent-stat .stat-sub{
+  font-family:var(--mono);font-size:10px;
+  color:var(--state-idle);
+  line-height:1.5;
+  letter-spacing:.4px;
+  transition:color .4s ease;
+}
+
+/* State-driven coloring — sub-line + icon shift, value stays solid white */
+.dcent-stat[data-state="good"]   .stat-icon,
+.dcent-stat[data-state="good"]   .stat-sub  {color:var(--state-active)}
+.dcent-stat[data-state="warn"]   .stat-icon,
+.dcent-stat[data-state="warn"]   .stat-sub  {color:var(--state-warn)}
+.dcent-stat[data-state="error"]  .stat-icon,
+.dcent-stat[data-state="error"]  .stat-sub  {color:var(--state-error)}
+.dcent-stat[data-state="achievement"]{
+  box-shadow:var(--shadow-card),0 0 24px var(--state-glow-active);
+  border-color:color-mix(in srgb,var(--state-active) 30%,var(--border));
+}
+.dcent-stat[data-state="achievement"] .stat-icon,
+.dcent-stat[data-state="achievement"] .stat-sub{color:var(--state-active)}
+
+/* Subtle value-flash micro-interaction (when render writes a fresh value) */
+.dcent-stat .stat-value.flash{animation:daxFlashKf .32s ease-out}

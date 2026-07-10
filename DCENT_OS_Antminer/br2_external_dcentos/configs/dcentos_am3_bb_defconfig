@@ -1,0 +1,65 @@
+# DCENTos Buildroot defconfig - Antminer S19j Pro BeagleBone Black (am3-bb).
+# D-Central Technologies, 2026.
+#
+# Target: TI AM335x BeagleBone Black control board (ARM Cortex-A8, armv7).
+# ASIC:   BM1362 on BHB42601 hashboards.
+# PSU:    APW121215f (fw 0x76 observed on .79).
+# Boot:   SD-card first boot. NAND flashing is a stop gate.
+#
+# Per-product OVERRIDE layer. Shared content lives in:
+#   dcentos-common.fragment   (workspace-wide package set + identity)
+#
+# am3-bb is the only Cortex-A8 + AM335x product on the matrix today, so the
+# arch / toolchain / filesystem bits stay inline rather than promoted to a
+# shared armv7 fragment. The arch trio Cortex-A9 (Zynq), Cortex-A8 (BB),
+# Cortex-A53 (Amlogic) each has its own toolchain ABI and FPU profile, so a
+# blanket "armv7" fragment would not actually help.
+
+# Target Architecture - AM335x / Cortex-A8.
+BR2_arm=y
+BR2_cortex_a8=y
+BR2_ARM_ENABLE_NEON=y
+BR2_ARM_ENABLE_VFP=y
+BR2_ARM_FPU_VFPV3=y
+
+# Toolchain - keep arm-linux-gnueabihf userspace compatible with old BB kernels.
+BR2_TOOLCHAIN_EXTERNAL=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM=y
+BR2_TOOLCHAIN_EXTERNAL_DOWNLOAD=y
+BR2_TOOLCHAIN_EXTERNAL_URL="https://releases.linaro.org/components/toolchain/binaries/7.2-2017.11/arm-linux-gnueabihf/gcc-linaro-7.2.1-2017.11-x86_64_arm-linux-gnueabihf.tar.xz"
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_PREFIX="arm-linux-gnueabihf"
+BR2_TOOLCHAIN_EXTERNAL_GCC_7=y
+BR2_TOOLCHAIN_EXTERNAL_HEADERS_4_10=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_GLIBC=y
+BR2_TOOLCHAIN_EXTERNAL_CXX=y
+
+# BB first boot uses a ramdisk-style rootfs plus an ext2 image for inspection.
+BR2_TARGET_ROOTFS_CPIO=y
+BR2_TARGET_ROOTFS_CPIO_GZIP=y
+BR2_TARGET_ROOTFS_EXT2=y
+BR2_TARGET_ROOTFS_EXT2_4=y
+BR2_TARGET_ROOTFS_EXT2_SIZE="128M"
+
+# Per-product identity.
+BR2_TARGET_GENERIC_HOSTNAME="dcentos-bb"
+BR2_TARGET_GENERIC_ISSUE="DCENTos for S19j Pro BeagleBone Black (am3-bb)"
+
+# Overlay-on-overlay: reuse the serial-platform init/dashboard layer (amlogic
+# overlay carries the same cpio.gz + serial-mining init scripts the BB needs),
+# then stamp BB identity on top.
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/beaglebone/am3-bb/rootfs-overlay"
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/beaglebone/am3-bb/post-build.sh"
+BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/beaglebone/am3-bb/post-image.sh"
+
+# am3-bb-only USB diagnostics (BeagleBone has USB host; Zynq + Amlogic do not
+# expose USB ports on stock control boards). usbutils stays product-local.
+BR2_PACKAGE_USBUTILS=y
+
+# am3-bb-only iptables — defense-in-depth for the daemons:22322 privesc on
+# stock Bitmain BB control boards. We already omit the `daemons` binary in
+# post-build.sh, but if a future kernel/initrd or a sideloaded blob ever
+# binds 127.0.0.1:22322 again, S41firewall drops both TCP and UDP traffic
+# at the netfilter layer before the listener can see it. See
+# `docs/THREAT_MODEL.md` (BB-1) and the reference rule
+# .
+BR2_PACKAGE_IPTABLES=y

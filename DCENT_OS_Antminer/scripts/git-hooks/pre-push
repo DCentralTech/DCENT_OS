@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+#
+# DCENT_OS pre-push verification gate (Wave-A / SB-2).
+#
+# The repo has no git remote, so the committed .github workflows never fire —
+# this local pre-push hook is the stand-in that runs the offline verification
+# loop (`make verify` = ci_offline_gates.sh + the workspace test compile-gate)
+# before any push, so a regression or a non-compiling test (the SB-3 class)
+# can't leave the machine. Install with: `cd DCENT_OS_Antminer && make install-hooks`.
+#
+# Bypass for a quick/WIP push: `DCENT_SKIP_VERIFY=1 git push ...`
+# (use sparingly — it shifts the failure to whoever pulls/builds next).
+#
+set -euo pipefail
+
+if [ "${DCENT_SKIP_VERIFY:-0}" = "1" ]; then
+    echo "pre-push: DCENT_SKIP_VERIFY=1 — skipping make verify (WIP push)." >&2
+    exit 0
+fi
+
+# Resolve repo root from this hook's location (.git/hooks/pre-push), or fall
+# back to `git rev-parse` when invoked from a copy.
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$HOOK_DIR/../.." 2>/dev/null && pwd || git rev-parse --show-toplevel)"
+DCENTOS_DIR="$REPO_ROOT/DCENT_OS_Antminer"
+
+if [ ! -f "$DCENTOS_DIR/Makefile" ]; then
+    echo "pre-push: WARNING — $DCENTOS_DIR/Makefile not found; skipping DCENT_OS gate." >&2
+    exit 0
+fi
+
+echo "pre-push: running DCENT_OS offline verification loop (make verify)..." >&2
+echo "          (set DCENT_SKIP_VERIFY=1 to bypass for a WIP push)" >&2
+if make -C "$DCENTOS_DIR" verify; then
+    echo "pre-push: make verify PASSED — push allowed." >&2
+    exit 0
+else
+    echo "pre-push: make verify FAILED — push blocked. Fix, or DCENT_SKIP_VERIFY=1 to override." >&2
+    exit 1
+fi

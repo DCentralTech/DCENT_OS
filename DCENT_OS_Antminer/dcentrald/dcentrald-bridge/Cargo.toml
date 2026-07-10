@@ -1,0 +1,45 @@
+[package]
+name = "dcentrald-bridge"
+version.workspace = true  # Single source: dcentrald/Cargo.toml [workspace.package]
+edition = "2021"
+description = "DCENT Expansion Pack (dcent-pack) bridge client for dcentrald"
+license = "GPL-3.0"
+
+[dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+sha2.workspace = true
+# The single genuinely-new direct dep. Pairs with the existing `sha2` 0.10.
+# `hmac` 0.12 is the matching MAC crate for `sha2` 0.10 (both use the
+# `digest` 0.10 trait family) so there is no transitive version skew.
+hmac.workspace = true
+# Reuse the EXACT feature set the daemon already pins (dcentrald/Cargo.toml:53):
+# default-features=false + rustls-tls + json. NO native-tls (no OpenSSL on the
+# cross targets), so the cross build does not need a system libssl.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json.workspace = true
+toml.workspace = true
+tokio = { workspace = true }
+axum.workspace = true
+tower = { version = "0.5", features = ["util"] }
+
+# W4.7 lint inheritance + grandfather override pattern (mirrors the sibling
+# leaf crates, e.g. dcentrald-api-types/Cargo.toml:24). This crate's
+# unwrap/expect/panic occurrences are confined to `#[cfg(test)]` modules and
+# the `tests/` integration harness (KAT pins, policy tables, mock-bridge
+# round-trips); production `src/` code is `?`-propagating and panic-free.
+# cargo 1.95+: per-crate overrides cannot coexist with `[lints] workspace = true`.
+[lints.clippy]
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+indexing_slicing = "allow"
+unwrap_in_result = "allow"

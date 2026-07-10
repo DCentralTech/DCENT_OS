@@ -1,0 +1,112 @@
+/* ──────────────────────────────────────────────────────────────────────────
+   asic-chips.css — Protected ASIC chip card (extracted Phase 2.B)
+   ──────────────────────────────────────────────────────────────────────────
+   PROTECTED FEATURE — silicon-die SVG + beam sweep + share bar + UART
+   daisy chain must remain alive at all times. v1 chip CSS (the dead
+   block at the prior dashboard.rs:341-349) was deleted on extraction.
+
+   Phase 2.B keeps both legacy `.hot` / `.error` class selectors AND
+   new `[data-state]` selectors for one step of overlap. Phase 2.D
+   removes the legacy selectors once renderChips switches to data-state.
+   ────────────────────────────────────────────────────────────────────────── */
+
+/* ── Chip grid responsive layouts ───────────────────────────────────── */
+.chip-grid{display:grid;gap:12px}
+.chip-grid-1{grid-template-columns:minmax(0,320px);justify-content:center}
+.chip-grid-2{grid-template-columns:repeat(2,1fr)}
+.chip-grid-4{grid-template-columns:repeat(4,1fr)}
+.chip-grid-6{grid-template-columns:repeat(6,1fr)}
+@media(max-width:1100px){.chip-grid-4{grid-template-columns:repeat(2,1fr)}.chip-grid-6{grid-template-columns:repeat(3,1fr)}}
+
+/* ── Chip tile (PROTECTED: v2 silicon-die port) ─────────────────────── */
+.chip-tile{
+  --chip-color:var(--accent);
+  --chip-glow:rgba(247,147,26,0.35);
+  cursor:pointer;
+  display:flex;flex-direction:column;
+  padding:var(--sp-4) var(--sp-4) var(--sp-3);
+  background:linear-gradient(180deg,rgba(255,255,255,0.015) 0%,rgba(0,0,0,0.25) 100%),var(--s-raised);
+  border:1px solid var(--border);
+  border-radius:var(--radius);
+  position:relative;overflow:visible;
+  transition:all var(--dur-base) var(--ease-out);
+  box-shadow:var(--shadow-card);
+}
+.chip-tile::before{content:'';position:absolute;top:0;left:12%;right:12%;height:1px;background:linear-gradient(90deg,transparent,var(--chip-color),transparent);opacity:0.5}
+.chip-tile::after{content:'';position:absolute;inset:0;background:radial-gradient(ellipse 90% 40% at 50% 115%,var(--chip-glow),transparent 70%);opacity:0.18;pointer-events:none;transition:opacity var(--dur-base);border-radius:inherit}
+.chip-tile:hover{transform:translateY(-2px);border-color:var(--chip-color);box-shadow:var(--shadow-card), 0 0 0 1px var(--chip-color), 0 12px 28px -16px var(--chip-glow)}
+.chip-tile:hover::after{opacity:0.8}
+
+/* Attribute-driven state ladder — replaces legacy .hot/.error classes (Phase 2.D) */
+.chip-tile[data-state="idle"]   {--chip-color:var(--muted);--chip-glow:rgba(107,122,141,.18)}
+.chip-tile[data-state="active"] {--chip-color:var(--accent);--chip-glow:var(--glow)}
+.chip-tile[data-state="warm"]   {--chip-color:var(--accent);--chip-glow:rgba(247,147,26,.32)}
+.chip-tile[data-state="hot"]    {--chip-color:var(--yellow);--chip-glow:rgba(251,191,36,.32);border-color:rgba(251,191,36,.35)}
+.chip-tile[data-state="error"]  {--chip-color:var(--red);--chip-glow:rgba(248,113,113,.32);border-color:rgba(248,113,113,.40)}
+
+/* ── Chip head (id + status dot) ─────────────────────────────────────── */
+.chip-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.chip-id{font-family:var(--mono);font-size:10px;font-weight:700;color:var(--dim);letter-spacing:1.2px}
+.chip-dot{width:6px;height:6px;border-radius:50%;background:var(--muted)}
+.chip-dot.active{background:var(--chip-color);box-shadow:0 0 8px var(--chip-color);animation:pulse 1.6s ease-in-out infinite}
+.chip-dot.error{background:var(--red);box-shadow:0 0 8px var(--red);animation:pulse 0.8s ease-in-out infinite}
+
+/* ── Chip metrics (TEMP / SHARES) ────────────────────────────────────── */
+.chip-metrics{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px}
+.chip-metric{display:flex;flex-direction:column;align-items:flex-start;line-height:1.1}
+.chip-metric:last-child{align-items:flex-end}
+.chip-metric-val{font-family:var(--mono);font-size:20px;font-weight:700;line-height:1.15;font-variant-numeric:tabular-nums;color:var(--text);letter-spacing:-0.5px}
+.chip-metric-unit{font-size:11px;color:var(--dim);margin-left:2px;font-weight:400}
+.chip-metric-lbl{font-family:var(--mono);font-size:8px;color:var(--dim);letter-spacing:1.3px;font-weight:600;margin-top:1px}
+
+/* ── Chip share bar (per-chip contribution %) ────────────────────────── */
+.chip-share-bar{position:relative;height:16px;background:var(--s-void);border:1px solid var(--border);border-radius:4px;overflow:hidden}
+.chip-share-fill{position:absolute;inset:0 auto 0 0;border-radius:4px;opacity:0.35;transition:width .8s var(--ease-out);background:var(--chip-color)}
+.chip-share-lbl{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:0.5px;color:var(--text)}
+
+/* ── UART daisy-chain visual ────────────────────────────────────────── */
+.uart-chain-v2{display:flex;align-items:center;flex-wrap:wrap;gap:4px;padding:10px 12px;background:var(--s-void);border:1px solid var(--border);border-radius:var(--radius-sm);font-family:var(--mono);font-size:10px;margin-top:12px;overflow:hidden;position:relative}
+.uart-node{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:4px;font-weight:600;letter-spacing:0.8px;white-space:nowrap}
+.uart-mcu{color:var(--cyan);border:1px solid rgba(34,211,238,0.3);background:rgba(34,211,238,0.06);box-shadow:0 0 12px rgba(34,211,238,0.12)}
+.uart-led{width:6px;height:6px;border-radius:50%;background:var(--cyan);box-shadow:0 0 8px var(--cyan);animation:pulse 1.6s ease-in-out infinite}
+.uart-chip{border:1px solid var(--border);color:var(--dim)}
+.uart-chip.active{color:var(--accent);border-color:rgba(247,147,26,0.35);background:var(--glow);box-shadow:0 0 12px rgba(247,147,26,0.15)}
+.uart-chip.error{color:var(--red);border-color:rgba(248,113,113,0.35);background:rgba(248,113,113,0.08)}
+.uart-line{flex:0 0 auto;width:24px;height:1px;background:linear-gradient(90deg,var(--dim),rgba(107,122,141,0.1));position:relative;margin:0 2px}
+
+/* ── Silicon die + beam sweep + HOT badge (PROTECTED) ───────────────── */
+.chip-silicon-wrap{position:relative;aspect-ratio:1;max-height:110px;margin:2px auto 6px;width:100%;display:flex;align-items:center;justify-content:center}
+.chip-silicon{width:100%;height:100%;filter:drop-shadow(0 0 10px var(--chip-glow))}
+.chip-beam{transform-origin:50px 50px;animation:chipBeam 3s linear infinite}
+@keyframes chipBeam{0%{transform:translateY(0);opacity:0}10%{opacity:0.9}90%{opacity:0.9}100%{transform:translateY(46px);opacity:0}}
+.chip-badge-hot{position:absolute;top:6px;right:6px;font-family:var(--mono);font-size:8px;font-weight:800;letter-spacing:1px;padding:2px 6px;border-radius:3px;background:var(--accent);color:#000;box-shadow:0 0 12px var(--accent);animation:hotPulse 1.4s ease-in-out infinite;z-index:2}
+@keyframes hotPulse{0%,100%{box-shadow:0 0 10px rgba(247,147,26,0.5)}50%{box-shadow:0 0 22px rgba(247,147,26,0.9)}}
+
+/* ── Hover popover (Phase 2.E — fades in after 200 ms via .pop-on) ──── */
+.chip-pop{
+  position:absolute;left:50%;bottom:calc(100% + 6px);
+  transform:translateX(-50%) translateY(4px);
+  min-width:180px;
+  background:rgba(10,14,20,.96);
+  border:1px solid var(--border-hi,rgba(255,255,255,.08));
+  border-radius:8px;
+  padding:8px 10px;
+  font-family:var(--mono);font-size:10px;color:var(--text);
+  opacity:0;pointer-events:none;
+  transition:opacity .18s ease, transform .18s ease;
+  z-index:50;
+  box-shadow:0 12px 36px rgba(0,0,0,.6);
+}
+.chip-tile.pop-on .chip-pop{opacity:1;transform:translateX(-50%) translateY(0)}
+.chip-pop .row{display:flex;justify-content:space-between;gap:10px;line-height:1.5}
+.chip-pop .row .k{color:var(--dim);text-transform:uppercase;letter-spacing:1.1px;font-size:8.5px;font-weight:700}
+.chip-pop .row .v{color:var(--text);font-variant-numeric:tabular-nums}
+
+/* ── board-picker (kept for board-variant indicator if reintroduced) ── */
+.board-picker{display:inline-flex;background:var(--s-void);border:1px solid var(--border);border-radius:8px;padding:3px;gap:2px}
+.board-opt{background:none;border:none;padding:4px 10px;border-radius:5px;display:flex;flex-direction:column;align-items:center;line-height:1.1;transition:all var(--dur-fast) var(--ease-out);font-family:var(--font);cursor:default}
+.board-opt-count{font-family:var(--mono);font-size:10px;font-weight:700;color:var(--dim)}
+.board-opt-lbl{font-size:8px;letter-spacing:1px;color:var(--muted);text-transform:uppercase;font-weight:600;margin-top:1px}
+.board-opt.sel{background:var(--glow);box-shadow:inset 0 0 0 1px rgba(247,147,26,0.3),0 0 12px rgba(247,147,26,0.18)}
+.board-opt.sel .board-opt-count{color:var(--accent);text-shadow:0 0 8px var(--accent)}
+.board-opt.sel .board-opt-lbl{color:var(--accent)}

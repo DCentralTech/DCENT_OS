@@ -1,0 +1,354 @@
+#!/bin/sh
+#
+# S50dropbear - DCENT_OS gated dropbear SSH service
+#
+# W1.1 Default-credential lockdown (DCENT_Security):
+#   On a fresh DCENT_OS image, dropbear MUST NOT start until either
+#     (a) the first-boot wizard has completed (Argon2id password set in
+#         /data/dcent/auth.json) AND /data/dcent/.ssh-enabled exists, or
+#     (b) the operator has uploaded an authorized_keys file via dashboard
+#         and the dashboard has stamped /data/dcent/.ssh-enabled.
+#
+#   This replaces the Buildroot dropbear package's default S50dropbear,
+#   which would start sshd on every boot regardless of credential state
+#   and leave the LAN one default-password guess from full root.
+#
+# DevOps Q1 finding 4K (2026-05-15):
+#   The lockdown collided with S99upgrade's SSH health check on first
+#   NAND installs of am2/am3 units — the operator had no way to complete
+#   the dashboard wizard before U-Boot auto-recovery flipped the firmware
+#   slot back. Resolution: when `/etc/dcentos/first-boot-grace` exists
+#   AND no other credential evidence is present, S50dropbear auto-stamps
+#   `/data/dcent/.ssh-enabled` on first boot so dropbear can come up with
+#   the build-time-baked `authorized_keys` if one was staged. The grace
+#   flag is consumed once (removed after first boot) so the lockdown
+#   re-engages immediately for subsequent boots.
+#
+# Helper: /usr/sbin/dcent-enable-ssh (called by the API on wizard
+# completion or after authorized_keys upload).
+#
+# POSIX shell only -- BusyBox ash, no bash.
+
+NAME=dropbear
+DAEMON=/usr/sbin/dropbear
+PIDFILE=/var/run/dropbear.pid
+DROPBEAR_DEFAULTS=/etc/default/dropbear
+
+# Auth files written by dcentrald during first-boot wizard.
+DCENT_AUTH_FILE=/data/dcent/auth.json
+DCENT_SSH_ENABLED=/data/dcent/.ssh-enabled
+DCENT_AUTHORIZED_KEYS=/data/dcent/authorized_keys
+# Phase 4J (2026-05-15): explicit operator opt-out. When this file exists on
+# the persistent /data overlay, S50dropbear skips startup regardless of all
+# other gates. When absent, S50dropbear enables-by-default after the
+# wizard/keys/first-boot-grace gates have been evaluated and emits one WARN
+# line so the operator knows the default is non-zero-trust.
+DCENT_SSH_DISABLED=/data/dcent/.ssh-disabled
+
+# First-boot grace marker. Created by post-image.sh on fresh installs and
+# consumed on the first successful S50dropbear start so the lockdown
+# re-engages on the second boot.
+DCENT_FIRST_BOOT_GRACE=/etc/dcentos/first-boot-grace
+
+# SEC-W24 (2026-05-22): release-image marker. Stamped into the rootfs only for
+# PRODUCTION/release builds (DCENT_RELEASE_IMAGE=1 at Buildroot time — the same
+# marker the Rust daemon's auth::is_release_image() and the MCP server read).
+# On a release image, SSH defaults to LOCKED: the enable-by-default and the
+# first-boot-grace auto-stamp are BOTH suppressed, so dropbear only comes up
+# once the operator has explicitly set a password (wizard) or uploaded
+# authorized_keys. On a DEV/LAB image (no marker) the gate is byte-identical to
+# today (enable-by-default with a WARN). The operator opt-out (.ssh-disabled)
+# and the explicit out-of-band `dcent-enable-ssh` helper still work on both.
+DCENT_RELEASE_IMAGE_MARKER=/etc/dcentos/release-image
+
+is_release_image() {
+    [ -f "$DCENT_RELEASE_IMAGE_MARKER" ]
+}
+# Build-time-baked authorized_keys (optional). If present, it is copied to
+# the persistent path the first time the grace flag is consumed.
+DCENT_BAKED_AUTHORIZED_KEYS=/etc/dcentos/first-boot-authorized_keys
+
+DROPBEAR_ARGS=""
+[ -r "$DROPBEAR_DEFAULTS" ] && . "$DROPBEAR_DEFAULTS"
+
+# Always make sure dropbear's host-key dir exists so the daemon can lazy
+# generate a key when SSH is finally enabled. Persistent overlay is
+# managed by S45persistent on Zynq; on other boards /etc/dropbear is
+# tmpfs-backed via /run.
+mkdir -p /etc/dropbear 2>/dev/null || true
+
+# --- SSH host-key persistence (N4 fix,  STABILIZE 2026-06-05) ----------
+# The live audit found /data/keys/dropbear/ EMPTY and the host key regenerating
+# every boot -> "REMOTE HOST IDENTIFICATION HAS CHANGED" on every reconnect and
+# broken host-key-pinning fleet tooling. Root cause: keys were only saved on
+# S45persistent STOP (graceful shutdown). A power-cycle (the common case for a
+# home miner) never runs stop, so the freshly lazy-generated tmpfs keys were
+# never copied to /data, and dropbear's `-R` re-generated brand-new keys on the
+# next boot.
+#
+# Fix (two halves, both here so the behavior is co-located and survives even if
+# the daemon binary rolls back):
+#   restore_host_keys()  - before start, copy any saved keys from /data into the
+#                          (overlay/tmpfs) /etc/dropbear so dropbear reuses them.
+#   persist_host_keys()  - after start, copy the now-present /etc/dropbear keys
+#                          back to /data so the NEXT boot (even a hard power cut)
+#                          restores the same identity.
+# dcentos-early-init.sh also restores keys early; this is the belt-and-braces
+# pair that additionally PERSISTS right after generation, closing the
+# power-cut-before-graceful-shutdown gap. All writes are under /etc (overlay ->
+# NAND) and /data — never the RO squashfs root.
+DCENT_PERSIST_KEYDIR=/data/keys/dropbear
+
+restore_host_keys() {
+    [ -d "$DCENT_PERSIST_KEYDIR" ] || return 0
+    _restored=0
+    for _k in "$DCENT_PERSIST_KEYDIR"/dropbear_*_host_key; do
+        [ -f "$_k" ] || continue
+        _base=$(basename "$_k")
+        if [ ! -f "/etc/dropbear/$_base" ]; then
+            if cp "$_k" "/etc/dropbear/$_base" 2>/dev/null; then
+                chmod 600 "/etc/dropbear/$_base" 2>/dev/null || true
+                _restored=1
+            fi
+        fi
+    done
+    [ "$_restored" = "1" ] && echo "  [OK] dropbear host keys restored from $DCENT_PERSIST_KEYDIR"
+    return 0
+}
+
+persist_host_keys() {
+    # Only meaningful when /data is mounted (NAND overlay). On boards without
+    # persistence this is a harmless no-op.
+    [ -d /data ] || return 0
+    mkdir -p "$DCENT_PERSIST_KEYDIR" 2>/dev/null || return 0
+    _saved=0
+    for _k in /etc/dropbear/dropbear_*_host_key; do
+        [ -f "$_k" ] || continue
+        _base=$(basename "$_k")
+        # Persist only if missing or changed (avoid needless NAND writes /
+        # flash wear on every boot once the key is stable).
+        if [ ! -f "$DCENT_PERSIST_KEYDIR/$_base" ] || \
+           ! cmp -s "$_k" "$DCENT_PERSIST_KEYDIR/$_base" 2>/dev/null; then
+            _tmp="$DCENT_PERSIST_KEYDIR/.${_base}.tmp.$$"
+            if cp "$_k" "$_tmp" 2>/dev/null && mv "$_tmp" "$DCENT_PERSIST_KEYDIR/$_base" 2>/dev/null; then
+                chmod 600 "$DCENT_PERSIST_KEYDIR/$_base" 2>/dev/null || true
+                _saved=1
+            else
+                rm -f "$_tmp" 2>/dev/null
+            fi
+        fi
+    done
+    [ "$_saved" = "1" ] && echo "  [OK] dropbear host keys persisted to $DCENT_PERSIST_KEYDIR"
+    return 0
+}
+
+# Bring any saved identity into /etc/dropbear before dropbear is consulted.
+restore_host_keys
+
+consume_first_boot_grace() {
+    # Consume the build-time-baked first-boot grace flag. Idempotent: the
+    # marker file is deleted after this runs once, so subsequent boots re-
+    # apply the lockdown. Returns 0 if grace was consumed, 1 otherwise.
+    [ -f "$DCENT_FIRST_BOOT_GRACE" ] || return 1
+    # Only consume grace if NO operator credential evidence exists yet.
+    # If the operator already finished the wizard or uploaded an
+    # authorized_keys file, we never want to override their state.
+    if [ -f "$DCENT_AUTH_FILE" ] || [ -s "$DCENT_AUTHORIZED_KEYS" ] || [ -f "$DCENT_SSH_ENABLED" ]; then
+        rm -f "$DCENT_FIRST_BOOT_GRACE" 2>/dev/null || true
+        return 1
+    fi
+    # Materialize /data/dcent and stage build-time-baked authorized_keys
+    # if one was shipped with the image.
+    mkdir -p /data/dcent 2>/dev/null || true
+    if [ -s "$DCENT_BAKED_AUTHORIZED_KEYS" ]; then
+        cp "$DCENT_BAKED_AUTHORIZED_KEYS" "$DCENT_AUTHORIZED_KEYS" 2>/dev/null || true
+        chmod 600 "$DCENT_AUTHORIZED_KEYS" 2>/dev/null || true
+    fi
+    : > "$DCENT_SSH_ENABLED"
+    rm -f "$DCENT_FIRST_BOOT_GRACE" 2>/dev/null || true
+    # Leave a consumed-marker so S99upgrade can soft-pass the SSH check on
+    # this exact boot. The marker lives in /etc (tmpfs on Zynq) so it
+    # disappears after reboot, preventing the soft-pass from leaking.
+    mkdir -p /etc/dcentos 2>/dev/null || true
+    : > /etc/dcentos/first-boot-grace-consumed
+    if command -v logger >/dev/null 2>&1; then
+        logger -t dcent-ssh -p auth.notice \
+            "DCENT_OS: first-boot grace consumed; SSH gate stamped open for installation flow"
+    fi
+    return 0
+}
+
+ssh_gate_state() {
+    # Echo one of: disabled-by-opt-out | enabled-by-wizard | enabled-by-keys |
+    # enabled-by-first-boot-grace | enabled-by-default | locked-release-image
+    # Phase 4J: explicit operator opt-out beats everything. Persistent
+    # /data overlay file lets the operator pin "no SSH" across reboots
+    # without rebuilding the image.
+    if [ -f "$DCENT_SSH_DISABLED" ]; then
+        echo "disabled-by-opt-out"
+        return
+    fi
+    # SEC-W24: on a release image, real operator credential evidence (wizard
+    # password OR uploaded authorized_keys) is the ONLY thing that opens SSH.
+    # We must therefore evaluate that evidence WITHOUT auto-stamping
+    # first-boot grace (which would otherwise open SSH with a build-time-baked
+    # key on a fresh production unit). DEV images keep consuming grace exactly
+    # as before.
+    if ! is_release_image; then
+        if [ ! -f "$DCENT_SSH_ENABLED" ]; then
+            if consume_first_boot_grace; then
+                # Grace just consumed; recompute below.
+                :
+            fi
+        fi
+    fi
+    if [ -s "$DCENT_AUTHORIZED_KEYS" ]; then
+        echo "enabled-by-keys"
+        return
+    fi
+    if [ -f "$DCENT_AUTH_FILE" ]; then
+        echo "enabled-by-wizard"
+        return
+    fi
+    # SEC-W24: release image with no operator credential evidence yet → LOCKED.
+    # No enable-by-default, no first-boot-grace auto-open. The operator reaches
+    # the daemon over the LAN dashboard (:80, no SSH needed) to set a password
+    # or upload keys; SSH then opens on the next boot. `dcent-enable-ssh`
+    # remains the explicit out-of-band escape hatch.
+    if is_release_image; then
+        echo "locked-release-image"
+        return
+    fi
+    # Grace stamped .ssh-enabled but no wizard/keys exist yet. Allow
+    # dropbear to come up so the operator can reach the dashboard and
+    # complete the wizard. Subsequent boots will require either auth.json
+    # or authorized_keys (grace is consumed and cannot re-stamp).
+    if [ -f "$DCENT_SSH_ENABLED" ]; then
+        echo "enabled-by-first-boot-grace"
+        return
+    fi
+    # Phase 4J: enable-by-default. The operator can opt out by creating
+    # /data/dcent/.ssh-disabled. A WARN is emitted at start() so the
+    # operator knows the default is non-zero-trust.
+    echo "enabled-by-default"
+}
+
+start_disabled_msg() {
+    # Use logger when available so the message lands in syslog/dmesg-like
+    # ring buffers reachable over the dashboard log tail. Fall back to
+    # stdout for early boot before syslog is up.
+    MSG="DCENT_OS: SSH disabled by operator (/data/dcent/.ssh-disabled present)"
+    if command -v logger >/dev/null 2>&1; then
+        logger -t dcent-ssh -p auth.warning "$MSG"
+    fi
+    echo "$MSG"
+}
+
+start_default_warn() {
+    # Phase 4J: one-line WARN when dropbear comes up on the enable-by-default
+    # path (no wizard, no keys, no rescue marker, no explicit opt-out). Tells
+    # the operator the default is non-zero-trust and points at the opt-out file.
+    MSG="DCENT_OS: first-boot SSH enabled by default; create /data/dcent/.ssh-disabled to opt out"
+    if command -v logger >/dev/null 2>&1; then
+        logger -t dcent-ssh -p auth.warning "$MSG"
+    fi
+    echo "$MSG"
+}
+
+start_release_locked_msg() {
+    # SEC-W24: one-line notice when SSH is held closed on a release image
+    # because no operator credential evidence exists yet. Points the operator
+    # at the LAN dashboard (set a password / upload keys) and the out-of-band
+    # escape hatch.
+    MSG="DCENT_OS: release image — SSH locked until a password is set or authorized_keys uploaded (use the dashboard on :80, or /usr/sbin/dcent-enable-ssh)"
+    if command -v logger >/dev/null 2>&1; then
+        logger -t dcent-ssh -p auth.notice "$MSG"
+    fi
+    echo "$MSG"
+}
+
+start() {
+    STATE=$(ssh_gate_state)
+    if [ "$STATE" = "disabled-by-opt-out" ]; then
+        printf 'Starting %s: BLOCKED (gate=%s)\n' "$NAME" "$STATE"
+        start_disabled_msg
+        # Exit cleanly so init does not retry. Operator removes
+        # /data/dcent/.ssh-disabled to re-enable on next boot, or calls
+        # `/usr/sbin/dcent-enable-ssh` to start dropbear out-of-band.
+        return 0
+    fi
+    if [ "$STATE" = "locked-release-image" ]; then
+        printf 'Starting %s: BLOCKED (gate=%s)\n' "$NAME" "$STATE"
+        start_release_locked_msg
+        # Exit cleanly so init does not retry. SSH opens on the next boot once
+        # the operator sets a password (wizard) or uploads authorized_keys.
+        return 0
+    fi
+    if [ "$STATE" = "enabled-by-default" ]; then
+        start_default_warn
+    fi
+    printf 'Starting %s: ' "$NAME"
+    # -R = generate host keys lazily on first connection (avoids early
+    #      boot entropy block; see CHANGELOG_v0.2.7.md).
+    # Append -R only if not already present in DROPBEAR_ARGS.
+    case " $DROPBEAR_ARGS " in
+        *" -R "*) ;;
+        *) DROPBEAR_ARGS="$DROPBEAR_ARGS -R" ;;
+    esac
+    # shellcheck disable=SC2086
+    start-stop-daemon -S -q -p "$PIDFILE" --exec "$DAEMON" -- $DROPBEAR_ARGS \
+        && echo "OK (gate=$STATE)" || { echo "FAIL"; return 1; }
+
+    # N4 host-key persistence: keep `-R` (lazy generation avoids the early-boot
+    # entropy block this kernel suffers) BUT persist the keys the instant they
+    # materialize. restore_host_keys() (run at script load) reuses a saved
+    # identity if one exists; if not, dropbear generates fresh keys on the first
+    # connection — so we background a short watcher that copies them to /data as
+    # soon as they appear, closing the "power-cut before graceful shutdown"
+    # window that left /data/keys/dropbear/ empty. The watcher persists once and
+    # exits (bounded ~5 min); it is a no-op if the keys were already restored
+    # (cmp -s short-circuits the copy).
+    (
+        _tries=0
+        while [ "$_tries" -lt 300 ]; do
+            for _hk in /etc/dropbear/dropbear_*_host_key; do
+                [ -f "$_hk" ] && { persist_host_keys; exit 0; }
+            done
+            sleep 1
+            _tries=$((_tries + 1))
+        done
+    ) >/dev/null 2>&1 &
+}
+
+stop() {
+    printf 'Stopping %s: ' "$NAME"
+    start-stop-daemon -K -q -p "$PIDFILE" 2>/dev/null && echo "OK" || echo "not running"
+}
+
+restart() {
+    stop
+    sleep 1
+    start
+}
+
+status() {
+    STATE=$(ssh_gate_state)
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+        echo "$NAME: running (gate=$STATE)"
+        return 0
+    fi
+    echo "$NAME: stopped (gate=$STATE)"
+    return 3
+}
+
+case "$1" in
+    start) start ;;
+    stop) stop ;;
+    restart|reload) restart ;;
+    status) status ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
+exit $?

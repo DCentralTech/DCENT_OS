@@ -1,0 +1,67 @@
+#!/bin/sh
+#
+# S70dcentos-discovery - DCENT_OS discovery daemon for am3-bb.
+#
+# Replaces stock monitor-ipsig with explicit Bitmain IP Reporter compatible
+# UDP beacons, DCENT fleet JSON, and mDNS service announcements. No stock
+# daemons localhost-22322 listener is staged or started.
+
+DAEMON=/usr/local/bin/dcentos-discovery
+PIDFILE=/var/run/dcentos-discovery.pid
+LOGFILE=/var/log/dcentos-discovery.log
+ARGS="--interval-seconds 60 --api-port 8080"
+
+if [ -r /etc/dcentos/discovery.env ]; then
+    . /etc/dcentos/discovery.env
+fi
+
+if [ -n "$DCENT_DISCOVERY_BUTTON_GPIO" ]; then
+    ARGS="$ARGS --button-gpio $DCENT_DISCOVERY_BUTTON_GPIO"
+fi
+
+case "$1" in
+    start)
+        echo -n "Starting dcentos-discovery: "
+        if [ ! -x "$DAEMON" ]; then
+            echo "FAIL ($DAEMON not executable)"
+            exit 1
+        fi
+        mkdir -p /var/run /var/log
+        start-stop-daemon -S -b -m -p "$PIDFILE" --exec "$DAEMON" -- $ARGS \
+            >>"$LOGFILE" 2>&1
+        if [ $? -eq 0 ]; then
+            echo "OK"
+        else
+            echo "FAIL"
+            exit 1
+        fi
+        ;;
+    stop)
+        echo -n "Stopping dcentos-discovery: "
+        start-stop-daemon -K -q -p "$PIDFILE" 2>/dev/null
+        rm -f "$PIDFILE"
+        echo "OK"
+        ;;
+    restart|reload)
+        "$0" stop
+        sleep 1
+        "$0" start
+        ;;
+    status)
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "dcentos-discovery running (PID $(cat "$PIDFILE"))"
+        else
+            echo "dcentos-discovery stopped"
+            exit 1
+        fi
+        ;;
+    broadcast)
+        "$DAEMON" --once --api-port 8080
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status|broadcast}"
+        exit 1
+        ;;
+esac
+
+exit 0

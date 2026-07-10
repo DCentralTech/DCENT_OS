@@ -1,0 +1,4628 @@
+/* Advanced Mode (Hacker) — Deep glass + green terminal accents
+   Lower opacity glass, monospace everything, retained hacker green for register/hex views */
+
+.mode-hacker {
+  --bg: #070710;
+  --bg-subtle: #0f0f17;
+  --card-bg: rgba(13, 13, 20, 0.9);
+  --card-bg-solid: #101018;
+  --card-hover: rgba(20, 20, 31, 0.94);
+  --card-shadow: 0 10px 30px rgba(0, 0, 0, 0.48);
+  --border: rgba(255, 255, 255, 0.08);
+  --border-glass: rgba(255, 255, 255, 0.1);
+  --text: #e8e8ee;
+  --text-secondary: #a2a2b4;
+  --text-dim: #66677a;
+  --accent: #00FF41;
+  --accent-light: #33FF66;
+  --accent-glow: rgba(0, 255, 65, 0.1);
+  --accent-secondary: #FAA500;
+  --accent-orange: #FAA500;
+  --accent-orange-glow: rgba(250, 165, 0, 0.16);
+  --accent-deep: #FA6700;
+  --sphere-hi: #FFC94D;
+  --accent-glow-hi: rgba(0, 255, 65, 0.28);
+  --accent-border: rgba(0, 255, 65, 0.25);
+  --accent-gradient: linear-gradient(135deg, #33FF66 0%, var(--accent) 100%);
+  --green: #00FF41;
+  --green-dim: rgba(0, 255, 65, 0.1);
+  --yellow: #FFD700;
+  --yellow-dim: rgba(255, 215, 0, 0.1);
+  --red: #FF4444;
+  --red-dim: rgba(255, 68, 68, 0.1);
+  --radius: 8px;
+  --radius-sm: 4px;
+  --focus-ring: var(--accent);
+  --focus-ring-soft: rgba(0, 255, 65, 0.18);
+
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  display: flex;
+}
+
+/* Sidebar (Glass, deep) */
+.mode-hacker .sidebar {
+  width: 240px;
+  background: rgba(6, 6, 9, 0.9);
+  backdrop-filter: blur(var(--blur-md));
+  -webkit-backdrop-filter: blur(var(--blur-md));
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  z-index: 200;
+  transition: width 0.2s var(--ease-standard);
+}
+
+.mode-hacker .sidebar.collapsed {
+  width: 64px;
+}
+
+@supports not (backdrop-filter: blur(1px)) {
+  .mode-hacker .sidebar {
+    background: rgba(6, 6, 9, 0.98);
+  }
+}
+
+.mode-hacker .sidebar .brand h1 {
+  color: var(--accent);
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 700;
+}
+
+.mode-hacker .sidebar .nav-item.active {
+  background: var(--accent-glow);
+  color: var(--accent);
+}
+
+.mode-hacker .sidebar .nav-item.active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 4px;
+  bottom: 4px;
+  width: 3px;
+  background: var(--accent);
+  border-radius: 0 2px 2px 0;
+  box-shadow: 0 0 8px var(--accent-glow);
+}
+
+.mode-hacker .main-content {
+  flex: 1;
+  margin-left: 240px;
+  min-width: 0;
+  width: calc(100vw - 240px);
+  max-width: calc(100vw - 240px);
+  overflow-x: hidden;
+}
+
+.mode-hacker .main-content.sidebar-collapsed {
+  margin-left: 64px;
+  width: calc(100vw - 64px);
+  max-width: calc(100vw - 64px);
+}
+
+.mode-hacker .hacker-mobile-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 199;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+.mode-hacker .hacker-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(12, 12, 18, 0.72);
+  backdrop-filter: blur(var(--blur-sm));
+  -webkit-backdrop-filter: blur(var(--blur-sm));
+  position: sticky;
+  top: 2px;
+  z-index: 100;
+}
+
+.mode-hacker .hacker-topbar-primary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.mode-hacker .hacker-mobile-menu-btn {
+  display: none;
+  color: var(--text);
+  font-size: 1.3rem;
+  padding: 0 6px;
+}
+
+/* In-dialog close for the mobile nav drawer (focus-trapped role=dialog) — gives
+   the trapped dialog a self-contained, focusable, discoverable dismiss control
+   beyond Escape/scrim-tap (mirrors the Standard drawer's close affordance). */
+.mode-hacker .hacker-sidebar-mobile-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 44px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 0.95rem;
+  cursor: pointer;
+  z-index: 2;
+}
+.mode-hacker .hacker-sidebar-mobile-close:hover,
+.mode-hacker .hacker-sidebar-mobile-close:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.mode-hacker .hacker-device-info,
+.mode-hacker .hacker-topbar-context {
+  min-width: 0;
+}
+
+.mode-hacker .hacker-device-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mode-hacker .hacker-device-model,
+.mode-hacker .hacker-context-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: var(--text);
+  margin: 0;
+}
+
+.mode-hacker .hacker-device-meta,
+.mode-hacker .hacker-context-copy {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+}
+
+.mode-hacker .hacker-topbar-context {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mode-hacker .hacker-topbar-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mode-hacker .hacker-status-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.mode-hacker .hacker-status-chip.success {
+  color: var(--green);
+  background: var(--green-dim);
+  border-color: rgba(0, 255, 65, 0.25);
+}
+
+.mode-hacker .hacker-status-chip.warning {
+  color: var(--yellow);
+  background: var(--yellow-dim);
+  border-color: rgba(255, 215, 0, 0.25);
+}
+
+.mode-hacker .hacker-status-chip.danger {
+  color: var(--red);
+  background: var(--red-dim);
+  border-color: rgba(255, 68, 68, 0.25);
+}
+
+.mode-hacker .hacker-status-chip.info {
+  color: var(--accent);
+  background: var(--accent-glow);
+  border-color: rgba(0, 255, 65, 0.2);
+}
+
+.mode-hacker .hacker-status-chip.neutral {
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.04);
+  border-color: var(--border);
+}
+
+/* ─── Warning Indicator (replaces full banner) ──────────── */
+.mode-hacker .warning-indicator {
+  height: 2px;
+  background: var(--red);
+  box-shadow: 0 0 8px rgba(255, 68, 68, 0.3);
+}
+
+/* ─── Console (Deep glass) ──────────────────────────────── */
+.mode-hacker .console {
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(var(--blur-xs));
+  -webkit-backdrop-filter: blur(var(--blur-xs));
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  /* : was 'overflow: hidden', which clipped the inner resizable
+     output scroll area. Keep horizontal clipping (rounded corners) but let
+     the vertical scroll pane work. */
+  overflow-x: hidden;
+  overflow-y: visible;
+}
+
+.mode-hacker .console-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: rgba(12, 12, 18, 0.6);
+  border-bottom: 1px solid var(--border);
+}
+
+.mode-hacker .console-toolbar input {
+  background: rgba(0, 0, 0, 0.5);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  padding: 4px 8px;
+  font-family: inherit;
+  font-size: 0.75rem;
+  flex: 1;
+}
+
+.mode-hacker .console-output {
+  padding: 12px;
+  /* Adapt to viewport instead of a fixed 400px that ate >50% of a tablet/phone. */
+  max-height: calc(100vh - 300px);
+  min-height: 150px;
+  overflow-y: auto;
+  line-height: 1.6;
+  color: var(--accent);
+  /* white-space and word-break are set dynamically via inline style */
+}
+
+.mode-hacker .console-output .log-error { color: var(--red); }
+.mode-hacker .console-output .log-warn { color: var(--yellow); }
+.mode-hacker .console-output .log-info { color: var(--accent); }
+.mode-hacker .console-output .log-debug { color: var(--text-dim); }
+
+/* ─── Register Inspector (Solid background, no blur) ────── */
+.mode-hacker .register-inspector {
+  background: var(--card-bg-solid, #0c0c12);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius);
+  padding: 16px;
+  box-shadow: var(--card-shadow);
+}
+
+/* ─── Glass Card (Hacker override — green accent) ───────── */
+.mode-hacker .glass-card {
+  background: var(--card-bg);
+  backdrop-filter: blur(var(--blur-sm));
+  -webkit-backdrop-filter: blur(var(--blur-sm));
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius);
+  box-shadow: var(--card-shadow);
+  transition: border-color 0.2s var(--ease-standard), box-shadow 0.2s var(--ease-standard);
+}
+
+.mode-hacker .glass-card:hover {
+  border-color: rgba(0, 255, 65, 0.15);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+}
+
+.mode-hacker .hex-dump {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  color: var(--accent);
+  background: rgba(0, 0, 0, 0.6);
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  overflow-x: auto;
+  white-space: pre;
+  line-height: 1.8;
+}
+
+.mode-hacker .hex-dump .addr { color: var(--text-dim); }
+.mode-hacker .hex-dump .byte { color: var(--accent); }
+.mode-hacker .hex-dump .ascii { color: var(--yellow); }
+
+/* ─── Chip Map ───────────────────────────────────────────── */
+.mode-hacker .chip-map {
+  display: grid;
+  gap: 2px;
+}
+
+.mode-hacker .chip-cell {
+  width: 14px;
+  height: 14px;
+  border-radius: 2px;
+  cursor: pointer;
+  transition: transform 0.1s var(--ease-standard);
+}
+
+.mode-hacker .chip-cell:hover {
+  transform: scale(1.5);
+  z-index: 10;
+}
+
+.mode-hacker .chip-cell.freq-low { background: #1a4731; }
+.mode-hacker .chip-cell.freq-med { background: #166534; }
+.mode-hacker .chip-cell.freq-high { background: #22c55e; }
+.mode-hacker .chip-cell.freq-max { background: #86efac; }
+.mode-hacker .chip-cell.chip-error { background: var(--red); }
+.mode-hacker .chip-cell.chip-dead { background: #333; }
+
+/* ─── Voltage Control ────────────────────────────────────── */
+.mode-hacker .voltage-slider {
+  -webkit-appearance: none;
+  width: 100%;
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  outline: none;
+}
+
+.mode-hacker .voltage-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  box-shadow: 0 0 8px var(--accent-glow);
+}
+
+/* ─── Tabs ───────────────────────────────────────────────── */
+.mode-hacker .tab-bar {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  gap: 0;
+  overflow-x: auto;
+}
+
+.mode-hacker .tab {
+  padding: 10px 16px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-dim);
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s var(--ease-standard);
+}
+
+.mode-hacker .tab:hover { color: var(--text); }
+
+.mode-hacker .tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+/* ─── API Explorer ───────────────────────────────────────── */
+.mode-hacker .api-explorer textarea {
+  width: 100%;
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  padding: 12px;
+  resize: vertical;
+  min-height: 120px;
+}
+
+.mode-hacker .json-response {
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  color: var(--accent);
+  white-space: pre-wrap;
+  overflow-x: auto;
+  max-height: 500px;
+  overflow-y: auto;
+}
+
+/* ─── Buttons (Glass borders) ────────────────────────────── */
+.mode-hacker .btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-radius: var(--radius-sm);
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 500;
+  font-size: 0.8rem;
+  transition: all 0.15s var(--ease-standard);
+  border: 1px solid var(--border-glass);
+}
+
+/*  D-16: the universal :focus-visible copy that lived here
+ * (.btn / .tab / .advanced-chip-button / .advanced-link-button /
+ * .hacker-mobile-menu-btn → 2px outline, no ambient glow) is now
+ * redundant: F1's canonical token-driven ring in design-system.css
+ * §F1-FOCUS covers these selectors and renders a *richer* ring
+ * (accent outline + soft halo + 14px ambient glow, phosphor-green
+ * under .mode-hacker). Removing the weaker local copy lets every
+ * advanced control inherit the canonical ring. No intentional
+ * per-element override was here — pure dedup, ring strengthened. */
+
+.mode-hacker .btn-primary {
+  background: var(--accent-glow);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.mode-hacker .btn-primary:hover {
+  background: rgba(0, 255, 65, 0.2);
+  box-shadow: 0 0 12px var(--accent-glow);
+}
+
+.mode-hacker .btn-danger {
+  background: var(--red-dim);
+  color: var(--red);
+  border-color: var(--red);
+}
+
+.mode-hacker .btn-secondary {
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text);
+}
+
+.mode-hacker .advanced-page {
+  padding: 24px;
+}
+
+.mode-hacker .advanced-page-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.mode-hacker .advanced-page-heading {
+  display: grid;
+  gap: 4px;
+}
+
+.mode-hacker .advanced-page-copy {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  max-width: 76ch;
+}
+
+.mode-hacker .advanced-page-toolbar-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mode-hacker .advanced-split-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 320px) minmax(0, 1fr);
+  gap: 20px;
+}
+
+.mode-hacker .advanced-grid-2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.mode-hacker .advanced-grid-3 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 20px;
+}
+
+.mode-hacker .psu-lab-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: minmax(0, 1.2fr) minmax(260px, 0.8fr);
+  align-items: start;
+}
+
+.mode-hacker .advanced-inline-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mode-hacker .advanced-control-label {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+}
+
+.mode-hacker .advanced-compact-button {
+  padding: 4px 10px;
+  font-size: 0.7rem;
+}
+
+.mode-hacker .advanced-toggle-button {
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  background: transparent;
+  color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  font-weight: 600;
+}
+
+.mode-hacker .advanced-toggle-button[aria-pressed="true"] {
+  background: var(--accent-glow);
+  color: var(--accent);
+  border-color: rgba(0, 255, 65, 0.25);
+}
+
+.mode-hacker .advanced-toolbar-status {
+  color: var(--text-dim);
+  font-size: 0.7rem;
+}
+
+.mode-hacker .advanced-scroll-card {
+  max-height: calc(100vh - 140px);
+  overflow-y: auto;
+}
+
+.mode-hacker .advanced-chip-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: transparent;
+}
+
+.mode-hacker .advanced-link-button {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.mode-hacker .advanced-scroll-region {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+/* ─── Forms ──────────────────────────────────────────────── */
+.mode-hacker input[type="text"],
+.mode-hacker input[type="number"],
+.mode-hacker input[type="password"],
+.mode-hacker select {
+  background: rgba(0, 0, 0, 0.5);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  padding: 8px 12px;
+  outline: none;
+}
+
+.mode-hacker input:focus,
+.mode-hacker select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-glow);
+}
+
+/* ─── KPI cards in hacker mode ───────────────────────────── */
+.mode-hacker .kpi-card {
+  background: var(--card-bg);
+  backdrop-filter: blur(var(--blur-xs));
+  -webkit-backdrop-filter: blur(var(--blur-xs));
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius);
+  box-shadow: var(--card-shadow);
+}
+
+.mode-hacker .kpi-card:hover {
+  border-color: rgba(0, 255, 65, 0.2);
+}
+
+/* ─── Shortcut Help Panel ──────────────────────────────── */
+.mode-hacker .shortcut-panel {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(var(--blur-xs));
+  -webkit-backdrop-filter: blur(var(--blur-xs));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+}
+
+/* ─── Collapsible sections ──────────────────────────────── */
+.mode-hacker .section-collapse-toggle {
+  cursor: pointer;
+  user-select: none;
+}
+
+.mode-hacker .section-collapse-toggle:hover {
+  color: var(--accent-light);
+}
+
+/* ─── Keyboard shortcut badges ───────────────────────────── */
+.mode-hacker .shortcut-badge {
+  font-size: 0.6rem;
+  color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace;
+  padding: 1px 4px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  background: rgba(0, 0, 0, 0.3);
+}
+
+/* ─── Polish pass (advanced tools — tighter density + tabular numerics) ───── */
+.mode-hacker .advanced-page,
+.mode-hacker .page-content {
+  padding: 14px 16px;
+}
+.mode-hacker .glass-card {
+  padding: 12px;
+}
+.mode-hacker .register-inspector {
+  padding: 12px;
+}
+
+/* Tabular numerics for advanced-mode data tables */
+.mode-hacker table th,
+.mode-hacker table td {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum';
+}
+
+/* Hover transition on table data rows (no color change — opacity/background lift) */
+.mode-hacker table tbody tr {
+  transition: background-color 0.12s var(--ease-standard);
+}
+.mode-hacker table tbody tr:hover {
+  background-color: rgba(0, 255, 65, 0.04);
+}
+
+/* Hover transition on advanced toggle/compact buttons */
+.mode-hacker .advanced-toggle-button,
+.mode-hacker .advanced-compact-button,
+.mode-hacker .advanced-link-button,
+.mode-hacker .advanced-chip-button {
+  transition: background-color 0.12s var(--ease-standard), border-color 0.12s var(--ease-standard), color 0.12s var(--ease-standard);
+}
+
+/*  D-16: the custom-button :focus-visible copy here
+ * (.advanced-toggle-button / .advanced-compact-button /
+ * .section-collapse-toggle) was the same weaker 2px-outline form
+ * F1's canonical §F1-FOCUS ring already covers. Removed — these
+ * controls now inherit the richer phosphor ring. No per-element
+ * override intended; dedup only. */
+
+/* Tabular numerics on hex dump + numeric input fields in hacker mode */
+.mode-hacker .hex-dump,
+.mode-hacker input[type="number"],
+.mode-hacker input[type="text"][value^="0x"] {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum';
+}
+
+/* ─── Responsive ───────────────────────────────────────────
+ *  D-17: hardcoded @media values snapped to F1's canonical
+ * 5-tier ladder (xs 360/359.98 · sm 480/479.98 · md 768/767.98 ·
+ * lg 1024/1023.98 · xl 1280/1279.98). max-width breaks use the
+ * −0.02 form; min-width companions keep the round tier value. */
+@media (max-width: 767.98px) {
+  .mode-hacker .sidebar {
+    transform: translateX(-100%);
+    width: 280px;
+  }
+  .mode-hacker .sidebar.open {
+    transform: translateX(0);
+  }
+  .mode-hacker .main-content {
+    margin-left: 0;
+    width: 100vw;
+    max-width: 100vw;
+  }
+  .mode-hacker .main-content.sidebar-collapsed {
+    margin-left: 0;
+    width: 100vw;
+    max-width: 100vw;
+  }
+  .mode-hacker .hacker-mobile-menu-btn {
+    /* The only nav-open control on phones — meet the 44px coarse-pointer floor
+       (this button is not in the responsive.css tap-target allowlist). */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .mode-hacker .hacker-topbar {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .mode-hacker .hacker-topbar-primary,
+  .mode-hacker .hacker-topbar-context,
+  .mode-hacker .hacker-topbar-actions {
+    width: 100%;
+  }
+  .mode-hacker .hacker-topbar-actions {
+    justify-content: flex-start;
+  }
+  .mode-hacker .advanced-page {
+    padding: 16px;
+  }
+  .mode-hacker .advanced-page-toolbar-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+  .mode-hacker .advanced-split-layout,
+  .mode-hacker .advanced-grid-2,
+  .mode-hacker .advanced-grid-3,
+  .mode-hacker .psu-lab-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Hacker shell — TUI / k9s / Linear admin aesthetic
+   Inspired by docs/design/.../ui_kits/dashboard/HackerMode.jsx
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Tighter base padding on advanced pages */
+.mode-hacker .advanced-page {
+  padding: 10px 14px;
+}
+.mode-hacker .glass-card,
+.mode-hacker .register-inspector {
+  padding: 10px 12px;
+}
+
+/* ─── Sidebar refinements ──────────────────────────────────────────────── */
+.mode-hacker .hacker-sidebar-brand {
+  padding: 14px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.mode-hacker .hacker-sidebar-brand-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mode-hacker .hacker-sidebar-brand h1 {
+  font-size: 0.95rem;
+  letter-spacing: 0.06em;
+  margin: 0;
+  color: var(--accent);
+  text-shadow: 0 0 12px rgba(0, 255, 65, 0.35);
+}
+.mode-hacker .hacker-sidebar-brand .version {
+  margin-top: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.mode-hacker .hacker-sidebar-prompt {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.62rem;
+  color: var(--text-dim);
+  letter-spacing: 0.02em;
+}
+.mode-hacker .hacker-sidebar-version {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.62rem;
+  color: var(--text-secondary);
+}
+
+.mode-hacker .hacker-sidebar-nav {
+  flex: 1;
+  padding: 6px;
+  overflow-y: auto;
+}
+
+.mode-hacker .hacker-sidebar-section-label {
+  margin: 10px 4px 2px;
+  font-size: 0.6rem;
+  color: var(--text-dim);
+  letter-spacing: 0.12em;
+  text-transform: lowercase;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.mode-hacker .nav-item-icon {
+  display: inline-flex;
+  width: 18px;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  color: inherit;
+}
+.mode-hacker .nav-item-body {
+  flex: 1;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.74rem;
+}
+.mode-hacker .nav-item-shortcut {
+  font-size: 0.58rem;
+  color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.mode-hacker .hacker-sidebar-foot {
+  padding: 6px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.mode-hacker .hacker-sidebar-collapse {
+  display: flex !important;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px !important;
+  border-radius: var(--radius-xs);
+  font-size: 0.72rem !important;
+  color: var(--text-dim) !important;
+  background: transparent;
+  border: 1px solid var(--border);
+}
+.mode-hacker .hacker-sidebar-collapse:hover {
+  color: var(--accent) !important;
+  border-color: rgba(0, 255, 65, 0.25);
+}
+
+/* ─── Console banner (terminal title row) ──────────────────────────────── */
+.mode-hacker .hacker-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  /* Safe-area top inset: this sticky banner is the real Hacker top bar (the
+     frozen responsive.css inset targets a .hacker-topbar that is not rendered). */
+  padding: calc(8px + env(safe-area-inset-top, 0px)) 14px 8px;
+  border-bottom: 1px solid var(--border);
+  background:
+    linear-gradient(90deg, rgba(0, 255, 65, 0.025), transparent 30%, transparent 70%, rgba(0, 255, 65, 0.025)),
+    rgba(10, 10, 14, 0.88);
+  backdrop-filter: blur(var(--blur-md));
+  -webkit-backdrop-filter: blur(var(--blur-md));
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 0.74rem;
+  color: var(--text);
+  position: sticky;
+  top: 2px;
+  z-index: 100;
+}
+
+.mode-hacker .hacker-banner-led {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  box-shadow: 0 0 4px var(--text-dim);
+  flex-shrink: 0;
+}
+.mode-hacker .hacker-banner-led.is-on {
+  background: var(--accent);
+  box-shadow: 0 0 10px var(--accent), 0 0 18px rgba(0, 255, 65, 0.4);
+  animation: hacker-led-pulse 2s ease-in-out infinite;
+}
+.mode-hacker .hacker-banner-led.is-off {
+  background: var(--red);
+  box-shadow: 0 0 6px var(--red);
+}
+@keyframes hacker-led-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.6; transform: scale(0.92); }
+}
+
+.mode-hacker .hacker-banner-host {
+  color: var(--accent);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-shadow: 0 0 8px rgba(0, 255, 65, 0.25);
+}
+.mode-hacker .hacker-banner-ip {
+  color: var(--text);
+}
+.mode-hacker .hacker-banner-sep {
+  color: var(--text-dim);
+  opacity: 0.7;
+}
+.mode-hacker .hacker-banner-state {
+  display: inline-flex;
+  align-items: center;
+  line-height: 1;
+  vertical-align: middle;
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  font-weight: 700;
+}
+.mode-hacker .hacker-banner-state.success { color: var(--green); background: rgba(0, 255, 65, 0.08); }
+.mode-hacker .hacker-banner-state.warning { color: var(--yellow); background: rgba(255, 215, 0, 0.08); }
+.mode-hacker .hacker-banner-state.danger  { color: var(--red); background: rgba(255, 68, 68, 0.08); }
+.mode-hacker .hacker-banner-state.info    { color: var(--accent); background: rgba(0, 255, 65, 0.06); }
+.mode-hacker .hacker-banner-state.neutral { color: var(--text-secondary); background: rgba(255, 255, 255, 0.03); }
+
+.mode-hacker .hacker-banner-flex { flex: 1; }
+.mode-hacker .hacker-banner-clock {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  padding: 0 4px;
+  text-shadow: 0 0 8px rgba(0, 255, 65, 0.15);
+}
+
+/* ─── Context bar (page title + actions) ───────────────────────────────── */
+.mode-hacker .hacker-context-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(8, 8, 12, 0.5);
+}
+.mode-hacker .hacker-context-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.mode-hacker .hacker-context-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: 0.01em;
+  margin: 0;
+}
+.mode-hacker .hacker-context-copy {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.68rem;
+  color: var(--text-secondary);
+}
+.mode-hacker .hacker-context-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mode-hacker .hacker-context-actions .btn {
+  padding: 4px 10px;
+  font-size: 0.7rem;
+}
+
+/* ─── Status strip wrap (persistent across pages) ──────────────────────── */
+.mode-hacker .hacker-status-strip-wrap {
+  padding: 8px 14px 0;
+}
+
+/* ─── Tool tab-bar (horizontal inline switcher) ────────────────────────── */
+.mode-hacker .hacker-tool-tabbar {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  padding: 8px 14px 0;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.mode-hacker .hacker-tool-tabbar::-webkit-scrollbar { height: 4px; }
+.mode-hacker .hacker-tool-tabbar::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 2px;
+}
+
+.mode-hacker .hacker-tool-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.12s var(--ease-standard), border-color 0.12s var(--ease-standard), background 0.12s var(--ease-standard);
+  margin-bottom: -1px;
+}
+.mode-hacker .hacker-tool-tab:hover {
+  color: var(--text);
+  background: rgba(0, 255, 65, 0.04);
+}
+.mode-hacker .hacker-tool-tab.is-active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  text-shadow: 0 0 8px rgba(0, 255, 65, 0.35);
+}
+.mode-hacker .hacker-tool-tab-icon {
+  display: inline-flex;
+  width: 14px;
+  align-items: center;
+  justify-content: center;
+}
+.mode-hacker .hacker-tool-tab-label { font-weight: 500; }
+
+/* ─── Page region (scrollable, bottom-padded for command bar) ─────────── */
+.mode-hacker .hacker-page-region {
+  padding-bottom: 56px; /* room for sticky CommandBar */
+}
+.mode-hacker .hacker-tabbed-page {
+  padding: 12px 14px;
+}
+.mode-hacker .hacker-inline-tab-bar {
+  margin-bottom: 10px;
+}
+.mode-hacker .hacker-tabbed-content {
+  min-height: 0;
+}
+
+/* ─── Overview (tool launcher) ─────────────────────────────────────────── */
+.mode-hacker .hacker-overview {
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.mode-hacker .hacker-section {
+  background: rgba(8, 10, 14, 0.45);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.mode-hacker .hacker-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  background: rgba(0, 255, 65, 0.025);
+  border-bottom: 1px solid var(--border);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.66rem;
+}
+.mode-hacker .hacker-section-eyebrow {
+  color: var(--accent);
+  letter-spacing: 0.05em;
+  text-transform: lowercase;
+  font-weight: 600;
+}
+.mode-hacker .hacker-section-meta {
+  color: var(--text-dim);
+}
+
+.mode-hacker .hacker-tool-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  background: var(--border);
+}
+.mode-hacker .hacker-tool-tile {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  background: rgba(10, 10, 14, 0.95);
+  border: none;
+  color: var(--text);
+  font-family: 'JetBrains Mono', monospace;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s var(--ease-standard), color 0.12s var(--ease-standard), box-shadow 0.12s var(--ease-standard);
+  position: relative;
+  min-height: 56px;
+}
+.mode-hacker .hacker-tool-tile:hover {
+  background: rgba(0, 255, 65, 0.06);
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px rgba(0, 255, 65, 0.2),
+              inset 3px 0 0 0 var(--accent);
+}
+.mode-hacker .hacker-tool-tile:focus-visible {
+  outline: none;
+  background: rgba(0, 255, 65, 0.06);
+  box-shadow: inset 0 0 0 1px var(--accent),
+              0 0 0 2px rgba(0, 255, 65, 0.25);
+}
+.mode-hacker .hacker-tool-tile-icon {
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+  flex-shrink: 0;
+  filter: drop-shadow(0 0 6px rgba(0, 255, 65, 0.25));
+}
+.mode-hacker .hacker-tool-tile-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+.mode-hacker .hacker-tool-tile-label {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+.mode-hacker .hacker-tool-tile-shortcut {
+  font-size: 0.6rem;
+  color: var(--text-dim);
+  font-weight: 400;
+}
+.mode-hacker .hacker-tool-tile-blurb {
+  font-size: 0.66rem;
+  color: var(--text-secondary);
+}
+.mode-hacker .hacker-tool-tile-chevron {
+  color: var(--text-dim);
+  font-size: 1rem;
+  opacity: 0;
+  transform: translateX(-4px);
+  transition: opacity 0.12s var(--ease-standard), transform 0.12s var(--ease-standard);
+}
+.mode-hacker .hacker-tool-tile:hover .hacker-tool-tile-chevron {
+  opacity: 1;
+  transform: translateX(0);
+  color: var(--accent);
+}
+
+/* ─── Chain status rows ────────────────────────────────────────────────── */
+.mode-hacker .hacker-chain-grid {
+  display: flex;
+  flex-direction: column;
+}
+.mode-hacker .hacker-chain-row {
+  display: grid;
+  grid-template-columns: 80px 1fr;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+}
+.mode-hacker .hacker-chain-row:last-child { border-bottom: none; }
+.mode-hacker .hacker-chain-row:hover {
+  background: rgba(0, 255, 65, 0.04);
+}
+.mode-hacker .hacker-chain-row.is-alive .hacker-chain-id {
+  color: var(--accent);
+  font-weight: 700;
+}
+.mode-hacker .hacker-chain-row.is-dead .hacker-chain-id {
+  color: var(--text-dim);
+}
+.mode-hacker .hacker-chain-row.is-alive .hacker-chain-data {
+  color: var(--green);
+}
+.mode-hacker .hacker-chain-row.is-dead .hacker-chain-data {
+  color: var(--text-dim);
+}
+
+.mode-hacker .hacker-overview-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.66rem;
+  color: var(--text-dim);
+  flex-wrap: wrap;
+}
+.mode-hacker .hacker-overview-footer kbd {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.6rem;
+  color: var(--accent);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1px 5px;
+  background: rgba(0, 0, 0, 0.4);
+}
+.mode-hacker .hacker-overview-footer-hints {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   StatusStrip — dense console row with live pulse dots
+   ═══════════════════════════════════════════════════════════════════════════ */
+.mode-hacker .hacker-status-strip {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 6px 10px;
+  background: rgba(10, 10, 14, 0.92);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 0.7rem;
+  flex-wrap: wrap;
+  position: relative;
+  overflow: hidden;
+}
+.mode-hacker .hacker-status-strip::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, rgba(0, 255, 65, 0.04), transparent 18%, transparent 82%, rgba(0, 255, 65, 0.04));
+  pointer-events: none;
+}
+.mode-hacker .hacker-status-strip-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  position: relative;
+  z-index: 1;
+}
+.mode-hacker .hacker-status-strip-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  flex-shrink: 0;
+}
+.mode-hacker .hacker-status-strip-field.tone-ok     .hacker-status-strip-dot { background: var(--green);  box-shadow: 0 0 6px var(--green);  animation: hacker-dot-pulse 2s ease-in-out infinite; }
+.mode-hacker .hacker-status-strip-field.tone-warn   .hacker-status-strip-dot { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); animation: hacker-dot-pulse 1.4s ease-in-out infinite; }
+.mode-hacker .hacker-status-strip-field.tone-danger .hacker-status-strip-dot { background: var(--red);    box-shadow: 0 0 6px var(--red);    animation: hacker-dot-pulse 0.9s ease-in-out infinite; }
+.mode-hacker .hacker-status-strip-field.tone-info   .hacker-status-strip-dot { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+@keyframes hacker-dot-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.45; }
+}
+.mode-hacker .hacker-status-strip-label {
+  color: var(--text-dim);
+  font-size: 0.62rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.mode-hacker .hacker-status-strip-data {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.mode-hacker .hacker-status-strip-value {
+  color: var(--text);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+}
+.mode-hacker .hacker-status-strip-value small {
+  font-size: 0.62rem;
+  font-weight: 500;
+  margin-left: 1px;
+  color: var(--text-dim);
+}
+.mode-hacker .hacker-status-strip-field.tone-ok     .hacker-status-strip-value { color: var(--accent); text-shadow: 0 0 6px rgba(0, 255, 65, 0.25); }
+.mode-hacker .hacker-status-strip-field.tone-warn   .hacker-status-strip-value { color: var(--yellow); }
+.mode-hacker .hacker-status-strip-field.tone-danger .hacker-status-strip-value { color: var(--red); }
+.mode-hacker .hacker-status-strip-field.tone-idle   .hacker-status-strip-value { color: var(--text-dim); }
+.mode-hacker .hacker-status-strip-sub {
+  font-size: 0.6rem;
+  color: var(--text-dim);
+  margin-left: 2px;
+}
+.mode-hacker .hacker-status-strip-sep {
+  color: var(--text-dim);
+  opacity: 0.6;
+}
+.mode-hacker .hacker-status-strip-good { color: var(--green) !important; }
+.mode-hacker .hacker-status-strip-bad  { color: var(--red) !important; }
+.mode-hacker .hacker-status-strip-dim  { color: var(--text-dim) !important; }
+.mode-hacker .hacker-status-strip-spark {
+  display: inline-block;
+  color: var(--accent);
+  opacity: 0.65;
+}
+
+.mode-hacker .hacker-status-strip-rec {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border: 1px solid var(--red);
+  border-radius: 999px;
+  background: rgba(255, 68, 68, 0.08);
+  color: var(--red);
+  font-size: 0.6rem;
+  letter-spacing: 0.1em;
+  font-weight: 700;
+  position: relative;
+  z-index: 1;
+}
+.mode-hacker .hacker-status-strip-rec-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--red);
+  box-shadow: 0 0 8px var(--red);
+  animation: hacker-rec-pulse 1s ease-in-out infinite;
+}
+@keyframes hacker-rec-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.4; transform: scale(0.7); }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Sticky CommandBar
+   ═══════════════════════════════════════════════════════════════════════════ */
+.mode-hacker .hacker-command-bar {
+  position: fixed;
+  left: 240px;
+  right: 0;
+  bottom: 0;
+  z-index: 150;
+  background:
+    linear-gradient(180deg, rgba(0, 255, 65, 0.025), rgba(6, 6, 9, 0.96)),
+    rgba(6, 6, 9, 0.95);
+  border-top: 1px solid rgba(0, 255, 65, 0.25);
+  box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.55), 0 -1px 0 rgba(0, 255, 65, 0.08);
+  backdrop-filter: blur(var(--blur-md)) saturate(1.1);
+  -webkit-backdrop-filter: blur(var(--blur-md)) saturate(1.1);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  transition: left 0.2s var(--ease-standard);
+}
+.mode-hacker .main-content.sidebar-collapsed ~ .hacker-command-bar,
+.mode-hacker .sidebar.collapsed ~ .main-content + .hacker-command-bar {
+  /* fallback — actual offset adjusts via media query when sidebar collapses */
+}
+.mode-hacker .hacker-command-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  min-height: 36px;
+}
+.mode-hacker .hacker-command-bar-prompt {
+  color: var(--accent);
+  font-weight: 700;
+  font-size: 0.95rem;
+  text-shadow: 0 0 8px rgba(0, 255, 65, 0.45);
+  flex-shrink: 0;
+  user-select: none;
+}
+.mode-hacker .hacker-command-bar-input {
+  flex: 1;
+  min-width: 0;
+  background: transparent !important;
+  border: none !important;
+  outline: none;
+  color: var(--text) !important;
+  font-family: inherit !important;
+  font-size: 0.82rem !important;
+  padding: 4px 0 !important;
+  letter-spacing: 0.01em;
+  caret-color: var(--accent);
+}
+.mode-hacker .hacker-command-bar-input::placeholder {
+  color: var(--text-dim);
+  font-style: normal;
+  opacity: 0.55;
+}
+.mode-hacker .hacker-command-bar-caret {
+  color: var(--accent);
+  text-shadow: 0 0 8px rgba(0, 255, 65, 0.45);
+  margin-left: -6px;
+  font-weight: 700;
+}
+.mode-hacker .hacker-command-bar-hints {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 8px;
+  flex-shrink: 0;
+}
+.mode-hacker .hacker-command-bar-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.62rem;
+  color: var(--text-dim);
+  background: transparent;
+  border: none;
+  padding: 2px 4px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.mode-hacker .hacker-command-bar-hint:hover {
+  color: var(--accent);
+}
+.mode-hacker .hacker-command-bar-hint kbd {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.58rem;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1px 4px;
+  background: rgba(0, 0, 0, 0.45);
+  color: var(--accent);
+}
+.mode-hacker .hacker-command-bar-sep {
+  color: var(--text-dim);
+  opacity: 0.6;
+  font-size: 0.62rem;
+}
+
+/* Dropdown above the bar */
+.mode-hacker .hacker-command-bar-dropdown {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 100%;
+  margin-bottom: 6px;
+  max-height: 240px;
+  overflow-y: auto;
+  background: rgba(6, 8, 12, 0.98);
+  border: 1px solid rgba(0, 255, 65, 0.28);
+  border-radius: 6px;
+  box-shadow: 0 -16px 40px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(0, 0, 0, 0.4);
+  padding: 4px;
+}
+.mode-hacker .hacker-command-bar-option {
+  display: grid;
+  grid-template-columns: 80px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 6px 10px;
+  background: transparent;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.74rem;
+  border-radius: var(--radius-xs);
+  transition: background 0.1s var(--ease-standard), color 0.1s var(--ease-standard);
+}
+.mode-hacker .hacker-command-bar-option:hover,
+.mode-hacker .hacker-command-bar-option.is-active {
+  background: rgba(0, 255, 65, 0.08);
+  color: var(--accent);
+}
+.mode-hacker .hacker-command-bar-cat {
+  font-size: 0.58rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.mode-hacker .hacker-command-bar-label {
+  color: inherit;
+  font-weight: 600;
+}
+.mode-hacker .hacker-command-bar-desc {
+  color: var(--text-dim);
+  font-size: 0.66rem;
+  grid-column: 2 / span 1;
+  grid-row: 2;
+  margin-top: -2px;
+}
+.mode-hacker .hacker-command-bar-shortcut {
+  color: var(--text-dim);
+  font-size: 0.6rem;
+  font-family: 'JetBrains Mono', monospace;
+}
+.mode-hacker .hacker-command-bar-empty {
+  padding: 10px;
+  color: var(--text-dim);
+  font-size: 0.7rem;
+  font-style: italic;
+  text-align: center;
+}
+
+/* Row hover with green flash on data tables (already partial; reinforce) */
+.mode-hacker table tbody tr {
+  transition: background-color 0.12s var(--ease-standard), box-shadow 0.12s var(--ease-standard);
+}
+.mode-hacker table tbody tr:hover {
+  background-color: rgba(0, 255, 65, 0.05);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+/* Collapsed sidebar — shift command bar left */
+.mode-hacker .sidebar.collapsed + .main-content + .hacker-command-bar,
+.mode-hacker .sidebar.collapsed ~ .hacker-command-bar {
+  left: 64px;
+}
+
+/* Responsive — mobile collapses command bar to viewport edges */
+@media (max-width: 767.98px) {
+  .mode-hacker .hacker-command-bar { left: 0 !important; }
+  .mode-hacker .hacker-tool-grid { grid-template-columns: 1fr; }
+  .mode-hacker .hacker-banner { flex-wrap: wrap; }
+  .mode-hacker .hacker-banner-flex { display: none; }
+}
+@media (min-width: 768px) and (max-width: 1023.98px) {
+  .mode-hacker .hacker-tool-grid { grid-template-columns: repeat(2, 1fr); }
+}
+
+/* ============================================================
+   Hacker Inspector — uniform tool-page scaffold (round 5)
+   Wraps every advanced/* tool page in a coherent inspector
+   look: header (eyebrow + title + actions), optional toolbar,
+   scrolling body, footer with stats + secondary actions.
+   ============================================================ */
+.mode-hacker .hacker-inspector {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  gap: 10px;
+  padding: 14px 16px 4px;
+}
+.mode-hacker .hacker-inspector-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  background: rgba(0, 255, 65, 0.04);
+  border: 1px solid rgba(0, 255, 65, 0.18);
+  border-radius: 8px;
+}
+.mode-hacker .hacker-inspector-title-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.mode-hacker .hacker-inspector-eyebrow {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.62rem;
+  color: rgba(0, 255, 65, 0.45);
+  letter-spacing: 0.08em;
+  text-transform: lowercase;
+}
+.mode-hacker .hacker-inspector-title {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 1rem;
+  color: #c8ffd8;
+  font-weight: 700;
+  letter-spacing: -0.005em;
+  margin: 0;
+  text-transform: uppercase;
+}
+.mode-hacker .hacker-inspector-subtitle {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.7rem;
+  color: rgba(0, 255, 65, 0.55);
+  margin: 2px 0 0;
+  font-weight: 400;
+  line-height: 1.45;
+}
+.mode-hacker .hacker-inspector-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.mode-hacker .hacker-inspector-status {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.68rem;
+  padding: 3px 8px;
+  border-radius: var(--radius-xs);
+  border: 1px solid rgba(0, 255, 65, 0.32);
+  background: rgba(0, 255, 65, 0.06);
+  color: var(--accent);
+  white-space: nowrap;
+}
+.mode-hacker .hacker-inspector-status.warning {
+  border-color: rgba(245, 158, 11, 0.45);
+  background: rgba(245, 158, 11, 0.08);
+  color: var(--yellow);
+}
+.mode-hacker .hacker-inspector-status.danger {
+  border-color: rgba(239, 68, 68, 0.45);
+  background: rgba(239, 68, 68, 0.08);
+  color: var(--red);
+}
+.mode-hacker .hacker-inspector-status.neutral {
+  border-color: rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-dim);
+}
+.mode-hacker .hacker-inspector-help,
+.mode-hacker .hacker-inspector-refresh {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.72rem;
+  padding: 4px 10px;
+  border-radius: var(--radius-xs);
+  border: 1px solid rgba(0, 255, 65, 0.22);
+  background: rgba(0, 255, 65, 0.04);
+  color: #c8ffd8;
+  cursor: pointer;
+  transition: background 0.15s var(--ease-standard), border-color 0.15s var(--ease-standard), color 0.15s var(--ease-standard);
+}
+.mode-hacker .hacker-inspector-help:hover,
+.mode-hacker .hacker-inspector-refresh:hover {
+  background: rgba(0, 255, 65, 0.10);
+  border-color: rgba(0, 255, 65, 0.45);
+}
+.mode-hacker .hacker-inspector-help:disabled,
+.mode-hacker .hacker-inspector-refresh:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.mode-hacker .hacker-inspector-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 4px;
+  flex-wrap: wrap;
+}
+.mode-hacker .hacker-inspector-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 6px 0;
+}
+.mode-hacker .hacker-inspector-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 12px;
+  border-top: 1px solid rgba(0, 255, 65, 0.12);
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 0.68rem;
+  color: rgba(0, 255, 65, 0.55);
+  flex-wrap: wrap;
+}
+.mode-hacker .hacker-inspector-stats {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.mode-hacker .hacker-inspector-stats > span + span::before {
+  content: '·';
+  margin-right: 12px;
+  opacity: 0.5;
+}
+.mode-hacker .hacker-inspector-actions-bottom {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+@media (max-width: 767.98px) {
+  .mode-hacker .hacker-inspector { padding: 10px 10px 2px; }
+  .mode-hacker .hacker-inspector-header { flex-wrap: wrap; }
+  .mode-hacker .hacker-inspector-actions { flex-wrap: wrap; }
+}
+
+/* ─── Fuzzy ranker match highlight (CommandBar) ─────────────── */
+.mode-hacker .hacker-command-bar-match {
+  background: rgba(93, 255, 155, 0.18);
+  color: var(--accent, #5dff9b);
+  border-radius: 2px;
+  padding: 0 1px;
+  font-weight: 600;
+}
+
+/* ─── NotificationCenter drawer ─────────────────────────────── */
+.mode-hacker .hacker-notif-center {
+  position: fixed;
+  top: 56px;
+  right: 0;
+  width: 360px;
+  max-width: 92vw;
+  height: calc(100vh - 56px);
+  background: rgba(10, 14, 12, 0.92);
+  backdrop-filter: blur(var(--blur-xs));
+  -webkit-backdrop-filter: blur(var(--blur-xs));
+  border-left: 1px solid rgba(93, 255, 155, 0.22);
+  box-shadow: -10px 0 30px rgba(0, 0, 0, 0.45);
+  transform: translateX(100%);
+  transition: transform 0.22s var(--ease-out-soft);
+  display: flex;
+  flex-direction: column;
+  z-index: 800;
+  font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+  pointer-events: none;
+}
+.mode-hacker .hacker-notif-center.is-open {
+  transform: translateX(0);
+  pointer-events: auto;
+}
+.mode-hacker .hacker-notif-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid rgba(93, 255, 155, 0.18);
+}
+.mode-hacker .hacker-notif-eyebrow {
+  color: var(--accent, #5dff9b);
+  font-size: 0.78rem;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+}
+.mode-hacker .hacker-notif-count {
+  font-size: 0.72rem;
+  color: var(--muted, #8aa090);
+  opacity: 0.8;
+  margin-left: auto;
+}
+.mode-hacker .hacker-notif-close {
+  background: transparent;
+  border: 1px solid rgba(93, 255, 155, 0.3);
+  color: var(--accent, #5dff9b);
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-xs);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+}
+.mode-hacker .hacker-notif-close:hover {
+  background: rgba(93, 255, 155, 0.12);
+}
+.mode-hacker .hacker-notif-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.mode-hacker .hacker-notif-empty {
+  padding: 32px 12px;
+  text-align: center;
+  font-size: 0.78rem;
+  color: var(--muted, #8aa090);
+  opacity: 0.7;
+}
+.mode-hacker .hacker-notif-row {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  gap: 8px;
+  align-items: baseline;
+  padding: 6px 8px;
+  border: 1px solid rgba(93, 255, 155, 0.10);
+  border-radius: var(--radius-xs);
+  background: rgba(20, 26, 22, 0.5);
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+.mode-hacker .hacker-notif-row.is-warn {
+  border-color: rgba(250, 165, 0, 0.32);
+  background: rgba(40, 28, 8, 0.45);
+}
+.mode-hacker .hacker-notif-row.is-error {
+  border-color: rgba(255, 92, 92, 0.36);
+  background: rgba(48, 14, 14, 0.5);
+}
+.mode-hacker .hacker-notif-row-time {
+  color: var(--muted, #8aa090);
+  opacity: 0.75;
+  font-size: 0.7rem;
+}
+.mode-hacker .hacker-notif-row-pill {
+  text-transform: uppercase;
+  font-size: 0.62rem;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+  font-weight: 600;
+}
+.mode-hacker .hacker-notif-row-pill.is-info { color: var(--accent, #5dff9b); }
+.mode-hacker .hacker-notif-row-pill.is-warn { color: var(--accent-orange, #faa500); }
+.mode-hacker .hacker-notif-row-pill.is-error { color: var(--red, #ff5c5c); }
+.mode-hacker .hacker-notif-row-msg {
+  color: var(--text, #cfe5d6);
+  word-break: break-word;
+}
+.mode-hacker .hacker-notif-foot {
+  padding: 8px 14px;
+  border-top: 1px solid rgba(93, 255, 155, 0.12);
+  font-size: 0.7rem;
+  color: var(--muted, #8aa090);
+  opacity: 0.7;
+}
+.mode-hacker .hacker-notif-foot kbd {
+  font-family: inherit;
+  background: rgba(93, 255, 155, 0.12);
+  border: 1px solid rgba(93, 255, 155, 0.3);
+  border-radius: 3px;
+  padding: 0 4px;
+  margin: 0 2px;
+  color: var(--accent, #5dff9b);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   DENSITY PASS — Hacker mode tightening (2026-05-14 audit)
+   Hacker mode should run ~40% denser than Standard. Tightens paddings,
+   gaps, vertical rhythm, and a couple font sizes where readability allows.
+   Scope: .mode-hacker only. Appended last so it overrides earlier rules
+   without editing them in place.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Advanced page padding (was 24px) */
+.mode-hacker .advanced-page { padding: 14px 16px; }
+
+/* Advanced page toolbar vertical rhythm */
+.mode-hacker .advanced-page-toolbar { margin-bottom: 12px; gap: 10px; }
+
+/* Advanced-grid gaps (were 20px) */
+.mode-hacker .advanced-split-layout { gap: 12px; }
+.mode-hacker .advanced-grid-3 { gap: 10px; }
+
+/* Hacker overview launcher — tighten outer pad + section gap */
+.mode-hacker .hacker-overview { padding: 10px 12px; gap: 10px; }
+
+/* Topbar gap (was 16px) */
+.mode-hacker .hacker-topbar { gap: 10px; padding: 10px 14px; }
+
+/* Tool-tile cushioning */
+.mode-hacker .hacker-tool-tile { padding: 10px 12px; gap: 8px; }
+
+/* Status-strip readability tweak (font 0.7 → 0.7 retained;
+   eyebrows + small text drop a notch) */
+.mode-hacker .hacker-status-strip-label { font-size: 0.58rem; }
+.mode-hacker .hacker-status-strip-value small { font-size: 0.58rem; }
+.mode-hacker .hacker-status-strip-sub { font-size: 0.58rem; }
+.mode-hacker .hacker-section-head { font-size: 0.62rem; }
+
+/* Section vertical rhythm — eat 4px off bottom margins */
+.mode-hacker .hacker-section { margin-bottom: 12px; }
+
+/* Notification drawer header/foot — trim */
+.mode-hacker .hacker-notif-head { padding: 10px 12px; }
+.mode-hacker .hacker-notif-foot { padding: 6px 12px; }
+.mode-hacker .hacker-notif-body { padding: 6px 10px 10px; gap: 4px; }
+.mode-hacker .hacker-notif-empty { padding: 24px 12px; }
+
+/* Canonical section override inside hacker mode — denser card */
+.mode-hacker .section { padding: 12px 14px; margin-bottom: 12px; }
+.mode-hacker .kpi-card { padding: 10px 12px; }
+.mode-hacker .hero-kpi { padding: 10px 12px; }
+
+/* Setting rows in hacker mode — denser top/bottom */
+.mode-hacker .setting-row { padding: 12px 0; gap: 16px; }
+.mode-hacker .toggle-row { padding: 10px 0; gap: 12px; }
+
+/* ─── Agent 8 H-4 — Hacker mode reduced-motion override ─────────────────────
+ * advanced.css ships ~10 keyframes (CRT scanline, phosphor flicker, glow
+ * pulses). Motion-sensitive users with prefers-reduced-motion get a static
+ * but still readable terminal — animations stripped, scanline overlay kept
+ * as static texture at 15% opacity.
+ */
+@media (prefers-reduced-motion: reduce) {
+  .mode-hacker *,
+  .mode-hacker *::before,
+  .mode-hacker *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .mode-hacker .console-output::after {
+    animation: none !important;
+    opacity: 0.15;
+  }
+}
+
+/* ─── Agent F — Inline-style migration () ────────────────────────────
+ * Pure CSS-class replacements for the inline styles that previously lived in
+ * Console.tsx and AnomalyPanel.tsx. Zero behavior changes — the inline
+ * style objects mapped here 1:1. Severity colors use existing tokens
+ * (--red / --yellow / --accent / --text-dim) and severity hex literals
+ * are preserved verbatim inside color-mix() so the visual output is byte-
+ * identical to the pre-migration inline form.
+ */
+
+/* Console.tsx — outer chrome */
+.console-page { padding: 24px; }
+.console-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+.console-header-title {
+  color: var(--accent);
+  margin-bottom: 0;
+}
+.console-header-meta {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  font-size: 0.75rem;
+}
+.console-header-count { font-weight: 700; }
+.console-header-count-err { color: var(--red); }
+.console-header-count-warn { color: var(--yellow); }
+.console-tab-bar { margin-bottom: 0; }
+
+/* Console.tsx — severity filter buttons */
+.console-severity-group { display: flex; gap: 2px; }
+.console-severity-btn.is-active.console-severity-btn-info {
+  color: var(--accent);
+  background: color-mix(in srgb, #00FF41 15%, transparent);
+}
+.console-severity-btn.is-active.console-severity-btn-warn {
+  color: var(--yellow);
+  background: color-mix(in srgb, #FFD700 15%, transparent);
+}
+.console-severity-btn.is-active.console-severity-btn-error {
+  color: var(--red);
+  background: color-mix(in srgb, #FF4444 15%, transparent);
+}
+.console-severity-btn.is-active.console-severity-btn-debug {
+  color: var(--text-dim);
+  background: color-mix(in srgb, #3e3e52 15%, transparent);
+}
+
+/* Console.tsx — pause button compact sizing */
+.console-pause-btn {
+  padding: 4px 12px;
+  font-size: 0.75rem;
+}
+
+/* Console.tsx — output shell (relative anchor for autoscroll pill) */
+.console-output-shell { position: relative; }
+.console-output-shell-inner {
+  resize: vertical;
+  overflow: auto;
+  min-height: 200px;
+  max-height: 80vh;
+}
+.console-output-shell-inner.is-wrapped {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.console-output-shell-inner.is-unwrapped {
+  white-space: pre;
+  word-break: normal;
+}
+.console-line-ts { color: var(--text-dim); }
+.console-line-level { font-weight: 600; }
+.console-output-empty {
+  color: var(--text-dim);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  min-height: 120px;
+}
+
+/* Console.tsx — tail -f autoscroll pill (anchored to output bottom) */
+.console-autoscroll-pill {
+  position: absolute;
+  bottom: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--accent-glow, rgba(0, 255, 65, 0.18));
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  padding: 4px 14px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.55);
+  white-space: nowrap;
+  z-index: 4;
+}
+
+/* Console.tsx — command prompt row */
+.console-prompt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-subtle);
+}
+.console-prompt-sigil {
+  color: var(--accent);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.console-prompt-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  outline: none;
+  padding: 0;
+}
+.console-prompt-cursor {
+  color: var(--accent);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  font-weight: 700;
+  margin-left: -6px;
+  pointer-events: none;
+}
+
+/* AnomalyPanel.tsx — severity rows */
+.anomaly-row-list { display: block; }
+.anomaly-row {
+  padding: 8px 16px;
+  font-size: 0.8rem;
+  font-family: 'JetBrains Mono', monospace;
+  margin-bottom: 2px;
+}
+.anomaly-row-glyph { display: inline; }
+.anomaly-row-critical {
+  color: var(--red);
+  background: var(--red-dim);
+  border-left: 3px solid var(--red);
+}
+.anomaly-row-warning {
+  color: var(--yellow);
+  background: var(--yellow-dim);
+  border-left: 3px solid var(--yellow);
+}
+.anomaly-row-nominal {
+  padding: 12px 16px;
+  color: var(--green, #2DD4A0);
+  font-size: 0.85rem;
+  font-family: 'JetBrains Mono', monospace;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 0;
+}
+.anomaly-row-nominal .anomaly-row-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--green, #2DD4A0);
+  display: inline-block;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  P3 — Advanced tool utility catalog ('adv-*')
+ * ───────────────────────────────────────────────────────────────────────────
+ * The 32 advanced/* tools carried ~1000 inline 'style=(())' blocks. They
+ * cannot inherit F1's glass/blur/glow tokens and are visually incoherent vs
+ * Standard. This catalog maps the recurring inline patterns 1:1 so the
+ * migration is PIXEL-EQUIVALENT — same px, same colors (severity hex kept
+ * verbatim via the same tokens the inline code used), same layout. Continues
+ * the  Console/AnomalyPanel pattern. All scoped under '.mode-hacker'
+ * where they consume hacker tokens; bare utilities (flex/grid/spacing) are
+ * mode-agnostic. Strictly additive — no existing class touched.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Exact spacing utilities (1:1 with the inline px values seen across
+ *    the 32 tools — margins/paddings only, never layout) ── */
+.adv-mt-2 { margin-top: 2px; }
+.adv-mt-4 { margin-top: 4px; }
+.adv-mt-8 { margin-top: 8px; }
+.adv-mt-12 { margin-top: 12px; }
+.adv-mt-16 { margin-top: 16px; }
+.adv-mt-20 { margin-top: 20px; }
+.adv-mb-2 { margin-bottom: 2px; }
+.adv-mb-4 { margin-bottom: 4px; }
+.adv-mb-6 { margin-bottom: 6px; }
+.adv-mb-8 { margin-bottom: 8px; }
+.adv-mb-12 { margin-bottom: 12px; }
+.adv-mb-16 { margin-bottom: 16px; }
+.adv-mb-20 { margin-bottom: 20px; }
+
+/* ── Card paddings / margins (was 'style=(( padding:16 ))' on .glass-card) ── */
+.adv-card { padding: 16px; }
+.adv-card-pad-12 { padding: 12px; }
+.adv-card-pad-20 { padding: 20px; }
+.adv-card-mt { margin-top: 20px; }
+.adv-card-mt-12 { margin-top: 12px; }
+.adv-card-mb { margin-bottom: 16px; }
+.adv-card-mb-12 { margin-bottom: 12px; }
+.adv-card-mb-20 { margin-bottom: 20px; }
+.adv-section-gap { margin-bottom: 16px; }
+
+/* ── Card / panel titles (was fontWeight:700 + color:var(--accent)) ── */
+.adv-card-title {
+  font-weight: 700;
+  color: var(--accent);
+  margin-bottom: 12px;
+}
+.adv-card-title.is-sm { font-size: 0.85rem; }
+.adv-card-title.is-sm-tight { font-size: 0.85rem; margin-bottom: 8px; }
+.adv-card-title.is-danger { color: var(--red); }
+.adv-card-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+/* ── Hint / sub-label text (was fontSize:0.7-0.75rem + color:var(--text-dim)) ── */
+.adv-hint {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+.adv-hint.is-xs { font-size: 0.7rem; }
+.adv-hint.is-mb { margin-bottom: 8px; }
+.adv-eyebrow-label {
+  font-size: 0.6rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 2px;
+}
+
+/* ── Status message lines (was color:var(--red/green/yellow) + fontSize) ── */
+.adv-msg { font-size: 0.8rem; margin-bottom: 8px; }
+.adv-msg.is-error { color: var(--red); }
+.adv-msg.is-success { color: var(--accent, #00FF41); }
+.adv-msg.is-warn { color: var(--yellow); }
+.adv-msg.is-sm { font-size: 0.75rem; }
+.adv-msg.is-mt { margin-top: 8px; }
+.adv-warn-strong {
+  color: var(--yellow);
+  font-size: 0.8rem;
+  font-weight: 600;
+  margin-bottom: 16px;
+}
+.adv-danger-note {
+  color: var(--red);
+  font-size: 0.74rem;
+  font-weight: 600;
+}
+.adv-danger-note .adv-safe-em { color: var(--green); }
+
+/* ── Monospace readout / code blocks (was rgba(0,20,0,…) + #00FF41 + JBM) ── */
+.adv-mono {
+  font-family: 'JetBrains Mono', monospace;
+}
+.adv-mono-block {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  background: rgba(0, 0, 0, 0.4);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  color: var(--accent);
+  line-height: 1.8;
+}
+.adv-mono-block.is-tight { padding: 8px 12px; line-height: 1.55; }
+.adv-mono-block.is-dim { color: var(--text-dim); }
+.adv-mono-block-dim { color: var(--text-dim); }
+.adv-code-readout {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  color: var(--accent, #00FF41);
+  background: rgba(0, 20, 0, 0.4);
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  margin-bottom: 8px;
+}
+.adv-decode-overlay {
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: rgba(0, 20, 0, 0.6);
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(0, 255, 65, 0.15);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+}
+.adv-decode-overlay-title {
+  color: #00FF41;
+  font-weight: 700;
+  margin-bottom: 4px;
+  font-size: 0.7rem;
+}
+.adv-decode-overlay-value { color: #00FF41; }
+.adv-decode-overlay-fields {
+  margin-top: 4px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.adv-ref-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+}
+.adv-ref-cell {
+  background: rgba(0, 20, 0, 0.4);
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(0, 255, 65, 0.1);
+}
+.adv-ref-cell-title { color: #00FF41; font-weight: 700; margin-bottom: 6px; }
+.adv-ref-cell-body { color: #00FF41; line-height: 1.8; }
+.adv-ref-cell-body .adv-ref-sub { color: var(--text-dim); padding-left: 12px; }
+
+/* ── Layout primitives (was inline flex/grid/gap) ── */
+.adv-row {
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.adv-row.is-tight { gap: 8px; }
+.adv-row.is-center { align-items: center; }
+.adv-row.is-baseline { align-items: baseline; }
+.adv-row.no-mb { margin-bottom: 0; }
+.adv-flex { display: flex; }
+.adv-flex-center { display: flex; align-items: center; gap: 8px; }
+.adv-flex-between {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.adv-flex-wrap { display: flex; flex-wrap: wrap; gap: 8px; }
+.adv-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.adv-grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+}
+.adv-grid-2.is-gap-16 { gap: 16px; }
+.adv-grid-2.is-gap-8 { gap: 8px; }
+.adv-grid-fill {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+.adv-stack-gap > * + * { margin-top: 8px; }
+
+/* ── MiscCtrl placeholder hint (RegisterInspector — \n needs pre-wrap) ── */
+.adv-miscctrl-hint {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  color: #00FF41;
+  opacity: 0.5;
+  padding: 8px 12px;
+  background: rgba(0, 20, 0, 0.3);
+  border-radius: var(--radius-sm);
+  white-space: pre-line;
+}
+
+/* ── Bitfield decode cells (RegisterInspector) ── */
+.adv-bf-cell {
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+}
+.adv-bf-cell.is-set {
+  background: rgba(0, 255, 65, 0.08);
+  border-color: rgba(0, 255, 65, 0.3);
+}
+.adv-bf-cell-name { color: var(--text-dim); font-weight: 700; }
+.adv-bf-cell.is-set .adv-bf-cell-name { color: #00FF41; }
+.adv-bf-cell-desc { color: var(--text-dim); font-size: 0.7rem; }
+
+/* ── Write-history log rows (RegisterInspector) ── */
+.adv-writelog-title {
+  font-weight: 600;
+  color: var(--text-dim);
+  font-size: 0.75rem;
+  margin-bottom: 8px;
+}
+.adv-writelog-row {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  margin-bottom: 2px;
+}
+.adv-writelog-row.is-fail { color: var(--red); }
+
+/* ── Chain-comparison rows (RegisterInspector) ── */
+.adv-compare-title {
+  font-weight: 600;
+  color: var(--accent);
+  font-size: 0.8rem;
+  margin-bottom: 8px;
+}
+.adv-compare-row {
+  margin-bottom: 4px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+}
+.adv-compare-ch {
+  color: var(--text-dim);
+  width: 60px;
+  display: inline-block;
+}
+.adv-compare-ok { color: var(--accent, #00FF41); }
+.adv-compare-fail { color: var(--red); }
+
+/* ── KPI sub-cells (Configured/Actual style read-outs) ── */
+.adv-readout-cell {
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  font-family: 'JetBrains Mono', monospace;
+}
+.adv-readout-value { font-size: 1.1rem; font-weight: 700; }
+.adv-readout-value.is-dim { color: var(--text-dim); }
+
+/* ── Inline numeric input sizing (was style=((width:N))) ── */
+.adv-in-tiny { width: 60px; }
+.adv-in-xs { width: 80px; }
+.adv-in-100 { width: 100px; }
+.adv-in-sm { width: 88px; }
+.adv-in-md { width: 120px; }
+.adv-in-lg { width: 140px; }
+.adv-in-xl { width: 160px; }
+.adv-in-mono {
+  font-family: 'JetBrains Mono', monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Compact stepper / micro buttons (was style=((padding:'2px 8px'))) ── */
+.adv-step-btn {
+  padding: 2px 8px;
+  font-size: 0.8rem;
+  line-height: 1;
+}
+.adv-mini-btn {
+  font-size: 0.75rem;
+  padding: 6px 12px;
+}
+.adv-mini-select {
+  font-size: 0.7rem;
+  padding: 2px 4px;
+}
+
+/* ── Inline contextual help popover (RegisterInspector ?-help) ── */
+.adv-help-anchor { position: relative; }
+.adv-help-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 50;
+  width: 360px;
+  max-width: 90vw;
+  padding: 12px;
+  background: var(--card-bg-solid, #101018);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm, 4px);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.6);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+  color: var(--text);
+  line-height: 1.55;
+}
+.adv-help-pop-title {
+  color: var(--accent);
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+.adv-help-pop-sub { color: var(--text-dim); }
+.adv-help-pop-warn { color: var(--yellow); margin-top: 6px; }
+.adv-help-pop-wide { width: 380px; }   /* I2cScanner help is 380, not 360 */
+
+/* ── Voltage / sparkline read-outs ── */
+.adv-spark {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 1rem;
+  color: var(--accent);
+  letter-spacing: 1px;
+}
+.adv-spark-range {
+  font-size: 0.65rem;
+  color: var(--text-dim);
+  margin-left: 8px;
+}
+.adv-zone-bar {
+  height: 6px;
+  border-radius: 3px;
+  display: flex;
+  overflow: hidden;
+  margin-bottom: 4px;
+  opacity: 0.6;
+}
+.adv-zone-label {
+  text-align: center;
+  margin-bottom: 8px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* ── PatchBayPanel (event-effect router — pixel-equivalent) ── */
+.pbp-list { display: grid; gap: 10px; }
+.pbp-lane { padding: 12px; display: grid; gap: 10px; }
+.pbp-lane-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.pbp-lane-name { color: var(--accent); font-weight: 700; }
+.pbp-lane-desc { color: var(--text-dim); font-size: 0.78rem; }
+.pbp-lane-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.pbp-opt { color: var(--text); }
+.pbp-effects {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  font-size: 0.76rem;
+}
+
+/* ── BlockerStatePanel (overlay blocker trace — pixel-equivalent) ── */
+.bsp-trace {
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 12px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.74rem;
+  line-height: 1.65;
+  color: var(--accent);
+  overflow-x: auto;
+}
+.bsp-row {
+  display: grid;
+  grid-template-columns: 170px minmax(220px, 1fr);
+  gap: 12px;
+}
+.bsp-k { color: var(--text-dim); }
+
+/* ── UartFifoInspector (chain FIFO inspector — reuses sf-* + uf-* deltas) ── */
+.uf-controls { gap: 16px; align-items: center; }
+.uf-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.uf-kpi { padding: 12px; display: grid; gap: 4px; }
+.uf-chain { display: grid; gap: 14px; }
+.uf-chip-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.uf-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+}
+.uf-metric { padding: 10px; display: grid; gap: 4px; }
+.uf-metric-label {
+  color: var(--text-secondary);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+}
+.uf-metric-value { font-weight: 700; font-size: 0.84rem; }
+.uf-chart-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+}
+.uf-chart-card { padding: 12px; }
+.uf-chart-title { color: var(--accent); font-weight: 700; margin-bottom: 8px; }
+.uf-overlay-title {
+  color: var(--accent);
+  font-weight: 700;
+  margin-bottom: 10px;
+}
+.uf-overlay-log { max-height: 260px; }
+.uf-overlay-empty { color: var(--text-secondary); }
+.uf-overlay-row {
+  display: grid;
+  grid-template-columns: 90px 88px 1fr;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.uf-overlay-ts { color: var(--text-dim); }
+.uf-overlay-detail { color: var(--text-secondary); }
+
+/* ── AsicCommander (raw 55 AA frame sender — pixel-equivalent) ── */
+.ac-reg-select { min-width: 180px; }
+.ac-reg-desc {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+  padding: 6px 10px;
+  background: var(--bg-subtle, #111);
+  border-radius: var(--radius-sm);
+}
+.ac-reg-desc-name { color: var(--accent); }
+.ac-decoded {
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: var(--green-dim);
+  border: 1px solid var(--green);
+  border-radius: var(--radius-sm);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  color: var(--green);
+}
+.ac-history-scroll { max-height: 400px; overflow-y: auto; }
+.ac-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+.ac-table tbody tr { border-bottom: 1px solid var(--border); }
+.ac-thead-sticky {
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--card-bg);
+}
+.ac-table th {
+  text-align: left;
+  padding: 6px 12px;
+  color: var(--text-dim);
+}
+.ac-table td { padding: 6px 12px; }
+.ac-td-mono { font-family: 'JetBrains Mono', monospace; }
+.ac-td-dim { color: var(--text-dim); }
+.ac-td-accent { color: var(--accent); }
+.ac-td-yellow { color: var(--yellow); }
+.ac-td-green { color: var(--green); }
+.ac-td-sm { font-size: 0.75rem; }
+.ac-td-xs { font-size: 0.7rem; }
+.ac-td-nowrap { white-space: nowrap; }
+.ac-td-clip {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── ChipFreqMap (per-chip heatmap — R1 leapfrog; dynamic colors stay inline) ── */
+.cfm-tabbar { margin-bottom: 0; }
+.cfm-tab-count { font-size: 0.65rem; margin-left: 6px; color: var(--text-dim); }
+.cfm-mode-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.cfm-mode-btn {
+  text-transform: capitalize;
+  font-size: 0.75rem;
+  padding: 5px 12px;
+}
+.cfm-legend {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 12px;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  flex-wrap: wrap;
+}
+.cfm-sw {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  margin-right: 4px;
+  vertical-align: middle;
+}
+.cfm-source-note {
+  background: #1a1a00;
+  border: 1px solid var(--yellow);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  margin-bottom: 16px;
+  font-size: 0.75rem;
+  color: var(--yellow);
+}
+.cfm-state-card { text-align: center; padding: 40px; }
+.cfm-state-msg { font-size: 0.9rem; }
+.cfm-state-dim { color: var(--text-dim); }
+.cfm-state-err { color: var(--red); }
+.cfm-retry-btn { font-size: 0.8rem; }
+.cfm-summary {
+  display: flex;
+  gap: 24px;
+  align-items: center;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: var(--radius-sm);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+}
+.cfm-summary-chain { color: var(--accent); font-weight: 700; }
+.cfm-summary-stats { color: var(--text-dim); }
+.cfm-summary-dead { color: var(--red); }
+.cfm-grade-dist { display: flex; gap: 8px; }
+.cfm-no-chips {
+  text-align: center;
+  padding: 20px;
+  color: var(--text-dim);
+  font-size: 0.85rem;
+}
+/* Chip cell: scope under .mode-hacker .advanced-chip-button to win over the
+ * base button rule (the original used always-winning inline style). */
+.mode-hacker .advanced-chip-button.cfm-cell {
+  width: 38px;
+  height: 38px;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.6rem;
+  font-weight: 600;
+  outline: none;
+  outline-offset: -1px;
+  transition: transform 0.1s var(--ease-standard);
+  position: relative;
+  border: none;
+}
+.mode-hacker .advanced-chip-button.cfm-cell.is-active {
+  outline: 2px solid var(--accent);
+}
+.cfm-tip {
+  position: fixed;
+  background: rgba(6, 6, 9, 0.95);
+  backdrop-filter: blur(var(--blur-xs));
+  -webkit-backdrop-filter: blur(var(--blur-xs));
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 0.75rem;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--text);
+  z-index: 9999;
+  pointer-events: none;
+  white-space: nowrap;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+}
+.cfm-tip-title { color: var(--accent); font-weight: 700; margin-bottom: 6px; }
+.cfm-tip-grid {
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 2px 12px;
+  line-height: 1.6;
+}
+.cfm-tip-k { color: var(--text-dim); }
+.cfm-detail {
+  padding: 24px;
+  border: 1px solid var(--accent);
+}
+.cfm-detail-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+.cfm-detail-title { font-weight: 700; color: var(--accent); font-size: 1rem; }
+.cfm-detail-grade {
+  font-weight: 700;
+  font-size: 1.1rem;
+  padding: 2px 10px;
+  border-radius: var(--radius-xs);
+  background: rgba(0, 0, 0, 0.4);
+}
+.cfm-detail-body {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  line-height: 2;
+  background: #000;
+  border-radius: var(--radius-sm);
+  padding: 12px;
+}
+.cfm-detail-foot {
+  margin-top: 16px;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+/* ── SiliconFingerprintPanel (per-chain personality — R1 leapfrog) ── */
+.sf-empty { color: var(--text-secondary); padding: 16px; }
+.sf-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.sf-kpi {
+  padding: 14px;
+  display: grid;
+  gap: 4px;
+}
+.sf-kpi-label {
+  color: var(--text-secondary);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.sf-kpi-value { font-size: 1rem; font-weight: 700; }
+.sf-chain-list { display: grid; gap: 16px; }
+.sf-chain { display: grid; gap: 10px; }
+.sf-chain-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.sf-chain-name { color: var(--accent); font-weight: 700; }
+.sf-chain-persona { color: var(--text-dim); font-size: 0.78rem; }
+.sf-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+}
+.sf-metric { padding: 10px; }
+.sf-metric-label {
+  color: var(--text-secondary);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+}
+.sf-metric-value { font-weight: 700; }
+
+/* ── Silicon Grade Report (W9/W15) + chip-imbalance diagnostic (Wave-G) ── */
+.sf-report-section {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+}
+.sf-report-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+/* P3-37: honest thermal-supervisor state block (enabled/disabled + caveats). */
+.sf-supervisor {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+}
+.sf-report-note {
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+  line-height: 1.45;
+  padding: 8px 12px;
+  border-left: 2px solid var(--yellow, #e3b341);
+  background: var(--bg-subtle, rgba(255, 255, 255, 0.03));
+  border-radius: 4px;
+}
+.sf-grade-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
+  gap: 10px;
+}
+.sf-grade-chip {
+  display: grid;
+  justify-items: center;
+  gap: 2px;
+  padding: 10px;
+  text-align: center;
+}
+.sf-grade-letter { font-weight: 800; font-size: 1.1rem; }
+.sf-grade-count { font-weight: 700; }
+.sf-grade-pct { color: var(--text-dim); font-size: 0.72rem; }
+.sf-chain-grades { display: grid; gap: 8px; }
+.sf-chain-grade {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+}
+.sf-chain-grade-dist {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+.sf-chain-grade-meta { color: var(--text-dim); font-size: 0.74rem; }
+.sf-imbalance { display: grid; gap: 8px; }
+.sf-imbalance-threshold { color: var(--text-dim); font-weight: 600; font-size: 0.82rem; }
+.sf-diag-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.12));
+}
+
+/* ── Audit Trail panel (W10 — persistent /data/audit.log viewer) ── */
+.audit-meta-note {
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+  line-height: 1.45;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  border-left: 2px solid var(--accent, #FAA500);
+  background: var(--bg-subtle, rgba(255, 255, 255, 0.03));
+  border-radius: 4px;
+}
+.audit-meta-note code { font-size: 0.74rem; opacity: 0.85; word-break: break-all; }
+.audit-error {
+  color: var(--red, #ff6b6b);
+  font-size: 0.82rem;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+}
+.audit-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+.audit-row { display: grid; gap: 4px; padding: 8px 12px; }
+.audit-row-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.audit-kind { color: var(--accent); font-weight: 700; }
+.audit-actor {
+  color: var(--text-secondary);
+  font-size: 0.74rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.audit-time { color: var(--text-dim); font-size: 0.74rem; margin-left: auto; }
+.audit-detail {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  line-height: 1.45;
+  word-break: break-word;
+}
+.audit-pager { display: flex; gap: 8px; }
+
+/* ── Sv2ProtocolInspector (encrypted-wire viewer — pixel-equivalent) ── */
+.sv2-inactive-title { color: var(--accent); margin-bottom: 0; }
+.sv2-inactive-card {
+  text-align: center;
+  padding: 40px;
+  background: var(--bg-subtle);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}
+.sv2-inactive-head {
+  font-size: 1.2rem;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+}
+.sv2-inactive-body {
+  color: var(--text-dim);
+  font-size: 0.85rem;
+  max-width: 400px;
+  margin: 0 auto;
+}
+.sv2-inactive-action { margin-top: 14px; }
+.sv2-inactive-err {
+  color: var(--red);
+  font-size: 0.75rem;
+  margin-top: 12px;
+}
+.sv2-stats {
+  display: flex;
+  gap: 20px;
+  margin-bottom: 12px;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace;
+  flex-wrap: wrap;
+}
+.sv2-controlbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  background: var(--bg-subtle);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.sv2-ctl-btn { font-size: 0.7rem; padding: 4px 12px; }
+.sv2-autoscroll {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.sv2-accent-check { accent-color: var(--accent); }
+.sv2-spacer { flex: 1; }
+.sv2-tally { font-size: 0.68rem; color: var(--text-dim); }
+.sv2-c-sent { color: #4ec96d; }
+.sv2-c-recv { color: #5cb8ff; }
+.sv2-colhead {
+  display: grid;
+  grid-template-columns: 90px 24px 1fr 70px;
+  gap: 8px;
+  min-width: 420px;
+  padding: 6px 12px;
+  font-size: 0.65rem;
+  font-weight: 700;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-bottom: 1px solid var(--border);
+}
+.sv2-col-right { text-align: right; }
+.sv2-msglist {
+  font-size: 0.75rem;
+  line-height: 1.6;
+  max-height: 520px;
+  overflow-y: auto;
+  background: var(--bg, #0a0a0a);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0;
+}
+.sv2-msg-empty {
+  text-align: center;
+  padding: 40px;
+  color: var(--text-dim);
+  font-size: 0.8rem;
+}
+/* Scoped to beat '.mode-hacker .advanced-link-button' (specificity 0,0,2,0)
+ * which the button also carries — the original used inline rowStyle which
+ * always won. '.advanced-link-button.sv2-row' = 0,0,3,0 keeps the grid. */
+.mode-hacker .advanced-link-button.sv2-row {
+  display: grid;
+  grid-template-columns: 90px 24px 1fr 70px;
+  gap: 8px;
+  padding: 4px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--bg-subtle, #1a1a1a);
+  background: transparent;
+  transition: background 0.15s;
+  align-items: center;
+}
+.mode-hacker .advanced-link-button.sv2-row.is-expanded {
+  border-bottom: none;
+  background: var(--bg-subtle, #111);
+}
+.sv2-row-ts { color: #555; }
+.sv2-row-arrow { text-align: center; font-size: 0.85rem; }
+.sv2-row-msg {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sv2-row-tag { margin-left: 6px; font-size: 0.65rem; opacity: 0.7; }
+.sv2-row-size { text-align: right; color: #555; }
+.sv2-expanded {
+  padding: 6px 12px 10px 134px;
+  border-bottom: 1px solid var(--bg-subtle, #1a1a1a);
+  background: var(--bg-subtle, #111);
+  color: var(--text-dim);
+  font-size: 0.7rem;
+}
+.sv2-field-k { color: var(--accent); font-weight: 700; }
+.sv2-field-name { color: #5cb8ff; }
+.sv2-no-decode { color: #555; font-style: italic; }
+
+/* ── I2cScanner (scan table + tx log — pixel-equivalent inline→class) ── */
+.i2c-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+.i2c-table thead tr,
+.i2c-table tbody tr { border-bottom: 1px solid var(--border); }
+.i2c-table th {
+  text-align: left;
+  padding: 8px 12px;
+  color: var(--text-dim);
+}
+.i2c-table th.i2c-th-right { text-align: right; }
+.i2c-table td { padding: 8px 12px; }
+.i2c-td-mono { font-family: 'JetBrains Mono', monospace; }
+.i2c-td-accent { color: var(--accent); }
+.i2c-td-dim { color: var(--text-dim); }
+.i2c-td-sm { font-size: 0.75rem; }
+.i2c-td-right { text-align: right; }
+.i2c-td-empty {
+  padding: 16px 12px;
+  color: var(--text-dim);
+  text-align: center;
+}
+.i2c-status { font-weight: 600; }
+.i2c-row-passthrough { opacity: 0.6; }
+.i2c-pic-decode {
+  margin-top: 8px;
+  padding: 6px 10px;
+  background: var(--green-dim);
+  border: 1px solid var(--green);
+  border-radius: var(--radius-sm);
+  font-size: 0.75rem;
+  color: var(--green);
+  font-family: 'JetBrains Mono', monospace;
+}
+.i2c-txlog {
+  max-height: 250px;
+  overflow-y: auto;
+}
+.i2c-tx-row {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  margin-bottom: 2px;
+  display: flex;
+  gap: 12px;
+}
+.i2c-tx-ts { color: var(--text-dim); flex-shrink: 0; }
+.i2c-tx-dir { flex-shrink: 0; width: 30px; }
+.i2c-tx-bus { flex-shrink: 0; width: 45px; }
+.i2c-tx-addr { flex-shrink: 0; width: 50px; color: var(--accent); }
+.i2c-tx-data { flex: 1; }
+.i2c-tx-ms { flex-shrink: 0; }
+
+/* ── SystemDebug (collapsible sections + 5 ref tables — D-38 table grammar) ── */
+.sd-block { margin-bottom: 20px; }
+.sd-section { margin-bottom: 20px; }
+.sd-section-head {
+  font-weight: 700;
+  color: var(--accent);
+  font-size: 0.85rem;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.sd-section-head.is-open { margin-bottom: 8px; }
+.sd-section-head.is-closed { margin-bottom: 0; }
+.sd-section-btn {
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+}
+.sd-section-caret {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  transition: transform 0.2s;
+  transform: rotate(0deg);
+}
+.sd-section-caret.is-open { transform: rotate(90deg); }
+.sd-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.sd-metric {
+  background: var(--bg-subtle, #111);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  font-family: 'JetBrains Mono', monospace;
+}
+.sd-metric-label {
+  font-size: 0.65rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+.sd-metric-value { font-size: 1.1rem; font-weight: 700; }
+.sd-i2c-head {
+  font-weight: 600;
+  color: var(--accent);
+  font-size: 0.8rem;
+  margin-bottom: 8px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.sd-i2c-row { display: flex; gap: 12px; }
+.sd-i2c-cell {
+  flex: 1;
+  background: var(--bg-subtle, #111);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  font-family: 'JetBrains Mono', monospace;
+}
+.sd-i2c-cell-k {
+  font-size: 0.65rem;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.sd-i2c-cell-v { font-size: 0.85rem; font-weight: 700; }
+.sd-dmesg {
+  background: rgba(0, 0, 0, 0.6);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  color: var(--accent);
+  max-height: 200px;
+  overflow-y: auto;
+  line-height: 1.6;
+}
+.sd-dmesg-empty {
+  color: var(--text-dim);
+  text-align: center;
+  padding: 20px;
+}
+.sd-info-block {
+  font-size: 0.8rem;                  /* .adv-mono-block base is 0.75rem */
+  background: rgba(0, 0, 0, 0.6);     /* original used 0.6, not catalog 0.4 */
+}
+.sd-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.75rem;
+  font-family: 'JetBrains Mono', monospace;
+}
+.sd-table thead tr,
+.sd-table tbody tr { border-bottom: 1px solid var(--border); }
+.sd-table th {
+  text-align: left;
+  padding: 6px 8px;
+  color: var(--text-dim);
+}
+.sd-table td { padding: 6px 8px; }
+.sd-td-accent { color: var(--accent); }
+.sd-td-yellow { color: var(--yellow); }
+.sd-td-dim { color: var(--text-dim); }
+
+/* ── PidTuner (fan control loop — pixel-equivalent inline→class) ── */
+.pid-col {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.pid-params-title { margin-bottom: 16px; }   /* override .adv-card-title mb-12 */
+.pid-chart-title { margin-bottom: 4px; }
+.pid-param { margin-bottom: 16px; }
+.pid-param-head {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+.pid-param-val {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+}
+.pid-state {
+  background: rgba(0, 0, 0, 0.4);
+  padding: 10px;       /* original was 10, not the catalog 8/12 */
+  line-height: 1.8;
+}
+.pid-chart-card { overflow: hidden; }
+.pid-legend {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 8px;
+  font-size: 0.7rem;
+}
+.pid-sp-actual {
+  margin-top: 16px;
+  display: flex;
+  gap: 24px;
+  padding: 10px 14px;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: var(--radius-sm);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  flex-wrap: wrap;
+}
+.pid-sp-label {
+  color: var(--text-dim);
+  font-size: 0.65rem;
+  display: block;
+  margin-bottom: 2px;
+}
+.pid-sp-value { font-size: 1.3rem; font-weight: 700; }
+.pid-term { margin-bottom: 10px; }
+.pid-term-head {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 4px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+}
+.pid-term-val { color: var(--text); }
+.pid-term-track {
+  height: 8px;
+  border-radius: var(--radius-xs);
+  background: rgba(255, 255, 255, 0.04);
+  position: relative;
+  overflow: hidden;
+}
+.pid-term-center {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgba(255, 255, 255, 0.15);
+}
+.pid-term-bar {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-radius: var(--radius-xs);
+  transition: all 0.3s var(--ease-standard);
+}
+
+/* ── VoltageControl per-chain card (safety-critical — pixel-equivalent) ── */
+.vc-chain-btn {
+  font-weight: 700;
+  color: var(--accent);
+  max-width: 100px;
+}
+.vc-pic-status { font-size: 0.65rem; }
+.vc-readout {
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  font-family: 'JetBrains Mono', monospace;
+}
+.vc-readout-label {
+  font-size: 0.6rem;
+  color: var(--text-dim);
+  margin-bottom: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.vc-readout-value { font-size: 1.1rem; font-weight: 700; }
+.vc-readout-value.is-dim { color: var(--text-dim); }
+.vc-match-ok { color: var(--green); font-size: 0.9rem; }
+.vc-match-delta { color: var(--yellow); font-size: 0.7rem; }
+.vc-picval-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 8px;
+}
+.vc-picval {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 1.2rem;
+  font-weight: 700;
+  color: var(--accent);
+  min-width: 40px;
+  text-align: center;
+}
+.vc-slider { margin-bottom: 4px; }
+
+/* ── Loading / empty inline states (branded, replaces bare text) ── */
+.adv-loading-card {
+  text-align: center;
+  padding: 20px;
+  color: var(--text-dim);
+}
+.adv-empty-note {
+  padding: 18px 16px;
+  border: 1px dashed var(--border-glass, rgba(255, 255, 255, 0.12));
+  border-radius: 8px;
+  color: var(--fg-dim, #6E6E80);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85rem;
+  text-align: center;
+}
+
+/* ── Modal / dialog inner shells (was inline padding/border on OverlayDialog) ── */
+.adv-modal-pad { padding: 24px; outline: none; }
+.adv-modal-danger {
+  padding: 32px;
+  text-align: center;
+  border: 1px solid var(--red);
+  border-radius: 12px;
+}
+.adv-modal-title {
+  font-weight: 700;
+  color: var(--accent);
+  font-size: 1rem;
+  margin-bottom: 16px;
+}
+.adv-modal-title.is-danger {
+  font-size: 1.2rem;
+  color: var(--red);
+}
+.adv-modal-body {
+  color: var(--text);
+  font-size: 0.9rem;
+  line-height: 1.6;
+  margin-bottom: 24px;
+}
+.adv-modal-foot { margin-top: 16px; text-align: right; }
+.adv-shortcut-list {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  line-height: 2;
+}
+.adv-shortcut-row { display: flex; justify-content: space-between; }
+.adv-shortcut-keys { color: var(--accent); font-weight: 600; min-width: 100px; }
+.adv-shortcut-desc { color: var(--text); }
+
+@keyframes adv-spin { to { transform: rotate(360deg); } }
+
+/* ── Collapsed sidebar mode-cycle glyph (was inline fontSize/color) ── */
+.adv-mode-cycle-glyph {
+  font-size: 0.7rem;
+  color: var(--accent);
+}
+
+/* ── Inline info banner notice (AdvancedOverview phone notice replacement
+ *    keeps F1 InfoBanner where used; this is the narrow caller-margin hook) ── */
+.adv-infobanner-slot { margin-bottom: 12px; }
+
+/* ── Unified tool-search across the AdvancedDashboard tabbar + sidebar
+ *    (/4 carry-forward D-23 — only the overview grid had search) ── */
+.hacker-sidebar-search {
+  padding: 8px 12px 4px;
+}
+.hacker-sidebar-search input {
+  width: 100%;
+  background: rgba(0, 0, 0, 0.32);
+  border: 1px solid var(--border-glass, rgba(255, 255, 255, 0.1));
+  color: var(--text);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.78rem;
+}
+.hacker-sidebar-search input::placeholder { color: var(--text-dim); }
+.hacker-sidebar-search input:focus-visible {
+  border-color: var(--accent);
+}
+.hacker-sidebar-nav-empty {
+  padding: 14px 16px;
+  color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  text-align: center;
+}
+/* ( ZONE-E net-lean: the '.hacker-tool-tabbar-search' rules were deleted
+   with their only consumer — the duplicate tabbar search input. The canonical
+   unified search now lives solely in '.hacker-sidebar-search' above.) */
+.hacker-tool-tab.is-search-empty {
+  color: var(--text-dim);
+  font-style: italic;
+  pointer-events: none;
+}
+
+/* ── JobDeclarationPanel (cross-zone: Standard pools + Advanced sv2 — markup
+ *    & prop contract frozen; this is pure inline→class, pixel-equivalent) ── */
+.jd-section-title { font-size: 0.9rem; }   /* .adv-card-title gives weight/accent/mb-12 */
+.jd-input {
+  width: 100%;
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  padding: 6px 10px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+}
+.jd-input-auto { width: auto; }
+.jd-input-120 { width: 120px; }
+.jd-label {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+  display: block;
+}
+.jd-check-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.jd-check { width: auto; }
+.jd-enable-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+.jd-enable-name { font-weight: 600; font-size: 0.85rem; }
+.jd-toggle {
+  width: 48px;
+  height: 26px;
+  border-radius: 13px;
+  background: var(--border);
+  border: none;
+  cursor: pointer;
+  position: relative;
+  transition: background 0.2s;
+}
+.jd-toggle.is-on { background: var(--accent); }
+.jd-toggle-knob {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff;
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  transition: left 0.2s;
+}
+.jd-toggle.is-on .jd-toggle-knob { left: 25px; }
+.jd-grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 12px;
+}
+.jd-check-group {
+  margin-top: 12px;
+  display: grid;
+  gap: 8px;
+}
+.jd-btn-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}
+.jd-btn { font-size: 0.8rem; }
+.jd-status-grid {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  background: rgba(0, 0, 0, 0.6);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  line-height: 2;
+}
+.jd-stat-row {
+  display: flex;
+  justify-content: space-between;
+}
+.jd-stat-row-err { gap: 12px; }
+.jd-stat-k { color: var(--text-dim); }
+.jd-stat-v { color: var(--text); }
+.jd-stat-ellipsis {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.jd-stat-row-err .jd-stat-ellipsis { max-width: 260px; }
+.jd-stat-err { color: var(--red); }
+.jd-reason {
+  margin-top: 16px;
+  padding: 8px 12px;
+  font-size: 0.75rem;
+  background: var(--yellow-dim, rgba(245, 158, 11, 0.08));
+  border: 1px solid rgba(245, 158, 11, 0.2);
+  border-radius: var(--radius-sm);
+  color: var(--yellow, #f59e0b);
+  line-height: 1.6;
+}
+.jd-reason.is-live {
+  background: rgba(34, 197, 94, 0.08);
+  border-color: rgba(34, 197, 94, 0.25);
+  color: var(--green);
+}
+
+/* ── Dense wide-table wrap helper (D-18 — RegisterInspector / I2cScanner /
+ *    UartFifoInspector / ProtocolTimeline overflow on desktop too). F1's
+ *    global '.table-wrap' is all-viewports now; this adds the hacker-mode
+ *    monospace scrollbar treatment so the overflow reads as intentional. */
+.mode-hacker .table-wrap {
+  scrollbar-color: var(--accent-border, rgba(0, 255, 65, 0.25)) transparent;
+}
+.mode-hacker .table-wrap::-webkit-scrollbar { height: 8px; }
+.mode-hacker .table-wrap::-webkit-scrollbar-thumb {
+  background: var(--accent-border, rgba(0, 255, 65, 0.25));
+  border-radius: var(--radius-xs);
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   WAVE-6 P3 — Advanced/Hacking closure & depth
+   (a) C-04 hover-lift: Advanced cards opt into the canonical .ds-card-hover
+       (shipped frozen by F6 in design-system.css). The 32 advanced tools'
+       card surfaces add 'ds-card-hover' to their className so Advanced
+       finally matches every other mode. NO new lift CSS here — we point
+       at the ONE F6 utility (do not re-invent the -2px transform).
+   (b) C-08 empty-state consolidation: the 10 bespoke per-tool *-empty
+       grammars (sf-empty / sv2-msg-empty / sd-dmesg-empty / uf-overlay-
+       empty / i2c-td-empty / hacker-*-empty / console-output-empty …)
+       converge onto ONE consistent Advanced state vocabulary built on the
+       existing '.adv-empty-note' (terminal aesthetic preserved). New
+       '.adv-state-*' variants cover loading / error so every tool has an
+       exhaustive, identical state grammar.
+   (c) The migration of the 13 carry-forward inline-styled tools reuses the
+       'adv-*' catalog above; the per-tool blocks below cover only the
+       patterns the catalog didn't already 1:1 — each is pixel-equivalent
+       to the exact prior inline px/color it replaces. Genuinely runtime/
+       data-driven inline (computed colors, % widths, grid-template counts,
+       SVG attrs) correctly STAYS inline.
+   ════════════════════════════════════════════════════════════════════════ */
+
+/* ── (b) Consolidated Advanced state grammar (loading / empty / error) ──
+   '.adv-empty-note' (above) is the base. These add the missing loading +
+   error siblings + an icon/title/hint sub-structure so the 10 bespoke
+   classes collapse onto ONE look. Same dashed-terminal frame, JBM font. */
+.adv-state {
+  padding: 18px 16px;
+  border: 1px dashed var(--border-glass, rgba(255, 255, 255, 0.12));
+  border-radius: var(--radius-sm);
+  color: var(--fg-dim, #6E6E80);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85rem;
+  text-align: center;
+}
+.adv-state.is-loading { color: var(--text-dim); }
+.adv-state.is-error {
+  color: var(--red);
+  border-color: rgba(255, 68, 68, 0.3);
+}
+.adv-state.is-inline { padding: 8px 0; border: none; text-align: left; }
+.adv-state-title { font-weight: 700; margin-bottom: 4px; }
+.adv-state-hint {
+  margin-top: 6px;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+/* Branded inline spinner for loading state panels. */
+.adv-state.is-loading::before {
+  content: '';
+  display: inline-block;
+  vertical-align: -2px;
+  width: 12px;
+  height: 12px;
+  margin-right: 8px;
+  border: 2px solid var(--accent-glow, rgba(0, 255, 65, 0.18));
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: adv-spin 0.7s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .adv-state.is-loading::before { animation: none; }
+}
+
+/* ── Shared section eyebrow + key/value row grammar (recurs in BeatLab,
+   PipelineScope, ApiExplorer, FlightRecorder, CommandJournal, etc.) ── */
+.adv-section-eyebrow {
+  color: var(--accent);
+  font-size: 0.8rem;
+  margin-bottom: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.adv-kv-stack { display: grid; gap: 8px; }
+.adv-kv-stack.is-gap-10 { gap: 10px; }
+.adv-kv-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.adv-kv-row.is-sm { font-size: 0.77rem; line-height: 1.7; }
+.adv-kv-row.is-78 { font-size: 0.78rem; }
+.adv-kv-k { color: var(--text-secondary); }
+.adv-kv-v { color: var(--accent); }
+.adv-kv-v.is-orange { color: var(--accent-orange, #FAA500); }
+.adv-kv-v.is-red { color: var(--red); }
+.adv-kv-v.is-right { text-align: right; }
+
+/* ── (c) Per-tool inline→class blocks ( 13-tool closure) ──
+   Each value below was copied from the exact prior inline style; the
+   provenance tool is named in the comment. */
+
+/* DiagnosticsPanel (dp-*) — self-test cards, recent-report rows, result
+   tables. minWidth:560 → responsive (R-01: was a hard min-width that
+   overflowed <560px; now max-content + scroll-x wrap). */
+.dp-sub {
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+}
+.dp-section { margin-bottom: 20px; }
+.dp-head-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.dp-head-row.is-top { align-items: flex-start; }
+.dp-title {
+  font-weight: 700;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+.dp-hint-sm { font-size: 0.8rem; color: var(--text-dim); }
+.dp-err { color: var(--red); font-size: 0.8rem; margin-bottom: 8px; }
+.dp-report-list { display: grid; gap: 8px; }
+.dp-report-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle, #111);
+  align-items: center;
+  flex-wrap: wrap;
+}
+.dp-report-meta { min-width: 0; }
+.dp-report-titlerow {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+.dp-report-name { font-weight: 700; color: var(--accent); }
+.dp-report-grade { font-size: 0.75rem; color: var(--green); }
+.dp-report-line { font-size: 0.75rem; color: var(--text-dim); }
+.dp-cards { display: grid; gap: 16px; }
+.dp-progress { margin-bottom: 12px; }
+.dp-progress-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.dp-progress-track {
+  width: 100%;
+  height: 6px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.dp-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width var(--dur-slow, 0.3s) var(--ease-standard);
+}
+.dp-progress-msg {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+.dp-result-head {
+  font-size: 0.75rem;
+  color: var(--green);
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.dp-result-title {
+  font-weight: 700;
+  color: var(--accent);
+  margin-bottom: 8px;
+  font-size: 0.85rem;
+}
+.dp-total {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 1rem;
+  color: var(--accent);
+  margin-bottom: 12px;
+}
+.dp-grade-line { font-size: 0.8rem; color: var(--text-dim); margin-bottom: 12px; }
+.dp-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+  font-family: 'JetBrains Mono', monospace;
+}
+.dp-table thead tr,
+.dp-table tbody tr { border-bottom: 1px solid var(--border); }
+.dp-table th { padding: 6px 10px; color: var(--text-dim); }
+.dp-table th.is-l { text-align: left; }
+.dp-table th.is-r { text-align: right; }
+.dp-table td { padding: 6px 10px; }
+.dp-table td.is-r { text-align: right; }
+.dp-table td.is-chain { color: var(--accent); }
+.dp-summary-row {
+  display: flex;
+  gap: 20px;
+  margin-bottom: 12px;
+  font-size: 0.85rem;
+  flex-wrap: wrap;
+}
+.dp-chip-scroll { overflow-x: auto; }
+.dp-chip-grid { display: grid; gap: 2px; min-width: max-content; }
+.dp-chip { width: 14px; height: 14px; border-radius: 2px; cursor: default; }
+.dp-check-list { display: grid; gap: 6px; }
+.dp-check {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  background: var(--bg-subtle, #111);
+  border-radius: var(--radius-sm);
+  font-size: 0.8rem;
+}
+.dp-check-icon {
+  font-weight: 700;
+  font-size: 1rem;
+  width: 20px;
+  text-align: center;
+}
+.dp-check-name { font-weight: 600; }
+.dp-check-detail {
+  color: var(--text-dim);
+  font-size: 0.75rem;
+  margin-left: auto;
+}
+.dp-json-fallback { max-height: 200px; }
+.dp-unsupported-note {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle, #111);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 0.8rem;
+}
+.dp-controls-row { gap: 16px; align-items: flex-end; }
+.dp-actions-shrink { flex-shrink: 0; }
+.dp-card-err { color: var(--red); font-size: 0.8rem; margin-top: 8px; }
+.dp-sum-ok { color: var(--green); }
+.dp-sum-warn { color: var(--yellow); }
+.dp-sum-fail { color: var(--red); }
+.dp-sum-total { color: var(--text-dim); }
+
+/* ── Shared Advanced stat-card grammar (used by SessionShareExport,
+   ThermalReplay, PipelineScope, BeatLab … — 'glass-card' + padding:14 +
+   uppercase micro-label + 1rem/700 tone-value; the value COLOR is
+   data-driven so it stays inline, the chrome is class-driven). ── */
+.adv-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+}
+.adv-stat-grid.is-min-220 { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+.adv-stat-grid.is-min-180 { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+.adv-stat-grid.is-mb { margin-bottom: 16px; }
+.adv-stat-card { padding: 14px; display: grid; gap: 4px; }
+.adv-stat-card.is-pad-10 { padding: 10px; display: block; }
+.adv-stat-label {
+  color: var(--text-secondary);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.adv-stat-label.no-track { letter-spacing: normal; }
+.adv-stat-value { font-size: 1rem; font-weight: 700; }
+.adv-stat-value.is-sm { font-size: inherit; }
+
+/* SessionShareExportPanel (sse-*) — section title + msg + opts */
+.sse-section-title {
+  color: var(--accent);
+  font-weight: 700;
+  margin-bottom: 12px;
+}
+.sse-opts { display: flex; gap: 16px; flex-wrap: wrap; }
+.sse-msg { font-size: 0.82rem; line-height: 1.7; color: var(--text-secondary); }
+.sse-msg.is-error { color: var(--red); }
+.sse-msg.is-success { color: var(--green); }
+
+/* ExperimentalFlags (xf-*) — reuses .jd-toggle/.jd-toggle-knob; the row
+   here is align-items:flex-start (vs .jd-enable-row center). */
+.xf-flag-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+.xf-flag-meta { flex: 1; margin-right: 16px; }
+.xf-flag-name { font-weight: 600; font-size: 0.85rem; margin-bottom: 4px; }
+.xf-flag-desc { font-size: 0.75rem; color: var(--text-dim); }
+.xf-flag-desc.has-warn { margin-bottom: 4px; }
+.xf-flag-warn { font-size: 0.7rem; color: var(--red); font-weight: 500; }
+/* FE-DEAD-2 coming-soon badge plus disabled toggle for not-yet-wired flags */
+.xf-flag-soon {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 0.6rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  vertical-align: middle;
+}
+.xf-flag-row.is-coming-soon .xf-flag-name { color: var(--text-dim); }
+.xf-toggle.is-coming-soon,
+.xf-toggle:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.xf-col-title {
+  font-weight: 700;
+  color: var(--accent);
+  margin-bottom: 12px;
+  font-size: 0.9rem;
+}
+.xf-toolbar-note { color: var(--yellow); font-size: 0.74rem; }
+/* .jd-toggle variant for the flag-start alignment (knob position dynamic
+   on 'enabled' so the toggle button itself keeps an inline left for the
+   knob — same as jd; only the static chrome is class-driven here). */
+.xf-toggle { flex-shrink: 0; }
+
+/* CommandJournalPanel (cj-*) */
+.cj-search { min-width: 280px; }
+.cj-tabbar { border-bottom: none; margin-bottom: 0; }
+.cj-stream { max-height: 560px; }
+.cj-row {
+  display: grid;
+  grid-template-columns: 88px 88px 1fr;
+  gap: 10px;
+  margin-bottom: 8px;
+  align-items: start;
+}
+.cj-time { color: var(--text-dim); }
+.cj-event { color: var(--text); }
+.cj-detail { color: var(--text-secondary); }
+/* MacroRecipesPanel (mr-*) */
+.mr-controls-card { margin-bottom: 20px; }
+.mr-controls-row { gap: 16px; align-items: flex-end; }
+.mr-context { color: var(--text-secondary); font-size: 0.76rem; line-height: 1.6; }
+.mr-context-chain { color: var(--accent); }
+.mr-list { display: grid; gap: 16px; }
+.mr-recipe { display: grid; gap: 10px; }
+.mr-recipe-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+.mr-recipe-title { font-weight: 700; color: var(--accent); margin-bottom: 4px; }
+.mr-recipe-desc { font-size: 0.8rem; color: var(--text-dim); max-width: 720px; }
+.mr-recipe-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 0.76rem;
+}
+.mr-last-run { color: var(--text-dim); }
+.adv-item-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+/* FlightRecorderPanel (fr-*) */
+.fr-split {
+  display: grid;
+  grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
+  gap: 20px;
+}
+.fr-marker-hint { font-size: 0.76rem; color: var(--text-secondary); line-height: 1.7; }
+.fr-mix-eyebrow { margin-top: 16px; }
+.fr-mix-stack { font-size: 0.76rem; line-height: 1.7; }
+.fr-timeline { max-height: 520px; }
+.fr-entry {
+  display: grid;
+  grid-template-columns: 84px 96px 1fr;
+  gap: 10px;
+  margin-bottom: 6px;
+  align-items: start;
+}
+.fr-entry-time { color: var(--text-dim); }
+.fr-entry-event { color: var(--text); }
+.fr-entry-detail { color: var(--text-secondary); }
+@media (max-width: 767.98px) {
+  .fr-split { grid-template-columns: 1fr; }
+}
+
+/* ApiExplorer (ax-*) — endpoint list + request/response panel. Values are
+   byte-copied from the prior inline styles. */
+.ax-title { color: var(--accent); margin-bottom: 0; }
+.ax-cat { margin-bottom: 12px; }
+.ax-cat-title {
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  padding: 4px 0;
+  margin-bottom: 4px;
+}
+.ax-ep-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  padding: 6px 8px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 0.75rem;
+  font-family: 'JetBrains Mono', monospace;
+  transition: all 0.1s var(--ease-standard);
+}
+.ax-ep-row.is-active { background: var(--accent-glow); color: var(--accent); }
+.ax-method {
+  font-weight: 700;
+  font-size: 0.65rem;
+  width: 32px;
+}
+.ax-method.is-get { color: var(--green); }
+.ax-method.is-post { color: var(--yellow); }
+.ax-ep-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ax-sel-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.ax-method-pill {
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  font-weight: 700;
+  font-size: 0.75rem;
+}
+.ax-method-pill.is-get {
+  background: var(--green-dim);
+  color: var(--green);
+  border: 1px solid var(--green);
+}
+.ax-method-pill.is-post {
+  background: var(--yellow-dim);
+  color: var(--yellow);
+  border: 1px solid var(--yellow);
+}
+.ax-sel-path {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85rem;
+  color: var(--accent);
+}
+.ax-sel-desc { font-size: 0.8rem; color: var(--text-dim); }
+.ax-proxy-warn { color: var(--yellow); font-size: 0.78rem; margin-top: 8px; }
+.ax-field-label {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+.ax-status { font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; }
+.ax-status-code { font-weight: 700; }
+.ax-status-time { color: var(--text-dim); margin-left: 12px; }
+.ax-resp-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.ax-copy-btn {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  padding: 4px 10px;
+  font-size: 0.7rem;
+  font-family: 'JetBrains Mono', monospace;
+  cursor: pointer;
+  transition: all 0.15s var(--ease-standard);
+}
+.ax-copy-btn.is-copied {
+  background: var(--green-dim);
+  border-color: var(--green);
+  color: var(--green);
+}
+
+/* PipelineScope (ps-*) — stage cards + throughput/flow. Byte-copied. */
+.ps-stage-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 20px;
+  margin-bottom: 16px;
+}
+.ps-stage-card { padding: 14px; position: relative; }
+.ps-stage-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.ps-stage-title {
+  color: var(--text-secondary);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.ps-stage-detail {
+  color: var(--accent-orange, #FAA500);
+  font-size: 0.92rem;
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+.ps-stage-meta { color: var(--text-secondary); font-size: 0.74rem; line-height: 1.6; }
+.ps-metric-row {
+  padding: 10px;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.ps-flow { max-height: 380px; }
+.ps-event { margin-bottom: 8px; }
+.ps-event-title { color: var(--accent-orange, #FAA500); font-weight: 700; }
+.ps-event-detail { color: var(--text-secondary); font-size: 0.76rem; }
+
+/* ProtocolTimeline (pt-*) — timeline rows; wrap in .table-wrap (D-18).
+   Grid layout byte-copied from the prior inline (92px 90px 1fr). */
+.pt-tabbar { margin-bottom: 0; }
+.pt-stat-grid { gap: 12px; margin-bottom: 16px; }
+.pt-stat-card { padding: 12px; }
+.pt-stream { max-height: 560px; }
+.pt-row {
+  display: grid;
+  grid-template-columns: 92px 90px 1fr;
+  gap: 10px;
+  margin-bottom: 8px;
+  align-items: start;
+}
+.pt-time { color: var(--text-dim); }
+.pt-lane { text-transform: uppercase; font-size: 0.72rem; }
+.pt-detail { color: var(--text-secondary); }
+.pt-tags { color: var(--text-dim); }
+
+/* MaintenanceMode (mm-*) — enter screen, health checks, firmware update,
+   system tools, reboot dialog (chrome only; truth-contract copy verbatim). */
+.mm-enter { text-align: center; padding: 40px; }
+.mm-enter-title { font-size: 1.2rem; font-weight: 700; margin-bottom: 8px; }
+.mm-enter-desc {
+  color: var(--text-dim);
+  font-size: 0.85rem;
+  max-width: 500px;
+  margin: 0 auto 24px;
+}
+.mm-active-banner {
+  background: var(--yellow-dim);
+  border: 1px solid var(--yellow);
+  border-radius: var(--radius);
+  padding: 12px 20px;
+  color: var(--yellow);
+  font-weight: 600;
+  margin-bottom: 20px;
+  font-size: 0.85rem;
+}
+.mm-action-row { display: flex; gap: 12px; margin-bottom: 20px; }
+.mm-block { margin-bottom: 20px; }
+.mm-block-title { font-weight: 700; color: var(--accent); margin-bottom: 12px; }
+.mm-block-title.is-lg { font-size: 0.9rem; }
+.mm-block-desc { font-size: 0.8rem; color: var(--text-dim); margin-bottom: 12px; }
+.mm-check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+.mm-check-icon {
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 700;
+  font-size: 0.8rem;
+  flex-shrink: 0;
+  width: 60px;
+}
+.mm-check-body { flex: 1; }
+.mm-check-name {
+  font-weight: 600;
+  font-size: 0.85rem;
+  text-transform: capitalize;
+  margin-bottom: 4px;
+}
+.mm-check-msg { font-size: 0.8rem; color: var(--text-dim); }
+.mm-check-details { margin-top: 8px; }
+.mm-check-summary { font-size: 0.75rem; color: var(--accent); cursor: pointer; }
+.mm-check-json { margin-top: 4px; max-height: 150px; }
+.mm-dropzone {
+  background: rgba(0, 0, 0, 0.6);
+  border: 2px dashed var(--border);
+  border-radius: var(--radius-sm);
+  padding: 24px;
+  text-align: center;
+  cursor: pointer;
+  transition: all var(--dur-med, 0.2s) var(--ease-standard);
+  margin-bottom: 12px;
+  width: 100%;
+  color: inherit;
+  display: block;
+}
+.mm-dropzone.is-dragover {
+  background: var(--accent-glow);
+  border-color: var(--accent);
+}
+.mm-file-hidden { display: none; }
+.mm-fw-name {
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 600;
+  margin-bottom: 4px;
+  color: var(--accent);
+}
+.mm-fw-size { font-size: 0.75rem; color: var(--text-dim); }
+.mm-drop-glyph { font-size: 1.2rem; margin-bottom: 4px; color: var(--text-dim); }
+.mm-drop-hint { color: var(--text-dim); font-size: 0.8rem; }
+.mm-progress { margin-bottom: 12px; }
+.mm-progress-track {
+  height: 6px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.mm-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width var(--dur-slow, 0.3s) var(--ease-standard);
+}
+.mm-progress-label {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  text-align: center;
+  margin-top: 4px;
+  font-family: 'JetBrains Mono', monospace;
+}
+.mm-fw-error { color: var(--red); font-size: 0.8rem; margin-bottom: 12px; }
+.mm-staged {
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.35);
+}
+.mm-staged-name { font-weight: 600; font-size: 0.8rem; color: var(--accent); }
+.mm-staged-desc { font-size: 0.75rem; color: var(--text-dim); margin-top: 4px; }
+.mm-staged-path {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  margin-top: 4px;
+  word-break: break-all;
+  font-family: 'JetBrains Mono', monospace;
+}
+.mm-staged-actions { display: flex; gap: 8px; margin-top: 12px; }
+.mm-btn-sm { font-size: 0.8rem; }
+.mm-btn-row { display: flex; gap: 8px; }
+.mm-url-section {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.mm-url-note { font-size: 0.75rem; color: var(--text-dim); margin-bottom: 8px; }
+.mm-url-input {
+  flex: 1;
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  padding: 6px 10px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+}
+.mm-tools-row { display: flex; gap: 12px; flex-wrap: wrap; }
+.mm-logs-line {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  margin-top: 8px;
+  font-family: 'JetBrains Mono', monospace;
+}
+.mm-reboot-modal {
+  padding: 24px;
+  border: 1px solid var(--red);
+  border-radius: var(--radius-md);
+}
+.mm-reboot-title {
+  font-weight: 700;
+  margin-bottom: 12px;
+  color: var(--red);
+  font-size: 1.1rem;
+}
+.mm-reboot-lead { color: var(--text-secondary); margin-bottom: 8px; font-size: 0.9rem; }
+.mm-reboot-list {
+  color: var(--text-dim);
+  font-size: 0.8rem;
+  margin-bottom: 20px;
+  padding-left: 20px;
+  line-height: 1.8;
+}
+.mm-reboot-warn {
+  background: var(--red-dim);
+  border: 1px solid var(--red);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  color: var(--red);
+  font-size: 0.8rem;
+  margin-bottom: 16px;
+  font-weight: 600;
+}
+.mm-reboot-foot {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 0;
+}
+
+/* ThermalReplayPanel (tr-*) — scrubber + delta cards (reuses adv-stat-grid;
+   the scrubber input keeps native width — no width override). */
+.tr-legend { margin-top: 8px; }
+.tr-dot-temp { background: var(--red); }
+.tr-dot-power { background: var(--accent); }
+.tr-scrubber-wrap { display: grid; gap: 10px; }
+.tr-time-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 0.76rem;
+  color: var(--text-dim);
+}
+.tr-delta-title { color: var(--accent); font-weight: 700; margin-bottom: 10px; }
+.tr-delta-val { font-weight: 700; }
+
+/* BeatLab (bl-*) — audio-viz; MOST of BeatLab's inline is genuinely
+   dynamic (waveform bar heights, computed colors) and correctly STAYS
+   inline. bl-* covers only the static chrome (section grid, sequence,
+   chain-voice cards). */
+.bl-section-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.bl-kv-stack-76 { display: grid; gap: 8px; font-size: 0.76rem; line-height: 1.7; }
+.bl-profile-btn { justify-content: space-between; width: 100%; }
+.bl-profile-desc { font-size: 0.68rem; opacity: 0.8; }
+.bl-map-stack { font-size: 0.77rem; line-height: 1.7; }
+.bl-mix-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.bl-mix-card { padding: 12px; }
+.bl-seq-grid {
+  display: grid;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+  gap: 10px;
+}
+.bl-seq-cell { padding: 10px 8px; display: grid; gap: 10px; }
+.bl-seq-cell.is-active {
+  border-color: var(--accent-orange, #FAA500);
+  box-shadow: 0 0 0 1px rgba(250, 165, 0, 0.45), 0 0 18px rgba(250, 165, 0, 0.15);
+}
+.bl-seq-num { color: var(--text-secondary); font-size: 0.7rem; text-align: center; }
+.bl-seq-num.is-active { color: var(--accent-orange, #FAA500); }
+.bl-seq-track { height: 56px; display: flex; align-items: flex-end; }
+.bl-seq-bar {
+  width: 100%;
+  background: linear-gradient(180deg, rgba(250, 165, 0, 0.7) 0%, rgba(0, 255, 65, 0.3) 100%);
+  border-radius: var(--radius-xs);
+  box-shadow: 0 0 12px rgba(0, 255, 65, 0.12);
+}
+.bl-seq-bar.is-active {
+  background: var(--accent-orange, #FAA500);
+  box-shadow: 0 0 16px rgba(250, 165, 0, 0.35);
+}
+.bl-voice-card { padding: 12px; display: grid; gap: 8px; }
+.bl-voice-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+.bl-voice-name { color: var(--accent-orange, #FAA500); font-size: 0.82rem; font-weight: 700; }
+.bl-voice-meta { color: var(--text-secondary); font-size: 0.72rem; }
+.bl-voice-track {
+  height: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: var(--radius-pill);
+  overflow: hidden;
+}
+.bl-voice-fill { height: 100%; }
+.bl-voice-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 0.72rem;
+}
+.bl-empty { line-height: 1.7; }
+
+/* PsuLab (pl-*) — APW watchdog/output gate. SAFETY COPY IS PRESERVED
+   VERBATIM IN THE TSX (the "I understand wrong APW voltage values can
+   damage attached hardware." line + watchdog buttons + isDangerous gate
+   are NOT touched — pl-* migrates chrome only). */
+.pl-auto-label {
+  color: var(--text-dim);
+  font-size: 0.7rem;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.pl-outer { display: grid; gap: 18px; }
+.pl-card { padding: 18px; }
+.pl-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 12px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.pl-head-title { color: var(--accent); font-weight: 700; font-size: 1rem; }
+.pl-head-desc {
+  color: var(--text-dim);
+  font-size: 0.82rem;
+  margin-top: 4px;
+  line-height: 1.5;
+}
+.pl-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.pl-stat-cell {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px;
+}
+.pl-stat-k { font-size: 0.72rem; color: var(--text-dim); margin-bottom: 4px; }
+.pl-stat-v { font-weight: 700; color: var(--text); }
+.pl-telemetry {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  margin-bottom: 14px;
+}
+.pl-result {
+  border: 1px solid var(--text-dim);
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: var(--radius-sm);
+  padding: 10px;
+  font-size: 0.8rem;
+  margin-bottom: 14px;
+}
+.pl-controls-stack { display: grid; gap: 12px; }
+.pl-proxy-warn {
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  background: rgba(245, 158, 11, 0.08);
+  border-radius: var(--radius-sm);
+  padding: 10px;
+  color: var(--yellow);
+  font-size: 0.8rem;
+}
+.pl-panel {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+}
+.pl-panel-title { font-weight: 700; color: var(--text); margin-bottom: 8px; }
+.pl-panel-title.is-mb10 { margin-bottom: 10px; }
+.pl-interlocks {
+  display: grid;
+  gap: 8px;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+.pl-interlock { display: flex; gap: 8px; align-items: start; }
+.pl-btn-wrap { display: flex; flex-wrap: wrap; gap: 8px; }
+.pl-voltage-row {
+  display: flex;
+  gap: 10px;
+  align-items: end;
+  flex-wrap: wrap;
+}
+.pl-voltage-field { flex: 1 1 180px; }
+.pl-voltage-label {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  display: block;
+  margin-bottom: 4px;
+}
+.pl-voltage-hint {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  margin-top: 8px;
+  line-height: 1.5;
+}
+.pl-hist-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.pl-hist-title { color: var(--accent); font-weight: 700; font-size: 0.95rem; }
+.pl-hist-desc { color: var(--text-dim); font-size: 0.78rem; margin-top: 4px; }
+.pl-hist-list { display: grid; gap: 8px; }
+.pl-hist-entry {
+  border: 1px solid var(--text-dim);
+  border-radius: var(--radius-sm);
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.pl-hist-entry-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 4px;
+}
+.pl-hist-action { color: var(--text); font-weight: 700; font-size: 0.8rem; }
+.pl-hist-ts { color: var(--text-dim); font-size: 0.72rem; }
+.pl-hist-msg { font-size: 0.78rem; margin-bottom: 4px; }
+.pl-hist-meta {
+  color: var(--text-dim);
+  font-size: 0.72rem;
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* ─── CLI-hint caption (design-handoff ) ──────────────────────────
+   '$ dcent …' equivalent shown under a Hacker GUI action. Phosphor-dim,
+   monospace, click-to-copy/echo. Additive; Hacker-mode scoped. */
+.mode-hacker .hacker-cli-hint {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 5px;
+  padding: 1px 0;
+  background: none;
+  border: none;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.66rem;
+  line-height: 1.3;
+  color: var(--text-dim);
+  opacity: 0.7;
+  cursor: pointer;
+  text-align: left;
+  transition: opacity 0.15s, color 0.15s;
+}
+.mode-hacker .hacker-cli-hint:hover,
+.mode-hacker .hacker-cli-hint:focus-visible {
+  opacity: 1;
+  color: var(--accent);
+  outline: none;
+}
+.mode-hacker .hacker-cli-hint-sigil {
+  color: var(--accent);
+  font-weight: 700;
+}
+.mode-hacker .hacker-cli-hint-cmd {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   WAVE 9 — ZONE E closure (Hacker mode polish)
+   Appended last so it overrides earlier rules without editing them in place.
+   All new animation lives under '.mode-hacker', so the H-4 reduced-motion
+   override above ('.mode-hacker *' animation-duration:0.01ms) already neutralises
+   it for prefers-reduced-motion users — no extra guard needed.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* P1 — StatusStrip live sparkline: phosphor identity.
+ * The flat polyline now glows (drop-shadow on currentColor = the field tone)
+ * and the new faint area fill sits under it. The fill polygon is rendered by
+ * StatusStrip.tsx with class '.hacker-status-strip-spark-fill'. */
+.mode-hacker .hacker-status-strip-spark {
+  filter: drop-shadow(0 0 4px currentColor);
+}
+.mode-hacker .hacker-status-strip-spark-fill {
+  fill: currentColor;
+  opacity: 0.12;
+}
+
+/* P1 — AdvancedDashboard banner clock: a 1Hz telemetry heartbeat on the
+ * ticking time so the live console reads as alive (opacity-only, no layout
+ * shift). The seconds field carries the pulse via '.is-pulse'. */
+.mode-hacker .hacker-banner-clock.is-pulse {
+  animation: dcm-telemetry-pulse 1s steps(2, jump-none) infinite;
+}
+
+/* P2 — tone-info status-strip dot: was the only tone without motion. Give it a
+ * slow steady pulse for consistency with the ok/warn/danger dots (those already
+ * pulse 2s / 1.4s / 0.9s — info is the calmest at 3s). */
+.mode-hacker .hacker-status-strip-field.tone-info .hacker-status-strip-dot {
+  animation: hacker-dot-pulse 3s ease-in-out infinite;
+}
+
+/* P1 — hacker tool-grid: 3-col clips tile blurbs in the 480-767 band.
+ * Drop to 2-col on phones here (NOT in the frozen responsive.css). */
+@media (max-width: 767.98px) {
+  .mode-hacker .hacker-tool-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

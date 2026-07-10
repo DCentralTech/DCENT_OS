@@ -1,0 +1,29 @@
+[package]
+name = "dcentaxe-mining"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Mining work dispatcher and statistics for DCENT_axe"
+
+[features]
+# Default: no research drivers wired in.
+default = []
+# UNTESTED research feature — gates the `for_kf1950` constructor.
+asic-kf1950 = []
+# Avalon shim — gates the `for_avalon` DispatcherConfig constructor used by
+# DCENT_axe Avalon and DCENT_OS Avalon. Default OFF.
+asic-avalon = []
+
+[dependencies]
+# Workspace crates
+dcentaxe-stratum = { path = "../dcentaxe-stratum" }
+
+# Logging
+log = "0.4"
+
+# Serialization for stats export
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Fixed-size buffers for embedded use (avoids heap alloc in hot paths)
+heapless = { version = "0.9", features = ["serde"] }

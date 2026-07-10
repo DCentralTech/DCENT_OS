@@ -1,0 +1,62 @@
+#!/bin/sh /etc/rc.common
+# DCENT_OS overlay daemon — runs alongside bosminer on BraiinsOS+ /data overlay.
+#
+# - Pure userspace overlay. No NAND writes, no rootfs mutation.
+# - Mode: --stratum-proxy. dcentrald NEVER touches /dev/mem, /dev/i2c*,
+#   /dev/ttyS*, the FPGA, the PIC, or the PSU. bosminer keeps ownership of all
+#   hardware. dcentrald only:
+#     * Listens on a Stratum V1 socket (configurable; default 127.0.0.1:3333)
+#       for proxy use, OR sits idle if not wired in.
+#     * Brings up the dashboard + REST API on http_port (config: 8080).
+#     * Scrapes the local cgminer JSON-RPC API (127.0.0.1:4028) for telemetry.
+#
+# Reverse cleanly:
+#   /etc/init.d/dcentrald-overlay disable
+#   /etc/init.d/dcentrald-overlay stop
+#   rm -rf /data/dcentrald/ /etc/init.d/dcentrald-overlay
+#
+# D-Central Technologies — DCENT_OS overlay
+START=99
+STOP=10
+USE_PROCD=1
+
+PROG=/data/dcentrald/dcentrald
+CONFIG=/data/dcentrald/dcentrald.toml
+LOGFILE=/data/dcentrald/dcentrald.log
+
+start_service() {
+    # Refuse to start if the binary or config went missing — better to log a
+    # clear error than to procd-respawn a non-existent path forever.
+    if [ ! -x "$PROG" ]; then
+        echo "[dcentrald-overlay] binary missing or not executable: $PROG" >&2
+        return 1
+    fi
+    if [ ! -f "$CONFIG" ]; then
+        echo "[dcentrald-overlay] config missing: $CONFIG" >&2
+        return 1
+    fi
+
+    procd_open_instance
+    procd_set_param command "$PROG" --config "$CONFIG" --stratum-proxy
+    # Respawn: 3600s threshold, 5s delay, retry forever (0 = infinite).
+    procd_set_param respawn 3600 5 0
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    # Reload daemon if config file changes.
+    procd_set_param file "$CONFIG"
+    # Tag the procd instance so logread filters cleanly.
+    procd_set_param pidfile /var/run/dcentrald-overlay.pid
+    procd_close_instance
+}
+
+stop_service() {
+    # procd handles SIGTERM by default. Belt-and-suspenders: pkill the binary
+    # path so a wedged instance doesn't survive across stop->start.
+    pkill -f "$PROG" 2>/dev/null || true
+}
+
+reload_service() {
+    stop
+    sleep 2
+    start
+}

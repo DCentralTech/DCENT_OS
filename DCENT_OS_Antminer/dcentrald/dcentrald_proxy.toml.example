@@ -1,0 +1,38 @@
+# dcentrald — Stratum V1 TCP relay (Phase 11B MVP) example config.
+#
+# Launch with:
+#   dcentrald --config /data/dcentrald_proxy.toml --stratum-proxy
+#
+# bosminer then points at 127.0.0.1:3333 (or whatever listen_addr is set to)
+# and dcentrald forwards its Stratum V1 byte stream to the upstream pool.
+#
+# The relay is byte-for-byte verbatim. No Stratum parsing, no TLS, no share
+# rewriting. See DCENT_OS_Antminer/dcentrald/dcentrald/src/stratum_proxy.rs
+# for invariants + design notes, and  for
+# the risk matrix that locked this design in.
+#
+# A dcentrald in --stratum-proxy mode does NOT touch hardware:
+#   - No /dev/mem, /dev/i2c*, /dev/ttyS*
+#   - No dcentrald-hal PSU / dsPIC / FPGA / UART relay code
+#   - No bosminer api calls
+#
+# Keep bosminer running and owning the hardware — the proxy only handles the
+# Stratum stream.
+
+[general]
+log_level = "info"
+
+[stratum_proxy]
+# Where bosminer should connect. Default is loopback only so the LAN never
+# sees the relay. Change to "0.0.0.0:3333" ONLY if you have a good reason and
+# you have firewalled port 3333 from untrusted networks.
+listen_addr = "127.0.0.1:3333"
+
+# Upstream Stratum V1 pool. Requires stratum+tcp://host:port.
+# Luxor example (plain TCP on :700 — confirmed by bosminer configs + live
+# probes in phase11a_D1_review.md):
+upstream_url = "stratum+tcp://btc.global.luxor.tech:700"
+
+# All other sections are optional. The relay never reads [pool], [mining],
+# [thermal], [psu], etc. — only [stratum_proxy] matters in --stratum-proxy
+# mode. They're left out here to make the intent obvious.

@@ -1,0 +1,29 @@
+[package]
+name = "dcentrald-api-types"
+version.workspace = true  # Single source: dcentrald/Cargo.toml [workspace.package]
+edition = "2021"
+description = "Pure API contract types for dcentrald"
+license = "GPL-3.0"
+
+[dependencies]
+serde.workspace = true
+#  tel-B audit_log encoder needs serde_json at runtime, not just tests.
+serde_json.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+# W4.7 lint inheritance + grandfather override (DCENT_DevOps + DCENT_QA, 2026-05-07).
+# This crate's ~664 unwrap occurrences are almost entirely inside `#[cfg(test)]`
+# modules and inline `#[test]` fns that drive hundreds of pure DTO contract
+# checks (snake-case serializers, freshness/snapshot DTOs, recent-share rows,
+# competitive-readiness contract). Lints are downgraded to `allow` here so
+# inline tests don't drown the build log. Audit status:
+# .
+# cargo 1.95+: per-crate overrides cannot coexist with `[lints] workspace = true`.
+[lints.clippy]
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+indexing_slicing = "allow"
+unwrap_in_result = "allow"

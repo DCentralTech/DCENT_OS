@@ -1,0 +1,77 @@
+# DCENT_OS Mining Daemon Configuration - Antminer S19j Pro AM335x BB
+#   MANAGEMENT-ONLY cold-boot posture (production-readiness matrix §7 #4).
+#
+# This is the DEFAULT cold-boot config for the AM3-BB install image. It is
+# selected by /etc/init.d/S82dcentrald whenever the cold-boot proof marker
+#   /data/dcentos/am3-bb-coldboot-proven
+# is ABSENT. With this config the daemon comes up MANAGEMENT-ONLY:
+#   - SSH (S50dropbear), MCP (S81mcp), and the REST/WebSocket + CGMiner API
+#     (served by dcentrald) all come up normally.
+#   - dcentrald enters `enter_management_only_idle` because
+#     `mining_start_enabled()` == (`[mining].enabled` && configured pool) is
+#     FALSE here: `enabled = false` AND the pool is empty. So NO PSU energize,
+#     NO dsPIC voltage, NO ASIC chain I/O happens on cold boot.
+#
+# WHY: a cold-boot install image for an unproven boot rail MUST come up
+# management-only and must NOT auto-energize/mine before an explicit operator
+# gate. This keeps a freshly installed unit safe and reachable for setup before
+# any power is applied to the hashboards.
+#
+# TO ENABLE MINING (after the cold-boot proof is captured and the operator
+# authorizes it): create the proof marker on the persistent /data overlay:
+#     touch /data/dcentos/am3-bb-coldboot-proven
+# and restart dcentrald (or reboot). S82dcentrald will then select the full
+# mining profile `/etc/dcentrald.toml` and pass `--am3-bb-mining`. The mining
+# config is preserved verbatim at /etc/dcentrald.toml — it is NOT deleted; it
+# is just not the cold-boot default until proven.
+
+[general]
+hostname = "dcentos-s19jpro-bb"
+log_level = "debug"
+
+# Management-only: empty pool + mining disabled. Either of these alone makes
+# `mining_start_enabled()` false, so the daemon never enters the energize/mine
+# path. Both are set for defense in depth. The full pool config lives in
+# /etc/dcentrald.toml and is selected once the cold-boot proof marker exists.
+[pool]
+url = ""
+protocol = "sv1"
+worker = ""
+password = "x"
+
+[mining]
+enabled = false
+frequency_mhz = 400
+voltage_mv = 13700
+suggest_difficulty = 256
+passthrough = false
+version_rolling = true
+serial_device = "/dev/ttyS1,/dev/ttyS2,/dev/ttyS4"
+serial_chip_count = 126
+serial_chip_type = "BM1362"
+model = "s19jpro-bb"
+
+[power]
+target_watts = 800
+
+[thermal]
+target_temp_c = 60
+hot_temp_c = 68
+dangerous_temp_c = 75
+fan_min_pwm = 10
+fan_max_pwm = 30
+pid_interval_s = 2.0
+
+[api]
+cgminer_port = 4028
+http_port = 8080
+websocket = true
+
+[watchdog]
+enabled = false
+
+[hash_on_disconnect]
+enabled = false
+
+[autotuner]
+enabled = false

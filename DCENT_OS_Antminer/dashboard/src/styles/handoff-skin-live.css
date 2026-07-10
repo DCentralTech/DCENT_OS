@@ -1,0 +1,796 @@
+/* ════════════════════════════════════════════════════════════════════════════
+   handoff-skin-live.css — PIXEL-FIDELITY skin for the four SIGNATURE LIVE
+   COMPONENTS that carry the DCENT_OS brand identity:
+
+     1. CurrentBlockCard   (.current-block-card + .current-block-modal-scope)
+     2. LiveAsicVisual     (.live-asic-visual / .live-asic-*)
+     3. AutotunerCard      (.autotuner-card-* + the page-hero / ds-glass-card hooks)
+     4. ChipHeatMap        (.ds-chip-cell grid + .time-tab mode tabs)
+
+   Canonical target = the design-extract kit:
+     ui_kits/dashboard/(CurrentBlockCard,LiveAsicVisual,AutotunerCard,ChipMap).jsx
+     + ui_kits/dashboard/styles.css  (.cb-* / .bm-* / .laov-* / .atc-* / .chipmap-*)
+     + preview/components-(current-block,live-asic,autotuner,chipmap,block-modal).html
+
+   This file is OVERRIDE-ONLY. It owns NO new component markup. It is loaded
+   LAST (after handoff-skin-components.css) so it wins the cascade over
+   current-block.css / standard.css / common.css / charts.css / motion.css
+   WITHOUT touching them or any .tsx.
+
+   RULES honoured:
+     • CSS only. Components + current-block.css untouched.
+     • Tokens-driven — every accent surface uses var(--accent…, --green, …), so
+       the runtime accent engine recolors this file for free. The kit's raw
+       rgba(250,165,0,…) literals are kept ONLY as graceful fallbacks behind
+       var(--accent-*, …) (matches current-block.css's own D-15 contract).
+     • Works in Standard + Heater (LiveAsicVisual --heater variant) + Hacker.
+     • Honesty preserved: this file changes LOOK only. Zero-hashrate ⇒ zero
+       lit cells is driven by the component's 'lit()' (only .is-active spans
+       get the glow); standby chains stay dimmed; no fabricated motion.
+     • Reduced-motion + print safe (see tails).
+     • No deps, no @import, no emoji.
+
+   Kit token bridge — the kit uses these; production exposes all of them:
+     --accent-gradient --accent --accent-glow --accent-border --green --yellow
+     --red --blue --font-mono --font-heading --surface-glass-card --border-glass
+     --border-subtle --radius-md --radius-sm --radius-pill --blur-sm
+     --ease-standard --dur-fast --fg-primary --fg-secondary --fg-dim --text-dim
+   ════════════════════════════════════════════════════════════════════════════ */
+
+/* Local kit-named keyframes (hslv- prefix => zero collision with production
+   'pulse' / 'dcm-asic-glow' / 'valueFlash' / 'ds-glowPulse'). */
+@keyframes hslvBreathe   { 0%, 100% { opacity: .85; } 50% { opacity: 1; } }
+@keyframes hslvGlow      { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
+@keyframes hslvChipPulse {
+  0%, 100% { opacity: 1;   box-shadow: 0 0 4px var(--accent-glow, rgba(250,165,0,.40)); }
+  50%      { opacity: .55; box-shadow: 0 0 8px var(--accent-glow-hi, rgba(250,165,0,.65)); }
+}
+@keyframes hslvStepFlash {
+  0%   { color: var(--accent); text-shadow: 0 0 8px var(--accent-glow-hi, rgba(250,165,0,.55)); }
+  100% { color: var(--fg-primary, #f5f5f7); text-shadow: none; }
+}
+@keyframes hslvNonceFlash {
+  0%   { box-shadow: 0 0 0 0 rgba(255,255,255,.9), 0 0 18px var(--accent-glow-hi, rgba(250,165,0,.70)); filter: brightness(1.6); }
+  60%  { box-shadow: 0 0 0 6px rgba(255,255,255,0), 0 0 8px var(--accent-glow, rgba(250,165,0,.30));   filter: brightness(1.2); }
+  100% { box-shadow: 0 0 0 0 rgba(255,255,255,0), 0 0 0 rgba(250,165,0,0);                              filter: brightness(1); }
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+   1 · CurrentBlockCard — kit .cb-* / .bm-* → production .current-block-*
+   styles.css:887-1131 + preview/components-current-block.html + block-modal.html
+   Production current-block.css already mirrors the kit; these rules tighten it
+   to the EXACT kit pixel values where they drifted (height typography, hairline
+   opacity, cell hover, modal shell, dashed-vs-solid dividers → kit solid).
+   ════════════════════════════════════════════════════════════════════════════ */
+
+.current-block-card {
+  /* kit: padding 22px 24px 20px / radius-md / glass + blur-sm */
+  padding: 22px 24px 20px;
+  border-radius: var(--radius-md);
+  background: var(--surface-glass-card, rgba(20,20,31,.88));
+  backdrop-filter: blur(var(--blur-sm, 12px));
+  -webkit-backdrop-filter: blur(var(--blur-sm, 12px));
+}
+/* kit ::before opacity 0.92, ::after hairline opacity 0.55 (styles.css:910/916) */
+.current-block-card::before { opacity: .92; }
+.current-block-card::after  { opacity: .55; }
+.current-block-card:hover,
+.current-block-card:focus-visible {
+  transform: translateY(-2px);
+  border-color: var(--accent-border, rgba(250,165,0,.32));
+  box-shadow: 0 8px 32px rgba(0,0,0,.4), 0 0 24px var(--accent-glow, rgba(250,165,0,.15));
+}
+.current-block-card-compact { padding: 18px; }
+.current-block-card-compact::before { opacity: .58; }
+.current-block-card-compact .current-block-height {
+  font-size: clamp(2.1rem, 1.8rem + 1.4vw, 2.8rem);   /* kit:928 */
+}
+
+.current-block-card-head { margin-bottom: 14px; }     /* kit .cb-head:930 */
+
+.current-block-kicker {
+  font-family: var(--font-mono);
+  font-size: 10px; letter-spacing: 1.8px; font-weight: 700;
+  color: var(--fg-secondary);
+  text-transform: uppercase;
+  gap: 8px;
+}
+.current-block-kicker-glyph {
+  width: 10px; height: 10px;
+  background: var(--accent-gradient);
+  transform: rotate(45deg); border-radius: 1px;
+}
+
+/* Live / Stale pill — kit .cb-live:938 (green) / stale → yellow */
+.current-block-live {
+  gap: 6px; padding: 3px 10px;
+  border-radius: var(--radius-pill, 999px);
+  font-family: var(--font-mono);
+  font-size: 10px; letter-spacing: 1.4px; font-weight: 700;
+  text-transform: uppercase;
+  background: rgba(34,197,94,.12);
+  border: 1px solid rgba(34,197,94,.35);
+  color: var(--green, #22C55E);
+}
+.current-block-live-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--green, #22C55E);
+  box-shadow: 0 0 6px rgba(34,197,94,.8);
+  animation: pulse 1.6s infinite;            /* production 'pulse' keyframe */
+}
+.current-block-live-stale {
+  background: rgba(234,179,8,.12);
+  border-color: rgba(234,179,8,.35);
+  color: var(--yellow, #EAB308);
+}
+.current-block-live-stale .current-block-live-dot {
+  background: var(--yellow, #EAB308);
+  box-shadow: 0 0 6px rgba(234,179,8,.8);
+  animation: none;
+}
+
+/* Hero block height — the brand moment: mono 800, big clamp, accent gradient
+   text + drop-shadow halo (kit .cb-height:949). */
+.current-block-height {
+  font-family: var(--font-mono);
+  font-weight: 800;
+  font-size: clamp(2.4rem, 2rem + 1.5vw, 2.85rem);
+  line-height: 1.0;
+  letter-spacing: -1.2px;
+  background: var(--accent-gradient);
+  -webkit-background-clip: text; background-clip: text;
+  color: transparent;
+  filter: drop-shadow(0 0 14px var(--accent-shadow-28, rgba(250,165,0,.28)));
+  font-variant-numeric: tabular-nums;
+  margin: 0;
+}
+.current-block-height-fallback {
+  background: none;
+  -webkit-text-fill-color: var(--fg-secondary);
+  color: var(--fg-secondary);
+  filter: none;
+  font-size: 1.5rem; font-weight: 600; letter-spacing: 0;
+}
+
+/* Hash row — kit .cb-hash:959 (mono 11.5px, dim uppercase label) */
+.current-block-hash-row {
+  gap: 10px; margin-top: 10px;
+  font-family: var(--font-mono); font-size: 11.5px;
+  color: var(--fg-primary);
+}
+.current-block-hash-row-label {
+  color: var(--fg-dim);
+  text-transform: uppercase; letter-spacing: 1.3px;
+  font-size: 9.5px; font-weight: 700;
+}
+.current-block-hash-row-value { word-break: break-all; font-variant-numeric: tabular-nums; }
+
+/* 4-cell facts grid — kit .cb-grid:966 / .cb-cell:968 */
+.current-block-grid4 {
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px; margin-top: 14px;
+}
+.current-block-card-compact .current-block-grid4 { grid-template-columns: repeat(2, minmax(0,1fr)); }
+.current-block-cell {
+  background: linear-gradient(180deg, rgba(255,255,255,.026) 0%, rgba(255,255,255,.014) 100%);
+  border: 1px solid var(--border-subtle, rgba(255,255,255,.06));
+  border-radius: var(--radius-sm, 8px);
+  padding: 11px 13px;
+}
+.current-block-card-compact .current-block-cell { padding: 9px 10px; }
+.current-block-cell:hover {
+  border-color: var(--accent-border, rgba(250,165,0,.22));
+  background: linear-gradient(180deg, var(--accent-tint-08, rgba(250,165,0,.08)) 0%, rgba(255,255,255,.014) 100%);
+}
+.current-block-cell-label {
+  font-family: var(--font-mono); font-size: 8.5px;
+  color: var(--fg-dim);
+  letter-spacing: 1.5px; font-weight: 700;
+  text-transform: uppercase; margin-bottom: 5px;
+}
+.current-block-cell-val {
+  font-family: var(--font-mono); font-size: 14.5px; font-weight: 700;
+  letter-spacing: -.25px; color: var(--fg-primary);
+  font-variant-numeric: tabular-nums; line-height: 1.18; word-break: break-all;
+}
+
+/* CTA strip — kit .cb-cta:991 uses a SOLID border-top + dim uppercase mono;
+   production drifted to dashed + fg-secondary — pull back to the kit. */
+.current-block-cta {
+  gap: 10px; margin-top: 14px; padding-top: 12px;
+  border-top: 1px solid var(--border-subtle, rgba(255,255,255,.06));
+  font-family: var(--font-mono); font-size: 10px;
+  letter-spacing: 1.2px; color: var(--fg-dim);
+  text-transform: uppercase; font-weight: 700;
+}
+.current-block-cta-arrow {
+  color: var(--accent); font-size: 14px;
+  transition: transform var(--dur-fast, 150ms) var(--ease-standard, ease);
+}
+.current-block-card:hover .current-block-cta-arrow { transform: translateX(3px); }
+
+/* ─── Block-source modal — kit .bm:1015 (gradient shell + accent hairline +
+   pop-spring). Production renders it through OverlayDialog scoped under
+   .current-block-modal-scope; tighten that scope to the kit. ─────────────── */
+.current-block-modal-scope .current-block-modal {
+  background: linear-gradient(180deg, rgba(22,22,32,.96), rgba(12,12,18,.98));
+  border: 1px solid var(--accent-border, rgba(250,165,0,.18));
+  border-radius: var(--radius-lg, 16px);
+  box-shadow:
+    0 26px 70px rgba(0,0,0,.46),
+    inset 0 1px 0 rgba(255,255,255,.05),
+    0 0 34px var(--accent-tint-14, rgba(250,165,0,.10));
+  padding: 0;
+  position: relative;
+  overflow: hidden auto;
+  max-height: 88vh;
+}
+/* kit .bm::before — top accent hairline across the modal (styles.css:1028) */
+.current-block-modal-scope .current-block-modal::before {
+  content: ''; position: absolute; inset: 0 0 auto 0; height: 1px;
+  pointer-events: none; z-index: 2;
+  background: linear-gradient(90deg,
+    transparent 0%,
+    var(--accent-border, rgba(250,165,0,.32)) 22%,
+    var(--accent) 50%,
+    var(--accent-border, rgba(250,165,0,.32)) 78%,
+    transparent 100%);
+  opacity: .75;
+}
+.current-block-modal-scope .bm-head {
+  align-items: flex-start;
+  gap: 14px; padding: 22px 22px 16px;
+  border-bottom: 0;
+}
+.current-block-modal-scope .bm-eyebrow {
+  gap: 8px; margin: 0 0 8px;
+  font-family: var(--font-mono); font-size: 10px;
+  letter-spacing: 1.8px; font-weight: 700;
+  color: var(--fg-secondary); text-transform: uppercase;
+}
+.current-block-modal-scope .bm-eyebrow .current-block-kicker-glyph {
+  width: 10px; height: 10px; background: var(--accent-gradient);
+  transform: rotate(45deg); border-radius: 1px;
+}
+.current-block-modal-scope .bm-title {
+  font-family: var(--font-heading); font-weight: 800; font-size: 1.6rem;
+  color: var(--fg-primary); letter-spacing: -.01em;
+  gap: 12px; line-height: 1.1; margin: 0;
+}
+.current-block-modal-scope .bm-title-height {
+  font-family: var(--font-mono); font-weight: 700; font-size: 1.2rem;
+  background: none; -webkit-text-fill-color: var(--accent);
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+.current-block-modal-scope .bm-sub {
+  margin: 8px 0 0; font-size: .82rem;
+  color: var(--fg-secondary); letter-spacing: 0;
+}
+.current-block-modal-scope .current-block-close {
+  width: 46px; height: 46px; min-width: 46px; min-height: 46px;
+  box-sizing: border-box;
+  border-radius: var(--radius-sm, 8px);
+  border: 1px solid var(--border-glass);
+  background: rgba(255,255,255,.04);
+  color: var(--fg-secondary);
+  font-size: 1.2rem; line-height: 1;
+  transition: all var(--dur-fast, 150ms) var(--ease-standard, ease);
+}
+.current-block-modal-scope .current-block-close:hover {
+  border-color: var(--accent-border);
+  color: var(--accent);
+  background: var(--accent-tint-08, rgba(250,165,0,.06));
+}
+.current-block-modal-scope .bm-section {
+  margin-top: 0;
+  padding: 0 22px 16px;
+}
+.current-block-modal-scope .bm-section-h {
+  font-family: var(--font-mono); font-size: 10px;
+  letter-spacing: 1.6px; font-weight: 700;
+  color: var(--fg-dim);                     /* kit:1061 dim, not accent */
+  text-transform: uppercase; margin: 8px 0 8px;
+}
+.current-block-modal-scope .bm-hrow {
+  gap: 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm, 8px);
+  padding: 9px 11px;
+  background: rgba(0,0,0,.25);
+}
+.current-block-modal-scope .bm-hrow-line { gap: 8px; }
+.current-block-modal-scope .bm-hrow code {
+  flex: 1 1 200px;
+  font-family: var(--font-mono); font-size: 11.5px;
+  color: var(--fg-primary);
+  word-break: break-all; font-variant-numeric: tabular-nums;
+  background: transparent; border: 0; padding: 0;
+}
+.current-block-modal-scope .bm-hrow-btn {
+  padding: 5px 11px; border-radius: 6px;
+  border: 1px solid var(--border-glass);
+  background: rgba(255,255,255,.04);
+  color: var(--fg-primary);
+  font-size: 11px; font-weight: 600; letter-spacing: 0;
+  text-transform: none; font-family: var(--font-ui, inherit);
+  transition: all var(--dur-fast, 150ms) var(--ease-standard, ease);
+}
+.current-block-modal-scope .bm-hrow-btn:hover {
+  border-color: var(--accent-border);
+  color: var(--accent);
+  background: var(--accent-tint-08, rgba(250,165,0,.06));
+}
+.current-block-modal-scope .bm-hrow-toast {
+  font-family: var(--font-mono); font-size: 10px;
+  letter-spacing: 1px; color: var(--green); text-transform: uppercase;
+}
+.current-block-modal-scope .bm-grid4 {
+  grid-template-columns: repeat(4, minmax(0,1fr)); gap: 8px;
+}
+.current-block-modal-scope .bm-cb {
+  background: linear-gradient(180deg, rgba(255,255,255,.026) 0%, rgba(255,255,255,.014) 100%);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm, 8px);
+  padding: 11px 12px;
+}
+.current-block-modal-scope .bm-cb-k {
+  font-family: var(--font-mono); font-size: 8.5px;
+  letter-spacing: 1.5px; font-weight: 700;
+  color: var(--fg-dim); text-transform: uppercase; margin-bottom: 5px;
+}
+.current-block-modal-scope .bm-cb-v {
+  font-family: var(--font-mono); font-size: 14px; font-weight: 700;
+  color: var(--fg-primary); font-variant-numeric: tabular-nums; line-height: 1.18;
+  letter-spacing: 0;
+}
+.current-block-modal-scope .bm-details {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm, 8px);
+  background: rgba(0,0,0,.20);
+}
+.current-block-modal-scope .bm-details > summary {
+  padding: 11px 14px;
+  font-family: var(--font-mono); font-size: 11px; font-weight: 700;
+  letter-spacing: 1.2px;
+  color: var(--fg-secondary);               /* kit:1110 secondary, not accent */
+  text-transform: uppercase;
+}
+.current-block-modal-scope .bm-details > summary::after { color: var(--fg-dim); font-size: inherit; }
+.current-block-modal-scope .current-block-detail-row {
+  gap: 10px; padding: 7px 0;
+  border-bottom: 1px solid var(--border-subtle);   /* kit:1119 solid */
+  font-size: 11.5px;
+}
+.current-block-modal-scope .current-block-detail-row > span {
+  color: var(--fg-dim);
+  font-family: var(--font-mono); letter-spacing: .5px;
+  text-transform: none; font-size: inherit; font-weight: 400;
+}
+.current-block-modal-scope .current-block-detail-row > strong {
+  color: var(--fg-primary); font-family: var(--font-mono);
+  font-weight: 600; font-variant-numeric: tabular-nums; text-align: right;
+}
+.current-block-modal-scope .current-block-explain h3 {
+  font-family: var(--font-heading); font-weight: 700; font-size: .92rem;
+  color: var(--fg-primary); letter-spacing: .02em;
+  margin: 8px 0 6px; text-transform: none;
+}
+.current-block-modal-scope .current-block-explain ul {
+  margin: 0 0 8px; padding-left: 20px;
+  font-family: inherit; font-size: .82rem;
+  color: var(--fg-secondary); line-height: 1.55;
+}
+.current-block-modal-scope .current-block-explain li { padding: 2px 0; margin: 0; }
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+   2 · LiveAsicVisual — kit .laov-* → production .live-asic-*
+   styles.css:1148-1284 + preview/components-live-asic.html
+   The signature animated hashboard stack: chip grid that lights by honest
+   load, warm halo that breathes ONLY when actually mining.
+   ════════════════════════════════════════════════════════════════════════════ */
+
+.live-asic-visual {
+  position: relative;
+  display: flex; flex-direction: column;
+  background: var(--surface-glass-card, rgba(20,20,31,.88));
+  backdrop-filter: blur(var(--blur-sm, 12px));
+  -webkit-backdrop-filter: blur(var(--blur-sm, 12px));
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-md, 12px);
+  padding: 18px 20px 14px;
+  overflow: hidden;
+}
+/* kit .live-asic-visual::before — corner accent radial wash */
+.live-asic-visual::before {
+  content: ''; position: absolute; inset: 0; pointer-events: none; z-index: 0;
+  background:
+    radial-gradient(120% 80% at 0% 0%,   var(--accent-glow, rgba(250,165,0,.10)), transparent 55%),
+    radial-gradient(80% 60% at 100% 100%, rgba(250,103,0,.08), transparent 65%);
+}
+.live-asic-visual > * { position: relative; z-index: 1; }
+/* kit: data-state="live" → breathing soft outer glow ring */
+.live-asic-visual[data-state="live"]::after {
+  content: ''; position: absolute; inset: -1px;
+  border-radius: var(--radius-md, 12px);
+  pointer-events: none; z-index: 0;
+  box-shadow: 0 0 0 1px var(--accent-glow, rgba(250,165,0,.08)),
+              0 0 24px var(--accent-glow, rgba(250,165,0,.10));
+  animation: hslvBreathe 4.5s ease-in-out infinite;
+}
+
+.live-asic-header {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 14px; margin-bottom: 12px;
+}
+.live-asic-heading h3 {
+  margin: 0 0 2px; font-family: var(--font-heading);
+  font-weight: 800; font-size: 1.1rem; letter-spacing: .005em;
+}
+.live-asic-heading p { margin: 0; font-size: .76rem; color: var(--fg-secondary); }
+.live-asic-eyebrow {
+  display: block; font-family: var(--font-mono); font-size: 10px;
+  letter-spacing: 1.6px; font-weight: 700;
+  color: var(--fg-dim); text-transform: uppercase; margin-bottom: 4px;
+}
+.live-asic-actions { display: flex; align-items: center; gap: 10px; }
+.live-asic-status {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 10px; border-radius: 999px;
+  font-family: var(--font-mono); font-size: 9.5px;
+  letter-spacing: 1.4px; font-weight: 700; text-transform: uppercase;
+}
+/* kit maps to .live/.standby; production uses health-tone classes — colour by
+   the actual tone class so it stays honest (no forced green). */
+.live-asic-status.success,
+.live-asic-status.live    { background: rgba(34,197,94,.12); color: var(--green);  border: 1px solid rgba(34,197,94,.32); }
+.live-asic-status.warning { background: rgba(234,179,8,.12); color: var(--yellow); border: 1px solid rgba(234,179,8,.32); }
+.live-asic-status.danger  { background: rgba(239,68,68,.12); color: var(--red);    border: 1px solid rgba(239,68,68,.32); }
+.live-asic-status.muted,
+.live-asic-status.standby { background: rgba(255,255,255,.04); color: var(--fg-dim); border: 1px solid var(--border-glass); }
+.live-asic-pulse {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor; box-shadow: 0 0 6px currentColor;
+}
+.live-asic-pulse.is-live { animation: pulse 1.6s ease-in-out infinite; }
+.live-asic-action {
+  padding: 6px 12px; border-radius: var(--radius-sm, 8px);
+  border: 1px solid var(--border-glass);
+  background: rgba(255,255,255,.04); color: var(--fg-primary);
+  font-size: .76rem; font-weight: 600;
+  transition: all var(--dur-fast, 150ms) var(--ease-standard, ease);
+}
+.live-asic-action:hover {
+  border-color: var(--accent-border);
+  background: var(--accent-tint-08, rgba(250,165,0,.06));
+  color: var(--accent);
+}
+
+.live-asic-stack { display: flex; flex-direction: column; gap: 10px; padding: 4px 0; }
+/* kit .laov-stack.is-mining .laov-chain.live::before — warm halo breathe ONLY
+   on a live chain while mining (honest signal). */
+.live-asic-stack.is-mining .live-asic-chain.live::before {
+  content: ''; position: absolute; inset: -1px;
+  border-radius: var(--radius-sm, 8px); pointer-events: none;
+  background: radial-gradient(120% 70% at 50% 0%, var(--accent-glow, rgba(250,165,0,.10)), transparent 65%);
+  animation: hslvGlow 3.6s ease-in-out infinite;
+}
+
+.live-asic-chain {
+  position: relative;
+  display: grid; grid-template-columns: 96px 1fr auto;
+  gap: 14px; align-items: center;
+  padding: 10px 12px;
+  background: linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,.012));
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm, 8px);
+}
+.live-asic-chain.standby,
+.live-asic-chain.muted { opacity: .65; }
+.live-asic-chain-meta {
+  display: flex; flex-direction: column; gap: 1px; min-width: 0;
+  font-family: var(--font-mono); font-size: 10px; line-height: 1.4;
+}
+.live-asic-chain-meta strong { font-size: 14px; color: var(--fg-primary); letter-spacing: .5px; font-weight: 700; }
+.live-asic-chain-meta span:first-child { color: var(--fg-dim); letter-spacing: 1.4px; text-transform: uppercase; font-size: 9px; font-weight: 700; }
+.live-asic-chain-meta span:last-child  { color: var(--fg-secondary); letter-spacing: .8px; text-transform: uppercase; font-size: 9px; font-weight: 600; }
+
+/* The chip grid — kit .laov-chip-grid:1224 (16-col, square cells, 3px gap).
+   Lit cells get the accent glow; pulsing only the data-pulse="on" ones. */
+.live-asic-chip-grid {
+  display: grid; grid-template-columns: repeat(16, 1fr);
+  gap: 3px; min-width: 0; align-items: center;
+}
+.live-asic-chip-grid > span {
+  display: block; aspect-ratio: 1; border-radius: 2px;
+  background: rgba(255,255,255,.05);
+  border: 1px solid rgba(255,255,255,.04);
+  transition: background .25s var(--ease-standard, ease);
+}
+.live-asic-chip-grid > span.is-active {
+  background: var(--accent);
+  border-color: var(--accent-border, rgba(250,165,0,.6));
+  box-shadow: 0 0 5px var(--accent-glow-hi, rgba(250,165,0,.55));
+}
+.live-asic-chip-grid > span[data-pulse="on"] {
+  animation: hslvChipPulse 1.4s ease-in-out infinite;
+}
+
+.live-asic-chain-readout {
+  display: flex; flex-direction: column; gap: 1px;
+  font-family: var(--font-mono); font-size: 10.5px; text-align: right;
+  color: var(--fg-secondary); font-variant-numeric: tabular-nums;
+  min-width: 92px; white-space: nowrap;
+}
+.live-asic-chain-readout span:first-child { color: var(--fg-primary); font-weight: 700; font-size: 12px; }
+
+/* kit .laov-chain-rail — full-width thin rail driven by --chain-load */
+.live-asic-chain-rail {
+  grid-column: 1 / -1; height: 3px; margin-top: 4px;
+  background: rgba(255,255,255,.06);
+  border-radius: 999px; overflow: hidden;
+}
+.live-asic-chain-rail > span {
+  display: block; height: 100%;
+  width: var(--chain-load, 0%);              /* honest: 0 hashrate ⇒ 0 width */
+  background: var(--accent-gradient);
+  box-shadow: 0 0 6px var(--accent-glow, rgba(250,165,0,.4));
+  transition: width .4s var(--ease-standard, ease);
+}
+
+.live-asic-footer {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 14px; padding-top: 10px; margin-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+  font-family: var(--font-mono); font-size: 11px; color: var(--fg-secondary);
+}
+.live-asic-footer strong { color: var(--fg-primary); font-weight: 700; font-variant-numeric: tabular-nums; }
+
+/* Hacker variant — kit .live-asic-visual--hacker:1272 (phosphor green) */
+.live-asic-visual--hacker {
+  background: rgba(0,15,5,.7);
+  border-color: rgba(0,255,65,.25);
+}
+.live-asic-visual--hacker .live-asic-heading h3,
+.live-asic-visual--hacker .live-asic-chain-meta strong,
+.live-asic-visual--hacker .live-asic-chain-readout span:first-child,
+.live-asic-visual--hacker .live-asic-footer strong {
+  color: var(--fg-hacker-green, #00ff41);
+}
+.live-asic-visual--hacker .live-asic-chip-grid > span.is-active {
+  background: var(--fg-hacker-green, #00ff41);
+  border-color: rgba(0,255,65,.6);
+  box-shadow: 0 0 5px rgba(0,255,65,.55);
+}
+/* Heater variant — kit warm tone; production renders LiveAsicVisual --heater
+   inside the Nest shell. Keep the glass but warm the accent surfaces. */
+.live-asic-visual--heater .live-asic-chip-grid > span.is-active {
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent-glow-hi, rgba(250,103,0,.55));
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+   3 · AutotunerCard — kit .atc-* → production hooks
+   styles.css:1290-1388 + preview/components-autotuner.html
+
+   IMPORTANT (no-production-hook note): the kit AutotunerCard's signature
+   sub-surfaces — the 4-step PHASE RIBBON, the per-chain FREQ/VOLT RAMP RAILS,
+   the A/B/C GRADE-BAR TRACKS, and the "last step" STEP STRIP — do NOT exist
+   in the production AutotunerCard.tsx. Production renders the phase via
+   '.page-hero-strip' + '.hero-kpi' tiles, the progress bar / grade bars /
+   policy rows entirely with INLINE 'style=((…))' (uncatchable from CSS), and
+   the card body is a generic '.ds-glass-card'. We skin every hook that DOES
+   exist toward the kit look; the ribbon/rails/grade-track/step-strip can only
+   be matched by a component edit (out of scope — flagged in the return note).
+   ════════════════════════════════════════════════════════════════════════════ */
+
+/* The card frame → kit .atc-card:1290 (glass + blur + top accent hairline). */
+.autotuner-card-policy-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
+  margin: 10px 0 14px;
+  padding: 10px 12px;
+  background: rgba(0,0,0,.22);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm, 8px);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.autotuner-card-policy-grid > div > span:first-child {
+  color: var(--fg-dim) !important;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  font-size: 9px !important;
+  font-weight: 700;
+}
+.autotuner-card-policy-grid > div > span:last-child {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The Autotuner section's glass body (the ds-glass-card directly inside the
+   autotuner '.section') → kit .atc-card surface + accent hairline. Scoped to
+   the autotuner card by the policy-grid descendant. NOTE: the policy grid is
+   conditionally rendered — when no preset/objective/safety info exists the
+   ':has()' won't match and the card keeps its base '.ds-glass-card' look
+   (acceptable: the kit accent-hairline is a non-load-bearing flourish, never
+   a data signal). */
+.section:has(> .ds-glass-card .autotuner-card-policy-grid) > .ds-glass-card {
+  position: relative;
+  background: var(--surface-glass-card, rgba(20,20,31,.88));
+  backdrop-filter: blur(var(--blur-sm, 12px));
+  -webkit-backdrop-filter: blur(var(--blur-sm, 12px));
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-md, 12px);
+  overflow: hidden;
+}
+.section:has(> .ds-glass-card .autotuner-card-policy-grid) > .ds-glass-card::before {
+  content: ''; position: absolute; inset: 0 0 auto 0; height: 1px;
+  pointer-events: none;
+  background: linear-gradient(90deg,
+    transparent 0%,
+    var(--accent-border, rgba(250,165,0,.32)) 22%,
+    var(--accent) 50%,
+    var(--accent-border, rgba(250,165,0,.32)) 78%,
+    transparent 100%);
+  opacity: .65;
+}
+
+/* The autotuner phase header (kit .atc-eyebrow + .atc-title + pulsing dot).
+   Production: '.page-hero-eyebrow' carrying the "AUTOTUNER" word + a
+   '.ds-dot-live.accent' when active → kit phase-dot pulse. */
+.page-hero-eyebrow .ds-dot-live.accent {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 10px var(--accent);
+  animation: pulse 1.8s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .page-hero-eyebrow .ds-dot-live.accent { animation: none; }
+}
+
+/* The Chips-Tuned KPI last-step flash → kit .atc-step-val flash (the only
+   genuine "daemon advanced" beat the production card exposes). */
+.hero-kpi .kpi-num-anim.ds-value-flash {
+  animation: hslvStepFlash .8s var(--ease-standard, ease);
+}
+@media (prefers-reduced-motion: reduce) {
+  .hero-kpi .kpi-num-anim.ds-value-flash { animation: none; }
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+   4 · ChipHeatMap — kit .chipmap-* → production .ds-chip-cell grid + .time-tab
+   styles.css:1394-1491 + preview/components-chipmap.html
+
+   IMPORTANT (no-production-hook note): the kit ChipMap's '.chipmap-shell',
+   '.chipmap-bar', '.chipmap-grid', '.chipmap-cell-num'/'.chipmap-cell-val'
+   in-cell labels, the '⚡' nonce-flash ::after glyph, the freq/temp/error
+   color RAMP MATH, and the '.chipmap-legend' gradient bar are all rendered by
+   the production ChipHeatMap.tsx with INLINE 'style=((…))' on plain <div>s and
+   per-cell <button>s (no kit-equivalent classnames). The only stable hooks are
+   '.ds-chip-cell' (+ -healthy/-missing/-active/-expanded), the '.time-tab'
+   mode buttons, '.ds-chip-tooltip', and '.ds-chip-detail-panel'. We bring
+   THOSE to the kit's chipmap look (cell radius/hover-lift/focus ring, the
+   nonce-flash energy, the pill-style mode switch). The 9×7 grid geometry,
+   in-cell numerals, ⚡ overlay and legend can't be CSS-skinned (inline) —
+   flagged in the return note. The kit cell color modes already match because
+   ChipHeatMap.tsx computes the same rgb() ramp inline.
+   ════════════════════════════════════════════════════════════════════════════ */
+
+/* kit .chipmap-cell:1442 — square, 3px radius, hover lift + dark shadow,
+   focus = white ring. Production cell already has the right structure;
+   align the radius/hover/focus to the kit and add the nonce-flash energy
+   onto the production "healthy" breathing cells (honest: healthy = present
+   + not in error/hot state, so only earning chips get the spark). */
+.mode-standard .ds-chip-cell,
+.mode-heater   .ds-chip-cell,
+.mode-advanced .ds-chip-cell {
+  border-radius: 3px;
+}
+.mode-standard .ds-chip-cell:hover,
+.mode-standard .ds-chip-cell:focus-visible,
+.mode-heater   .ds-chip-cell:hover,
+.mode-heater   .ds-chip-cell:focus-visible {
+  box-shadow: 0 4px 12px rgba(0,0,0,.4),
+              0 0 14px var(--ds-chip-color, var(--accent));
+  border-color: rgba(255,255,255,.4) !important;
+  z-index: 4;
+}
+.mode-standard .ds-chip-cell.ds-chip-expanded,
+.mode-heater   .ds-chip-cell.ds-chip-expanded {
+  box-shadow: 0 0 0 1px #fff, 0 4px 14px rgba(0,0,0,.5);
+  z-index: 3;
+}
+/* Nonce-find energy — the kit's signature "⚡ chip just found a nonce" beat,
+   re-expressed on the production breathing-healthy cell so it reads as live
+   without fabricating data (only ds-chip-healthy = real earning chip). */
+.mode-standard .ds-chip-cell.ds-chip-active.ds-chip-healthy {
+  animation: hslvNonceFlash 2.8s ease-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .mode-standard .ds-chip-cell.ds-chip-active.ds-chip-healthy { animation: none; }
+}
+
+/* Color-mode tab bar — production renders '.time-tab' buttons; kit
+   .chipmap-mode-switch:1416 is a pill-grouped segmented control with an
+   accent-tinted active state. Skin the in-chipmap tabs to that. The
+   ChipHeatMap mode buttons sit in a role="group" aria-label="…chip map
+   color mode" — target the buttons via the surrounding panel. */
+.ds-chip-detail-panel ~ * .time-tab,
+[aria-label$="chip map color mode"] .time-tab {
+  font-size: .72rem; font-weight: 600;
+  padding: 4px 10px; border-radius: 4px;
+  color: var(--fg-secondary);
+  border: 0; background: transparent;
+  transition: all var(--dur-fast, 150ms) var(--ease-standard, ease);
+}
+[aria-label$="chip map color mode"] {
+  display: inline-flex;
+  border: 1px solid var(--border-glass);
+  border-radius: 6px;
+  padding: 2px;
+  background: rgba(0,0,0,.25);
+  gap: 0 !important;
+}
+[aria-label$="chip map color mode"] .time-tab:hover { color: var(--fg-primary); }
+[aria-label$="chip map color mode"] .time-tab.active {
+  background: var(--accent-tint-14, rgba(250,165,0,.14));
+  color: var(--accent);
+}
+
+/* Hover / detail panels — kit .chipmap-hover-detail:1488 mono, accent
+   strongs; production .ds-chip-tooltip / .ds-chip-detail-panel already inline
+   most of it. Tighten the frame to the kit's darker callout. */
+.ds-chip-tooltip {
+  border: 1px solid var(--border-subtle) !important;
+  background: rgba(0,0,0,.30) !important;
+  font-family: var(--font-mono) !important;
+  font-variant-numeric: tabular-nums;
+}
+.ds-chip-detail-panel {
+  border: 1px solid var(--accent-border, rgba(250,165,0,.32)) !important;
+  background: rgba(0,0,0,.30) !important;
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+   Reduced-motion + print — global safety tail for everything above.
+   ════════════════════════════════════════════════════════════════════════════ */
+@media (prefers-reduced-motion: reduce) {
+  .current-block-live-dot,
+  .live-asic-visual[data-state="live"]::after,
+  .live-asic-stack.is-mining .live-asic-chain.live::before,
+  .live-asic-chip-grid > span[data-pulse="on"],
+  .live-asic-pulse.is-live {
+    animation: none !important;
+  }
+  .current-block-card,
+  .current-block-card:hover,
+  .current-block-card:focus-visible { transform: none !important; }
+}
+
+@media print {
+  .current-block-live-dot,
+  .live-asic-visual[data-state="live"]::after,
+  .live-asic-stack.is-mining .live-asic-chain.live::before,
+  .live-asic-chip-grid > span[data-pulse="on"],
+  .live-asic-pulse.is-live,
+  .page-hero-eyebrow .ds-dot-live.accent,
+  .hero-kpi .kpi-num-anim.ds-value-flash,
+  .mode-standard .ds-chip-cell.ds-chip-active.ds-chip-healthy {
+    animation: none !important;
+  }
+  .current-block-card,
+  .live-asic-visual {
+    box-shadow: none !important;
+    transform: none !important;
+  }
+  .current-block-card::before,
+  .live-asic-visual::before { opacity: .2 !important; }
+}

@@ -1,0 +1,89 @@
+# dcentrald.toml — DCENTos S19 Test Configuration
+# Target: S19 (BraiinsOS+, am2-s17 control board)
+# Deploy to: /data/dcentrald.toml on the miner
+#
+# S19 differences from S9:
+#   - 4 FPGA chain slots (chain 1-4, only 3 boards physically)
+#   - PIC addresses: 0x88, 0x89, 0xB9, 0xFE
+#   - BM1398 ASICs (76 chips/board, vs S9's 63 BM1387)
+#   - Higher voltage: 13.8V default (vs S9's ~9.1V)
+#   - Fan UIO at uio16 (vs S9's uio0)
+#   - Platform auto-detected from UIO names (chain1-* = S19)
+
+[general]
+hostname = "dcentos-unit"
+log_level = "info"
+
+[pool]
+url = "stratum+tcp://solo.ckpool.org:3333"
+worker = ""
+password = "d=1"
+
+[mining]
+# Conservative S19 settings for first test
+# 500 MHz is well below the 675 MHz default
+frequency_mhz = 500
+# S19 voltage in mV — 13800 is default, start at 12000 for safety
+voltage_mv = 12000
+# Difficulty 256 for initial testing
+suggest_difficulty = 256
+# Passthrough mode: ride bosminer's existing ASIC config (hot start)
+# Set to false for standalone DCENTos cold boot
+passthrough = true
+# Disable ASICBoost until midstate slots verified for BM1398
+version_rolling = false
+
+[power]
+mode = "bypass"
+target_watts = 0
+
+[thermal]
+# S19 runs hotter than S9 — adjust thresholds
+target_temp_c = 60
+hot_temp_c = 75
+dangerous_temp_c = 85
+fan_min_pwm = 10
+fan_max_pwm = 127
+
+[api]
+cgminer_port = 4028
+http_port = 80
+websocket = true
+auth_enabled = false
+auth_password = ""
+
+[donation]
+enabled = false
+percent = 0.0
+pool_url = "stratum+tcp://donate.dcentral.pool:3333"
+worker = "dcentrald-donation"
+
+[watchdog]
+# Disabled for initial testing
+enabled = false
+kick_interval_s = 5
+
+[hash_on_disconnect]
+enabled = true
+
+[mode]
+active = "standard"
+
+[autotuner]
+# Disabled for first S19 test — manual frequency only
+enabled = false
+target_mode = "hashrate"
+measurement_window_s = 3
+verification_window_s = 15
+error_threshold_pct = 0.5
+safety_margin_pct = 5.0
+min_freq_mhz = 200
+max_freq_mhz = 1300
+background_interval_s = 60
+
+[heater]
+target_watts = 1700
+night_mode = false
+night_start_hour = 22
+night_end_hour = 7
+night_target_watts = 800

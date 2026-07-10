@@ -1,0 +1,84 @@
+{
+  "summary": {
+    "STATUS": [
+      {
+        "STATUS": "S",
+        "Code": 11,
+        "Msg": "Summary"
+      }
+    ],
+    "SUMMARY": [
+      {
+        "Elapsed": 7800,
+        "MHS av": 104250500.0,
+        "MHS 5s": 103900000.0,
+        "Accepted": 40,
+        "Rejected": 1,
+        "Hardware Errors": 10,
+        "Best Share": 60933.43,
+        "Device Hardware%": 19.607843137254903,
+        "Device Rejected%": 2.4390243902439024
+      }
+    ],
+    "id": 1
+  },
+  "devs": {
+    "STATUS": [
+      {
+        "STATUS": "S",
+        "Code": 9,
+        "Msg": "Devs"
+      }
+    ],
+    "DEVS": [
+      {
+        "ASC": 0,
+        "Name": "chain6",
+        "ID": 0,
+        "Enabled": "Y",
+        "Status": "Alive",
+        "Temperature": 62.5,
+        "MHS 5s": 21000000.0,
+        "Last Share Time": 1700000000,
+        "chain_acn": 114,
+        "frequency": 525,
+        "voltage": 13.7
+      },
+      {
+        "ASC": 1,
+        "Name": "chain7",
+        "ID": 1,
+        "Enabled": "Y",
+        "Status": "Alive",
+        "Temperature": 64.0,
+        "MHS 5s": 20500000.0,
+        "Last Share Time": 1700000000,
+        "chain_acn": 110,
+        "frequency": 530,
+        "voltage": 13.75
+      }
+    ],
+    "id": 1
+  },
+  "version": {
+    "STATUS": [
+      {
+        "STATUS": "S",
+        "Code": 22,
+        "Msg": "Version"
+      }
+    ],
+    "VERSION": [
+      {
+        "CGMiner": "dcentrald/contract",
+        "API": "3.7",
+        "Type": "Antminer",
+        "Miner": "dcentrald/contract",
+        "BMMiner": "dcentrald/contract",
+        "Firmware": "DCENTOS",
+        "Description": "DCENT_OS dcentrald/contract (open-source firmware on Antminer hardware)"
+      }
+    ],
+    "id": 1
+  }
+}

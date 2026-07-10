@@ -1,0 +1,23 @@
+#!/bin/sh
+#
+# Shared AM3 NAND/rootfs geometry constants.
+#
+# Host-side tools source this file so install, lab, and revert workflows agree
+# on the same rootfs window. These values are evidence-scoped to the am3-aml
+# S19K/S21 Amlogic layout; AM335x BB NAND remains unvalidated and must not use
+# these constants.
+
+DCENT_AM3_ROOTFS_MTD="${DCENT_AM3_ROOTFS_MTD:-/dev/mtd5}"
+DCENT_AM3_ROOTFS_OFFSET_HEX="${DCENT_AM3_ROOTFS_OFFSET_HEX:-0x05700000}"
+DCENT_AM3_ROOTFS_WINDOW_HEX="${DCENT_AM3_ROOTFS_WINDOW_HEX:-0x02800000}"
+DCENT_AM3_ROOTFS_ERASE_COUNT="${DCENT_AM3_ROOTFS_ERASE_COUNT:-320}"
+DCENT_AM3_ROOTFS_ERASESIZE_EXPECTED="${DCENT_AM3_ROOTFS_ERASESIZE_EXPECTED:-131072}"
+DCENT_AM3_RECOVERY_FLAG_OFFSET_HEX="${DCENT_AM3_RECOVERY_FLAG_OFFSET_HEX:-0x05300000}"
+
+dcent_am3_geometry_init() {
+    DCENT_AM3_ROOTFS_OFFSET_DEC=$((DCENT_AM3_ROOTFS_OFFSET_HEX))
+    DCENT_AM3_ROOTFS_WINDOW_DEC=$((DCENT_AM3_ROOTFS_WINDOW_HEX))
+    DCENT_AM3_ROOTFS_END_DEC=$((DCENT_AM3_ROOTFS_OFFSET_DEC + DCENT_AM3_ROOTFS_WINDOW_DEC))
+}
+
+dcent_am3_geometry_init
