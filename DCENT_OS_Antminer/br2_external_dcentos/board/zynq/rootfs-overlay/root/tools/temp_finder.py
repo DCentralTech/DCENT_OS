@@ -24,6 +24,11 @@ import time
 import json
 import collections
 
+from dcentos_asic_wire import (
+    crc5_bm13xx_command,
+    require_captured_bm1387_protocol_profile,
+)
+
 try:
     import fcntl
     import termios
@@ -68,46 +73,20 @@ TEMP_ENCODINGS = {
 # CRC5 for BM1387
 # ============================================================================
 
-def crc5_bm1387(data, bit_length=None):
-    """CRC5 polynomial 0x05, init 0x1F."""
-    crc = 0x1F
-    poly = 0x05
-    if bit_length is None:
-        bit_length = len(data) * 8
-    bit_index = 0
-    for byte in data:
-        for i in range(7, -1, -1):
-            if bit_index >= bit_length:
-                break
-            bit = (byte >> i) & 1
-            top_bit = (crc >> 4) & 1
-            crc = ((crc << 1) | bit) & 0x3F
-            if top_bit ^ ((crc >> 5) & 1):
-                crc ^= poly
-            crc &= 0x1F
-            bit_index += 1
-            if bit_index >= bit_length:
-                break
-    return crc & 0x1F
-
-
 def build_read_register_cmd(chip_addr, reg_addr):
     """Build BM1387 read register command."""
     cmd_data = bytes([CMD_READ_REGISTER, chip_addr, reg_addr])
-    crc = crc5_bm1387(cmd_data)
+    crc = crc5_bm13xx_command(cmd_data)
     return bytes([CMD_READ_REGISTER, chip_addr, reg_addr, crc & 0x1F])
 
 
 def parse_read_response(response):
-    """Parse 7-byte response."""
-    if len(response) < READ_RESPONSE_LEN:
+    """Structurally parse a response and preserve unverified raw bytes."""
+    if len(response) != READ_RESPONSE_LEN:
         return None
     reg_addr = response[0]
     value = (response[1] << 24) | (response[2] << 16) | (response[3] << 8) | response[4]
-    resp_crc = response[5] & 0x1F
-    calc_crc = crc5_bm1387(response[:5])
-    crc_ok = (calc_crc == resp_crc)
-    return (reg_addr, value, crc_ok)
+    return (reg_addr, value, "unverified", bytes(response[:READ_RESPONSE_LEN]))
 
 
 # ============================================================================
@@ -123,6 +102,7 @@ class UARTInterface:
         self.timeout = timeout
         self.fd = None
         self.fobj = None
+        self.last_response_observation = None
 
     def open(self):
         self.fd = os.open(self.device, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
@@ -151,6 +131,7 @@ class UARTInterface:
             self.fd = None
 
     def write(self, data):
+        require_captured_bm1387_protocol_profile()
         if self.fobj:
             self.fobj.write(data)
             self.fobj.flush()
@@ -187,7 +168,16 @@ class UARTInterface:
             if len(resp) == READ_RESPONSE_LEN:
                 parsed = parse_read_response(resp)
                 if parsed is not None:
-                    return parsed
+                    self.last_response_observation = {
+                        "requested_register": reg_addr,
+                        "returned_register": parsed[0],
+                        "register_matches": parsed[0] == reg_addr,
+                        "response_integrity": parsed[2],
+                        "raw_response_hex": parsed[3].hex(),
+                        "raw_response_bytes": list(parsed[3]),
+                    }
+                    if parsed[0] == reg_addr:
+                        return parsed
             if attempt < retries:
                 time.sleep(0.02)
         return None
@@ -264,34 +254,34 @@ class MockUART:
             # Encode as value * 256 (8.8 fixed point) in lower 16 bits
             raw_temp = int(temp_c * 256) & 0xFFFF
             value = raw_temp
-            return (reg_addr, value, True)
+            return (reg_addr, value, "simulated", b"")
 
         elif reg_addr == 0x04:
             # Hash rate counter - changes rapidly (NOT temperature)
             value = (self._read_count * 12345 + chip_idx * 67890) & 0xFFFFFFFF
-            return (reg_addr, value, True)
+            return (reg_addr, value, "simulated", b"")
 
         elif reg_addr == 0xA0:
             # Golden nonce - changes rapidly (NOT temperature)
             value = (self._read_count * 54321 + chip_idx * 9876) & 0xFFFFFFFF
-            return (reg_addr, value, True)
+            return (reg_addr, value, "simulated", b"")
 
         elif reg_addr == 0xA4:
             # Return nonce - also changes
             value = (self._read_count * 11111 + chip_idx * 22222) & 0xFFFFFFFF
-            return (reg_addr, value, True)
+            return (reg_addr, value, "simulated", b"")
 
         elif reg_addr == 0x48:
             # Error counter - slowly incrementing
             value = self._read_count // 5
-            return (reg_addr, value, True)
+            return (reg_addr, value, "simulated", b"")
 
         elif static_val is not None:
-            return (reg_addr, static_val, True)
+            return (reg_addr, static_val, "simulated", b"")
 
         else:
             # Unknown register - return 0
-            return (reg_addr, 0x00000000, True)
+            return (reg_addr, 0x00000000, "simulated", b"")
 
     def flush_input(self):
         pass
@@ -313,7 +303,7 @@ def check_temp_plausibility(value):
     Returns list of (encoding_name, decoded_temp) for plausible matches.
     """
     matches = []
-    v16 = value & 0xFFFF  # Lower 16 bits most likely to hold temp
+    v16 = value & 0xFFFF  # Lower 16 bits are one structural decode candidate
 
     # Direct C (unlikely but check)
     if 20 <= v16 <= 120:
@@ -397,7 +387,7 @@ def analyze_register_variance(readings_over_time):
 def classify_varying_register(reg_addr, analysis):
     """
     Classify a varying register as temperature candidate or noise.
-    Returns (is_temp_candidate, confidence, reason).
+    Returns (is_temp_candidate, heuristic_score, reason).
     """
     if not analysis["varies"]:
         return (False, 0.0, "static")
@@ -458,10 +448,10 @@ def classify_varying_register(reg_addr, analysis):
         reasons.append("KNOWN STATIC REG (unlikely temp)")
 
     is_candidate = score >= 0.3
-    confidence = min(score, 1.0)
+    heuristic_score = min(score, 1.0)
     reason = "; ".join(reasons) if reasons else "no strong indicators"
 
-    return (is_candidate, confidence, reason)
+    return (is_candidate, heuristic_score, reason)
 
 
 def scan_for_temperature(uart, chip_addr, num_rounds=5, delay_between=2.0,
@@ -473,6 +463,7 @@ def scan_for_temperature(uart, chip_addr, num_rounds=5, delay_between=2.0,
     """
     # Collect readings over time
     all_readings = collections.defaultdict(list)
+    all_observations = collections.defaultdict(list)
 
     for round_num in range(num_rounds):
         if progress:
@@ -482,13 +473,45 @@ def scan_for_temperature(uart, chip_addr, num_rounds=5, delay_between=2.0,
         for reg in range(reg_start, reg_end + 1, reg_step):
             result = uart.read_register(chip_addr, reg)
             if result is not None:
-                _, value, crc_ok = result
-                if crc_ok:
-                    all_readings[reg].append(value)
-                else:
-                    all_readings[reg].append(None)  # CRC error
+                returned_reg, value, integrity, raw_response = result
+                if returned_reg != reg:
+                    all_readings[reg].append(None)
+                    all_observations[reg].append({
+                        "round": round_num + 1,
+                        "value": None,
+                        "value_hex": None,
+                        "response_integrity": integrity,
+                        "status": "register_mismatch",
+                        "requested_register": reg,
+                        "returned_register": returned_reg,
+                        "raw_response_hex": raw_response.hex(),
+                        "raw_response_bytes": list(raw_response),
+                    })
+                    continue
+                # Structurally valid readings remain useful diagnostics, but
+                # their unverified integrity remains attached to the value.
+                all_readings[reg].append(value)
+                all_observations[reg].append({
+                    "round": round_num + 1,
+                    "value": value,
+                    "value_hex": "0x{:08X}".format(value),
+                    "response_integrity": integrity,
+                    "status": "structural_candidate",
+                    "requested_register": reg,
+                    "returned_register": returned_reg,
+                    "raw_response_hex": raw_response.hex(),
+                    "raw_response_bytes": list(raw_response),
+                })
             else:
                 all_readings[reg].append(None)  # No response
+                all_observations[reg].append({
+                    "round": round_num + 1,
+                    "value": None,
+                    "value_hex": None,
+                    "response_integrity": "unknown",
+                    "raw_response_hex": None,
+                    "raw_response_bytes": None,
+                })
 
         if round_num < num_rounds - 1:
             if progress:
@@ -500,7 +523,26 @@ def scan_for_temperature(uart, chip_addr, num_rounds=5, delay_between=2.0,
     for reg in sorted(all_readings.keys()):
         readings = all_readings[reg]
         analysis = analyze_register_variance(readings)
-        is_candidate, confidence, reason = classify_varying_register(reg, analysis)
+        is_candidate, heuristic_score, reason = classify_varying_register(reg, analysis)
+        observations = all_observations[reg]
+        observed_integrities = {
+            observation["response_integrity"]
+            for observation in observations
+            if observation["value"] is not None
+        }
+        aggregate_integrity = (
+            "unverified" if "unverified" in observed_integrities
+            else "simulated" if observed_integrities == {"simulated"}
+            else "unknown"
+        )
+        has_matched_response = any(
+            observation.get("status") == "structural_candidate"
+            for observation in observations
+        )
+        has_register_mismatch = any(
+            observation.get("status") == "register_mismatch"
+            for observation in observations
+        )
 
         entry = {
             "register": reg,
@@ -516,9 +558,23 @@ def scan_for_temperature(uart, chip_addr, num_rounds=5, delay_between=2.0,
             "average": analysis.get("average"),
             "cv": analysis.get("cv"),
             "is_temp_candidate": is_candidate,
-            "confidence": round(confidence, 2),
+            "heuristic_score": round(heuristic_score, 2),
+            "verified": False,
+            "evidence_status": (
+                "structural_candidate" if has_matched_response
+                else "register_mismatch" if has_register_mismatch
+                else "no_response"
+            ),
             "reason": reason,
             "readings": analysis.get("values", []),
+            "response_integrity": aggregate_integrity,
+            "response_observations": observations,
+            "raw_responses_hex": [
+                observation["raw_response_hex"] for observation in observations
+            ],
+            "raw_responses_bytes": [
+                observation["raw_response_bytes"] for observation in observations
+            ],
         }
 
         # Add temperature decode attempts for candidates
@@ -529,9 +585,9 @@ def scan_for_temperature(uart, chip_addr, num_rounds=5, delay_between=2.0,
 
         if verbose and analysis["varies"]:
             tag = "*** TEMP CANDIDATE ***" if is_candidate else ""
-            sys.stderr.write("  [0x{:02X}] varies: spread={} unique={} confidence={:.2f} {} {}\n".format(
+            sys.stderr.write("  [0x{:02X}] varies: spread={} unique={} heuristic_score={:.2f} {} {}\n".format(
                 reg, analysis.get("spread", 0), analysis.get("unique_values", 0),
-                confidence, reason[:50], tag))
+                heuristic_score, reason[:50], tag))
 
     return results
 
@@ -548,29 +604,84 @@ def cross_chip_comparison(uart, chip_addrs, candidate_regs, num_reads=3,
         chip_values = {}
         for chip_addr in chip_addrs:
             values = []
+            observations = []
             for _ in range(num_reads):
                 result = uart.read_register(chip_addr, reg)
                 if result:
-                    _, value, crc_ok = result
-                    if crc_ok:
-                        values.append(value)
+                    returned_reg, value, integrity, raw_response = result
+                    if returned_reg != reg:
+                        observations.append({
+                            "value": None,
+                            "value_hex": None,
+                            "response_integrity": integrity,
+                            "status": "register_mismatch",
+                            "requested_register": reg,
+                            "returned_register": returned_reg,
+                            "raw_response_hex": raw_response.hex(),
+                            "raw_response_bytes": list(raw_response),
+                        })
+                        time.sleep(0.1)
+                        continue
+                    values.append(value)
+                    observations.append({
+                        "value": value,
+                        "value_hex": "0x{:08X}".format(value),
+                        "response_integrity": integrity,
+                        "status": "structural_candidate",
+                        "requested_register": reg,
+                        "returned_register": returned_reg,
+                        "raw_response_hex": raw_response.hex(),
+                        "raw_response_bytes": list(raw_response),
+                    })
                 time.sleep(0.1)
-            if values:
-                avg = sum(values) / len(values)
-                chip_values[chip_addr] = {
-                    "values": values,
-                    "average": avg,
-                }
+            observed_integrities = {
+                observation["response_integrity"] for observation in observations
+            }
+            aggregate_integrity = (
+                "unverified" if "unverified" in observed_integrities
+                else "simulated" if observed_integrities == {"simulated"}
+                else "unknown"
+            )
+            chip_values[chip_addr] = {
+                "values": values,
+                "average": sum(values) / len(values) if values else None,
+                "response_integrity": aggregate_integrity,
+                "evidence_status": (
+                    "structural_candidate" if values
+                    else "register_mismatch" if any(
+                        observation.get("status") == "register_mismatch"
+                        for observation in observations
+                    )
+                    else "no_response"
+                ),
+                "response_observations": observations,
+                "raw_responses_hex": [
+                    observation["raw_response_hex"] for observation in observations
+                ],
+                "raw_responses_bytes": [
+                    observation["raw_response_bytes"] for observation in observations
+                ],
+            }
 
-        if len(chip_values) >= 2:
-            averages = [cv["average"] for cv in chip_values.values()]
-            spread = max(averages) - min(averages)
-            overall_avg = sum(averages) / len(averages)
+        valid_chip_values = {
+            chip_addr: value for chip_addr, value in chip_values.items()
+            if value["average"] is not None
+        }
+        if chip_values:
+            averages = [cv["average"] for cv in valid_chip_values.values()]
+            has_cross_chip_data = len(averages) >= 2
+            spread = max(averages) - min(averages) if has_cross_chip_data else None
+            overall_avg = (
+                sum(averages) / len(averages) if has_cross_chip_data else None
+            )
 
             # Temperature pattern: values are similar but not identical
             # Typically within 10-20C of each other
-            similar = spread < overall_avg * 0.3 if overall_avg > 0 else False
-            not_identical = spread > 0
+            similar = (
+                spread < overall_avg * 0.3
+                if has_cross_chip_data and overall_avg > 0 else False
+            )
+            not_identical = spread > 0 if spread is not None else False
 
             entry = {
                 "register": reg,
@@ -580,21 +691,47 @@ def cross_chip_comparison(uart, chip_addrs, candidate_regs, num_reads=3,
                 "cross_chip_avg": overall_avg,
                 "similar_not_identical": similar and not_identical,
                 "temp_pattern": similar and not_identical,
+                "response_integrity": (
+                    "unverified"
+                    if any(
+                        value["response_integrity"] == "unverified"
+                        for value in chip_values.values()
+                    )
+                    else "simulated"
+                    if all(
+                        value["response_integrity"] == "simulated"
+                        for value in chip_values.values()
+                    )
+                    else "unknown"
+                ),
+                "verified": False,
+                "evidence_status": (
+                    "structural_candidate" if valid_chip_values
+                    else "register_mismatch" if any(
+                        value["evidence_status"] == "register_mismatch"
+                        for value in chip_values.values()
+                    )
+                    else "no_response"
+                ),
             }
 
             for chip_addr, cv in chip_values.items():
                 entry["chips"]["0x{:02X}".format(chip_addr)] = cv
 
                 # Add temp decodings
-                temp_matches = check_temp_plausibility(int(cv["average"]))
+                temp_matches = (
+                    check_temp_plausibility(int(cv["average"]))
+                    if cv["average"] is not None else []
+                )
                 if temp_matches:
                     entry["chips"]["0x{:02X}".format(chip_addr)]["temp_decodings"] = temp_matches
 
             results.append(entry)
 
             if verbose:
-                sys.stderr.write("  [0x{:02X}] cross-chip: spread={:.0f} similar={} pattern={}\n".format(
-                    reg, spread, similar, similar and not_identical))
+                sys.stderr.write("  [0x{:02X}] cross-chip: spread={} similar={} pattern={}\n".format(
+                    reg, "{:.0f}".format(spread) if spread is not None else "?",
+                    similar, similar and not_identical))
 
     return results
 
@@ -614,19 +751,27 @@ def format_temp_report(scan_results, cross_results=None):
     lines.append("Static registers: {}".format(len(static)))
     lines.append("Varying registers: {}".format(len(varying)))
     lines.append("Temperature candidates: {}".format(len(candidates)))
+    reported_integrities = sorted({
+        result.get("response_integrity", "unknown") for result in scan_results
+    })
+    lines.append(
+        "Response integrity: {} (values are observational)".format(
+            ", ".join(reported_integrities) if reported_integrities else "unknown"
+        )
+    )
     lines.append("")
 
     if candidates:
-        lines.append("--- Temperature Candidates (ranked by confidence) ---")
+        lines.append("--- Structural Temperature Candidates (ranked by heuristic score) ---")
         lines.append("{:<8} {:<10} {:<12} {:<12} {:<8} {}".format(
             "REG", "CONF", "AVG", "SPREAD", "UNIQUE", "REASON"))
         lines.append("-" * 65)
 
-        sorted_candidates = sorted(candidates, key=lambda x: -x["confidence"])
+        sorted_candidates = sorted(candidates, key=lambda x: -x["heuristic_score"])
         for c in sorted_candidates:
             lines.append("{:<8} {:<10.2f} {:<12} {:<12} {:<8} {}".format(
                 c["register_hex"],
-                c["confidence"],
+                c["heuristic_score"],
                 "0x{:08X}".format(int(c["average"])) if c["average"] else "?",
                 c.get("spread", 0),
                 c.get("unique_values", 0),
@@ -657,24 +802,30 @@ def format_temp_report(scan_results, cross_results=None):
         lines.append("--- Cross-Chip Comparison ---")
         for cr in cross_results:
             pattern = "TEMP PATTERN" if cr["temp_pattern"] else "not temp"
-            lines.append("  [{}] cross-chip spread={:.0f} avg={:.0f} -> {}".format(
-                cr["register_hex"], cr["cross_chip_spread"],
-                cr["cross_chip_avg"], pattern))
+            spread = cr["cross_chip_spread"]
+            average = cr["cross_chip_avg"]
+            lines.append("  [{}] cross-chip spread={} avg={} integrity={} -> {}".format(
+                cr["register_hex"],
+                "{:.0f}".format(spread) if spread is not None else "?",
+                "{:.0f}".format(average) if average is not None else "?",
+                cr.get("response_integrity", "unknown"), pattern))
             for chip_key, cv in cr.get("chips", {}).items():
                 temp_str = ""
                 if "temp_decodings" in cv:
                     temp_str = " -> " + ", ".join(
                         "{}: {:.1f}C".format(e, t) for e, t in cv["temp_decodings"][:2])
-                lines.append("    chip {}: avg={:.0f}{}".format(
-                    chip_key, cv["average"], temp_str))
+                lines.append("    chip {}: avg={} integrity={}{}".format(
+                    chip_key,
+                    "{:.0f}".format(cv["average"]) if cv["average"] is not None else "?",
+                    cv.get("response_integrity", "unknown"), temp_str))
         lines.append("")
 
     # Final recommendation
     lines.append("--- Recommendation ---")
     if candidates:
-        best = max(candidates, key=lambda x: x["confidence"])
-        lines.append("Most likely temperature register: {} (confidence {:.0f}%)".format(
-            best["register_hex"], best["confidence"] * 100))
+        best = max(candidates, key=lambda x: x["heuristic_score"])
+        lines.append("Top structural candidate: {} (heuristic score {:.0f}%)".format(
+            best["register_hex"], best["heuristic_score"] * 100))
         if "temp_decodings" in best and best["temp_decodings"]:
             enc, temp = best["temp_decodings"][0]
             lines.append("Likely encoding: {} (current reading: {:.1f} C)".format(enc, temp))
@@ -707,9 +858,9 @@ def run_self_tests():
         tests.append({"name": name, "status": status, "detail": detail})
 
     # --- Test 1: CRC5 basic ---
-    crc = crc5_bm1387(bytes([0x54, 0x00, 0x44]))
-    test("CRC5: valid range",
-         0 <= crc <= 0x1F,
+    crc = crc5_bm13xx_command(bytes([0x52, 0x05, 0x00, 0x00]))
+    test("CRC5: captured get-address vector",
+         crc == 0x0A,
          "crc=0x{:02X}".format(crc))
 
     # --- Test 2: Build read command ---
@@ -720,11 +871,11 @@ def run_self_tests():
     # --- Test 3: Parse response ---
     val = 0x00002D00  # ~45C in div256 encoding
     resp = bytes([0x44, 0x00, 0x00, 0x2D, 0x00])
-    crc_r = crc5_bm1387(resp)
-    full = resp + bytes([crc_r, 0x00])
+    full = resp + bytes([0xA5, 0x5A])
     parsed = parse_read_response(full)
-    test("Parse response: correct value",
-         parsed is not None and parsed[1] == 0x00002D00,
+    test("Parse response: value and unverified raw bytes preserved",
+         parsed is not None and parsed[1] == 0x00002D00
+         and parsed[2] == "unverified" and parsed[3] == full,
          "parsed={}".format(parsed))
 
     # --- Test 4: Temp plausibility - div256 (45C) ---
@@ -742,9 +893,11 @@ def run_self_tests():
          "matches={}".format(matches2))
 
     # --- Test 6: Temp plausibility - out of range ---
-    matches3 = check_temp_plausibility(0xDEADBEEF)
-    test("Temp plausibility: rejects 0xDEADBEEF",
-         len(matches3) == 0 or all(m[1] < 20 or m[1] > 120 for m in matches3),
+    # Use a value too small for every supported encoding. Masked low bits of
+    # arbitrary sentinels such as 0xDEADBEEF can accidentally look plausible.
+    matches3 = check_temp_plausibility(0x00000001)
+    test("Temp plausibility: rejects very small value",
+         len(matches3) == 0,
          "matches={}".format(matches3))
 
     # --- Test 7: Variance analysis - static ---
@@ -769,7 +922,7 @@ def run_self_tests():
     is_cand, conf, reason = classify_varying_register(0xA0, analysis_counter)
     test("Classify: counter rejected",
          not is_cand,
-         "confidence={:.2f} reason={}".format(conf, reason))
+         "heuristic_score={:.2f} reason={}".format(conf, reason))
 
     # --- Test 11: Classify - temperature candidate ---
     # Values around 11520 (45C in div256) with small drift
@@ -778,7 +931,7 @@ def run_self_tests():
     is_cand2, conf2, reason2 = classify_varying_register(0x44, analysis_temp)
     test("Classify: temp candidate at 0x44",
          is_cand2 and conf2 > 0.3,
-         "confidence={:.2f} reason={}".format(conf2, reason2))
+         "heuristic_score={:.2f} reason={}".format(conf2, reason2))
 
     # --- Test 12: Classify - static register ---
     analysis_s = analyze_register_variance([0x13871387] * 5)
@@ -917,7 +1070,7 @@ Strategy:
 
 Known temperature register candidates for BM1387:
   0x40 - Temperature sensor control
-  0x44 - Temperature sensor data (most likely)
+  0x44 - Temperature sensor data (structural candidate)
   0x48 - May be error/temp related
 
 Examples:

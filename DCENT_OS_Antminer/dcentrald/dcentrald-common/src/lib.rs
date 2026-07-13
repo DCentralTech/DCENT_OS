@@ -19,14 +19,55 @@
 //!   loop's gated, default-OFF quiet-window 0x3A read publishes a fresh measured
 //!   rail here; the API per-chain telemetry projection reads it back so a
 //!   plausible reading is tagged `measured`. Read-only/measure-only.
+//! - [`atomic_file`] — bounded same-filesystem state replacement and durable
+//!   deletion with directory fsync plus explicit publication/failure evidence.
 
+pub mod am2_topology;
 pub mod at3_rail;
+pub mod atomic_file;
+/// Declarative control-board composition identity (ADR-0011). Scaffold registry.
+pub mod board_desc;
 pub mod chain_voltage;
 pub mod dspic_decode;
 pub mod dspic_heartbeat;
+/// Install/packaging matrix from BoardDesc (toolbox/CI/docs generators).
+pub mod install_matrix;
+/// PowerCut + FanCommand policy (cut-hash-before-noise; home PWM cap).
+pub mod safety_command;
+/// Pure serial work-engine bookkeeping (history ring, dedup, job-id cursor).
+pub mod serial_work_engine;
+/// Shared serial work-history / job-id / dedup policy (mining strangler).
+pub mod serial_work_policy;
 pub mod time;
 pub mod units;
+/// VoltageRail facet trait + errors (ADR-0010). Adapters live in asic/hal.
+pub mod voltage_rail;
 pub mod wallet_mask;
+
+pub use board_desc::{
+    BoardDesc, BoardFamily, ChainTransportKind, SlotPolicy, VoltageControllerClass, WorkEngineKind,
+};
+pub use install_matrix::{
+    ab_sysupgrade_board_targets, install_matrix, install_matrix_tsv, public_beta_board_targets,
+    InstallMatrixRow,
+};
+pub use safety_command::{
+    power_precedes_fan_raise, violates_home_fan_cap, FanCommand, PowerCut, PowerCutReason,
+    SafetyAction, SafetyStep, FAN_PWM_ABSOLUTE_MAX, HOME_FAN_PWM_SAFETY_MAX,
+};
+pub use serial_work_engine::{
+    AsicJobIdCursor, SeenShareSet, SerialWorkBookkeeping, WorkHistoryEntry, WorkHistoryRing,
+};
+pub use serial_work_policy::{
+    next_asic_job_id, serial_share_dedup_key, should_clear_seen_shares,
+    work_history_depth_for_chip_id, AM3_BB_WORK_HISTORY_PER_ID, BM1362_SERIAL_NONCE_LEN,
+    BM1398_WORK_HISTORY_PER_ID, DEFAULT_SEEN_SHARES_CAP, DEFAULT_SERIAL_JOB_ID_STEP,
+    DEFAULT_WORK_HISTORY_PER_ID,
+};
+pub use voltage_rail::{
+    is_hard_refuse, refuse_degraded_firmware, refuse_wrong_mode, unsupported_voltage_path,
+    VoltageRail, VoltageRailError, VoltageRefuseReason,
+};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

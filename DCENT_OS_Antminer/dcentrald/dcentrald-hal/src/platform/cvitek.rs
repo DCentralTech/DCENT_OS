@@ -962,11 +962,11 @@ mod tests {
     // ─── Voltage controller routing ───
 
     #[test]
-    fn cv1835_voltage_controller_default_is_pic1704() {
+    fn control_board_type_alone_never_selects_pic1704() {
         // BoardType static default for diagnostic / preflight code.
         assert_eq!(
             BoardType::CVitek.voltage_controller_default(),
-            VoltageControllerKind::Pic1704
+            VoltageControllerKind::NoPic
         );
     }
 

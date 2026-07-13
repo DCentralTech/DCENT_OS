@@ -160,7 +160,17 @@ fn build_router() -> (axum::Router, Arc<AppState>) {
 fn grant_beta_identity(state: &Arc<AppState>) {
     let mut hw = state.hardware_info.lock().expect("hardware_info lock");
     hw.chip_type = "BM1387".to_string();
-    hw.identification.confidence = "exact".to_string();
+    hw.identification = dcentrald_api::HardwareIdentification::from_evidence(
+        vec![
+            dcentrald_api::HardwareIdentityEvidence::declared_asic_board_target("am1-s9", "BM1387"),
+            dcentrald_api::HardwareIdentityEvidence::measured_asic_enumeration(
+                0x1387,
+                "BM1387",
+                dcentrald_api::HardwareCompositionToken::new(1, "test:am1-s9"),
+            ),
+        ],
+        Some("test S9 enumeration evidence".to_string()),
+    );
 }
 
 async fn body_to_value(resp: axum::response::Response) -> (StatusCode, Value) {
@@ -645,7 +655,9 @@ async fn test_delete_unknown_identity_returns_409() {
         .oneshot(
             Request::builder()
                 .method(Method::DELETE)
-                .uri("/api/profiles/silicon/antminer_s9__BHB-S9-generic__bm1387__operator_confirmed")
+                .uri(
+                    "/api/profiles/silicon/antminer_s9__BHB-S9-generic__bm1387__operator_confirmed",
+                )
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -710,7 +722,11 @@ async fn test_import_home_mode_returns_403_no_write() {
         .await
         .unwrap();
     let (status, _body) = body_to_value(resp).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "Home mode must refuse import");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "Home mode must refuse import"
+    );
     assert_eq!(
         operator_json_count(&root),
         0,

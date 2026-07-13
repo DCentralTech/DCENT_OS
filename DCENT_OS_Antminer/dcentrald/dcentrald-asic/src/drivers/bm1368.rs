@@ -966,22 +966,15 @@ impl ChipDriver for Bm1368Driver {
     }
 
     fn set_voltage(&self, _pic: &mut PicController, _voltage_mv: u16) -> Result<()> {
-        // S21 does NOT use PIC for voltage control.
-        // Voltage is controlled via TAS5782M I2C DAC on the hash board.
-        // The DAC communicates over I2C to set the LDO/OpAmp voltage reference.
-        //
-        // For S9 control board with S21 hash boards (Universal Hash Board mode),
-        // voltage is controlled by the S9's PIC as usual. The S21 hash board
-        // power delivery is entirely different — no PIC, no DC-DC PICs.
-        //
-        // This method is a no-op for native S21 hardware.
-        // When running on S9 control board, the caller should use the S9's
-        // PicController directly (which is chip-agnostic).
+        // S21 does NOT use PIC for voltage control (TAS5782M / NoPic path).
+        // ADR-0010: refuse silent Ok(()) — callers must use the real voltage rail.
         tracing::warn!(
             "BM1368: set_voltage() called — S21 uses TAS5782M DAC, not PIC. \
              On S9 control board, use PicController directly.",
         );
-        Ok(())
+        Err(crate::AsicError::InvalidParameter(
+            "BM1368/S21 voltage is TAS5782M/NoPic (not PicController ChipDriver path)".into(),
+        ))
     }
 
     fn send_work(&self, chain: &mut FpgaChain, work: &MiningWork) -> Result<u16> {

@@ -29,16 +29,17 @@
 //!   /api/diagnostics/*   - Diagnostic test management
 
 use std::collections::VecDeque;
-use std::io::{self, Read, Seek, SeekFrom};
+#[cfg(test)]
+use std::io;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::atomic_io::{atomic_write, storage_write_failure_kind, StorageWriteFailureKind};
+use crate::atomic_io::atomic_write;
 use crate::{solar_provider_support, solar_transport as shared_solar_transport};
-use axum::body::{to_bytes, Body};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Json, Multipart, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
@@ -83,221 +84,28 @@ use uuid::Uuid;
 
 use crate::AppState;
 
+#[cfg(test)]
+use axum::body::to_bytes;
+
+mod diagnostic_store;
+mod error_response;
+mod network_diagnostic;
+
+use diagnostic_store::{
+    list_snapshot_reports, load_snapshot_artifact, load_snapshot_artifact_with_html_status,
+    load_snapshot_html, persist_snapshot_artifact, snapshot_html_available,
+};
+#[cfg(test)]
+use error_response::ERROR_ENVELOPE_BODY_LIMIT;
+use error_response::{
+    api_error, normalize_api_error_response, pool_validation_error, ConfigPersistenceError,
+};
+use network_diagnostic::{
+    run_network_diagnostic, NetworkProbeError, NetworkProbeInput, ProbeStatus,
+};
+
 const MCP_HTTP_PATH: &str = "/mcp";
 const MCP_TRANSPORT: &str = "streamable-http";
-const ERROR_ENVELOPE_BODY_LIMIT: usize = 64 * 1024;
-
-fn api_error(
-    status: StatusCode,
-    code: impl Into<String>,
-    error: impl Into<String>,
-    suggestion: Option<&str>,
-) -> Response {
-    let mut body = dcentrald_api_types::ApiErrorBody::new(error).with_code(code);
-    if let Some(suggestion) = suggestion {
-        body = body.with_suggestion(suggestion);
-    }
-    (status, Json(body)).into_response()
-}
-
-fn pool_validation_error(message: impl Into<String>) -> Response {
-    api_error(
-        StatusCode::BAD_REQUEST,
-        dcentrald_api_types::api_error_codes::POOL_VALIDATION,
-        message,
-        Some("Check the pool URL format, worker name, and failover split settings."),
-    )
-}
-
-#[derive(Debug)]
-enum ConfigPersistenceError {
-    BadRequest(String),
-    Storage {
-        kind: StorageWriteFailureKind,
-        detail: String,
-    },
-}
-
-impl ConfigPersistenceError {
-    fn bad_request(message: impl Into<String>) -> Self {
-        Self::BadRequest(message.into())
-    }
-
-    fn from_io(action: &'static str, error: io::Error) -> Self {
-        if let Some(kind) = storage_write_failure_kind(&error) {
-            return Self::Storage {
-                kind,
-                detail: format!("{action}: {error}"),
-            };
-        }
-        Self::BadRequest(format!("{action}: {error}"))
-    }
-
-    fn into_response(self) -> Response {
-        match self {
-            Self::BadRequest(message) => (
-                StatusCode::BAD_REQUEST,
-                Json(
-                    dcentrald_api_types::ApiErrorBody::new(message)
-                        .with_code(dcentrald_api_types::api_error_codes::CONFIG_VALIDATION)
-                        .with_suggestion(
-                            "Check the submitted config fields and retry with supported values.",
-                        ),
-                ),
-            )
-                .into_response(),
-            Self::Storage { kind, detail } => {
-                let (message, suggestion) = match kind {
-                    StorageWriteFailureKind::StorageFull => (
-                        "Persistent storage is full; configuration was not saved.",
-                        "Free space under /data, rotate logs, or move snapshots off-device, then retry.",
-                    ),
-                    StorageWriteFailureKind::ReadOnly => (
-                        "Persistent storage is read-only; configuration was not saved.",
-                        "Check the /data mount state and filesystem health, then retry after it is writable.",
-                    ),
-                };
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(
-                        dcentrald_api_types::ApiErrorBody::new(message)
-                            .with_code(kind.code())
-                            .with_detail(detail)
-                            .with_suggestion(suggestion),
-                    ),
-                )
-                    .into_response()
-            }
-        }
-    }
-}
-
-fn is_json_content_type(content_type: &str) -> bool {
-    let media_type = content_type
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    media_type == "application/json" || media_type.ends_with("+json")
-}
-
-fn is_text_content_type(content_type: &str) -> bool {
-    content_type
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .eq_ignore_ascii_case("text/plain")
-}
-
-fn error_body_bytes(body: dcentrald_api_types::ApiErrorBody) -> Vec<u8> {
-    serde_json::to_vec(&body).unwrap_or_else(|_| br#"{"error":"Request failed"}"#.to_vec())
-}
-
-fn envelope_bytes(message: String) -> Vec<u8> {
-    error_body_bytes(
-        dcentrald_api_types::ApiErrorBody::new(message)
-            .with_code(dcentrald_api_types::api_error_codes::UNCLASSIFIED_ERROR),
-    )
-}
-
-fn legacy_error_body_from_json(
-    value: &serde_json::Value,
-) -> Option<dcentrald_api_types::ApiErrorBody> {
-    let object = value.as_object()?;
-    let status = object.get("status")?.as_str()?;
-    if !status.eq_ignore_ascii_case("error") {
-        return None;
-    }
-    let message = object.get("message")?.as_str()?.trim();
-    if message.is_empty() {
-        return None;
-    }
-
-    let mut body = dcentrald_api_types::ApiErrorBody::new(message.to_string())
-        .with_code(dcentrald_api_types::api_error_codes::LEGACY_ERROR);
-    if let Some(detail) = object
-        .get("detail")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        body = body.with_detail(detail.to_string());
-    }
-    if let Some(code) = object
-        .get("code")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        body = body.with_code(code.to_string());
-    }
-    if let Some(suggestion) = object
-        .get("suggestion")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        body = body.with_suggestion(suggestion.to_string());
-    }
-    Some(body)
-}
-
-fn legacy_error_envelope_bytes(value: &serde_json::Value) -> Option<Vec<u8>> {
-    legacy_error_body_from_json(value).map(error_body_bytes)
-}
-
-async fn normalize_api_error_response(response: Response) -> Response {
-    if response.status().is_success() {
-        return response;
-    }
-
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let is_text = is_text_content_type(&content_type);
-    let is_json = is_json_content_type(&content_type);
-    if !is_text && !is_json {
-        return response;
-    }
-
-    let (mut parts, body) = response.into_parts();
-    let Ok(bytes) = to_bytes(body, ERROR_ENVELOPE_BODY_LIMIT).await else {
-        return api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            dcentrald_api_types::api_error_codes::ERROR_BODY_UNAVAILABLE,
-            "The daemon could not normalize the error response body.",
-            None,
-        );
-    };
-
-    let envelope = if is_text {
-        let text = String::from_utf8_lossy(&bytes).trim().to_string();
-        (!text.is_empty()).then(|| envelope_bytes(text))
-    } else {
-        match serde_json::from_slice::<serde_json::Value>(&bytes) {
-            Ok(serde_json::Value::String(message)) if !message.trim().is_empty() => {
-                Some(envelope_bytes(message.trim().to_string()))
-            }
-            Ok(value) => legacy_error_envelope_bytes(&value),
-            _ => None,
-        }
-    };
-
-    if let Some(envelope) = envelope {
-        parts.headers.insert(
-            header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/json"),
-        );
-        return Response::from_parts(parts, Body::from(envelope));
-    }
-
-    Response::from_parts(parts, Body::from(bytes))
-}
 
 // Pool-state predicates for API/UI/metrics surfaces. Keep these evidence levels
 // separate: connecting is not connected, and connected is not necessarily mining.
@@ -856,29 +664,18 @@ fn push_runtime_cap(caps: &mut Vec<RuntimeCapability>, cap: RuntimeCapability) {
     }
 }
 
-fn source_contains_any(sources: &[String], needles: &[&str]) -> bool {
-    sources.iter().any(|source| {
-        let source = source.to_ascii_lowercase();
-        needles.iter().any(|needle| source.contains(needle))
-    })
-}
-
 fn capability_identity_confidence(
     hw: &crate::HardwareInfo,
     profile: Option<&MinerProfile>,
 ) -> IdentityConfidence {
-    match hw
-        .identification
-        .confidence
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "exact" => IdentityConfidence::Exact,
-        "high" => IdentityConfidence::High,
-        "medium" | "low" => IdentityConfidence::Low,
-        _ if profile.is_some() && !hw.chip_type.trim().is_empty() => IdentityConfidence::Low,
-        _ => IdentityConfidence::Unknown,
+    match hw.identification.strongest_asic_evidence_level() {
+        Some(crate::HardwareIdentityEvidenceLevel::Measured) => IdentityConfidence::High,
+        Some(
+            crate::HardwareIdentityEvidenceLevel::Observed
+            | crate::HardwareIdentityEvidenceLevel::Declared,
+        ) => IdentityConfidence::Low,
+        None if profile.is_some() && !hw.chip_type.trim().is_empty() => IdentityConfidence::Low,
+        None => IdentityConfidence::Unknown,
     }
 }
 
@@ -919,14 +716,27 @@ fn capability_identity_note(
     hw.identification.note.clone()
 }
 
-fn antminer_beta_anchor(chip_id: Option<u16>, sources: &[String]) -> bool {
+fn has_declared_asic_target(hw: &crate::HardwareInfo, exact_target: &str, chip: &str) -> bool {
+    hw.identification.evidence.iter().any(|evidence| {
+        evidence.claim == crate::HardwareIdentityClaim::AsicFamily
+            && evidence.source
+                == crate::HardwareIdentityEvidenceSource::Declared(
+                    crate::DeclaredIdentitySource::BoardTarget,
+                )
+            && evidence.source_value == exact_target
+            && evidence.resolved_value == chip
+    })
+}
+
+fn antminer_beta_anchor(chip_id: Option<u16>, hw: &crate::HardwareInfo) -> bool {
     match chip_id {
-        // BM1387 is the S9 beta anchor in the current public support matrix.
-        Some(0x1387) => true,
+        // BM1387 also appears outside S9. The exact typed board-target
+        // declaration is composition evidence for support-tier selection; it
+        // still cannot authorize mutations without measured ASIC evidence.
+        Some(0x1387) => has_declared_asic_target(hw, "am1-s9", "BM1387"),
         // BM1362 is not enough by itself: plain S19j/S19j Pro routes and
-        // non-Zynq control boards exist. Require the exact AM2 S19j Pro
-        // evidence tags emitted by the daemon identity resolver.
-        Some(0x1362) => source_contains_any(sources, &["am2-s19jpro-zynq", "s19jproam2"]),
+        // non-Zynq control boards exist. Require the exact shipped AM2 target.
+        Some(0x1362) => has_declared_asic_target(hw, "am2-s19j", "BM1362"),
         _ => false,
     }
 }
@@ -934,9 +744,9 @@ fn antminer_beta_anchor(chip_id: Option<u16>, sources: &[String]) -> bool {
 fn antminer_support_tier(
     chip_id: Option<u16>,
     profile: Option<&MinerProfile>,
-    sources: &[String],
+    hw: &crate::HardwareInfo,
 ) -> CapabilitySupportTier {
-    if antminer_beta_anchor(chip_id, sources) {
+    if antminer_beta_anchor(chip_id, hw) {
         return CapabilitySupportTier::Beta;
     }
 
@@ -1237,7 +1047,7 @@ fn build_antminer_capability_descriptor(
     let board_version = antminer_board_version(hw);
     let sources = capability_identity_sources(hw);
     let confidence = capability_identity_confidence(hw, profile);
-    let support = antminer_support_tier(chip_id, profile, &sources);
+    let support = antminer_support_tier(chip_id, profile, hw);
     let grants_mutations = antminer_grants_mutating_capabilities(support, confidence);
     let mut runtime_caps = antminer_runtime_caps(grants_mutations, &board_target);
     let power_writes_enabled = grants_mutations
@@ -1987,47 +1797,7 @@ fn report_storage_error_response(error: &impl std::fmt::Display) -> axum::respon
         .into_response()
 }
 
-fn persist_snapshot_artifact(
-    test_id: Uuid,
-    artifact: &impl Serialize,
-    html: Option<&str>,
-) -> Result<serde_json::Value, axum::response::Response> {
-    let json_value = serde_json::to_value(artifact).map_err(|error| {
-        report_storage_error_response(&format!("failed to serialize diagnostic artifact: {error}"))
-    })?;
-    ReportGenerator::new()
-        .save_report(&test_id, html, &json_value)
-        .map(|_| json_value)
-        .map_err(|error| report_storage_error_response(&error))
-}
-
-fn load_snapshot_artifact(test_id: &Uuid) -> Result<serde_json::Value, axum::response::Response> {
-    ReportGenerator::new()
-        .load_report_json(test_id)
-        .map_err(|error| match error {
-            dcentrald_diagnostics::DiagnosticError::Io(io)
-                if io.kind() == std::io::ErrorKind::NotFound =>
-            {
-                report_not_found_response(&test_id.to_string())
-            }
-            _ => report_storage_error_response(&error),
-        })
-}
-
-fn load_snapshot_html(test_id: &Uuid) -> Result<String, axum::response::Response> {
-    ReportGenerator::new()
-        .load_report_html(test_id)
-        .map_err(|error| match error {
-            dcentrald_diagnostics::DiagnosticError::Io(io)
-                if io.kind() == std::io::ErrorKind::NotFound =>
-            {
-                report_not_found_response(&test_id.to_string())
-            }
-            _ => report_storage_error_response(&error),
-        })
-}
-
-fn build_timed_hashreport_result(
+async fn build_timed_hashreport_result(
     state: &Arc<AppState>,
     test_id: Uuid,
     chain: Option<u8>,
@@ -2056,17 +1826,11 @@ fn build_timed_hashreport_result(
     report.warnings.sort();
     report.warnings.dedup();
 
-    let html = ReportGenerator::new()
-        .render_hashreport(&report)
-        .map_err(|error| {
-            dcentrald_diagnostics::DiagnosticError::ReportGeneration(error.to_string())
-        })?;
-    persist_snapshot_artifact(test_id, &report, Some(&html))
-        .map_err(response_to_diagnostic_error)?;
-
-    let data = serde_json::to_value(&report).map_err(|error| {
-        dcentrald_diagnostics::DiagnosticError::ReportGeneration(error.to_string())
-    })?;
+    let (report, data) = persist_snapshot_artifact(test_id, report, |generator, report| {
+        generator.render_hashreport(report).map(Some)
+    })
+    .await
+    .map_err(response_to_diagnostic_error)?;
     Ok(TestResult {
         test_id,
         test_type: TestType::HashReport,
@@ -3274,8 +3038,8 @@ pub(crate) fn apply_home_night_mode_to_table(
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
         if let toml::Value::Table(ref mut home_table) = home {
             let nm = home_table
-            .entry("night_mode".to_string())
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                .entry("night_mode".to_string())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
             if let toml::Value::Table(ref mut nm_table) = nm {
                 nm_table.insert("enabled".into(), toml::Value::Boolean(enabled));
                 nm_table.insert("start_hour".into(), toml::Value::Integer(start_hour as i64));
@@ -6411,74 +6175,6 @@ fn secs_since(epoch_secs: u64) -> u64 {
     now.saturating_sub(epoch_secs)
 }
 
-fn psu_diag_gpio_payload(hw: &crate::HardwareInfo) -> serde_json::Value {
-    let output_enabled = dcentrald_hal::platform::amlogic::is_psu_enabled();
-
-    serde_json::json!({
-        "detected": true,
-        "model": hw.psu_model,
-        "fw_version": hw.psu_fw_version,
-        "transport": "gpio",
-        "control_mode": "gpio_enable",
-        "output_enabled": output_enabled,
-        "voltage_range": hw.psu_voltage_range,
-        "voltage_in": null,
-        "voltage_out": null,
-        "current_a": null,
-        "power_w": null,
-        "temp_c": null,
-        "supports_output_gate": true,
-        "supports_voltage_set": false,
-        "supports_watchdog": false,
-        "message": "GPIO PSU control is available on this Amlogic platform. Live PSU voltage/current/power telemetry is not exposed here, and APW voltage programming is not wired for the GPIO-only path.",
-    })
-}
-
-fn psu_diag_kernel_payload(
-    hw: &crate::HardwareInfo,
-    psu: &mut dcentrald_hal::psu::PsuController,
-) -> serde_json::Value {
-    let fw_version = psu.get_version().ok();
-    let model = fw_version
-        .as_deref()
-        .map(dcentrald_hal::psu::PsuController::model_name_from_version);
-    let voltage_range = fw_version
-        .as_deref()
-        .and_then(dcentrald_hal::psu::PsuController::format_voltage_range);
-    let output_enabled = psu.read_state().ok();
-    let voltage_out = psu.measure_voltage().ok();
-    let supports_output_gate = hw.control_board.starts_with("Zynq am2-s17");
-    let output_gate_enabled = if supports_output_gate {
-        Some(dcentrald_hal::platform::zynq::is_psu_output_enabled())
-    } else {
-        None
-    };
-
-    serde_json::json!({
-        "detected": true,
-        "model": model,
-        "fw_version": fw_version,
-        "transport": psu.transport_name(),
-        "control_mode": "bitmain_apw_i2c",
-        "output_enabled": output_enabled,
-        "output_gate_enabled": output_gate_enabled,
-        "voltage_range": voltage_range,
-        "voltage_in": null,
-        "voltage_out": voltage_out,
-        "current_a": null,
-        "power_w": null,
-        "temp_c": null,
-        "supports_output_gate": supports_output_gate,
-        "supports_voltage_set": true,
-        "supports_watchdog": true,
-        "message": if supports_output_gate {
-            "Smart APW runtime control is available on the Bitmain I2C path, and this Zynq board also exposes a GPIO PSU output gate. Current, power, and temperature telemetry are not yet exposed."
-        } else {
-            "Smart APW runtime control is available on the Bitmain I2C path. This implementation currently reads firmware, output state, and output voltage only; current, power, and temperature telemetry are not exposed."
-        },
-    })
-}
-
 /// Mode middleware is applied to gate debug endpoints.
 ///
 /// NOTE: Does NOT call `.with_state()` — the caller must apply state
@@ -7514,11 +7210,12 @@ fn validate_pool_url_support(url: &str) -> std::result::Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-fn diagnostic_pool_dns_host(pool_url: &str) -> String {
+fn diagnostic_pool_dns_host(pool_url: &str) -> Option<String> {
     let sanitized = dcentrald_stratum::pool_api::sanitize_pool_url(pool_url);
     parse_pool_host_port(&sanitized)
         .map(|(host, _port)| host)
-        .unwrap_or_else(|_| "public-pool.io".to_string())
+        .ok()
+        .filter(|host| !host.trim().is_empty())
 }
 
 struct NormalizedHashrateSplit {
@@ -8543,10 +8240,22 @@ fn thermal_supervisor_snapshot_response_value(
     let mut value = serde_json::to_value(snap).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(obj) = value.as_object_mut() {
         obj.extend([
-            ("configured_enabled".into(), serde_json::json!(status.configured_enabled)),
-            ("runtime_present".into(), serde_json::json!(status.runtime_present)),
-            ("snapshot_available".into(), serde_json::json!(status.snapshot_available)),
-            ("commissioning_state".into(), serde_json::json!(status.commissioning_state)),
+            (
+                "configured_enabled".into(),
+                serde_json::json!(status.configured_enabled),
+            ),
+            (
+                "runtime_present".into(),
+                serde_json::json!(status.runtime_present),
+            ),
+            (
+                "snapshot_available".into(),
+                serde_json::json!(status.snapshot_available),
+            ),
+            (
+                "commissioning_state".into(),
+                serde_json::json!(status.commissioning_state),
+            ),
         ]);
     }
     value
@@ -9635,7 +9344,9 @@ pub fn grpc_bridge_set_fan(
     // `allow_loud = false`: the gRPC bridge never opts above the universal
     // PWM-30 safety cap. On Home this is doubly-enforced (per-mode max is 30).
     let pwm = compute_commanded_fan_pwm(current_mode, "custom", custom_pwm, false)?;
-    let (_uio, _variant, commanded_pwm, _pwm0, _pwm1, _max_rpm) = set_fan_pwm_via_hal(pwm)?;
+    let hardware_mutation_lease = acquire_hardware_mutation_lease(state, "gRPC bridge:set_fan")?;
+    let (_uio, _variant, commanded_pwm, _pwm0, _pwm1, _max_rpm) =
+        set_fan_pwm_via_hal(&hardware_mutation_lease, pwm)?;
     tracing::info!(
         requested_pwm,
         applied_pwm = pwm,

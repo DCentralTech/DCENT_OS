@@ -95,6 +95,62 @@ pub struct Identify {
     pub asic_model: String,
 }
 
+/// Bitcoin network snapshot relayed over the mesh — the "Bitcoin ON mesh" ticker
+/// (Phase 3). A GATEWAY node with internet fetches this from mempool.space and
+/// originates it; every off-grid node relays it (managed flood, [`crate::flood`])
+/// and displays it with **no Wi-Fi** — a sovereign no-internet Bitcoin ticker.
+/// The pure logic around it (freshness, formatting, mempool parsers) lives in
+/// [`crate::bitcoin`].
+///
+/// `timestamp_unix` is when the GATEWAY fetched the data, carried so a consumer
+/// can show the data's age and never present a stale relay as live.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NetInfo {
+    pub block_height: i64,
+    /// Network difficulty (huge float; a consumer renders it compactly).
+    pub difficulty: f64,
+    /// BTC/USD spot price.
+    pub price_usd: f64,
+    /// Fastest recommended fee (sat/vB).
+    pub fee_fastest_sat_vb: u32,
+    /// Unix seconds when the gateway fetched this snapshot (freshness anchor).
+    pub timestamp_unix: u64,
+}
+
+/// Chain tip for Phase-4 mining-on-mesh: a gateway broadcasts one of these on
+/// each new block so an off-grid node can build a solo coinbase-only template.
+///
+/// `prev_hash` is the **block-header internal** 32-byte previous-block hash
+/// (the same byte order that sits at header bytes `[4..36]`). Wire encoding is
+/// lowercase hex of those 32 bytes. The receiver re-validates `nbits` before
+/// mining (see `dcentaxe_stratum::solo`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Tip {
+    pub prev_hash: [u8; 32],
+    /// Compact target (Bitcoin `nBits`).
+    pub nbits: u32,
+    /// Suggested block timestamp (unix seconds).
+    pub ntime: u32,
+    /// Next block height (BIP34 coinbase height).
+    pub height: i64,
+}
+
+/// One fragment of a found block being relayed back to a gateway for
+/// `submitblock`. A complete block (80-byte header + coinbase tx) exceeds a
+/// single LoRa payload, so the originator slices it into ordered fragments
+/// sharing a common `id`. See [`crate::reassembly`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlockFragment {
+    /// Originator-chosen reassembly key (e.g. low 32 bits of header hash).
+    pub id: u32,
+    /// Zero-based fragment index.
+    pub seq: u8,
+    /// Total fragment count (`1..=MAX_BLOCK_FRAGMENTS`).
+    pub total: u8,
+    /// Raw fragment payload bytes (NOT hex — hex is the wire encoding only).
+    pub bytes: Vec<u8>,
+}
+
 /// Owner-authed control frame received over the air. Reuses the BAP CMD/PARAM/
 /// VALUE vocabulary. SAFETY: a control frame from the air MUST pass the same
 /// owner auth as the MCP owner-control path — never accept a passwordless
@@ -140,6 +196,13 @@ pub enum MeshKind {
     BlockFound(BlockFound),
     Identify(Identify),
     Command(MeshCommand),
+    /// Bitcoin network snapshot (block/difficulty/price/fee) — the Phase-3
+    /// "Bitcoin on mesh" ticker, originated by a gateway node.
+    NetInfo(NetInfo),
+    /// Chain tip for solo mining-on-mesh (Phase 4). Gateway → off-grid miners.
+    Tip(Tip),
+    /// Fragment of a found block relayed back to a gateway (Phase 4).
+    BlockFragment(BlockFragment),
     /// Delivery acknowledgement (the param echoes what is being acked).
     Ack(String),
 }
@@ -151,6 +214,9 @@ impl MeshKind {
             MeshKind::BlockFound(_) => "BLK",
             MeshKind::Identify(_) => "IDN",
             MeshKind::Command(_) => "CMD",
+            MeshKind::NetInfo(_) => "NET",
+            MeshKind::Tip(_) => "TIP",
+            MeshKind::BlockFragment(_) => "BFG",
             MeshKind::Ack(_) => "ACK",
         }
     }
@@ -254,6 +320,24 @@ impl MeshFrame {
             MeshKind::Identify(i) => {
                 format!("{},{}", escape(&i.device_model), escape(&i.asic_model))
             }
+            MeshKind::NetInfo(n) => format!(
+                "{},{:.0},{:.2},{},{}",
+                n.block_height, n.difficulty, n.price_usd, n.fee_fastest_sat_vb, n.timestamp_unix,
+            ),
+            MeshKind::Tip(t) => format!(
+                "{},{:08x},{:08x},{}",
+                hex_lower(&t.prev_hash),
+                t.nbits,
+                t.ntime,
+                t.height,
+            ),
+            MeshKind::BlockFragment(f) => format!(
+                "{:08x},{:02x},{:02x},{}",
+                f.id,
+                f.seq,
+                f.total,
+                hex_lower(&f.bytes),
+            ),
             MeshKind::Command(c) => format!(
                 "{},{},{},{}",
                 escape(&c.verb),
@@ -351,6 +435,53 @@ fn decode_kind(tok: &str, fields: &str) -> Result<MeshKind, LoraError> {
                 asic_model: unescape(parts[1]),
             }))
         }
+        "NET" => {
+            if parts.len() != 5 {
+                return Err(bad());
+            }
+            Ok(MeshKind::NetInfo(NetInfo {
+                block_height: parts[0].parse().map_err(|_| bad())?,
+                difficulty: parts[1].parse().map_err(|_| bad())?,
+                price_usd: parts[2].parse().map_err(|_| bad())?,
+                fee_fastest_sat_vb: parts[3].parse().map_err(|_| bad())?,
+                timestamp_unix: parts[4].parse().map_err(|_| bad())?,
+            }))
+        }
+        "TIP" => {
+            if parts.len() != 4 {
+                return Err(bad());
+            }
+            let prev_hash = parse_hex32(parts[0]).ok_or_else(bad)?;
+            Ok(MeshKind::Tip(Tip {
+                prev_hash,
+                nbits: u32::from_str_radix(parts[1], 16).map_err(|_| bad())?,
+                ntime: u32::from_str_radix(parts[2], 16).map_err(|_| bad())?,
+                height: parts[3].parse().map_err(|_| bad())?,
+            }))
+        }
+        "BFG" => {
+            if parts.len() != 4 {
+                return Err(bad());
+            }
+            let id = u32::from_str_radix(parts[0], 16).map_err(|_| bad())?;
+            let seq = u8::from_str_radix(parts[1], 16).map_err(|_| bad())?;
+            let total = u8::from_str_radix(parts[2], 16).map_err(|_| bad())?;
+            // Align wire policy with reassembly (H4): refuse total outside
+            // 1..=MAX_BLOCK_FRAGMENTS and empty/oversize payloads at decode.
+            if total == 0 || total > crate::reassembly::MAX_BLOCK_FRAGMENTS || seq >= total {
+                return Err(bad());
+            }
+            let bytes = parse_hex_bytes(parts[3]).ok_or_else(bad)?;
+            if bytes.is_empty() || bytes.len() > crate::reassembly::MAX_FRAGMENT_BYTES {
+                return Err(bad());
+            }
+            Ok(MeshKind::BlockFragment(BlockFragment {
+                id,
+                seq,
+                total,
+                bytes,
+            }))
+        }
         "CMD" => {
             if parts.len() != 4 {
                 return Err(bad());
@@ -405,6 +536,53 @@ fn unescape(s: &str) -> String {
         }
     }
     out
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn parse_hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parse an even-length hex string into raw bytes. Returns `None` on odd length
+/// or non-hex input — never panics.
+fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
+    let b = s.as_bytes();
+    if b.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(b.len() / 2);
+    let mut i = 0;
+    while i < b.len() {
+        let hi = parse_hex_nibble(b[i])?;
+        let lo = parse_hex_nibble(b[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Some(out)
+}
+
+fn parse_hex32(s: &str) -> Option<[u8; 32]> {
+    let v = parse_hex_bytes(s)?;
+    if v.len() != 32 {
+        return None;
+    }
+    let mut a = [0u8; 32];
+    a.copy_from_slice(&v);
+    Some(a)
 }
 
 // ---------------------------------------------------------------------------
@@ -702,6 +880,96 @@ mod tests {
             }),
         );
         assert_eq!(round_trip(&frame), frame);
+    }
+
+    #[test]
+    fn netinfo_round_trip() {
+        // Values chosen so the `{:.0}` difficulty and `{:.2}` price round-trip
+        // exactly (difficulty is effectively integer at network scale).
+        let frame = MeshFrame::new(
+            NODE,
+            MeshKind::NetInfo(NetInfo {
+                block_height: 901_234,
+                difficulty: 110_568_428_300_952.0,
+                price_usd: 67_890.00,
+                fee_fastest_sat_vb: 12,
+                timestamp_unix: 1_800_000_000,
+            }),
+        );
+        let back = round_trip(&frame);
+        assert_eq!(back, frame);
+        assert!(frame.encode().unwrap().starts_with(b"$DCM,NET,"));
+    }
+
+    #[test]
+    fn tip_round_trip() {
+        let mut prev = [0u8; 32];
+        for (i, b) in prev.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let frame = MeshFrame::new(
+            NODE,
+            MeshKind::Tip(Tip {
+                prev_hash: prev,
+                nbits: 0x1d00_ffff,
+                ntime: 0x4d_65_82_11,
+                height: 100,
+            }),
+        );
+        let back = round_trip(&frame);
+        assert_eq!(back, frame);
+        assert!(frame.encode().unwrap().starts_with(b"$DCM,TIP,"));
+    }
+
+    #[test]
+    fn block_fragment_round_trip() {
+        let frame = MeshFrame::new(
+            NODE,
+            MeshKind::BlockFragment(BlockFragment {
+                id: 0xdead_beef,
+                seq: 1,
+                total: 3,
+                bytes: vec![0x01, 0x02, 0xab, 0xcd],
+            }),
+        );
+        let back = round_trip(&frame);
+        assert_eq!(back, frame);
+        assert!(frame.encode().unwrap().starts_with(b"$DCM,BFG,"));
+    }
+
+    #[test]
+    fn block_fragment_rejects_seq_ge_total() {
+        // Checksum-valid body with seq >= total must be refused (no panic).
+        let body = "DCM,BFG,deadbeef,02,02,aabb";
+        let cks = xor_checksum(body.as_bytes());
+        let raw = format!("${body}*{cks:02X}\r\n");
+        assert!(matches!(
+            MeshFrame::decode(raw.as_bytes()),
+            Err(LoraError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn bfg_decode_rejects_total_above_max() {
+        // total=0x11 = 17 > MAX_BLOCK_FRAGMENTS (16).
+        let body = "DCM,BFG,deadbeef,00,11,aabb";
+        let cks = xor_checksum(body.as_bytes());
+        let raw = format!("${body}*{cks:02X}\r\n");
+        assert!(matches!(
+            MeshFrame::decode(raw.as_bytes()),
+            Err(LoraError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn bfg_decode_rejects_empty_payload() {
+        let body = "DCM,BFG,deadbeef,00,01,";
+        let cks = xor_checksum(body.as_bytes());
+        let raw = format!("${body}*{cks:02X}\r\n");
+        assert!(matches!(
+            MeshFrame::decode(raw.as_bytes()),
+            Err(LoraError::Protocol(_))
+        ));
     }
 
     #[test]
@@ -1031,7 +1299,7 @@ mod tests {
         };
         // Alphabet biased toward the mesh grammar ($ D C M , * CR LF, the
         // escape bytes \ c a, the tokens, hex + punctuation) plus uniform noise.
-        let alphabet = b"$DCM,*\r\n\\caTLMBLKIDNCMDACK0123456789abcdef.-+ ";
+        let alphabet = b"$DCM,*\r\n\\caTLMBLKIDNCMDNETTIPBFGACK0123456789abcdef.-+ ";
         for _ in 0..6000 {
             let len = (next() % 300) as usize;
             let mut buf: Vec<u8> = Vec::with_capacity(len);

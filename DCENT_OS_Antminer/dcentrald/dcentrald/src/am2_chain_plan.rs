@@ -31,16 +31,16 @@
 //! Lives next to `s19j_hybrid_mining.rs` so the runtime can `use crate::am2_chain_plan`.
 
 use anyhow::{Context, Result};
+use dcentrald_common::am2_topology::{dspic_address_for_slot, slot_for_uart};
 
 /// Canonical AM2 dsPIC I²C address table, indexed by hashboard slot 0..=3.
 /// Matches `s19j_hybrid_mining::S19_DSPIC_ADDRS` (kept in lockstep — single
-/// source of truth lives there; this is a local mirror for pure plan code).
+/// source of truth is `dcentrald_common::am2_topology` and is consumed below.
 ///
 /// Slot 0 = PL UART 0 = `/dev/ttyS1` → dsPIC 0x20
 /// Slot 1 = PL UART 1 = `/dev/ttyS2` → dsPIC 0x21
 /// Slot 2 = PL UART 2 = `/dev/ttyS3` → dsPIC 0x22
 /// Slot 3 = PL UART 3 = `/dev/ttyS4` → dsPIC 0x23
-const AM2_SLOT_DSPIC_ADDRS: [u8; 4] = [0x20, 0x21, 0x22, 0x23];
 
 /// One planned chain — the runtime opens one `SerialChainBackend`,
 /// orchestrates one PIC's voltage path, and dispatches/polls work per
@@ -79,23 +79,20 @@ pub fn build_am2_chain_plan(serial_devices: &[String]) -> Result<Vec<Am2ChainCon
         }
         seen.push(dev.as_str());
 
-        let am2_slot = am2_slot_from_serial_device(dev).with_context(|| {
+        let am2_slot = slot_for_uart(dev).with_context(|| {
             format!(
                 "AM2 chain plan: '{}' is not a recognized PL UART path \
                  (expected /dev/ttyS1..ttyS4 for slots 0..=3)",
                 dev
             )
         })?;
-        let dspic_addr = AM2_SLOT_DSPIC_ADDRS
-            .get(am2_slot as usize)
-            .copied()
-            .with_context(|| {
-                format!(
-                    "AM2 chain plan: slot {} for '{}' has no dsPIC address \
+        let dspic_addr = dspic_address_for_slot(am2_slot).with_context(|| {
+            format!(
+                "AM2 chain plan: slot {} for '{}' has no dsPIC address \
                          (canonical table has 4 slots — indexable 0..=3)",
-                    am2_slot, dev
-                )
-            })?;
+                am2_slot, dev
+            )
+        })?;
         let chain_id_u8 = u8::try_from(chain_id).with_context(|| {
             format!(
                 "AM2 chain plan: chain_id {} exceeds u8 range (would-overflow plan size)",
@@ -110,18 +107,6 @@ pub fn build_am2_chain_plan(serial_devices: &[String]) -> Result<Vec<Am2ChainCon
         });
     }
     Ok(plan)
-}
-
-/// Canonical slot lookup. Mirrors `s19j_hybrid_mining::am2_slot_from_serial_device`.
-/// Inlined here so this module is pure and host-testable independently.
-fn am2_slot_from_serial_device(serial_device: &str) -> Option<u8> {
-    match serial_device {
-        "/dev/ttyS1" => Some(0),
-        "/dev/ttyS2" => Some(1),
-        "/dev/ttyS3" => Some(2),
-        "/dev/ttyS4" => Some(3),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

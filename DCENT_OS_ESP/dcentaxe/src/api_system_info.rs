@@ -251,6 +251,9 @@ pub struct LoraInfoView {
     pub peer_count: u32,
     pub last_beacon_unix_ms: Option<u64>,
     pub last_rx_rssi_dbm: Option<i16>,
+    /// Phase-3 "Bitcoin on mesh" ticker (freshest tip snapshot heard over the
+    /// mesh). `present:false` inside when nothing has been received yet.
+    pub bitcoin: Option<dcentaxe_lora::bitcoin::BitcoinTickerView>,
 }
 
 /// Read-only MQTT config view for `/api/system/info`. The password is masked to

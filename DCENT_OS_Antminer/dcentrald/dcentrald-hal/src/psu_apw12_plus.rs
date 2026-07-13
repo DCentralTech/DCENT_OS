@@ -55,9 +55,7 @@
 //! runtime gate (`dcentrald_hal::platform::subtype::classify_with_probe`
 //! → `VoltageControllerKind::NoPic` for S21 family).
 
-use std::time::Duration;
-
-use crate::i2c::{I2cServiceHandle, I2cTransactionStep};
+use crate::i2c::{I2cOperationIntent, I2cServiceHandle, I2cTransactionStep};
 use crate::HalError;
 use crate::Result;
 
@@ -329,12 +327,27 @@ pub const APW121215F_REG_POINTER: u8 = 0x11;
 /// APW121215f watchdog opcode (frame CMD). RE: `_bitmain_set_watchdog`.
 pub const APW121215F_CMD_WATCHDOG: u8 = 0x81;
 
+/// Largest payload representable by the APW121215f 8-bit LEN field.
+/// LEN includes CMD, LEN itself, and the two checksum bytes.
+pub const APW121215F_MAX_PAYLOAD_LEN: usize = u8::MAX as usize - 4;
+
 /// Build a byte-exact APW121215f command frame
 /// `[0x55, 0xAA, LEN, CMD, payload..., CKSUM_lo, CKSUM_hi]` where
 /// `LEN = payload.len() + 4` and `CKSUM = LEN + CMD + sum(payload)` as a 16-bit
 /// little-endian word. RE 2026-06-02 from the S21 jig.
-pub fn build_apw121215f_frame(cmd: u8, payload: &[u8]) -> Vec<u8> {
-    let len = (payload.len() as u8).wrapping_add(4);
+///
+/// Returns an error before allocating when `payload` cannot be represented by
+/// the wire format's 8-bit LEN field.
+pub fn build_apw121215f_frame(cmd: u8, payload: &[u8]) -> Result<Vec<u8>> {
+    if payload.len() > APW121215F_MAX_PAYLOAD_LEN {
+        return Err(HalError::PsuProtocolOwned(format!(
+            "APW121215f frame payload is {} bytes; maximum is {}",
+            payload.len(),
+            APW121215F_MAX_PAYLOAD_LEN
+        )));
+    }
+    let len =
+        u8::try_from(payload.len() + 4).expect("APW121215F_MAX_PAYLOAD_LEN proves LEN fits in u8");
     let mut sum: u16 = u16::from(len).wrapping_add(u16::from(cmd));
     for &b in payload {
         sum = sum.wrapping_add(u16::from(b));
@@ -344,12 +357,13 @@ pub fn build_apw121215f_frame(cmd: u8, payload: &[u8]) -> Vec<u8> {
     frame.extend_from_slice(payload);
     frame.push((sum & 0xFF) as u8);
     frame.push((sum >> 8) as u8);
-    frame
+    Ok(frame)
 }
 
 /// APW121215f watchdog frame for control byte `ctrl` (0 = disable/arm-off).
 /// Disable (`ctrl=0`) = `[55 AA 06 81 00 00 87 00]` — RE-exact (S21 jig).
-pub fn apw121215f_watchdog_frame(ctrl: u8) -> Vec<u8> {
+/// Returns the same fallible frame-builder result as [`build_apw121215f_frame`].
+pub fn apw121215f_watchdog_frame(ctrl: u8) -> Result<Vec<u8>> {
     build_apw121215f_frame(APW121215F_CMD_WATCHDOG, &[ctrl, 0x00])
 }
 
@@ -678,8 +692,12 @@ impl<M: Apw12PlusAuthorized> Apw12PlusBackend<M> {
     /// Power on the rail (write CONTROL=0x01 to register 0x20). Caches
     /// `output_on=true` and sleeps [`POWER_ON_SETTLE_MS`] before returning.
     pub fn power_on(&mut self) -> Result<()> {
-        self.run(power_on_steps())?;
-        std::thread::sleep(Duration::from_millis(POWER_ON_SETTLE_MS));
+        let mut steps = power_on_steps();
+        // The settle interval is part of the controller transaction. Keeping
+        // it on the service worker prevents another client from issuing a
+        // command while the PSU is still processing POWER_ON.
+        steps.push(I2cTransactionStep::SleepMs(POWER_ON_SETTLE_MS));
+        self.run_with_intent(I2cOperationIntent::Energize, steps)?;
         self.output_on = true;
         tracing::info!(
             addr = format_args!("0x{:02X}", self.address),
@@ -692,7 +710,7 @@ impl<M: Apw12PlusAuthorized> Apw12PlusBackend<M> {
     /// Power off the rail (write CONTROL=0x00 to register 0x20). Caches
     /// `output_on=false`.
     pub fn power_off(&mut self) -> Result<()> {
-        self.run(power_off_steps())?;
+        self.run_with_intent(I2cOperationIntent::SafeOff, power_off_steps())?;
         self.output_on = false;
         tracing::info!(
             addr = format_args!("0x{:02X}", self.address),
@@ -703,7 +721,7 @@ impl<M: Apw12PlusAuthorized> Apw12PlusBackend<M> {
 
     /// Clear faults (write CLEAR_FAULTS_PAYLOAD to register 0x21).
     pub fn clear_faults(&mut self) -> Result<()> {
-        self.run(clear_faults_steps())?;
+        self.run_with_intent(I2cOperationIntent::Recovery, clear_faults_steps())?;
         tracing::info!(
             addr = format_args!("0x{:02X}", self.address),
             "APW12+ CLEAR_FAULTS"
@@ -720,7 +738,7 @@ impl<M: Apw12PlusAuthorized> Apw12PlusBackend<M> {
                 watts, POWER_LIMIT_MAX_W
             )));
         }
-        self.run(set_power_limit_steps(watts))?;
+        self.run_with_intent(I2cOperationIntent::Energize, set_power_limit_steps(watts))?;
         tracing::info!(
             addr = format_args!("0x{:02X}", self.address),
             watts,
@@ -733,13 +751,21 @@ impl<M: Apw12PlusAuthorized> Apw12PlusBackend<M> {
     //  Internal: dispatch through I2C service
     // -----------------------------------------------------------------------
 
-    fn run(&self, steps: Vec<I2cTransactionStep>) -> Result<()> {
-        let _ = self.i2c.transaction(self.address, steps)?;
+    fn run_with_intent(
+        &self,
+        intent: I2cOperationIntent,
+        steps: Vec<I2cTransactionStep>,
+    ) -> Result<()> {
+        let _ = self
+            .i2c
+            .transaction_with_intent(intent, self.address, steps)?;
         Ok(())
     }
 
     fn run_read(&self, steps: Vec<I2cTransactionStep>) -> Result<Vec<u8>> {
-        let mut reads = self.i2c.transaction(self.address, steps)?;
+        let mut reads =
+            self.i2c
+                .transaction_with_intent(I2cOperationIntent::ReadOnly, self.address, steps)?;
         reads
             .pop()
             .ok_or_else(|| HalError::PsuProtocolOwned("transaction returned no read result".into()))
@@ -794,7 +820,7 @@ mod tests {
         // The float-frame checksum is genuinely DIFFERENT from the per-byte sum
         // the DAC-byte builder would compute over the same LEN+CMD+payload —
         // pin that they diverge so the two encodings can't be conflated.
-        let bytesum = build_apw121215f_frame(0x83, &19.0f32.to_le_bytes());
+        let bytesum = build_apw121215f_frame(0x83, &19.0f32.to_le_bytes()).unwrap();
         // bytesum frame ends with the per-byte sum; the float-frame's last two
         // bytes (word-sum) must NOT equal the byte-sum frame's last two bytes.
         assert_ne!(
@@ -810,16 +836,16 @@ mod tests {
         // `_bitmain_set_watchdog` builds [55 AA 06 81 ctrl 00 CK16] (CK16 = LEN+CMD+payload,
         // 16-bit LE). Watchdog DISABLE (ctrl=0) = [55 AA 06 81 00 00 87 00] (CK16 = 0x06+0x81).
         assert_eq!(
-            apw121215f_watchdog_frame(0x00),
+            apw121215f_watchdog_frame(0x00).unwrap(),
             vec![0x55, 0xAA, 0x06, 0x81, 0x00, 0x00, 0x87, 0x00]
         );
         // ctrl=1 → CK16 = 0x87 + 0x01 = 0x88.
         assert_eq!(
-            apw121215f_watchdog_frame(0x01),
+            apw121215f_watchdog_frame(0x01).unwrap(),
             vec![0x55, 0xAA, 0x06, 0x81, 0x01, 0x00, 0x88, 0x00]
         );
         // LEN = payload + 4 (counts LEN + CMD + payload + 2 checksum bytes).
-        let f = build_apw121215f_frame(0x83, &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let f = build_apw121215f_frame(0x83, &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
         assert_eq!(f[0], 0x55);
         assert_eq!(f[1], 0xAA);
         assert_eq!(f[2], 0x0A, "LEN = payload(6) + 4");
@@ -831,13 +857,14 @@ mod tests {
         assert_eq!(ck, 0x0687);
         // DISTINCT from the am2 APW121215a 8-bit frame: APW121215f watchdog is 8 bytes
         // (16-bit cksum, LEN=payload+4), vs am2's 6-byte [55 AA 03 81 00 84] (8-bit, LEN=payload+2).
-        assert_eq!(apw121215f_watchdog_frame(0x00).len(), 8);
+        assert_eq!(apw121215f_watchdog_frame(0x00).unwrap().len(), 8);
         assert_eq!(APW121215F_REG_POINTER, 0x11);
         assert_eq!(APW121215F_CMD_WATCHDOG, 0x81);
 
         // Transport: the frame is written one byte at a time, each as a [0x11, byte] I2C write
         // to the register-pointer (RE: exec_power_cmd_v2). Watchdog-disable → 8 such writes.
-        let txn = apw121215f_reg11_transaction(&apw121215f_watchdog_frame(0x00));
+        let watchdog = apw121215f_watchdog_frame(0x00).unwrap();
+        let txn = apw121215f_reg11_transaction(&watchdog);
         assert_eq!(txn.len(), 8);
         for (step, &fb) in txn
             .iter()
@@ -854,14 +881,34 @@ mod tests {
         // (N = convert_V_to_N(V), a per-version linear `offset - V*slope`), and the frame is
         // [55 AA 06 83 N 00 CK16] with CK16 = LEN+CMD+N = 0x89 + N. This is EXACTLY this builder, so
         // build_apw121215f_frame ALSO byte-exactly produces the BB APW121215f set-voltage frame.
-        let set_v = build_apw121215f_frame(0x83, &[0x6C, 0x00]); // N=0x6C (e.g. ~13.7 V DAC)
+        let set_v = build_apw121215f_frame(0x83, &[0x6C, 0x00]).unwrap(); // N=0x6C (e.g. ~13.7 V DAC)
         assert_eq!(set_v, vec![0x55, 0xAA, 0x06, 0x83, 0x6C, 0x00, 0xF5, 0x00]); // CK16 = 0x89+0x6C = 0xF5
                                                                                  // CK16 carry when N is large (N=0xFF): 0x89 + 0xFF = 0x0188 → lo 0x88, hi 0x01.
-        let set_v_hi = build_apw121215f_frame(0x83, &[0xFF, 0x00]);
+        let set_v_hi = build_apw121215f_frame(0x83, &[0xFF, 0x00]).unwrap();
         assert_eq!(
             set_v_hi,
             vec![0x55, 0xAA, 0x06, 0x83, 0xFF, 0x00, 0x88, 0x01]
         );
+    }
+
+    #[test]
+    fn apw121215f_frame_enforces_u8_length_boundary() {
+        let payload = vec![0xFF; APW121215F_MAX_PAYLOAD_LEN];
+        let frame = build_apw121215f_frame(0xFF, &payload).unwrap();
+        assert_eq!(frame[2], u8::MAX);
+        assert_eq!(frame.len(), APW121215F_MAX_PAYLOAD_LEN + 6);
+
+        let expected_checksum = payload.iter().copied().fold(
+            u16::from(u8::MAX).wrapping_add(u16::from(0xFFu8)),
+            |sum, byte| sum.wrapping_add(u16::from(byte)),
+        );
+        assert_eq!(
+            u16::from_le_bytes([frame[frame.len() - 2], frame[frame.len() - 1]]),
+            expected_checksum
+        );
+
+        let oversized = vec![0xFF; APW121215F_MAX_PAYLOAD_LEN + 1];
+        assert!(build_apw121215f_frame(0xFF, &oversized).is_err());
     }
 
     #[test]
@@ -1088,7 +1135,8 @@ mod tests {
         assert!((v - 15.0).abs() < 0.001, "got {}", v);
     }
 
-    /// `power_on` issues exactly one transaction with `[0x20, 0x01]`.
+    /// `power_on` keeps the POWER_ON write and settle interval in one service
+    /// transaction so no other controller command can interleave.
     #[test]
     fn power_on_runtime_writes_correct_bytes() {
         let (handle, rx) = I2cServiceHandle::for_unit_tests();
@@ -1105,6 +1153,10 @@ mod tests {
             I2cTransactionStep::Write(buf) => assert_eq!(buf, &[0x20, 0x01]),
             other => panic!("expected Write, got {:?}", other),
         }
+        assert!(matches!(
+            log[0].1.get(1),
+            Some(I2cTransactionStep::SleepMs(POWER_ON_SETTLE_MS))
+        ));
     }
 
     /// `power_off` issues exactly one transaction with `[0x20, 0x00]`.

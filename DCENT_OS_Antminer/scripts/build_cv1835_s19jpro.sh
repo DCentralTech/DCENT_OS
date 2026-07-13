@@ -56,7 +56,7 @@ mkdir -p "$OUTPUT_DIR"
 if [ "$SKIP_CARGO" -eq 0 ]; then
     echo "==> Cross-compile dcentrald (armv7-unknown-linux-musleabihf)"
     cd "$DCENTRALD_DIR"
-    cargo build --release --target armv7-unknown-linux-musleabihf
+    cargo build --release --locked --target armv7-unknown-linux-musleabihf
     BIN="$DCENTRALD_DIR/target/armv7-unknown-linux-musleabihf/release/dcentrald"
     if [ ! -f "$BIN" ]; then
         echo "ERROR: dcentrald binary not produced at $BIN" >&2

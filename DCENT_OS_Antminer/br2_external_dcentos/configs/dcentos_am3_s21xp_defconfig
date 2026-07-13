@@ -24,5 +24,5 @@ BR2_TARGET_GENERIC_ISSUE="DCENTos for S21 XP (am3-aml NoPic) - D-Central Technol
 # Overlay-on-overlay — shared amlogic overlay first, am3-s21xp identity last.
 # =============================================================================
 BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/am3-s21xp/rootfs-overlay"
-BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/am3-s21xp/post-build.sh"
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/am3-s21xp/post-build.sh $(BR2_EXTERNAL_DCENTOS_PATH)/board/common/prune-runtime-research-tools.sh"
 BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/am3-s21xp/post-image.sh"

@@ -4,49 +4,76 @@ A fresh install always boots **management-only** (dashboard, SSH, and API up; ha
 you explicitly enable mining, so a flash can't surprise-start a loud miner. **Always keep a
 known-good recovery path before flashing.**
 
-## 1. Build a flashable image
+> **Public beta (not production-stable).** No model is `stable`. Install readiness is
+> **path-specific** and separate from mining/driver readiness — see the per-method
+> table below and the per-model notes for the honest per-path status.
+
+## Preferred methods (priority order)
+
+| Priority | Method | When to use | Honest readiness today |
+| --- | --- | --- | --- |
+| **1** | **SD card** | Reversible try + physical recovery | **S9 SD-boot try** Supported (keep card; no NAND). **AM2 SD** Public Beta Experimental — host complete+signed under `releases/am2-sd/…`; cold-boot open (not Supported; not NAND install). |
+| **2** | **DCENT_Toolbox** | Detect, dry-run, persistent NAND/eMMC, recovery | **S9** persistent Supported (operator-gated capstone). **S19j Pro Zynq** guarded lab / live Blocked until clean unit. Everything else experimental, detect-only, or lab-flagged. |
+
+## Public beta warning (read before flashing)
+
+- Supported **beta install anchors:** Antminer **S9 (Xilinx)** and **S19j Pro (Xilinx)** only.
+- Fingerprint the **control board** before any flash (S19j Pro exists as Zynq, BB, Amlogic, CV).
+- **Automatic failed-boot rollback is not guaranteed** — keep serial and SD or a verified full-NAND restore path.
+- On AM2, complete full-NAND backup + `restore_action_proof.verified=true` before install.
+- Install only **signed** packages from the checksum ledger.
+- Degraded EEPROM/dsPIC units (including `a lab unit`-class) are refused for public-beta GO evidence.
+- Home safety: quiet fan profile (~PWM 30); cut hash before noise.
+
+## 1. Build or obtain a flashable image
 
 ```bash
-# Cross-compile the daemon for your miner's SoC (from the repo root):
-cd dcentrald
-cargo build --release --target armv7-unknown-linux-musleabihf    # Zynq  (S9 / S17 / S19 / S19j Pro)
-cargo build --release --target aarch64-unknown-linux-musl        # Amlogic (S19j Pro AML / S21)
-
-# Build the firmware image (Docker, from the repo root):
-cd ..
-bash scripts/build_in_docker.sh
+# The only admitted source build today is the exact S9 release capsule.
+make -C DCENT_OS_Antminer release RELEASE_TARGET=s9
 ```
+
+Do not invoke `build-dcentrald.sh` plus `build_in_docker.sh` as a packaging
+shortcut. The inner driver now requires an authenticated release invocation and
+fails closed when called directly. AM2, Amlogic, BeagleBone, CVitek, and S17
+source packaging remains blocked until each lane has the same capsule lifecycle;
+use only an already approved signed artifact whose target-specific evidence has
+been independently verified.
+
+Or use a **release-signed** sysupgrade tarball (local beta set under
+`DCENT_OS_Antminer/output/beta-xil-20260617/` for S9 + S19j Pro XIL). Public HTTPS
+publication remains operator-gated.
 
 ## 2. Install onto the miner
 
-There are two ways to install, depending on your hardware. **You do not need the DCENT Toolbox for
-the S9 SD-boot path.**
-
-### Option A — S9 SD-boot (no toolbox, fully reversible)
+### Option A — S9 SD-boot try (no toolbox, fully reversible)
 
 S9 hardware boots DCENT_OS straight from an SD card with **no NAND write at all** — pull the card to
-revert to the stock firmware. This is the safest way to try DCENT_OS on a recoverable unit, and it
-needs no companion tooling. See the per-platform notes below and [`../PLATFORMS.md`](../PLATFORMS.md).
+revert to the prior firmware. Keep the card inserted while using DCENT_OS. See
+[`S9_XILINX.md`](S9_XILINX.md) and [`../qa/S9_PRIVATE_BETA_SD_RELEASE.md`](../qa/S9_PRIVATE_BETA_SD_RELEASE.md).
 
-### Option B — DCENT Toolbox (route-specific install planning)
+This is **not** “SD install to NAND.” Permanent S9 NAND uses Option B.
 
-The **DCENT Toolbox** is D-Central's separate companion CLI — a stand-alone fleet-management and
-install tool published in the [D-Central GitHub org](https://github.com/DCentralTech), not part of
-this repository. It auto-detects the stock firmware (BraiinsOS / VNish / stock Bitmain / LuxOS) and
-shows the matching route. A route row is not a production install claim; live writes stay gated by
-per-model proof, signed artifacts, recovery evidence, and explicit operator authorization:
+### Option B — DCENT Toolbox (detect → plan → gated write)
+
+The **DCENT Toolbox** auto-detects stock firmware (BraiinsOS / VNish / stock Bitmain / LuxOS) and
+shows the matching route. A route row is **not** a production install claim; live writes stay gated
+by per-model proof, signed artifacts, recovery evidence, and explicit operator authorization:
 
 ```bash
 dcent doctor <MINER_IP>
 dcent support --flash-readiness --json
 dcent install --list-routes
+dcent install --list-routes --explain <MINER_IP>
 dcent install <MINER_IP> -f <signed-package> --dry-run
-# Commit only from the matching per-platform runbook after gates pass.
+# Commit only after dry-run is unblocked and recovery evidence exists.
 ```
 
-> Once DCENT_OS is installed, it updates itself toolbox-free: the dashboard's **A/B sysupgrade** flow
-> uploads a signed update bundle to the inactive slot and flips to it on the next boot. Failed-boot
-> recovery stays platform/runbook-gated; keep a known-good serial or SD recovery path.
+**S19j Pro Xilinx:** Toolbox is the primary path (AM2 production SD is not customer-ready). Success
+on AM2 sysupgrade is often **`upload_accepted`** — power-cycle to boot the new slot; do not assume
+auto-reboot. See [`S19J_PRO_XILINX.md`](S19J_PRO_XILINX.md).
+
+> Once DCENT_OS is installed, updates can use A/B sysupgrade with a signed bundle. Failed-boot
+> recovery stays platform/runbook-gated; keep serial or SD recovery media.
 
 ## 3. First boot
 
@@ -57,16 +84,17 @@ Open `http://<MINER_IP>/` and finish the setup wizard. Set your pool in
 
 | Platform | Notes |
 | --- | --- |
-| **S9 (Zynq)** | SD-boot beta path available; see [`S9_XILINX.md`](S9_XILINX.md). Persistent NAND routes require the toolbox proof ladder. |
-| **S19 Pro / S19j Pro (Zynq)** | Mining/lab evidence exists; persistent install is lab/operator-gated, not public-install-ready. See [`S19J_PRO_XILINX.md`](S19J_PRO_XILINX.md). |
-| **S17 / S19 base** | Bring-up/evidence-gap or runtime-only depending on source firmware; do not advertise as production install-ready. |
-| **S21 / S19k Pro / Amlogic** | aarch64 image; stock AMLCtrl in-place rootfs-window install remains blocked. VNish-AML/rootfs-window and control-board-replacement routes are lab-only and require physical recovery assumptions. |
-| **S19j Pro (BeagleBone)** | AM335x IO board; SD/runtime paths, not a general NAND/sysupgrade production install. |
-| **Bitaxe Max / Ultra / Supra / Gamma / Hex Ultra / Hex Supra** | ESP32-S3 OTA/USB routes require a signed DCENT_axe manifest and `DCENT_OTA_PUBLIC_KEY_HEX`; see [`ESP_DEVICES.md`](ESP_DEVICES.md). |
+| **S9 (Zynq)** | SD-boot try Supported; see [`S9_XILINX.md`](S9_XILINX.md). Persistent NAND via Toolbox + signed package. |
+| **S19j Pro (Zynq)** | Signed artifact exists; live install operator/lab-gated; **not** “any unit GO”. Multi-board: fingerprint first. See [`S19J_PRO_XILINX.md`](S19J_PRO_XILINX.md). |
+| **S19 Pro (Zynq)** | Experimental runtime / guarded lab; no public-beta signed install package in XIL beta set. |
+| **S17 / S19 base** | Runtime-only or evidence-gap; do not advertise as production install-ready. |
+| **S21 / S19k Pro / Amlogic** | aarch64; no public SD path; rootfs-window install is lab-only (restore_verified). |
+| **S19j Pro (BeagleBone)** | SD/runtime lab; not general NAND production install. |
+| **S11 / S15 / S23** | Detect-only or do-not-flash. |
+| **Bitaxe Max / Ultra / Supra / Gamma / Hex\*** | ESP OTA/USB require signed manifest; ESP OTA pubkey residual (B-T-1); see [`ESP_DEVICES.md`](ESP_DEVICES.md). |
 
-See [`../PLATFORMS.md`](../PLATFORMS.md) for the per-model maturity status and the universal
-hash-board story, and [`../CONFIGURATION.md`](../CONFIGURATION.md) for tuning, donation, and safety
-settings.
+See [`../PLATFORMS.md`](../PLATFORMS.md) for per-model maturity and
+[`../CONFIGURATION.md`](../CONFIGURATION.md) for tuning and safety settings.
 
 > Hardware-specific bring-up details (per-board EEPROM/dsPIC quirks, NAND layouts) are intricate and
 > evolve quickly — open a **platform bring-up issue** with your captures and we'll help, and your

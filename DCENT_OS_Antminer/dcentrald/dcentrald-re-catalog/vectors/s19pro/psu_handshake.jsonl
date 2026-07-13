@@ -1,0 +1,15 @@
+{"schema":"dcent-psu-trace-v1","model":"s19pro","strictness":"exact","provenance":["","","DCENT_OS_Antminer/dcentrald/dcentrald-asic/src/dspic.rs"]}
+{"event":"i2c_timeout_changed","bus":0,"timeout_jiffies":10}
+{"event":"i2c_write_read","bus":0,"addr":32,"write":[85,170,23],"read":[137]}
+{"event":"i2c_write","bus":0,"addr":32,"bytes":[85]}
+{"event":"i2c_write","bus":0,"addr":32,"bytes":[170]}
+{"event":"i2c_write","bus":0,"addr":32,"bytes":[22]}
+{"event":"i2c_write","bus":0,"addr":32,"bytes":[85]}
+{"event":"i2c_write","bus":0,"addr":32,"bytes":[170]}
+{"event":"i2c_write","bus":0,"addr":32,"bytes":[16]}
+{"event":"i2c_write","bus":0,"addr":32,"bytes":[53]}
+{"event":"i2c_write","bus":0,"addr":32,"bytes":[232]}
+{"event":"i2c_write","bus":0,"addr":32,"bytes":[85]}
+{"event":"i2c_write","bus":0,"addr":32,"bytes":[170]}
+{"event":"i2c_write","bus":0,"addr":32,"bytes":[21]}
+{"event":"i2c_write","bus":0,"addr":32,"bytes":[1]}

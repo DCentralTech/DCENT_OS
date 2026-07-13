@@ -47,10 +47,14 @@ use dcentrald_asic::drivers::{
     },
     MinerProfile,
 };
-use dcentrald_asic::dspic::{DspicFirmware, DspicService, Pic0x89Service};
+use dcentrald_asic::dspic::{
+    dspic_runtime_protocol_is_proven, DspicEndpointSession, DspicFirmware, DspicService,
+    Pic0x89EndpointSession, Pic0x89Service,
+};
 use dcentrald_asic::uart_trans::{UartTransService, UartWork, DEFAULT_CHAIN_TTYS};
 use dcentrald_hal::i2c::{
-    spawn_i2c_service_no_register_touch_with_denylist, I2cServiceHandle, I2cTransactionStep,
+    spawn_i2c_service_no_register_touch_with_denylist, I2cMutationLabel, I2cServiceHandle,
+    I2cTransactionStep,
 };
 use dcentrald_hal::platform::{FanAccess, Platform};
 use dcentrald_hal::psu::Apw121215a;
@@ -60,6 +64,11 @@ use dcentrald_hal::serial_chain::SerialChainBackend;
 use crate::config::DcentraldConfig;
 use crate::history::{self, HistoryBuffer};
 use crate::model;
+use crate::runtime::safety_watchdog::{
+    SafetyLiveness, SafetyWatchdogOwner, WatchdogCloseoutReceipt, WatchdogDisarmPermit,
+    DEFAULT_WATCHDOG_STOP_TIMEOUT, DEFAULT_WATCHDOG_TEARDOWN_GRACE,
+};
+use crate::runtime::thread_guard::RuntimeThreadGuard;
 
 // P1.2 fix (Audit C F-004): Bible/memory rule cap is ~50 work-frames/sec on
 // serial work dispatch. The previous
@@ -77,21 +86,76 @@ const DEFAULT_SERIAL_WORK_QUEUE_DEPTH: usize = 16;
 const BM1362_SERIAL_WORK_QUEUE_DEPTH: usize = 512;
 const DEFAULT_SERIAL_TX_BURST: usize = 3;
 const BM1362_SERIAL_TX_BURST: usize = 1;
-const WORK_HISTORY_PER_ID: usize = 32;
-const BM1398_WORK_HISTORY_PER_ID: usize = 96;
+const WORK_HISTORY_PER_ID: usize = dcentrald_common::DEFAULT_WORK_HISTORY_PER_ID;
+const BM1398_WORK_HISTORY_PER_ID: usize = dcentrald_common::BM1398_WORK_HISTORY_PER_ID;
 const AMLOGIC_TEMP_STARTUP_GRACE_S: u64 = 30;
 const AMLOGIC_TEMP_MISS_LIMIT: u8 = 3;
 const AMLOGIC_THERMAL_RESTART_DELAY_S: u64 = 60;
 const APW12_139_ASSUMED_FW: u8 = 0x71;
+const RUNTIME_THREAD_STOP_TIMEOUT: Duration = Duration::from_secs(3);
+const NOPIC_WATCHDOG_BRINGUP_GRACE: Duration = Duration::from_secs(120);
+const NOPIC_SAFETY_LIVENESS_INTERVAL: Duration = Duration::from_secs(2);
 const HASHBOARD_EEPROM_WRITE_DENYLIST: [u8; 8] = [0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57];
 
+fn observed_dspic_firmware(version: Option<u8>) -> Result<DspicFirmware> {
+    let version = version.context(
+        "dsPIC firmware was not observed; refusing protocol-dependent heartbeat startup",
+    )?;
+    let firmware = DspicFirmware::from_version(version);
+    if !dspic_runtime_protocol_is_proven(firmware) {
+        anyhow::bail!(
+            "unsupported observed dsPIC firmware 0x{version:02X}; refusing protocol-dependent heartbeat startup"
+        );
+    }
+    Ok(firmware)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoPicPowerState {
+    NeverOwned,
+    MayBeEnergized,
+    EnabledByDaemon,
+}
+
 struct NoPicPsuGuard {
-    armed: bool,
+    state: NoPicPowerState,
+}
+
+impl NoPicPsuGuard {
+    fn new() -> Self {
+        Self {
+            state: NoPicPowerState::NeverOwned,
+        }
+    }
+
+    fn prepare_enable(&mut self, fan_max_pwm: u8) {
+        self.state = NoPicPowerState::MayBeEnergized;
+        arm_nopic_teardown(fan_max_pwm);
+    }
+
+    fn mark_enabled(&mut self) {
+        debug_assert_eq!(self.state, NoPicPowerState::MayBeEnergized);
+        self.state = NoPicPowerState::EnabledByDaemon;
+    }
+
+    fn owns_power(&self) -> bool {
+        self.state != NoPicPowerState::NeverOwned
+    }
+
+    fn safe_off(&mut self) -> Result<dcentrald_hal::platform::amlogic::PsuSafeOffReceipt> {
+        if !self.owns_power() {
+            anyhow::bail!("NoPic software safe-off requested without an owned power lease");
+        }
+        let receipt = dcentrald_hal::platform::amlogic::disable_psu_checked()
+            .context("checked NoPic GPIO437 safe-off failed")?;
+        self.state = NoPicPowerState::NeverOwned;
+        Ok(receipt)
+    }
 }
 
 impl Drop for NoPicPsuGuard {
     fn drop(&mut self) {
-        if self.armed {
+        if self.owns_power() {
             // Safety (cut-hash-before-noise + PWM-30 home cap, per
             // ): CUT PSU POWER FIRST so the heat
             // source (the hashboards) is removed, THEN hold fans at the quiet
@@ -103,7 +167,7 @@ impl Drop for NoPicPsuGuard {
             // (Was: 100% fan-blast for 2 s applied BEFORE the PSU cut — a direct
             // inversion of cut-hash-before-noise and a violation of the absolute
             // PWM-30 home cap. Audit wf_4a84d55e ABSENT finding, 2026-05-29.)
-            if let Err(e) = dcentrald_hal::platform::amlogic::disable_psu() {
+            if let Err(e) = dcentrald_hal::platform::amlogic::disable_psu_checked() {
                 warn!(error = %e, "Failed to disable NoPic PSU during shutdown");
             }
             // Quiet coast-down at PWM 30 (home cap). The Amlogic PWM period is
@@ -113,6 +177,23 @@ impl Drop for NoPicPsuGuard {
             let _ = std::fs::write("/sys/class/pwm/pwmchip0/pwm0/duty_cycle", "30000");
             let _ = std::fs::write("/sys/class/pwm/pwmchip0/pwm1/duty_cycle", "30000");
         }
+    }
+}
+
+fn checked_nopic_emergency_safe_off(
+    guard: &mut NoPicPsuGuard,
+) -> Result<dcentrald_hal::platform::amlogic::PsuSafeOffReceipt> {
+    if guard.owns_power() {
+        guard.safe_off()
+    } else {
+        // BM1366 adopted-live and legacy passthrough routes do not yet carry a
+        // typed power lease. Preserve their existing emergency cut capability,
+        // but use the checked GPIO-low path and never treat this receipt as
+        // authority to disarm the legacy watchdog. Migration to an explicit
+        // AdoptedPowerLease remains required before those routes can use the
+        // reusable safety-watchdog closeout contract.
+        dcentrald_hal::platform::amlogic::disable_psu_checked()
+            .context("checked emergency GPIO437 safe-off on unowned NoPic route failed")
     }
 }
 
@@ -143,45 +224,6 @@ pub fn nopic_panic_hook_best_effort_teardown() {
         let duty_s = duty.to_string();
         let _ = std::fs::write("/sys/class/pwm/pwmchip0/pwm0/duty_cycle", &duty_s);
         let _ = std::fs::write("/sys/class/pwm/pwmchip0/pwm1/duty_cycle", &duty_s);
-    }
-}
-
-struct RuntimeThreadGuard {
-    shutdown: CancellationToken,
-    handles: Vec<(&'static str, std::thread::JoinHandle<()>)>,
-}
-
-impl RuntimeThreadGuard {
-    fn new(shutdown: CancellationToken) -> Self {
-        Self {
-            shutdown,
-            handles: Vec::new(),
-        }
-    }
-
-    fn push(&mut self, name: &'static str, handle: std::thread::JoinHandle<()>) {
-        self.handles.push((name, handle));
-    }
-
-    fn stop_and_join(&mut self) {
-        if self.handles.is_empty() {
-            return;
-        }
-
-        self.shutdown.cancel();
-        while let Some((name, handle)) = self.handles.pop() {
-            if handle.join().is_err() {
-                warn!(thread = name, "runtime thread panicked during shutdown");
-            } else {
-                info!(thread = name, "runtime thread joined");
-            }
-        }
-    }
-}
-
-impl Drop for RuntimeThreadGuard {
-    fn drop(&mut self) {
-        self.stop_and_join();
     }
 }
 
@@ -308,11 +350,8 @@ impl Am2PsuRuntimeGuard {
             // Drop during unwind aborts). Recover the guard instead so the
             // safety teardown actually runs. Matches the proven i2c.rs idiom.
             let mut psu = psu.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = psu.watchdog(false) {
-                warn!(reason, error = %e, "BM1362 direct path PSU watchdog disable failed");
-            }
-            if let Err(e) = psu.set_voltage_min() {
-                warn!(reason, error = %e, "BM1362 direct path PSU set_voltage_min failed");
+            if let Err(e) = psu.safe_shutdown_to_min() {
+                warn!(reason, error = %e, "BM1362 direct path PSU safe-direction shutdown failed");
             }
         }
 
@@ -323,11 +362,53 @@ impl Am2PsuRuntimeGuard {
             }
         }
     }
+
+    /// Immediate transport-independent fallback for a feeder that cannot be
+    /// proven quiescent. Never enters the PSU mutex or emits dsPIC traffic:
+    /// either may still be owned by the detached worker. PWR_CONTROL is cut
+    /// first and watchdog feeding has already been cancelled by the thread
+    /// owner. An already in-flight heartbeat may complete once, but cannot
+    /// begin another loop iteration after the post-lock cancellation fence.
+    fn hard_stop_out_of_band(&mut self, reason: &'static str) {
+        if self.gate.is_none() && self.psu.is_none() && self.dspic.is_none() {
+            return;
+        }
+        if let Some(mut gate) = self.gate.take() {
+            let gpio = gate.gpio();
+            if let Err(e) = gate.deassert() {
+                warn!(
+                    reason,
+                    gpio,
+                    error = %e,
+                    "serial AM2 out-of-band PWR_CONTROL hard stop failed"
+                );
+            } else {
+                warn!(
+                    reason,
+                    gpio, "serial AM2 PWR_CONTROL hard stop asserted without entering PSU mutex"
+                );
+            }
+        } else {
+            warn!(
+                reason,
+                "serial AM2 out-of-band hard stop had no owned PWR_CONTROL gate; relying on cancelled heartbeat watchdogs"
+            );
+        }
+
+        // Dropping these owners is non-blocking. A detached feeder retains its
+        // own Arc until it returns; no destructor here attempts to reclaim it.
+        self.psu.take();
+        self.dspic.take();
+    }
 }
 
 impl Drop for Am2PsuRuntimeGuard {
     fn drop(&mut self) {
-        self.teardown("drop");
+        // Drop can run on any `?` path while a feeder is wedged. It must never
+        // wait on the shared PSU mutex or on I2C. Explicit graceful teardown is
+        // performed only after `RuntimeThreadGuard::stop_and_join` proves every
+        // feeder quiescent.
+        self.hard_stop_out_of_band("drop");
     }
 }
 
@@ -422,6 +503,9 @@ fn post_enable_chain_uart_probe(serial_device: &str, pic_addr: u8) {
     // `uart` drops here, releasing the mmap. Phase 2 init_asic_chain reopens.
 }
 
+/// Legacy count-inference policy retained only as a regression reference.
+/// Production uses `resolve_native_serial_identity_and_geometry`.
+#[cfg(test)]
 fn serial_chip_id(model_hint: Option<&str>, chip_count: u8) -> u16 {
     if let Some(chip_id) = model_hint.and_then(model::model_chip_id) {
         return chip_id;
@@ -445,13 +529,14 @@ fn serial_chip_id(model_hint: Option<&str>, chip_count: u8) -> u16 {
 ///
 /// Source: `dcentrald-asic::drivers::PicType` profile table + `model.rs`
 /// `pic_type_hint` (S21/T21/S21 Pro/+/XP all `ModelPicTypeHint::NoPic`).
+#[cfg(test)]
 fn serial_chip_id_is_nopic_family(chip_id: u16) -> bool {
     matches!(chip_id, 0x1368 | 0x1370 | 0x1373)
 }
 
-/// Fail-safe driver-family discriminator for the serial (Amlogic/NoPic +
-/// am2 BM1362) mining path — the single source of truth that the per-family
-/// `is_bm*` dispatch booleans are derived from.
+/// Legacy count-inference discriminator retained only to pin historical
+/// regression behavior. It is not production authority; native serial mining
+/// requires catalog identity through `resolve_native_serial_identity_and_geometry`.
 ///
 /// Carry-forward **F-E3** (Preparedness-Sweep-v2 HIGH SAFETY): BM1370 SKUs
 /// (S21 Pro / S21+ / S21 XP) must NOT silently route through the BM1368 (S21)
@@ -480,6 +565,7 @@ fn serial_chip_id_is_nopic_family(chip_id: u16) -> bool {
 ///   `mining.model`).
 /// - Proven count anchors are preserved exactly (114→1398, 110/77→1366,
 ///   65→1370, 108→1368, and the am2/XIL BM1362 default for PIC units).
+#[cfg(test)]
 fn resolve_serial_chip_id(model_hint: Option<&str>, chip_count: u8, nopic: bool) -> Result<u16> {
     let chip_id = serial_chip_id(model_hint, chip_count);
     let model_pinned = model_hint.and_then(model::model_chip_id).is_some();
@@ -504,21 +590,86 @@ fn resolve_serial_chip_id(model_hint: Option<&str>, chip_count: u8, nopic: bool)
     Ok(chip_id)
 }
 
-fn hardware_difficulty_for_serial_family(model_hint: Option<&str>, chip_count: u8) -> u64 {
-    let chip_id = serial_chip_id(model_hint, chip_count);
-
+fn hardware_difficulty_for_serial_family(chip_id: u16) -> Result<u64> {
     MinerProfile::for_chip(chip_id)
         .map(|profile| profile.hardware_difficulty as u64)
-        .unwrap_or(256)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "native serial chip 0x{chip_id:04X} has no MinerProfile difficulty policy"
+            )
+        })
 }
 
-fn requires_explicit_serial_chip_count(model_hint: Option<&str>) -> bool {
-    let Some(model_hint) = model_hint else {
-        return false;
-    };
+fn validate_serial_model_voltage_identity(
+    model_name: &str,
+    chip_id: u16,
+    pic_hint: Option<model::ModelPicTypeHint>,
+) -> Result<()> {
+    let definitively_nopic_family = matches!(chip_id, 0x1368 | 0x1370 | 0x1373);
+    let controller_only_family =
+        matches!(chip_id, 0x1362 | 0x1387 | 0x1391 | 0x1396 | 0x1397 | 0x1398);
+    match pic_hint {
+        Some(model::ModelPicTypeHint::NoPic) if controller_only_family => anyhow::bail!(
+            "native serial model `{model_name}` declares NoPic but chip 0x{chip_id:04X} is a controller-only family"
+        ),
+        Some(model::ModelPicTypeHint::Pic16 | model::ModelPicTypeHint::DsPic)
+            if definitively_nopic_family =>
+        {
+            anyhow::bail!(
+                "native serial model `{model_name}` declares a PIC/dsPIC but chip 0x{chip_id:04X} is a definitive NoPic family"
+            )
+        }
+        None if definitively_nopic_family => anyhow::bail!(
+            "native serial model `{model_name}` has definitive NoPic chip 0x{chip_id:04X} but no voltage-architecture declaration"
+        ),
+        _ => Ok(()),
+    }
+}
 
-    model::model_chip_count_hint(model_hint).is_none()
-        && matches!(model::model_family_key(model_hint), Some("bm1398"))
+fn resolve_native_serial_identity_and_geometry(
+    model_hint: Option<&str>,
+    configured_chip_count: Option<u8>,
+) -> Result<(u16, u8)> {
+    let model_name = model_hint
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context(
+            "native serial mining requires an explicit recognized mining.model; chip count is geometry, not ASIC identity",
+        )?;
+    let chip_id = model::model_chip_id(model_name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "native serial mining model `{model_name}` is unknown or has no authoritative chip identity"
+        )
+    })?;
+    if !matches!(chip_id, 0x1362 | 0x1366 | 0x1368 | 0x1370 | 0x1398) {
+        anyhow::bail!(
+            "native serial mining model `{model_name}` resolves to unsupported chip 0x{chip_id:04X}; no serial dispatcher exists for this family"
+        );
+    }
+    validate_serial_model_voltage_identity(
+        model_name,
+        chip_id,
+        model::model_pic_type_hint(model_name),
+    )?;
+    let chip_count = configured_chip_count
+        .or_else(|| model::model_chip_count_hint(model_name))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "native serial mining model `{model_name}` has no authoritative per-chain geometry; set mining.serial_chip_count explicitly"
+            )
+        })?;
+    if chip_count == 0 {
+        anyhow::bail!("native serial mining chip count must be at least 1");
+    }
+    Ok((chip_id, chip_count))
+}
+
+fn subtype_requires_bhb56_endpoint_capability(subtype: Option<&str>) -> bool {
+    subtype
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_uppercase().starts_with("AMLCTRL_BHB56"))
+        .unwrap_or(false)
 }
 
 /// Check if we're on a NoPic miner (no PIC voltage controller — voltage is
@@ -1004,6 +1155,30 @@ impl SerialMiner {
         Ok(Some(addr))
     }
 
+    fn dspic_service_for_serial_route(
+        i2c: &I2cServiceHandle,
+        sessions: &[DspicEndpointSession],
+        endpoint_capability_required: bool,
+        address: u8,
+        firmware: Option<DspicFirmware>,
+    ) -> Result<DspicService> {
+        if let Some(session) = sessions.iter().find(|session| session.address() == address) {
+            return Ok(match firmware {
+                Some(firmware) => session.service_with_firmware(firmware),
+                None => session.service(),
+            });
+        }
+        if endpoint_capability_required {
+            anyhow::bail!(
+                "discovery-bound dsPIC endpoint capability for I2C 0x{address:02X} is unavailable; refusing caller-asserted protocol/address fallback"
+            );
+        }
+        Ok(match firmware {
+            Some(firmware) => DspicService::new_with_firmware(i2c.clone(), address, firmware),
+            None => DspicService::new(i2c.clone(), address),
+        })
+    }
+
     fn am3_bb_uart_trans_chain_from_serial_device(serial_device: &str) -> Option<usize> {
         DEFAULT_CHAIN_TTYS
             .iter()
@@ -1328,7 +1503,16 @@ impl SerialMiner {
                 return;
             }
             std::thread::sleep(interval);
-            let result = { psu.lock().unwrap().heartbeat() };
+            if shutdown.is_cancelled() {
+                info!("PSU heartbeat thread shutting down after sleep");
+                return;
+            }
+            let mut psu = psu.lock().unwrap_or_else(|e| e.into_inner());
+            if shutdown.is_cancelled() {
+                info!("PSU heartbeat thread shutting down after acquiring PSU lock");
+                return;
+            }
+            let result = psu.heartbeat();
             match result {
                 Ok(()) => {
                     if consecutive_fails > 0 {
@@ -1357,7 +1541,7 @@ impl SerialMiner {
         }
     }
 
-    fn pic_read_fw_version_service(i2c: &I2cServiceHandle, addr: u8) -> Result<u8> {
+    fn pic_read_fw_version_service(i2c: &I2cServiceHandle, addr: u8) -> Result<(u8, Vec<u8>)> {
         // Service-only three-phase probing: flush -> write -> quiet window -> read.
         // Do not use I2C_RDWR here; it can turn a parser wedge into persistent bus noise.
         //
@@ -1380,7 +1564,8 @@ impl SerialMiner {
 
         for attempt in 1..=3 {
             for (variant, frame, read_len) in probes.iter().copied() {
-                let buf = match i2c.transaction(
+                let buf = match i2c.transaction_mutating(
+                    I2cMutationLabel::Recovery,
                     addr,
                     vec![
                         I2cTransactionStep::SetTimeout(10),
@@ -1430,7 +1615,7 @@ impl SerialMiner {
                 );
 
                 if let Some(fw) = Self::parse_pic_fw_reply(&buf, buf.len()) {
-                    return Ok(fw);
+                    return Ok((fw, buf));
                 }
 
                 warn!(
@@ -2524,45 +2709,81 @@ impl SerialMiner {
             .clone()
             .unwrap_or_else(|| "/dev/ttyS2".to_string());
         let model_hint = self.config.mining.model.as_deref();
-        let model_chip_count_hint = model_hint.and_then(model::model_chip_count_hint);
         let nopic = is_nopic(&self.config);
-        if self.config.mining.serial_chip_count.is_none()
-            && requires_explicit_serial_chip_count(model_hint)
-        {
-            return Err(anyhow::anyhow!(
-                "model={} requires explicit mining.serial_chip_count on the serial BM1398 path; the catalog has no safe default geometry for this variant",
-                model_hint.unwrap_or("bm1398")
-            ));
-        }
-        let chip_count = self
-            .config
-            .mining
-            .serial_chip_count
-            .or(model_chip_count_hint)
-            .unwrap_or(126);
+        let (resolved_chip_id, chip_count) = resolve_native_serial_identity_and_geometry(
+            model_hint,
+            self.config.mining.serial_chip_count,
+        )?;
         let target_freq = self.config.mining.frequency_mhz;
         let passthrough = self.config.mining.passthrough;
-        let mut nopic_psu_guard = NoPicPsuGuard { armed: false };
-        let mut am2_power = Am2PsuRuntimeGuard::new();
-        let mut runtime_threads = RuntimeThreadGuard::new(self.shutdown.clone());
-        let mut bm1362_detected_pic_fw: Option<u8> = None;
 
-        // Detect chip type from config. `resolve_serial_chip_id` is the SINGLE
-        // discriminator — the per-family `is_bm*` booleans below are derived
-        // from its result so a BM1370 SKU can never silently fall through to
-        // the BM1368 path (count==108) or the BM1362 catch-all (any other
-        // count). It also fail-closes when a NoPic S21-class chain cannot be
-        // disambiguated from chip_count alone (carry-forward F-E3).
-        let resolved_chip_id = resolve_serial_chip_id(model_hint, chip_count, nopic)?;
+        // `resolve_native_serial_identity_and_geometry` is the production
+        // identity boundary. Per-family dispatch is derived only from its
+        // catalog chip ID; chip count is geometry and never selects a driver.
         let is_bm1398 = resolved_chip_id == 0x1398;
         let is_bm1368 = resolved_chip_id == 0x1368;
         let is_bm1366 = resolved_chip_id == 0x1366;
         let is_bm1370 = resolved_chip_id == 0x1370;
         let is_bm1362 = resolved_chip_id == 0x1362;
-        // `resolved_chip_id` and `serial_chip_id` agree here (resolution only
-        // ever refuses, never remaps), so the existing helper stays the
-        // hardware-difficulty source of truth.
-        let hw_difficulty = hardware_difficulty_for_serial_family(model_hint, chip_count);
+        let native_nopic_power_owner = !passthrough && (is_bm1368 || is_bm1370);
+        let nopic_watchdog_liveness = SafetyLiveness::default();
+        // Declared before the PSU guard so ordinary unwinding cuts GPIO437
+        // before dropping the watchdog command owner.
+        let mut nopic_watchdog: Option<SafetyWatchdogOwner> = None;
+        let mut nopic_psu_guard = NoPicPsuGuard::new();
+        let mut am2_power = Am2PsuRuntimeGuard::new();
+        // Hardware-worker cancellation is independent from the process token.
+        // The main loop observes process shutdown, admits watchdog Teardown,
+        // and only then asks this owner to stop its actors.
+        let mut runtime_threads = RuntimeThreadGuard::new(CancellationToken::new());
+        let mut bm1362_detected_pic_fw: Option<u8> = None;
+        let hw_difficulty = hardware_difficulty_for_serial_family(resolved_chip_id)?;
+        let system_subtype = dcentrald_hal::platform::subtype::read_subtype();
+        let bhb56_endpoint_capability_required = is_bm1366 && !nopic && !passthrough;
+        if bhb56_endpoint_capability_required
+            && !subtype_requires_bhb56_endpoint_capability(system_subtype.as_deref())
+        {
+            anyhow::bail!(
+                "BM1366 PIC voltage route requires exact AMLCtrl_BHB56-family system identity; refusing model/config-only dsPIC authorization (observed subtype: {})",
+                system_subtype.as_deref().unwrap_or("<missing>")
+            );
+        }
+
+        // Capability issuance MUST precede the serialized service: discovery
+        // performs non-payload probes with a short-lived raw fd, while the
+        // service becomes the sole bus owner immediately after it is spawned.
+        // Exact BHB56 identity makes this route mandatory; any missing bus,
+        // address, or ACK aborts before protocol bytes can be selected.
+        let pending_bhb56_endpoints = if bhb56_endpoint_capability_required {
+            let mut endpoints = Vec::with_capacity(S19_DSPIC_ADDRS.len());
+            for address in S19_DSPIC_ADDRS {
+                endpoints.push(
+                    dcentrald_hal::platform::discover_system_voltage_controller_endpoint(
+                        0, address,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "BHB56 endpoint discovery failed on I2C bus 0 address 0x{address:02X}"
+                        )
+                    })?,
+                );
+            }
+            endpoints
+        } else {
+            Vec::new()
+        };
+        // The direct BM1362 path is shared by several control boards. Only an
+        // exact DCENT_OS `am2-s19j` image may make AM2 endpoint authority
+        // mandatory here; every non-target retains the existing AM3-BB or raw
+        // compatibility path. Planning reads system identity before the
+        // serialized service owns the bus and emits no controller traffic.
+        let pending_am2_bm1362_plan = if is_bm1362 && !nopic && !passthrough {
+            dcentrald_hal::platform::try_discover_system_am2_controller_plan(&[
+                serial_device.clone()
+            ])?
+        } else {
+            None
+        };
         let bm1362_i2c_service = if (is_bm1398 || is_bm1366 || is_bm1362) && !nopic && !passthrough
         {
             Some(
@@ -2574,6 +2795,18 @@ impl SerialMiner {
             )
         } else {
             None
+        };
+        let bhb56_dspic_sessions = if pending_bhb56_endpoints.is_empty() {
+            Vec::new()
+        } else {
+            let i2c_service = bm1362_i2c_service
+                .as_ref()
+                .context("BHB56 endpoints were issued but serialized I2C service did not start")?;
+            pending_bhb56_endpoints
+                .into_iter()
+                .map(|endpoint| DspicEndpointSession::new(i2c_service.clone(), endpoint))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("failed to bind BHB56 endpoints to serialized I2C service")?
         };
 
         let bm1362_pic_addr = Self::bm1362_pic_addr_for_serial_runtime(
@@ -2663,6 +2896,7 @@ impl SerialMiner {
         // until the catalog is filled in — strict-mode operators should
         // confirm classification first.
         // ────────────────────────────────────────────────────────────────────
+        let mut retained_eeprom_bytes: [Option<Vec<u8>>; 3] = [None, None, None];
         if !passthrough {
             use crate::runtime::hardware_info::{
                 read_hashboard_eeprom_for_energize_gate, EepromReadinessError,
@@ -2679,7 +2913,10 @@ impl SerialMiner {
             let mut probes: Vec<ChainProbe> = Vec::with_capacity(3);
             for slot in 0u8..=2u8 {
                 match read_hashboard_eeprom_for_energize_gate(slot as usize, deadline) {
-                    Ok(bytes) => probes.push(classify_chain(slot, Some(&bytes))),
+                    Ok(bytes) => {
+                        retained_eeprom_bytes[slot as usize] = Some(bytes.clone());
+                        probes.push(classify_chain(slot, Some(&bytes)));
+                    }
                     Err(EepromReadinessError::Timeout { .. }) => {
                         probes.push(ChainProbe::Timeout { chain_id: slot });
                     }
@@ -2833,11 +3070,9 @@ impl SerialMiner {
             // ---- BM1366 (S19 XP / S19K Pro): dsPIC voltage init + ASIC init ----
             //
             // Two variants supported:
-            //   1. PIC variant — am2 chassis with dsPIC at 0x20/0x21/0x22 driving
-            //      DC-DC voltage. Hypothetical for BM1366 (no factory unit yet
-            //      seen in the field), but we keep the code path for symmetry
-            //      with BM1362 / BM1398 PIC paths and the user note (2026-04-29)
-            //      that PIC and NoPic variants of the same chassis can ship.
+            //   1. BHB56 dsPIC variant — exact AMLCtrl_BHB56-family identity,
+            //      bus-0 family anchor, and per-address ACKs issue the endpoint
+            //      sessions used below. Model/config hints alone are refused.
             //   2. NoPic variant — am3-aml (S19K Pro NoPic, S19 XP, S19J XP).
             //      Voltage is set by kernel-managed TAS5782M DACs at i2c-0
             //      0x49/0x4A/0x4B per DTB. NO dsPIC anywhere on the bus.
@@ -2872,7 +3107,13 @@ impl SerialMiner {
                     .as_ref()
                     .context("AM2 serial I2C service missing for BM1366 dsPIC init")?;
                 for &addr in &S19_DSPIC_ADDRS {
-                    let mut dspic = DspicService::new(i2c_service.clone(), addr);
+                    let mut dspic = Self::dspic_service_for_serial_route(
+                        i2c_service,
+                        &bhb56_dspic_sessions,
+                        bhb56_endpoint_capability_required,
+                        addr,
+                        None,
+                    )?;
                     match dspic.cold_boot_init(target_voltage_mv) {
                         Ok(()) => {
                             info!(
@@ -2969,20 +3210,44 @@ impl SerialMiner {
                 );
             }
 
+            if !native_nopic_power_owner {
+                anyhow::bail!(
+                    "internal NoPic ownership mismatch: energizing path lacks an explicit power lease"
+                );
+            }
+            if self.shutdown.is_cancelled() {
+                anyhow::bail!("shutdown was already requested before NoPic watchdog admission");
+            }
+            let (watchdog_owner, watchdog_admission) =
+                SafetyWatchdogOwner::start_before_energizing(
+                    &self.config.watchdog,
+                    NOPIC_WATCHDOG_BRINGUP_GRACE,
+                    NOPIC_SAFETY_LIVENESS_INTERVAL,
+                    nopic_watchdog_liveness.clone(),
+                )
+                .await?;
+            let arm_receipt = watchdog_admission.require_armed("native serial NoPic")?;
+            info!(
+                requested_timeout_s = arm_receipt.requested_timeout_s,
+                effective_timeout_s = arm_receipt.effective_timeout_s,
+                kick_interval_s = arm_receipt.kick_interval_s,
+                bringup_grace_s = NOPIC_WATCHDOG_BRINGUP_GRACE.as_secs(),
+                "NoPic watchdog arm admission observed before GPIO437 mutation"
+            );
+            nopic_watchdog = Some(watchdog_owner);
+            if self.shutdown.is_cancelled() {
+                anyhow::bail!("shutdown raced NoPic watchdog admission; refusing PSU enable");
+            }
+
             // Enable PSU via GPIO 437 (PWR_EN, active HIGH: 1=ON, 0=OFF —
             // Q10, polarity CORRECTED 2026-05-21; see amlogic/mod.rs enable_psu_gpio
             // + the psu_enable_is_active_high_437 test). Do NOT re-read this as the
             // old "PSU_nEN active LOW" — that inverted reading was the original
             // polarity bug. (prod-readiness hunt-2 #H2.) Arm the shutdown guard
             // immediately so a failed init does not leave boards powered.
+            nopic_psu_guard.prepare_enable(self.config.thermal.fan_max_pwm);
             dcentrald_hal::platform::amlogic::enable_psu().context("Failed to enable NoPic PSU")?;
-            nopic_psu_guard.armed = true;
-            // W24-CRASH-1 (am3-aml): arm the panic-hook teardown at the instant the
-            // NoPic PSU is energized. `panic="abort"` bypasses NoPicPsuGuard::Drop and
-            // NoPic has NO PIC watchdog, so this is the only crash backstop that cuts
-            // PSU power — and arming HERE (the energize point, not the mining-loop)
-            // covers a panic during enum / open-core / stratum handshake too.
-            arm_nopic_teardown(self.config.thermal.fan_max_pwm);
+            nopic_psu_guard.mark_enabled();
 
             let startup_board_temps = dcentrald_hal::platform::amlogic::read_board_temps(1);
             if startup_board_temps.is_empty() {
@@ -3212,7 +3477,7 @@ impl SerialMiner {
                         .context("BM1362 direct path PSU write-only cold_boot_sequence failed")?;
                     let psu = Arc::new(Mutex::new(psu));
                     let psu_hb = psu.clone();
-                    let shutdown_hb = self.shutdown.clone();
+                    let shutdown_hb = runtime_threads.cancellation_token();
                     let handle = std::thread::Builder::new()
                         .name("s19j-serial-psu-hb".into())
                         .spawn(move || {
@@ -3241,7 +3506,7 @@ impl SerialMiner {
                         .context("BM1362 direct path APW service cold_boot_sequence failed")?;
                     let psu = Arc::new(Mutex::new(psu));
                     let psu_hb = psu.clone();
-                    let shutdown_hb = self.shutdown.clone();
+                    let shutdown_hb = runtime_threads.cancellation_token();
                     let handle = std::thread::Builder::new()
                         .name("s19j-serial-psu-hb".into())
                         .spawn(move || {
@@ -3262,14 +3527,15 @@ impl SerialMiner {
                 let pic_addr =
                     bm1362_pic_addr.context("BM1362 direct PIC address was not resolved")?;
                 info!("Phase 1: PIC init at I2C 0x{:02X} (Pic0x89 flow)", pic_addr);
-                let detected_fw = if let Some(i2c_service) = bm1362_i2c_service.as_ref() {
-                    Self::pic_read_fw_version_service(i2c_service, pic_addr)
-                        .context("BM1362 direct PIC service GET_VERSION preflight failed")?
-                } else {
-                    anyhow::bail!(
-                        "BM1362 direct PIC service missing; refusing second /dev/i2c-0 owner"
-                    )
-                };
+                let (detected_fw, detected_fw_reply) =
+                    if let Some(i2c_service) = bm1362_i2c_service.as_ref() {
+                        Self::pic_read_fw_version_service(i2c_service, pic_addr)
+                            .context("BM1362 direct PIC service GET_VERSION preflight failed")?
+                    } else {
+                        anyhow::bail!(
+                            "BM1362 direct PIC service missing; refusing second /dev/i2c-0 owner"
+                        )
+                    };
                 info!(
                     fw = format_args!("0x{:02X}", detected_fw),
                     "BM1362 direct PIC FW version"
@@ -3292,11 +3558,68 @@ impl SerialMiner {
                 info!("Phase 1c: Waiting 2s after HB reset for fan/autoconfig gate ('Fans OK' window)");
                 std::thread::sleep(Duration::from_secs(2));
                 if let Some(i2c_service) = bm1362_i2c_service.as_ref() {
-                    let mut pic = Pic0x89Service::new_with_fw(
-                        i2c_service.clone(),
+                    let mut pic = match dcentrald_hal::platform::beaglebone::try_bind_system_am3_bb_dspic_endpoint(
+                        &serial_device,
                         pic_addr,
-                        Some(detected_fw),
-                    );
+                        &retained_eeprom_bytes,
+                        &detected_fw_reply,
+                    )
+                    .context("AM3-BB direct PIC endpoint binding failed")?
+                    {
+                        Some(endpoint) => {
+                            info!(
+                                serial_device = %serial_device,
+                                pic_addr = format_args!("0x{:02X}", endpoint.address()),
+                                "BM1362 direct PIC owner bound to exact AM3-BB endpoint capability"
+                            );
+                            Pic0x89EndpointSession::new(i2c_service.clone(), endpoint)
+                                .context("failed to bind AM3-BB Pic0x89 endpoint to I2C service")?
+                                .into_controller()
+                        }
+                        None => {
+                            if let Some(plan) = pending_am2_bm1362_plan.as_ref() {
+                                let context = plan.context_for_address(pic_addr).ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "exact am2-s19j plan has no context for observed PIC address 0x{pic_addr:02X}; refusing raw-address fallback"
+                                    )
+                                })?;
+                                let eeprom_bytes = retained_eeprom_bytes
+                                    .get(usize::from(context.slot()))
+                                    .and_then(|bytes| bytes.clone())
+                                    .with_context(|| {
+                                        format!(
+                                            "exact am2-s19j slot {} lacks its retained pre-energize EEPROM observation",
+                                            context.slot()
+                                        )
+                                    })?;
+                                let presence =
+                                    dcentrald_hal::platform::bind_am2_hashboard_presence(
+                                        plan,
+                                        context,
+                                        eeprom_bytes,
+                                    )?;
+                                let endpoint = dcentrald_hal::platform::bind_am2_controller_endpoint_from_observation(
+                                    &presence,
+                                    &detected_fw_reply,
+                                )?;
+                                info!(
+                                    serial_device = %serial_device,
+                                    pic_addr = format_args!("0x{:02X}", endpoint.address()),
+                                    firmware = ?endpoint.observed_firmware(),
+                                    "BM1362 direct PIC owner bound to exact AM2 endpoint capability from retained observations"
+                                );
+                                Pic0x89EndpointSession::new(i2c_service.clone(), endpoint)
+                                    .context("failed to bind AM2 Pic0x89 endpoint to I2C service")?
+                                    .into_controller()
+                            } else {
+                                Pic0x89Service::new_with_fw(
+                                    i2c_service.clone(),
+                                    pic_addr,
+                                    Some(detected_fw),
+                                )
+                            }
+                        }
+                    };
                     // DspicService handles fw0x86 bare ENABLE as a one-byte
                     // firmware ACK and uses frame-shape-aware RESET/JUMP
                     // guards.
@@ -3345,12 +3668,18 @@ impl SerialMiner {
             info!("Phase 3: SKIPPED — NoPic model, no PIC heartbeat needed");
         } else {
             info!("Phase 3: Starting PIC heartbeat thread");
-            let hb_shutdown = self.shutdown.clone();
+            let hb_shutdown = runtime_threads.cancellation_token();
             let hb_uses_dspic = is_bm1398 || is_bm1366 || is_bm1362;
             let hb_is_bm1362 = is_bm1362;
             let heartbeat_pic_addr = bm1362_pic_addr.unwrap_or(S19J_PIC_ADDR_7BIT);
-            let heartbeat_pic_fw = bm1362_detected_pic_fw;
+            let heartbeat_bm1362_firmware = if hb_is_bm1362 {
+                Some(observed_dspic_firmware(bm1362_detected_pic_fw)?)
+            } else {
+                None
+            };
             let heartbeat_i2c_service = bm1362_i2c_service.clone();
+            let heartbeat_bhb56_sessions = bhb56_dspic_sessions;
+            let heartbeat_requires_endpoint = bhb56_endpoint_capability_required;
             let handle = std::thread::Builder::new()
                 .name("s19j-pic-hb".to_string())
                 .spawn(move || {
@@ -3373,9 +3702,16 @@ impl SerialMiner {
                                 };
                                 for &addr in addrs {
                                     let firmware = if hb_is_bm1362 {
-                                        heartbeat_pic_fw
-                                            .map(DspicFirmware::from_version)
-                                            .unwrap_or(DspicFirmware::Fw89)
+                                        // Resolved once at the lifecycle boundary before
+                                        // spawning this thread. `Some` is proven by the
+                                        // `hb_is_bm1362` branch above.
+                                        let Some(firmware) = heartbeat_bm1362_firmware else {
+                                            error!(
+                                                "BM1362 heartbeat firmware invariant was lost; stopping heartbeat thread"
+                                            );
+                                            return;
+                                        };
+                                        firmware
                                     } else {
                                         match addr {
                                             0x20 => DspicFirmware::Fw82,
@@ -3384,8 +3720,24 @@ impl SerialMiner {
                                             _ => DspicFirmware::Unknown,
                                         }
                                     };
-                                    let mut dspic =
-                                        DspicService::new_with_firmware(i2c_service.clone(), addr, firmware);
+                                    let mut dspic = match Self::dspic_service_for_serial_route(
+                                        &i2c_service,
+                                        &heartbeat_bhb56_sessions,
+                                        heartbeat_requires_endpoint,
+                                        addr,
+                                        Some(firmware),
+                                    ) {
+                                        Ok(dspic) => dspic,
+                                        Err(error) => {
+                                            ok = false;
+                                            error!(
+                                                addr = format_args!("0x{:02X}", addr),
+                                                %error,
+                                                "dsPIC heartbeat refused without bound endpoint capability"
+                                            );
+                                            continue;
+                                        }
+                                    };
                                     if let Err(e) = dspic.send_heartbeat() {
                                         ok = false;
                                         warn!(
@@ -3487,11 +3839,13 @@ impl SerialMiner {
         // counter has started advancing. The Amlogic thermal arm still owns
         // actual temperature fail-closed behavior.
         let watchdog_liveness = Arc::new(AtomicU64::new(0));
-        crate::daemon::spawn_watchdog_kicker(
-            &self.config.watchdog,
-            self.shutdown.clone(),
-            Some(watchdog_liveness.clone()),
-        );
+        if nopic_watchdog.is_none() {
+            crate::daemon::spawn_watchdog_kicker(
+                &self.config.watchdog,
+                self.shutdown.clone(),
+                Some(watchdog_liveness.clone()),
+            );
+        }
 
         // ---- Phase 4: Pool connection ----
         info!("Phase 4: Connecting to pool");
@@ -3858,7 +4212,7 @@ impl SerialMiner {
 
         // Keep VTIME=1 (100ms) — proven to work. Bounded queue provides pipeline depth.
 
-        let reader_shutdown = self.shutdown.clone();
+        let reader_shutdown = runtime_threads.cancellation_token();
         let parsed_uart_trans_chains = if is_bm1362 {
             Self::am3_bb_uart_trans_chains_from_serial_device(&serial_device)
         } else {
@@ -4022,6 +4376,7 @@ impl SerialMiner {
             self.config.power.calibration.clone().unwrap_or_default(),
         ));
         let psu_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let hardware_mutation_gate = dcentrald_hal::platform::HardwareMutationGate::new_open();
 
         let history_path = history::storage_path();
         let history_buffer = HistoryBuffer::load(&history_path);
@@ -4071,6 +4426,7 @@ impl SerialMiner {
             power_rx: power_rx.clone(),
             power_calibration,
             psu_lock,
+            hardware_mutation_gate: hardware_mutation_gate.clone(),
             autotuner_status_rx: auto_status_rx,
             autotuner_efficiency_rx: auto_eff_rx,
             autotuner_chip_health_rx: auto_health_rx,
@@ -4147,7 +4503,6 @@ impl SerialMiner {
         });
 
         // ---- Phase 5: Mining loop ----
-        nopic_psu_guard.armed = nopic;
         info!(
             "=== MINING ACTIVE — {} {} chips on {} at {} MHz ===",
             chip_count,
@@ -4166,7 +4521,7 @@ impl SerialMiner {
             target_freq
         );
 
-        let mut work_builder = dcentrald_stratum::WorkBuilder::new();
+        let mut work_builder = dcentrald_stratum::share_pipeline::WorkBuilder::new();
         let mut current_job: Option<dcentrald_stratum::types::JobTemplate> = None;
         let mut asic_job_id: u8 = 0;
         let history_per_id = if is_bm1398 {
@@ -4251,13 +4606,14 @@ impl SerialMiner {
                                 effective_fan_max_pwm,
                             );
                         }
-                        fan.set_speed(effective_fan_max_pwm);
-                        let latched_pwm = fan.get_speed_pwm();
-                        if latched_pwm == 0 {
-                            return Err(anyhow::anyhow!(
-                                "Amlogic fan control did not latch safety PWM — refusing to mine without verified fan control"
-                            ));
-                        }
+                        let fan_receipt = fan
+                            .set_speed_checked(effective_fan_max_pwm)
+                            .context("Amlogic two-channel safety PWM command/readback failed")?;
+                        debug!(
+                            requested_pwm = fan_receipt.requested_pwm(),
+                            observed_pwm = fan_receipt.observed_pwm(),
+                            "Amlogic startup fan command completed on both PWM channels"
+                        );
                         info!(pwm = effective_fan_max_pwm, "Amlogic fan control initialized (degraded-tach-clamped profile max during startup)");
                         Some(fan)
                     }
@@ -4290,6 +4646,17 @@ impl SerialMiner {
         let mut latest_fan_rpm: u32 = 0;
         let thermal_started_at = Instant::now();
         let mut consecutive_missing_temp_ticks: u8 = 0;
+        let mut early_safe_off_receipt: Option<
+            dcentrald_hal::platform::amlogic::PsuSafeOffReceipt,
+        > = None;
+        let mut terminal_safety_error: Option<anyhow::Error> = None;
+
+        if let Some(watchdog) = nopic_watchdog.as_mut() {
+            // The serial actor, fan owner, and thermal branch now exist. The
+            // worker snapshots liveness at this transition; the next completed
+            // thermal tick must advance it, so zero is never an unlimited grace.
+            watchdog.enter_mining().await?;
+        }
 
         loop {
             tokio::select! {
@@ -4310,8 +4677,20 @@ impl SerialMiner {
                             // PWM-30 stale-temp safety cap). Both only lower the value.
                             let stale_pwm = effective_fan_max_pwm
                                 .min(dcentrald_hal::fan::PWM_SAFETY_MAX);
-                            latest_fan_pwm = stale_pwm;
-                            fan.set_speed(stale_pwm);
+                            match fan.set_speed_checked(stale_pwm) {
+                                Ok(receipt) => latest_fan_pwm = receipt.observed_pwm(),
+                                Err(fan_error) => {
+                                    error!(%fan_error, "Amlogic stale-temperature fan command/readback failed; cutting hash power");
+                                    match checked_nopic_emergency_safe_off(&mut nopic_psu_guard) {
+                                        Ok(receipt) => early_safe_off_receipt = Some(receipt),
+                                        Err(safe_off_error) => error!(%safe_off_error, "Amlogic fan failure emergency safe-off did not complete"),
+                                    }
+                                    terminal_safety_error = Some(anyhow::anyhow!(
+                                        "Amlogic stale-temperature fan command/readback failed: {fan_error}"
+                                    ));
+                                    break;
+                                }
+                            }
                             latest_fan_rpm = fan.get_rpm();
                             consecutive_missing_temp_ticks = consecutive_missing_temp_ticks.saturating_add(1);
 
@@ -4323,11 +4702,17 @@ impl SerialMiner {
                                     grace_s = AMLOGIC_TEMP_STARTUP_GRACE_S,
                                     "No valid Amlogic board temperatures after startup grace — shutting down NoPic mining for safety"
                                 );
-                                let _ = dcentrald_hal::platform::amlogic::disable_psu();
+                                match checked_nopic_emergency_safe_off(&mut nopic_psu_guard) {
+                                    Ok(receipt) => early_safe_off_receipt = Some(receipt),
+                                    Err(safe_off_error) => error!(%safe_off_error, "Amlogic missing-temperature checked safe-off did not complete"),
+                                }
                                 let _ = crate::restart::schedule_daemon_restart(
                                     "amlogic_missing_temps_restart",
                                     Duration::from_secs(AMLOGIC_THERMAL_RESTART_DELAY_S),
                                 );
+                                terminal_safety_error = Some(anyhow::anyhow!(
+                                    "Amlogic board temperatures remained unavailable after the startup grace"
+                                ));
                                 break;
                             }
                         } else {
@@ -4344,14 +4729,32 @@ impl SerialMiner {
                                 // emergency cap (cut-hash-before-noise — disable_psu next).
                                 let emergency_pwm = effective_fan_max_pwm
                                     .min(dcentrald_hal::fan::PWM_SAFETY_MAX);
-                                latest_fan_pwm = emergency_pwm;
-                                fan.set_speed(emergency_pwm);
+                                match fan.set_speed_checked(emergency_pwm) {
+                                    Ok(receipt) => latest_fan_pwm = receipt.observed_pwm(),
+                                    Err(fan_error) => {
+                                        error!(%fan_error, "Amlogic emergency fan command/readback failed; cutting hash power");
+                                        match checked_nopic_emergency_safe_off(&mut nopic_psu_guard) {
+                                            Ok(receipt) => early_safe_off_receipt = Some(receipt),
+                                            Err(safe_off_error) => error!(%safe_off_error, "Amlogic emergency fan failure safe-off did not complete"),
+                                        }
+                                        terminal_safety_error = Some(anyhow::anyhow!(
+                                            "Amlogic emergency fan command/readback failed: {fan_error}"
+                                        ));
+                                        break;
+                                    }
+                                }
                                 latest_fan_rpm = fan.get_rpm();
-                                let _ = dcentrald_hal::platform::amlogic::disable_psu();
+                                match checked_nopic_emergency_safe_off(&mut nopic_psu_guard) {
+                                    Ok(receipt) => early_safe_off_receipt = Some(receipt),
+                                    Err(safe_off_error) => error!(%safe_off_error, "Amlogic dangerous-temperature checked safe-off did not complete"),
+                                }
                                 let _ = crate::restart::schedule_daemon_restart(
                                     "amlogic_thermal_restart",
                                     Duration::from_secs(AMLOGIC_THERMAL_RESTART_DELAY_S),
                                 );
+                                terminal_safety_error = Some(anyhow::anyhow!(
+                                    "Amlogic dangerous temperature {max_temp:.1} C triggered emergency shutdown"
+                                ));
                                 break; // exit mining loop — NoPicPsuGuard::Drop handles cleanup
                             } else if max_temp >= self.config.thermal.hot_temp_c as f32 {
                                 warn!(temp = max_temp, "HOT — fans to profile max");
@@ -4364,8 +4767,20 @@ impl SerialMiner {
                                 // hard fan cap — a HOT event must never blast past it.
                                 let hot_pwm =
                                     effective_fan_max_pwm.min(dcentrald_hal::fan::PWM_SAFETY_MAX);
-                                latest_fan_pwm = hot_pwm;
-                                fan.set_speed(hot_pwm);
+                                match fan.set_speed_checked(hot_pwm) {
+                                    Ok(receipt) => latest_fan_pwm = receipt.observed_pwm(),
+                                    Err(fan_error) => {
+                                        error!(%fan_error, "Amlogic hot-state fan command/readback failed; cutting hash power");
+                                        match checked_nopic_emergency_safe_off(&mut nopic_psu_guard) {
+                                            Ok(receipt) => early_safe_off_receipt = Some(receipt),
+                                            Err(safe_off_error) => error!(%safe_off_error, "Amlogic hot-state fan failure safe-off did not complete"),
+                                        }
+                                        terminal_safety_error = Some(anyhow::anyhow!(
+                                            "Amlogic hot-state fan command/readback failed: {fan_error}"
+                                        ));
+                                        break;
+                                    }
+                                }
                                 latest_fan_rpm = fan.get_rpm();
                             } else {
                                 // Proportional fan control: scale between min and the
@@ -4380,12 +4795,25 @@ impl SerialMiner {
                                 let min_pwm = self.config.thermal.fan_min_pwm.min(effective_fan_max_pwm) as f32;
                                 let max_pwm = effective_fan_max_pwm as f32;
                                 let pwm = (min_pwm + ratio * (max_pwm - min_pwm)) as u8;
-                                latest_fan_pwm = pwm;
-                                fan.set_speed(pwm);
+                                match fan.set_speed_checked(pwm) {
+                                    Ok(receipt) => latest_fan_pwm = receipt.observed_pwm(),
+                                    Err(fan_error) => {
+                                        error!(%fan_error, "Amlogic thermal fan command/readback failed; cutting hash power");
+                                        match checked_nopic_emergency_safe_off(&mut nopic_psu_guard) {
+                                            Ok(receipt) => early_safe_off_receipt = Some(receipt),
+                                            Err(safe_off_error) => error!(%safe_off_error, "Amlogic thermal fan failure safe-off did not complete"),
+                                        }
+                                        terminal_safety_error = Some(anyhow::anyhow!(
+                                            "Amlogic thermal fan command/readback failed: {fan_error}"
+                                        ));
+                                        break;
+                                    }
+                                }
                                 latest_fan_rpm = fan.get_rpm();
                             }
                         }
                     }
+                    nopic_watchdog_liveness.mark_progress();
                 }
 
                 Some(job) = job_rx.recv() => {
@@ -4739,7 +5167,7 @@ impl SerialMiner {
                     //
                     // prev_block_hash: internal header format (reverse_endianness_per_word
                     // already applied by WorkBuilder). merkle_root: raw SHA-256d output.
-                    let latest_meets_target = dcentrald_stratum::validate_full_header(
+                    let latest_meets_target = dcentrald_stratum::share_pipeline::validate_full_header(
                         &serial_build_header(&latest_entry, latest_rolled_version, nonce),
                         &latest_entry.share_target,
                     );
@@ -4764,7 +5192,7 @@ impl SerialMiner {
                             midstate_idx,
                         )?;
                         let header = serial_build_header(candidate, rolled_version, nonce);
-                        if dcentrald_stratum::validate_full_header(&header, &candidate.share_target) {
+                        if dcentrald_stratum::share_pipeline::validate_full_header(&header, &candidate.share_target) {
                             Some((candidate.clone(), rolled_version, header))
                         } else {
                             None
@@ -4898,12 +5326,95 @@ impl SerialMiner {
         }
 
         info!("=== SHUTDOWN ===");
-        runtime_threads.stop_and_join();
-        am2_power.teardown("shutdown");
+        let watchdog_teardown_result = if let Some(watchdog) = nopic_watchdog.as_mut() {
+            watchdog
+                .begin_teardown(DEFAULT_WATCHDOG_TEARDOWN_GRACE)
+                .await
+        } else {
+            Ok(())
+        };
+        // Close every control-plane hardware mutation before actor cancellation
+        // and wait for admitted calls to finish. A timeout is retained as
+        // negative evidence: teardown still cuts power, but watchdog Disarm is
+        // then unreachable.
+        let mutation_gate_for_drain = hardware_mutation_gate.clone();
+        let mutation_barrier_result = match tokio::task::spawn_blocking(move || {
+            mutation_gate_for_drain.close_and_drain(RUNTIME_THREAD_STOP_TIMEOUT)
+        })
+        .await
+        {
+            Ok(result) => result.map_err(anyhow::Error::from),
+            Err(join_error) => Err(anyhow::anyhow!(
+                "hardware mutation barrier worker failed: {join_error}"
+            )),
+        };
+        // Stop future hardware mutations before cancelling the serial actor.
+        work_queue
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                warn!("work queue mutex poisoned during shutdown; recovering for terminal clear");
+                poisoned.into_inner()
+            })
+            .clear();
+        let thread_stop = runtime_threads
+            .stop_and_join(RUNTIME_THREAD_STOP_TIMEOUT)
+            .await;
+        if thread_stop.any_timed_out() {
+            warn!(
+                timeout_ms = RUNTIME_THREAD_STOP_TIMEOUT.as_millis(),
+                "one or more serial runtime threads were detached at the shutdown deadline; using out-of-band hard stop"
+            );
+            am2_power.hard_stop_out_of_band("runtime-thread-timeout");
+        } else {
+            am2_power.teardown("shutdown");
+        }
+
+        if let Some(watchdog_owner) = nopic_watchdog.take() {
+            // Cut hash power before acoustic coast-down. A fan readback failure
+            // is degraded shutdown evidence, but must not force a reboot that
+            // could re-energize a GPIO already proven low.
+            let power_receipt = match early_safe_off_receipt.take() {
+                Some(receipt) => receipt,
+                None => nopic_psu_guard.safe_off()?,
+            };
+            if let Some(fan) = amlogic_fan.as_ref() {
+                match fan.set_speed_checked(dcentrald_hal::fan::PWM_SAFETY_MAX) {
+                    Ok(receipt) => info!(
+                        requested_pwm = receipt.requested_pwm(),
+                        observed_pwm = receipt.observed_pwm(),
+                        "NoPic quiet fan coast-down completed on both PWM channels"
+                    ),
+                    Err(error) => warn!(
+                        %error,
+                        "NoPic power is checked low, but quiet fan coast-down readback failed"
+                    ),
+                }
+            }
+            watchdog_teardown_result?;
+            let mutation_barrier = mutation_barrier_result?;
+            let permit = WatchdogDisarmPermit::from_evidence(
+                &mutation_barrier,
+                &thread_stop,
+                &power_receipt,
+            )?;
+            let closeout = watchdog_owner
+                .disarm_and_join(permit, DEFAULT_WATCHDOG_STOP_TIMEOUT)
+                .await?;
+            match closeout {
+                WatchdogCloseoutReceipt::MagicCloseWriteCompletedAndWorkerExitObserved => info!(
+                    gpio = power_receipt.gpio(),
+                    "NoPic watchdog close and worker exit observed after actor quiescence and checked GPIO-low safe-off"
+                ),
+            }
+        }
         if let Err(e) = history_buffer.save(&history_path) {
             warn!(error = %e, path = %history_path.display(), "Failed to persist history to disk");
         }
-        Ok(())
+        if let Some(error) = terminal_safety_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -5020,6 +5531,18 @@ fn serial_next_asic_job_id(asic_job_id: u8, job_id_increment: u8) -> u8 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn bm1362_heartbeat_requires_supported_observed_dspic_firmware() {
+        assert!(observed_dspic_firmware(None).is_err());
+        assert!(observed_dspic_firmware(Some(0x00)).is_err());
+        assert!(observed_dspic_firmware(Some(0xff)).is_err());
+        assert!(observed_dspic_firmware(Some(0x88)).is_err());
+        assert!(matches!(
+            observed_dspic_firmware(Some(0x89)).unwrap(),
+            DspicFirmware::Fw89
+        ));
+    }
+
     fn sample_entry(version: u32, version_mask: u32) -> WorkEntry {
         WorkEntry {
             generation: 1,
@@ -5092,7 +5615,7 @@ mod tests {
         let nonce = 0x2a00_0000;
         let header = serial_build_header(&entry, entry.version, nonce);
 
-        assert!(dcentrald_stratum::validate_full_header(
+        assert!(dcentrald_stratum::share_pipeline::validate_full_header(
             &header,
             &entry.share_target
         ));
@@ -5123,7 +5646,7 @@ mod tests {
         let header = serial_build_header(&entry, rolled_version, 0x1b2c_3d4e);
 
         assert_eq!(rolled_version, 0x2000_6000);
-        assert!(dcentrald_stratum::validate_full_header(
+        assert!(dcentrald_stratum::share_pipeline::validate_full_header(
             &header,
             &entry.share_target
         ));
@@ -5268,6 +5791,277 @@ mod tests {
         assert_eq!(resolve_serial_chip_id(None, 114, false).unwrap(), 0x1398);
         assert_eq!(resolve_serial_chip_id(None, 110, false).unwrap(), 0x1366);
         assert_eq!(resolve_serial_chip_id(None, 77, false).unwrap(), 0x1366);
+    }
+
+    #[test]
+    fn native_serial_identity_never_comes_from_default_or_explicit_geometry() {
+        assert!(resolve_native_serial_identity_and_geometry(None, None).is_err());
+        assert!(resolve_native_serial_identity_and_geometry(None, Some(126)).is_err());
+        assert!(
+            resolve_native_serial_identity_and_geometry(Some("future-miner"), Some(126)).is_err()
+        );
+        assert!(
+            resolve_native_serial_identity_and_geometry(Some("s9"), Some(63)).is_err(),
+            "a recognized model outside the native serial dispatcher must fail closed"
+        );
+    }
+
+    #[test]
+    fn native_serial_geometry_requires_catalog_evidence_or_explicit_override() {
+        assert_eq!(
+            resolve_native_serial_identity_and_geometry(Some("s19jpro"), None).unwrap(),
+            (0x1362, 126)
+        );
+        assert!(resolve_native_serial_identity_and_geometry(Some("t19"), None).is_err());
+        assert_eq!(
+            resolve_native_serial_identity_and_geometry(Some("t19"), Some(76)).unwrap(),
+            (0x1398, 76)
+        );
+        assert!(resolve_native_serial_identity_and_geometry(Some("t19"), Some(0)).is_err());
+    }
+
+    #[test]
+    fn native_serial_voltage_identity_rejects_impossible_model_chip_pairs() {
+        assert!(validate_serial_model_voltage_identity(
+            "bad-pic-s21",
+            0x1368,
+            Some(model::ModelPicTypeHint::DsPic),
+        )
+        .is_err());
+        assert!(validate_serial_model_voltage_identity(
+            "bad-nopic-s19j",
+            0x1362,
+            Some(model::ModelPicTypeHint::NoPic),
+        )
+        .is_err());
+        assert!(
+            validate_serial_model_voltage_identity("missing-s21-declaration", 0x1370, None,)
+                .is_err()
+        );
+        assert!(validate_serial_model_voltage_identity(
+            "s19kpro",
+            0x1366,
+            Some(model::ModelPicTypeHint::NoPic),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn native_serial_difficulty_requires_a_registered_profile() {
+        assert!(hardware_difficulty_for_serial_family(0xFFFF).is_err());
+        let expected = MinerProfile::for_chip(0x1362)
+            .expect("BM1362 profile")
+            .hardware_difficulty as u64;
+        assert_eq!(
+            hardware_difficulty_for_serial_family(0x1362).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn only_exact_bhb56_family_identity_requires_endpoint_capability() {
+        for subtype in ["AMLCtrl_BHB56902", "amlctrl_bhb56999"] {
+            assert!(subtype_requires_bhb56_endpoint_capability(Some(subtype)));
+        }
+        for subtype in [
+            None,
+            Some(""),
+            Some("AMLCtrl_BHB42XXX"),
+            Some("AMLCtrl_BHB68xxx"),
+            Some("FutureCtrl_BHB56"),
+        ] {
+            assert!(!subtype_requires_bhb56_endpoint_capability(subtype));
+        }
+    }
+
+    #[test]
+    fn nopic_watchdog_and_safeoff_order_is_fail_closed() {
+        let source = include_str!("serial_mining.rs");
+        let power_start = source
+            .find("if !native_nopic_power_owner")
+            .expect("NoPic power-ownership boundary");
+        let power_end = source[power_start..]
+            .find("let startup_board_temps")
+            .map(|offset| power_start + offset)
+            .expect("NoPic post-enable temperature boundary");
+        let power = &source[power_start..power_end];
+        let watchdog_arm = power
+            .find("SafetyWatchdogOwner::start_before_energizing")
+            .expect("pre-energize watchdog admission");
+        let may_be_energized = power
+            .find("nopic_psu_guard.prepare_enable")
+            .expect("pre-mutation NoPic guard arm");
+        let psu_enable = power
+            .find("amlogic::enable_psu()")
+            .expect("GPIO437 enable call");
+        let enabled_receipt = power
+            .find("nopic_psu_guard.mark_enabled()")
+            .expect("NoPic enable ownership receipt");
+        assert!(watchdog_arm < may_be_energized);
+        assert!(may_be_energized < psu_enable);
+        assert!(psu_enable < enabled_receipt);
+
+        assert!(source.contains("RuntimeThreadGuard::new(CancellationToken::new())"));
+        assert!(source.contains("let reader_shutdown = runtime_threads.cancellation_token();"));
+
+        let shutdown = source
+            .split("info!(\"=== SHUTDOWN ===\");")
+            .nth(1)
+            .expect("serial shutdown section");
+        let teardown = shutdown
+            .find(".begin_teardown(DEFAULT_WATCHDOG_TEARDOWN_GRACE)")
+            .expect("watchdog Teardown admission");
+        let mutation_barrier = shutdown
+            .find(".close_and_drain(RUNTIME_THREAD_STOP_TIMEOUT)")
+            .expect("control-plane hardware mutation barrier");
+        let actor_join = shutdown
+            .find(".stop_and_join(RUNTIME_THREAD_STOP_TIMEOUT)")
+            .expect("serial actor join");
+        let power_off = shutdown
+            .find("nopic_psu_guard.safe_off()")
+            .expect("checked NoPic safe-off");
+        let quiet_fan = shutdown
+            .find("fan.set_speed_checked")
+            .expect("checked quiet fan command");
+        let permit = shutdown
+            .find("WatchdogDisarmPermit::from_evidence")
+            .expect("typed watchdog disarm permit");
+        let disarm = shutdown
+            .find(".disarm_and_join")
+            .expect("watchdog close and join");
+        let persistence = shutdown
+            .find("history_buffer.save")
+            .expect("noncritical history persistence");
+        assert!(teardown < mutation_barrier);
+        assert!(mutation_barrier < actor_join);
+        assert!(actor_join < power_off);
+        assert!(power_off < quiet_fan);
+        assert!(quiet_fan < permit);
+        assert!(permit < disarm);
+        assert!(disarm < persistence);
+    }
+
+    #[test]
+    fn bhb56_endpoint_issuance_precedes_service_and_init_has_no_raw_fallback() {
+        let source = include_str!("serial_mining.rs");
+        let issue = source
+            .find("let pending_bhb56_endpoints")
+            .expect("BHB56 endpoint issuance");
+        let spawn = source
+            .find("let bm1362_i2c_service")
+            .expect("serialized I2C service spawn");
+        let bind = source
+            .find("let bhb56_dspic_sessions")
+            .expect("endpoint-to-service session binding");
+        assert!(issue < spawn && spawn < bind);
+        assert!(source.contains("refusing model/config-only dsPIC authorization"));
+
+        let branch_start = source
+            .find("// ---- BM1366 (S19 XP / S19K Pro): dsPIC voltage init + ASIC init ----")
+            .expect("BM1366 voltage-init branch");
+        let branch_end = source[branch_start..]
+            .find("} else if is_bm1368 || is_bm1370 {")
+            .map(|offset| branch_start + offset)
+            .expect("end of BM1366 voltage-init branch");
+        let branch = &source[branch_start..branch_end];
+        assert!(branch.contains("Self::dspic_service_for_serial_route("));
+        assert!(!branch.contains("DspicService::new("));
+        assert!(!branch.contains("DspicService::new_with_firmware("));
+
+        let helper_start = source
+            .find("fn dspic_service_for_serial_route(")
+            .expect("capability-aware service helper");
+        let helper_end = source[helper_start..]
+            .find("fn am3_bb_uart_trans_chain_from_serial_device(")
+            .map(|offset| helper_start + offset)
+            .expect("end of capability-aware service helper");
+        let helper = &source[helper_start..helper_end];
+        assert!(helper.contains("if endpoint_capability_required"));
+        assert!(helper.contains("refusing caller-asserted protocol/address fallback"));
+    }
+
+    #[test]
+    fn am3_bb_bm1362_init_reuses_existing_observations_for_endpoint_authority() {
+        let source = include_str!("serial_mining.rs");
+        assert!(source
+            .contains("let mut retained_eeprom_bytes: [Option<Vec<u8>>; 3] = [None, None, None];"));
+        assert!(source.contains("retained_eeprom_bytes[slot as usize] = Some(bytes.clone());"));
+        assert!(source.contains("let (detected_fw, detected_fw_reply)"));
+        let get_version_call = [
+            "Self::pic_read_fw_version_service",
+            "(i2c_service, pic_addr)",
+        ]
+        .concat();
+        assert_eq!(
+            source.matches(&get_version_call).count(),
+            1,
+            "endpoint binding must reuse the one existing GET_VERSION observation"
+        );
+        assert!(source.contains("try_bind_system_am3_bb_dspic_endpoint("));
+        assert!(source.contains("Pic0x89EndpointSession::new(i2c_service.clone(), endpoint)"));
+
+        let branch_start = source
+            .find("let (detected_fw, detected_fw_reply)")
+            .expect("BM1362 existing firmware observation");
+        let branch_end = source[branch_start..]
+            .find("post_enable_chain_uart_probe(&serial_device, pic_addr);")
+            .map(|offset| branch_start + offset)
+            .expect("BM1362 post-enable proof boundary");
+        let branch = &source[branch_start..branch_end];
+        assert!(branch.contains("try_bind_system_am3_bb_dspic_endpoint("));
+        assert!(branch.contains("Pic0x89EndpointSession::new"));
+    }
+
+    #[test]
+    fn exact_am2_bm1362_init_reuses_the_same_eeprom_and_version_observations() {
+        let source = include_str!("serial_mining.rs");
+        let plan = source
+            .find("let pending_am2_bm1362_plan")
+            .expect("AM2 direct-serial plan discovery");
+        let service = source
+            .find("let bm1362_i2c_service")
+            .expect("serialized I2C service spawn");
+        assert!(
+            plan < service,
+            "identity planning must emit no service traffic"
+        );
+
+        let get_version_call = [
+            "Self::pic_read_fw_version_service",
+            "(i2c_service, pic_addr)",
+        ]
+        .concat();
+        assert_eq!(
+            source.matches(&get_version_call).count(),
+            1,
+            "AM2 endpoint binding must not add a second GET_VERSION transaction"
+        );
+
+        let branch_start = source
+            .find("let (detected_fw, detected_fw_reply)")
+            .expect("existing BM1362 firmware observation");
+        let branch_end = source[branch_start..]
+            .find("post_enable_chain_uart_probe(&serial_device, pic_addr);")
+            .map(|offset| branch_start + offset)
+            .expect("BM1362 post-enable proof boundary");
+        let branch = &source[branch_start..branch_end];
+        assert!(branch.contains("pending_am2_bm1362_plan.as_ref()"));
+        assert!(branch.contains("retained_eeprom_bytes"));
+        assert!(branch.contains("bind_am2_hashboard_presence("));
+        assert!(branch.contains("bind_am2_controller_endpoint_from_observation("));
+        assert!(branch.contains("&detected_fw_reply"));
+        assert!(branch.contains("Pic0x89EndpointSession::new"));
+        assert!(branch.contains("refusing raw-address fallback"));
+
+        let exact_start = branch
+            .find("if let Some(plan) = pending_am2_bm1362_plan.as_ref()")
+            .expect("exact AM2 capability branch");
+        let legacy_start = branch[exact_start..]
+            .find("Pic0x89Service::new_with_fw(")
+            .map(|offset| exact_start + offset)
+            .expect("non-target compatibility seam");
+        assert!(branch[exact_start..legacy_start].contains("Pic0x89EndpointSession::new"));
+        assert!(!branch[exact_start..legacy_start].contains("Pic0x89Service::new_with_fw"));
     }
 
     #[test]

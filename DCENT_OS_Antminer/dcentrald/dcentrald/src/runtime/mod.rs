@@ -42,6 +42,9 @@ pub mod hardware_info;
 pub mod impls;
 pub mod job_declaration;
 pub mod notifications;
+pub(crate) mod safety_watchdog;
+pub(crate) mod task_guard;
+pub(crate) mod thread_guard;
 
 use std::future::Future;
 
@@ -84,8 +87,8 @@ pub trait MiningRuntime: Send + 'static {
     ///
     /// Modes that don't construct their own full `AppState` should call
     /// this from inside their `run()` BEFORE entering the work-dispatch
-    /// loop. The returned `JoinHandle`s must be kept alive for the lifetime
-    /// of the process — dropping them aborts the API tasks.
+    /// loop. The returned `JoinHandle`s must be retained and explicitly joined
+    /// or aborted; dropping a Tokio handle detaches its still-running task.
     ///
     /// This is the load-bearing piece of the trait. Per
     /// , every non-`Daemon` mode

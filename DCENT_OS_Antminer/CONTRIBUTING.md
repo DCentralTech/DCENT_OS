@@ -32,6 +32,11 @@ hardware. This guide explains how to contribute effectively.
 5. **Be honest in user-facing surfaces.** The dashboard and APIs must never claim a state that
    isn't true (e.g. "connected" ≠ "mining", "scheduled" ≠ "flashed", pool-target ≠ achieved
    difficulty). Truthfulness is a hard rule.
+6. **Prefer decade-scale architecture.** Read [`docs/architecture/`](docs/architecture/README.md)
+   before adding a platform path. **Do not** add a new full `*_mining.rs` engine (ADR-0009). Prefer
+   composition facets (ASIC / board / power / cooling / storage / network). Prefer config/markers
+   over a new product `DCENT_*` env var (ADR-0012). Prefer transport-neutral ASIC helpers over new
+   `FpgaChain`-only APIs (ADR-0010).
 
 ## Development setup
 

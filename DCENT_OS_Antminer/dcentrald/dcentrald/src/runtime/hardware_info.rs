@@ -405,10 +405,6 @@ struct ChipIdentityResolution {
     identification: dcentrald_api::HardwareIdentification,
 }
 
-fn chip_source(source: &str, key: &str, chip: &str) -> String {
-    format!("{}:{}->{}", source, key, chip)
-}
-
 /// Resolve the public ASIC label and structured evidence for that identity.
 ///
 /// Precedence intentionally matches the historical chip-type behavior:
@@ -426,61 +422,76 @@ fn resolve_chip_identity(
         {
             ChipIdentityResolution {
                 chip_label: config_chip,
-                identification: dcentrald_api::HardwareIdentification {
-                    confidence: "high".to_string(),
-                    sources: vec![
-                        chip_source("config_model", model_key, config_chip),
-                        chip_source("board_target", board_target, board_chip),
+                identification: dcentrald_api::HardwareIdentification::from_evidence(
+                    vec![
+                        dcentrald_api::HardwareIdentityEvidence::declared_asic_config(
+                            model_key,
+                            config_chip,
+                        ),
+                        dcentrald_api::HardwareIdentityEvidence::declared_asic_board_target(
+                            board_target,
+                            board_chip,
+                        ),
                     ],
-                    note: Some(
+                    Some(
                         "configured model and baked board target agree on ASIC family"
                             .to_string(),
                     ),
-                },
+                ),
             }
         }
         (Some(model_key), Some(config_chip), Some(board_target), Some(board_chip)) => {
             ChipIdentityResolution {
                 chip_label: config_chip,
-                identification: dcentrald_api::HardwareIdentification {
-                    confidence: "low".to_string(),
-                    sources: vec![
-                        chip_source("config_model", model_key, config_chip),
-                        chip_source("board_target", board_target, board_chip),
+                identification: dcentrald_api::HardwareIdentification::from_evidence(
+                    vec![
+                        dcentrald_api::HardwareIdentityEvidence::declared_asic_config(
+                            model_key,
+                            config_chip,
+                        ),
+                        dcentrald_api::HardwareIdentityEvidence::declared_asic_board_target(
+                            board_target,
+                            board_chip,
+                        ),
                     ],
-                    note: Some(
+                    Some(
                         "configured model and baked board target disagree; using configured model chip label"
                             .to_string(),
                     ),
-                },
+                ),
             }
         }
         (Some(model_key), Some(config_chip), _, _) => ChipIdentityResolution {
             chip_label: config_chip,
-            identification: dcentrald_api::HardwareIdentification {
-                confidence: "medium".to_string(),
-                sources: vec![chip_source("config_model", model_key, config_chip)],
-                note: Some("ASIC family is pinned by configured model only".to_string()),
-            },
+            identification: dcentrald_api::HardwareIdentification::from_evidence(
+                vec![dcentrald_api::HardwareIdentityEvidence::declared_asic_config(
+                    model_key,
+                    config_chip,
+                )],
+                Some("ASIC family is declared by configured model only".to_string()),
+            ),
         },
         (_, _, Some(board_target), Some(board_chip)) => ChipIdentityResolution {
             chip_label: board_chip,
-            identification: dcentrald_api::HardwareIdentification {
-                confidence: "high".to_string(),
-                sources: vec![chip_source("board_target", board_target, board_chip)],
-                note: Some("ASIC family is pinned by baked board target".to_string()),
-            },
+            identification: dcentrald_api::HardwareIdentification::from_evidence(
+                vec![
+                    dcentrald_api::HardwareIdentityEvidence::declared_asic_board_target(
+                        board_target,
+                        board_chip,
+                    ),
+                ],
+                Some("ASIC family is declared by baked board target only".to_string()),
+            ),
         },
         _ => ChipIdentityResolution {
             chip_label: "Auto-detect",
-            identification: dcentrald_api::HardwareIdentification {
-                confidence: "unknown".to_string(),
-                sources: Vec::new(),
-                note: Some(
+            identification: dcentrald_api::HardwareIdentification::from_evidence(
+                Vec::new(),
+                Some(
                     "no configured model or recognized board target pins the ASIC family"
                         .to_string(),
                 ),
-            },
+            ),
         },
     }
 }
@@ -518,6 +529,13 @@ pub fn collect_hardware_info(config: &DcentraldConfig) -> dcentrald_api::Hardwar
     // never fabricate a chip on an unidentified board).
     info.chip_type = chip_identity.chip_label.to_string();
     info.identification = chip_identity.identification;
+    if !info.control_board.trim().is_empty() {
+        info.identification.push_evidence(
+            dcentrald_api::HardwareIdentityEvidence::observed_control_board(
+                info.control_board.clone(),
+            ),
+        );
+    }
 
     if let Some(chip_id) = profile_chip_id {
         if let Some(profile) = MinerProfile::for_chip(chip_id) {
@@ -602,7 +620,8 @@ pub fn collect_hardware_info(config: &DcentraldConfig) -> dcentrald_api::Hardwar
     tracing::info!(
         control_board = %info.control_board,
         chip_type = %info.chip_type,
-        identification_confidence = %info.identification.confidence,
+        identification_confidence = ?info.identification.confidence,
+        identification_evidence = ?info.identification.evidence,
         identification_sources = ?info.identification.sources,
         serial = ?info.miner_serial,
         psu = ?info.psu_model,
@@ -772,11 +791,17 @@ mod tests {
     static EEPROM_PIC_DETECT_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn chip_identity_high_confidence_when_config_and_board_target_agree() {
+    fn correlated_declarations_do_not_mint_high_confidence() {
         let resolved = resolve_chip_identity(Some("s19jpro"), Some("am2-s19jpro-zynq"));
 
         assert_eq!(resolved.chip_label, "BM1362");
-        assert_eq!(resolved.identification.confidence, "high");
+        assert_eq!(
+            resolved.identification.confidence,
+            dcentrald_api::HardwareIdentityConfidence::Low
+        );
+        assert!(resolved.identification.evidence.iter().all(|evidence| {
+            evidence.level() == dcentrald_api::HardwareIdentityEvidenceLevel::Declared
+        }));
         assert_eq!(
             resolved.identification.sources,
             vec![
@@ -794,7 +819,10 @@ mod tests {
             resolved.chip_label, "BM1398",
             "configured model remains the selected chip label for compatibility"
         );
-        assert_eq!(resolved.identification.confidence, "low");
+        assert_eq!(
+            resolved.identification.confidence,
+            dcentrald_api::HardwareIdentityConfidence::Low
+        );
         assert!(resolved
             .identification
             .note
@@ -804,11 +832,18 @@ mod tests {
     }
 
     #[test]
-    fn chip_identity_board_target_only_stays_high_confidence() {
+    fn chip_identity_board_target_only_stays_declared_and_low_confidence() {
         let resolved = resolve_chip_identity(None, Some("am1-s9"));
 
         assert_eq!(resolved.chip_label, "BM1387");
-        assert_eq!(resolved.identification.confidence, "high");
+        assert_eq!(
+            resolved.identification.confidence,
+            dcentrald_api::HardwareIdentityConfidence::Low
+        );
+        assert_eq!(
+            resolved.identification.strongest_asic_evidence_level(),
+            Some(dcentrald_api::HardwareIdentityEvidenceLevel::Declared)
+        );
         assert_eq!(
             resolved.identification.sources,
             vec!["board_target:am1-s9->BM1387".to_string()]
@@ -820,7 +855,10 @@ mod tests {
         let resolved = resolve_chip_identity(None, Some("am2"));
 
         assert_eq!(resolved.chip_label, "Auto-detect");
-        assert_eq!(resolved.identification.confidence, "unknown");
+        assert_eq!(
+            resolved.identification.confidence,
+            dcentrald_api::HardwareIdentityConfidence::Unknown
+        );
         assert!(resolved.identification.sources.is_empty());
     }
 

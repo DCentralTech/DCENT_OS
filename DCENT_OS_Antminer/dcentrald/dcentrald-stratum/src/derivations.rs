@@ -267,11 +267,14 @@ mod tests {
         tx.push(0x01); // txin count = 1
         tx.extend_from_slice(&[0u8; 32]); // prevout hash (coinbase = all zero)
         tx.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // prevout index
-        assert!(scriptsig.len() < 0xFD, "test scriptsig fits a 1-byte varint");
+        assert!(
+            scriptsig.len() < 0xFD,
+            "test scriptsig fits a 1-byte varint"
+        );
         tx.push(scriptsig.len() as u8); // scriptSig length
         tx.extend_from_slice(scriptsig);
         tx.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // sequence
-        // (outputs + locktime omitted — the height parse never reaches them)
+                                                         // (outputs + locktime omitted — the height parse never reaches them)
         tx
     }
 
@@ -490,7 +493,10 @@ mod tests {
     fn network_difficulty_from_nbits_genesis_is_about_one() {
         // Genesis nbits 0x1d00ffff ⇒ network difficulty ≈ 1 (pdiff convention).
         let d = network_difficulty_from_nbits(0x1d00ffff);
-        assert!((d - 1.0).abs() < 0.01, "genesis network difficulty {d} != ~1");
+        assert!(
+            (d - 1.0).abs() < 0.01,
+            "genesis network difficulty {d} != ~1"
+        );
     }
 
     #[test]

@@ -18,8 +18,9 @@ Bitmain wire format (port 14235):
 
 DCENT extended format (port 14237):
   JSON with model, hostname, ip, mac, firmware, dcentrald_status,
-  hashrate_th, uptime_s, chains_alive, dspic_fw_at_0x21. dcent-toolbox
-  `dcent listen` parses this for full fleet discovery.
+  hashrate_th, uptime_s, and chains_alive. dcent-toolbox `dcent listen`
+  parses this for full fleet discovery. Hardware telemetry is consumed from
+  dcentrald-owned snapshots; this auxiliary process never opens an I2C bus.
 """
 import argparse
 import json
@@ -103,10 +104,6 @@ def get_dcent_extra():
     extra["dcentrald_status"] = "alive" if pid else "dead"
     if pid:
         extra["dcentrald_pid"] = int(pid.split()[0])
-    # dsPIC FW byte at 0x21 (single 1-byte read; non-destructive)
-    dspic_raw = run_cmd("i2cget -y 0 0x21 b 2>/dev/null")
-    if dspic_raw and dspic_raw.startswith("0x"):
-        extra["dspic_fw_at_0x21"] = dspic_raw
     # Uptime
     try:
         with open("/proc/uptime") as f:

@@ -5,6 +5,7 @@ use crate::board_health::BoardHealthResult;
 use crate::chip_health::{
     ChipColor, ChipHealthChainSnapshot, ChipHealthSnapshot, ChipMap, ChipMapCell,
 };
+use crate::evidence::DiagnosticEvidence;
 use crate::hashreport::{
     calculate_unit_grade, score_to_grade, BaselineSnapshot, BoardResult, ChipHealthScore,
     HashReport, SystemInfo, WindowData,
@@ -141,6 +142,9 @@ pub fn build_chip_health_snapshot(
                         .and_then(|c| expected_nonce_rate_hz(chip.freq_mhz, c)),
                     health_ts: now_ts,
                     die_temp_c: None,
+                    anomaly_gradient: None,
+                    anomaly_cross_slot_zscore: None,
+                    anomaly_nonce_deficit: None,
                 });
             }
             if let Some(profile) = profile {
@@ -167,8 +171,13 @@ pub fn build_chip_health_snapshot(
                         .and_then(|c| expected_nonce_rate_hz(chip.operating_mhz, c)),
                     health_ts: now_ts,
                     die_temp_c: None,
+                    anomaly_gradient: None,
+                    anomaly_cross_slot_zscore: None,
+                    anomaly_nonce_deficit: None,
                 });
             }
+            // Profile baselines carry per-chip nonce counts — enrich deficit now.
+            chipmap.enrich_nonce_deficits();
             "saved_profile_baseline".to_string()
         } else {
             let inferred_score = inferred_chain_score(chain, expected_chip_count) as f32;
@@ -188,6 +197,9 @@ pub fn build_chip_health_snapshot(
                         .and_then(|c| expected_nonce_rate_hz(chain.frequency_mhz, c)),
                     health_ts: now_ts,
                     die_temp_c: None,
+                    anomaly_gradient: None,
+                    anomaly_cross_slot_zscore: None,
+                    anomaly_nonce_deficit: None,
                 });
             }
             warnings.push(format!(
@@ -292,6 +304,8 @@ pub fn build_board_health_snapshot(
                 notes: vec![
                     "Board-health values are derived from the miner's current runtime snapshot; no standalone stress pass was launched.".to_string(),
                     "Voltage shown is the commanded/last-known setpoint — the rail was NOT measured in snapshot mode (no PIC/dsPIC set/get readback); deviation is not available. A collapsed rail can still show a non-zero commanded value.".to_string(),
+                    "CRC status is inferred from a cumulative runtime counter; no bounded command window was measured, so zero errors cannot prove a measured PASS.".to_string(),
+                    "Board model/serial metadata is not EEPROM checksum or schema validation; EEPROM validity is unavailable in snapshot mode.".to_string(),
                 ],
                 chips_expected: expected,
                 chips_responding: chain.chips,
@@ -305,16 +319,42 @@ pub fn build_board_health_snapshot(
                 voltage_readback_v: voltage_v,
                 voltage_deviation_pct: 0.0,
                 voltage_ok: chain.voltage_mv > 0,
+                voltage_evidence: DiagnosticEvidence::commanded(
+                    voltage_v,
+                    "runtime_voltage_setpoint",
+                    None,
+                ),
                 crc_commands_sent: 0,
                 crc_errors_received: chain.errors,
                 crc_error_rate_pct: 0.0,
                 crc_ok,
+                crc_evidence: DiagnosticEvidence::inferred(
+                    chain.errors,
+                    "runtime_cumulative_error_counter_without_test_window",
+                    None,
+                ),
                 temperature_c: chain.temp_c,
                 temperature_ok: temp_ok,
-                eeprom_present: context.board_type.is_some(),
-                eeprom_valid: context.board_type.is_some(),
+                // Runtime model metadata does not prove that EEPROM bytes were
+                // read or that their checksum/schema was validated.
+                eeprom_present: false,
+                eeprom_valid: false,
                 eeprom_model: context.board_type.clone(),
                 eeprom_serial: context.serial.clone(),
+                eeprom_evidence: context
+                    .board_type
+                    .as_ref()
+                    .map(|_| {
+                        DiagnosticEvidence::inferred(
+                            false,
+                            "runtime_board_model_metadata_not_eeprom_validation",
+                            None,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        DiagnosticEvidence::unavailable("eeprom_not_observed_in_snapshot")
+                    }),
+                required_evidence_measured: false,
                 grade: 'F',
                 grade_explanation: String::new(),
             };
@@ -344,7 +384,7 @@ pub fn build_hashreport_snapshot(
     let windows = build_windows(context, chain_filter);
     let unit_grade = calculate_unit_grade(&boards);
     let unit_grade_explanation = format!(
-        "{} snapshot board(s) analyzed using current runtime state{}.",
+        "{} snapshot board(s) analyzed using current runtime state{}. Passing grade withheld because snapshot voltage is commanded and CRC validity is inferred rather than measured in a bounded test window.",
         boards.len(),
         if duration_seconds > 0 {
             format!(" and {}s of retained history", duration_seconds)
@@ -444,6 +484,7 @@ fn build_board_results(chip_health: &ChipHealthSnapshot) -> Vec<BoardResult> {
                 .iter()
                 .filter(|cell| cell.health_score <= 0.01)
                 .count() as u8;
+            let health_grade = score_to_grade(chain.board_health_score as f32);
             BoardResult {
                 chain_id: chain.chain_id,
                 chips_expected: chain.chip_count as u8,
@@ -451,9 +492,23 @@ fn build_board_results(chip_health: &ChipHealthSnapshot) -> Vec<BoardResult> {
                 chips_dead,
                 hashrate_ghs: chain.board_hashrate_ghs as f32,
                 voltage_v: chain.voltage_mv as f32 / 1000.0,
+                voltage_evidence: DiagnosticEvidence::commanded(
+                    chain.voltage_mv as f32 / 1000.0,
+                    "runtime_voltage_setpoint",
+                    None,
+                ),
                 temp_c: chain.board_temp_c,
                 crc_errors: chain.errors,
-                grade: score_to_grade(chain.board_health_score as f32),
+                crc_evidence: DiagnosticEvidence::inferred(
+                    chain.errors,
+                    "runtime_cumulative_error_counter_without_test_window",
+                    None,
+                ),
+                grade: if matches!(health_grade, 'A' | 'B') {
+                    'C'
+                } else {
+                    health_grade
+                },
                 chips,
             }
         })
@@ -617,6 +672,9 @@ fn fill_missing_profile_cells(
                 .and_then(|c| expected_nonce_rate_hz(chip.operating_mhz, c)),
             health_ts: now_ts,
             die_temp_c: None,
+            anomaly_gradient: None,
+            anomaly_cross_slot_zscore: None,
+            anomaly_nonce_deficit: None,
         });
         present.insert(index, true);
     }
@@ -794,5 +852,82 @@ mod re010_helpers_tests {
             ts > 1_700_000_000,
             "Unix timestamp {ts} looks pre-2023 — system clock unset?"
         );
+    }
+}
+
+#[cfg(test)]
+mod evidence_producer_tests {
+    use super::{build_board_health_snapshot, build_hashreport_snapshot};
+    use crate::evidence::EvidenceKind;
+    use crate::snapshot::{SnapshotChain, SnapshotContext};
+    use uuid::Uuid;
+
+    fn snapshot(board_type: Option<&str>) -> SnapshotContext {
+        SnapshotContext {
+            report_id: Uuid::nil(),
+            generated_at: "2026-07-12T00:00:00Z".into(),
+            firmware_version: "test".into(),
+            serial: Some("runtime-serial".into()),
+            mac: None,
+            model: Some("test-miner".into()),
+            chip_type: "BM1397".into(),
+            chip_id: Some(0x1397),
+            control_board: "test-control-board".into(),
+            board_type: board_type.map(str::to_owned),
+            chain_states: vec![SnapshotChain {
+                chain_id: 0,
+                chips: 100,
+                frequency_mhz: 500,
+                voltage_mv: 13_700,
+                temp_c: 55.0,
+                hashrate_ghs: 1_000.0,
+                errors: 0,
+                status: "running".into(),
+            }],
+            fan_pwm: 50,
+            fan_rpm: 4_000,
+            accepted_shares: 1,
+            rejected_shares: 0,
+            pool_url: String::new(),
+            pool_status: "connected".into(),
+            pool_difficulty: 1.0,
+            uptime_s: 60,
+            history: Vec::new(),
+            live_chip_health: Vec::new(),
+            saved_profiles: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn runtime_snapshot_producer_cannot_emit_a_measured_board_or_unit_pass() {
+        let context = snapshot(Some("BHB42"));
+        let boards = build_board_health_snapshot(&context, None);
+        assert_eq!(boards.len(), 1);
+        assert_eq!(boards[0].grade, 'C');
+        assert_eq!(boards[0].voltage_evidence.kind(), EvidenceKind::Commanded);
+        assert_eq!(boards[0].crc_evidence.kind(), EvidenceKind::Inferred);
+        assert!(!boards[0].eeprom_present);
+        assert!(!boards[0].eeprom_valid);
+        assert_eq!(boards[0].eeprom_evidence.kind(), EvidenceKind::Inferred);
+        assert!(!boards[0].required_evidence_measured);
+
+        let report = build_hashreport_snapshot(&context, None);
+        assert_eq!(report.boards.len(), 1);
+        assert_eq!(report.boards[0].grade, 'C');
+        assert_eq!(
+            report.boards[0].voltage_evidence.kind(),
+            EvidenceKind::Commanded
+        );
+        assert_eq!(report.boards[0].crc_evidence.kind(), EvidenceKind::Inferred);
+        assert_eq!(report.unit_grade, 'C');
+    }
+
+    #[test]
+    fn missing_eeprom_observation_is_explicitly_unavailable() {
+        let boards = build_board_health_snapshot(&snapshot(None), None);
+        assert_eq!(boards[0].eeprom_evidence.kind(), EvidenceKind::Unavailable);
+        assert_eq!(boards[0].eeprom_evidence.value(), None);
+        assert!(!boards[0].eeprom_present);
+        assert!(!boards[0].eeprom_valid);
     }
 }

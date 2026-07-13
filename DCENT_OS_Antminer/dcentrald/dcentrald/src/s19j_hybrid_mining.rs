@@ -57,7 +57,7 @@
 //!     —.
 //!   - PSU SetVoltage calls outside of `cold_boot_sequence` are also gated —
 //!     enforced by the `Apw121215a` driver itself.
-//!   - Graceful shutdown MUST `watchdog(false)` then `disable()` the PSU so
+//!   - Graceful shutdown MUST stop the feeder, ramp to minimum, then disarm the PSU watchdog so
 //!     bosminer can cleanly restart afterwards.
 //!   - Passthrough relay to bosminer needs SIGKILL (not SIGTERM) —
 //!     . Owned by the caller, not this module.
@@ -75,6 +75,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::am2_chain_plan::{build_am2_chain_plan, Am2ChainContext};
+use crate::runtime::thread_guard::RuntimeThreadGuard;
 use dcentrald_asic::bm1362::{bip320_reconstruct_rolled_version, parse_bm1362_serial_nonce};
 use dcentrald_asic::drivers::bm1362::{
     build_serial_work_frame, decode_pll_reg_to_freq, jig_pll1_reclock_regs, pll_lookup_extended,
@@ -83,11 +84,15 @@ use dcentrald_asic::drivers::bm1362::{
 use dcentrald_asic::drivers::MiningWork as AsicMiningWork;
 use dcentrald_hal::board_control::BoardControl;
 use dcentrald_hal::fpga_chain::{self, DevmemFpgaChain, FpgaChain};
+use dcentrald_hal::platform::{
+    bind_am2_hashboard_presence, discover_am2_controller_endpoint,
+    discover_system_am2_controller_plan, Am2HashboardPresence, VoltageControllerEndpoint,
+};
 use dcentrald_hal::xadc::Xadc;
 // W13.B1 (2026-05-10) merged glitch_monitor + uart_relay imports below.
 use dcentrald_hal::i2c::{
     spawn_i2c_service_no_register_touch, spawn_i2c_service_no_register_touch_with_denylist,
-    I2cServiceHandle, I2cTransactionStep,
+    I2cMutationLabel, I2cServiceHandle, I2cTransactionStep,
 };
 use dcentrald_hal::psu::Apw121215a;
 // PsuGpioGate is now owned by `Apw121215a` and asserted automatically
@@ -116,7 +121,8 @@ use dcentrald_hal::glitch_monitor::{
 
 use dcentrald_asic::dspic::{
     bosminer_warmup, dspic_fw86_trust_degraded_override_enabled, dspic_voltage_command_allowed,
-    dspic_voltage_refusal_detail, pic0x89_firmware_from_observed_fw_byte, Pic0x89Service,
+    dspic_voltage_refusal_detail, pic0x89_firmware_from_observed_fw_byte, Pic0x89EndpointSession,
+    Pic0x89Service,
 };
 
 use crate::config::DcentraldConfig;
@@ -597,9 +603,10 @@ fn am2_read_fan_rpm_max() -> u32 {
 }
 
 fn force_am2_fans_to_configured_cap(fan_max_pwm: u8, reason: &str) {
-    let cap = fan_max_pwm
-        .min(dcentrald_hal::fan::PWM_MAX)
-        .min(dcentrald_hal::fan::PWM_SAFETY_MAX);
+    // Policy chokepoint: FanCommand intersects profile max ∩ home safety (30).
+    let cap = dcentrald_common::FanCommand::emergency_cap(fan_max_pwm)
+        .effective_pwm()
+        .min(dcentrald_hal::fan::PWM_MAX);
     match open_am2_fan_controller(reason) {
         Some((discovery, fan)) => {
             fan.set_speed(cap);
@@ -645,6 +652,10 @@ fn force_am2_thermal_hard_stop(config: &DcentraldConfig, reason: &str) {
     // Measured thermal failure is different from a normal park/no-nonce stop:
     // cut hashboard power first, then keep the home safety cooling cap instead
     // of immediately dropping to idle.
+    // Policy order is `PowerCut::home_thermal_hard_stop_action` (cut then fans).
+    let _policy =
+        dcentrald_common::PowerCut::home_thermal_hard_stop_action(config.thermal.fan_max_pwm);
+    debug_assert!(dcentrald_common::power_precedes_fan_raise(&_policy.steps()));
     force_pwr_control_low(config.psu.pwr_control_gpio.as_deref(), reason);
     force_am2_fans_to_configured_cap(config.thermal.fan_max_pwm, reason);
 }
@@ -658,10 +669,12 @@ fn force_am2_thermal_hard_stop(config: &DcentraldConfig, reason: &str) {
 /// without opening a UIO device. See
 /// .
 fn compute_quiet_idle_pwm(idle_pwm: u8, fan_max_pwm: u8) -> u8 {
-    idle_pwm
-        .min(fan_max_pwm)
-        .min(dcentrald_hal::fan::PWM_SAFETY_MAX)
-        .min(dcentrald_hal::fan::PWM_MAX)
+    dcentrald_common::FanCommand {
+        profile_max_pwm: fan_max_pwm.min(dcentrald_hal::fan::PWM_MAX),
+        requested_pwm: idle_pwm,
+        apply_home_safety_cap: true,
+    }
+    .effective_pwm()
 }
 
 /// am2 low-idle fan setter for the management-only park paths.
@@ -746,6 +759,24 @@ fn am2_safe_teardown_enabled() -> bool {
     !am2_env_flag_off("DCENT_AM2_SAFE_TEARDOWN")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pic0x89CleanStopOwnerPolicy {
+    Endpoint,
+    LegacyCompatibility,
+    RefuseMissingExactEndpoint,
+}
+
+const fn pic0x89_clean_stop_owner_policy(
+    exact_endpoint_required: bool,
+    endpoint_session_present: bool,
+) -> Pic0x89CleanStopOwnerPolicy {
+    match (exact_endpoint_required, endpoint_session_present) {
+        (_, true) => Pic0x89CleanStopOwnerPolicy::Endpoint,
+        (true, false) => Pic0x89CleanStopOwnerPolicy::RefuseMissingExactEndpoint,
+        (false, false) => Pic0x89CleanStopOwnerPolicy::LegacyCompatibility,
+    }
+}
+
 /// Phase 3A — graceful chain teardown so the next `dcentrald` launch can
 /// re-init the chain in software, eliminating the operator AC-cycle-per-
 /// attempt blocker.
@@ -768,22 +799,57 @@ fn am2_safe_teardown_enabled() -> bool {
 ///
 /// Caller is responsible for the final PWR_CONTROL deassert + fan cap —
 /// handled by `Am2HomeHardStopGuard::Drop` (run-scope) or by an explicit
-/// `force_am2_home_hard_stop` call on the fail-closed path. Each step
-/// logs but does not propagate errors: teardown is best-effort safety;
-/// the run-scope hard-stop guard is the final safety net.
+/// `force_am2_home_hard_stop` call on the fail-closed path. Hardware-operation
+/// errors remain best-effort because the run-scope hard-stop guard is the final
+/// safety net. Losing a required exact endpoint session returns an error and
+/// never reconstructs raw address/firmware authority.
 fn am2_safe_teardown_sequence(
+    endpoint_session: Option<&mut Pic0x89EndpointSession>,
+    exact_endpoint_required: bool,
     pic_service: Option<&I2cServiceHandle>,
     pic_addr: u8,
     pic_fw: Option<u8>,
     reason: &str,
-) {
+) -> Result<()> {
     info!(reason, "Phase 3A: am2 safe-teardown sequence starting");
+
+    let owner_policy =
+        pic0x89_clean_stop_owner_policy(exact_endpoint_required, endpoint_session.is_some());
+    let mut endpoint_session = endpoint_session;
+    let mut legacy_controller = match owner_policy {
+        Pic0x89CleanStopOwnerPolicy::LegacyCompatibility => match (pic_service, pic_fw) {
+            (Some(service), Some(fw)) => Some(Pic0x89Service::new_with_fw(
+                service.clone(),
+                pic_addr,
+                Some(fw),
+            )),
+            _ => None,
+        },
+        Pic0x89CleanStopOwnerPolicy::Endpoint
+        | Pic0x89CleanStopOwnerPolicy::RefuseMissingExactEndpoint => None,
+    };
+
+    if owner_policy == Pic0x89CleanStopOwnerPolicy::RefuseMissingExactEndpoint {
+        error!(
+            addr = format_args!("0x{:02X}", pic_addr),
+            reason,
+            "exact AM2 controller identity was established but its endpoint session is missing at clean stop; refusing raw address/firmware reconstruction"
+        );
+    }
 
     // Step 1: walk chip rail to floor so the chips coast down rather than
     // dropping voltage in one step (which leaves more charge on the caps).
-    if let (Some(service), Some(fw)) = (pic_service, pic_fw) {
-        let mut pic = Pic0x89Service::new_with_fw(service.clone(), pic_addr, Some(fw));
-        match pic.set_voltage(11500) {
+    let step1_result = match owner_policy {
+        Pic0x89CleanStopOwnerPolicy::Endpoint => endpoint_session
+            .as_deref_mut()
+            .map(|session| session.controller_mut().set_voltage(11500)),
+        Pic0x89CleanStopOwnerPolicy::LegacyCompatibility => legacy_controller
+            .as_mut()
+            .map(|controller| controller.set_voltage(11500)),
+        Pic0x89CleanStopOwnerPolicy::RefuseMissingExactEndpoint => None,
+    };
+    if let Some(result) = step1_result {
+        match result {
             Ok(()) => info!(
                 addr = format_args!("0x{:02X}", pic_addr),
                 "teardown step 1/5: walked chip rail to 11500 mV floor"
@@ -835,9 +901,17 @@ fn am2_safe_teardown_sequence(
 
     // Step 5: formal disable_voltage. By this point chips are coasted +
     // caps drained; this is the dsPIC bookkeeping more than a power cut.
-    if let (Some(service), Some(fw)) = (pic_service, pic_fw) {
-        let mut pic = Pic0x89Service::new_with_fw(service.clone(), pic_addr, Some(fw));
-        match pic.disable_voltage() {
+    let step5_result = match owner_policy {
+        Pic0x89CleanStopOwnerPolicy::Endpoint => endpoint_session
+            .as_deref_mut()
+            .map(|session| session.controller_mut().disable_voltage()),
+        Pic0x89CleanStopOwnerPolicy::LegacyCompatibility => legacy_controller
+            .as_mut()
+            .map(|controller| controller.disable_voltage()),
+        Pic0x89CleanStopOwnerPolicy::RefuseMissingExactEndpoint => None,
+    };
+    if let Some(result) = step5_result {
+        match result {
             Ok(()) => info!(
                 addr = format_args!("0x{:02X}", pic_addr),
                 "teardown step 5/5: PIC voltage disabled"
@@ -851,6 +925,12 @@ fn am2_safe_teardown_sequence(
     }
 
     info!("Phase 3A: am2 safe-teardown sequence complete");
+    if owner_policy == Pic0x89CleanStopOwnerPolicy::RefuseMissingExactEndpoint {
+        anyhow::bail!(
+            "exact AM2 controller endpoint session missing during safe teardown; raw fallback refused"
+        );
+    }
+    Ok(())
 }
 
 fn am2_uart_fallback_candidates() -> &'static [&'static str] {
@@ -1124,9 +1204,7 @@ const AM2_MID_RUN_STALL_MIN_DEFAULT_S: u64 = 300;
 /// Fail-closed = cut hash power, fans stay at the configured cap — never a
 /// fan blast.
 struct Am2ThermalSupervisor {
-    i2c: Option<I2cServiceHandle>,
-    pic_addr: u8,
-    pic_fw: Option<u8>,
+    pic: Option<Pic0x89Service>,
     hot_temp_c: f32,
     dangerous_temp_c: f32,
     last_good: Option<(Instant, f32)>,
@@ -1144,17 +1222,13 @@ struct Am2ThermalSupervisor {
 
 impl Am2ThermalSupervisor {
     fn new(
-        i2c: Option<I2cServiceHandle>,
-        pic_addr: u8,
-        pic_fw: Option<u8>,
+        pic: Option<Pic0x89Service>,
         hot_temp_c: u8,
         dangerous_temp_c: u8,
         die_cal_cfg: dcentrald_thermal::die_calibration::DieCalibrationConfig,
     ) -> Self {
         Self {
-            i2c,
-            pic_addr,
-            pic_fw,
+            pic,
             hot_temp_c: f32::from(hot_temp_c),
             dangerous_temp_c: f32::from(dangerous_temp_c),
             last_good: None,
@@ -1195,10 +1269,9 @@ impl Am2ThermalSupervisor {
     /// calibration (when enabled) corrects. Keeping them separate lets
     /// [`Self::maybe_capture_die_baseline`] seed the calibration and lets
     /// [`Self::poll_max_temp`] apply it to the die alone.
-    fn read_board_and_die(&self) -> (Option<f32>, Option<f32>) {
+    fn read_board_and_die(&mut self) -> (Option<f32>, Option<f32>) {
         let mut board_max = f32::NEG_INFINITY;
-        if let Some(i2c) = self.i2c.as_ref() {
-            let mut pic = Pic0x89Service::new_with_fw(i2c.clone(), self.pic_addr, self.pic_fw);
+        if let Some(pic) = self.pic.as_mut() {
             for t in pic.read_all_temperatures() {
                 let t = t as f32;
                 if t.is_finite() && (-20.0..=125.0).contains(&t) {
@@ -1229,7 +1302,7 @@ impl Am2ThermalSupervisor {
     /// `>=` the pre-calibration max. Calibration therefore never delays or
     /// suppresses an over-temp trip. When calibration is off/uncaptured the die
     /// value passes through raw and this is byte-identical to the prior path.
-    fn poll_max_temp(&self) -> Option<f32> {
+    fn poll_max_temp(&mut self) -> Option<f32> {
         let (board, die) = self.read_board_and_die();
         let mut max_c = f32::NEG_INFINITY;
         if let Some(b) = board {
@@ -1356,6 +1429,8 @@ impl Am2ThermalSupervisor {
 /// (`Platform::S19jProAm2` × `PicFw::Dspic33epHealthy` = 1 s tick).
 /// The matrix is the canonical source — keep this constant in sync.
 const PIC_HEARTBEAT_INTERVAL_MS: u64 = 1000;
+/// One aggregate deadline for all blocking AM2 heartbeat/feed workers.
+const AM2_FEEDER_STOP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Consecutive selected-dsPIC heartbeat failures after which the am2 hybrid run
 /// cancels itself so teardown de-energizes the chain rail.
@@ -1478,7 +1553,8 @@ fn probe_dspic_addrs(i2c: &I2cServiceHandle) -> Result<u8> {
     for (idx, &addr) in S19_DSPIC_ADDRS.iter().enumerate() {
         // : .139 is expected to expose only
         // hb2 at 0x21; hb3/0x22 can ACK scans yet return 0xFF forever.
-        let reply = i2c.transaction(
+        let reply = i2c.transaction_mutating(
+            I2cMutationLabel::Recovery,
             addr,
             vec![
                 I2cTransactionStep::SetTimeout(10),
@@ -1551,7 +1627,8 @@ fn probe_dspic_addrs(i2c: &I2cServiceHandle) -> Result<u8> {
 /// otherwise produces an EIO storm that desyncs the AXI-IIC controller faster
 /// than the rate-limited (1/sec) fd-reopen can recover.
 fn am2_dspic_present(i2c: &I2cServiceHandle, addr: u8) -> bool {
-    match i2c.transaction(
+    match i2c.transaction_mutating(
+        I2cMutationLabel::Recovery,
         addr,
         vec![
             I2cTransactionStep::SetTimeout(10),
@@ -1579,7 +1656,7 @@ fn am2_dspic_present(i2c: &I2cServiceHandle, addr: u8) -> bool {
 /// driver increments `wid` by 1 per job → hardware work_id increments by 2.
 const JOB_ID_INCREMENT: u8 = 2;
 const JOB_ID_MASK: u8 = 0x7F;
-const WORK_HISTORY_PER_ID: usize = 32;
+const WORK_HISTORY_PER_ID: usize = dcentrald_common::DEFAULT_WORK_HISTORY_PER_ID;
 
 /// BM1362 FPGA work size (am2, Phase 4A authoritative):
 /// 4 header words + 2 midstate slots × 8 words = 20 words.
@@ -2036,13 +2113,13 @@ fn bm1362_per_chip_fast_init(
 }
 
 /// BM1362 serial-wire nonce frame length (`[0xAA 0x55][9 body bytes]`).
-const AM2_SERIAL_NONCE_LEN: usize = 11;
+const AM2_SERIAL_NONCE_LEN: usize = dcentrald_common::BM1362_SERIAL_NONCE_LEN;
 
 /// `asic_job_id` step for the serial-dispatch path. The BM1362 echoes the sent
 /// job id as `(sent << 1) & 0xF0` in the RESULT byte high nibble, so only bits
 /// [6:3] of the sent id survive the round trip. Stepping by 8 keeps every
 /// in-flight job in a distinct echoed slot (16 slots: 0, 8, .. 120).
-const AM2_SERIAL_JOB_ID_STEP: u8 = 8;
+const AM2_SERIAL_JOB_ID_STEP: u8 = dcentrald_common::DEFAULT_SERIAL_JOB_ID_STEP;
 
 /// The echoed job-id slot the BM1362 reports for a given sent job id. Mirrors
 /// `parse_bm1362_serial_nonce`'s `(result_byte & 0xF0) >> 1` recovery.
@@ -2058,7 +2135,7 @@ fn am2_serial_echoed_job_id(sent: u8) -> u8 {
 /// consumes `version` / `nbits` / `ntime` / `merkle_root` / `prev_block_hash`,
 /// so the FPGA-only fields are filled with inert defaults.
 fn build_am2_serial_work_frame(
-    work: &dcentrald_stratum::work::MiningWork,
+    work: &dcentrald_stratum::share_pipeline::MiningWork,
     asic_job_id: u8,
 ) -> [u8; 88] {
     let asic_work = AsicMiningWork {
@@ -3098,7 +3175,7 @@ fn am2_zynq_bm1362_recipe_gate_matches() -> bool {
 }
 
 /// 2026-06-07 (COLD-BYTE-DIFF Fix B) — opt-in env gate for emitting the `a lab unit`
-/// cold dsPIC strace-derived warmup as ONE atomic `i2c.transaction()` (vs the
+/// cold dsPIC strace-derived warmup as ONE atomic typed I2C transaction (vs the
 /// proven N separate transactions). When set, the entire flush→RESET→JUMP
 /// warmup runs as a single service request, so no other i2c-0 producer
 /// (thermal LM75 reads, PIC heartbeats, absent-slave probes) can interleave
@@ -4026,7 +4103,7 @@ struct Am2SerialChainState {
     /// Diagnostic chain index (0 = primary, 1 = second). Carried into logs +
     /// the per-chain freq-only autotuner snapshot chain_id.
     chain_id: u8,
-    work_builder: dcentrald_stratum::WorkBuilder,
+    work_builder: dcentrald_stratum::share_pipeline::WorkBuilder,
     current_job: Option<dcentrald_stratum::types::JobTemplate>,
     asic_job_id: u8,
     work_history: Vec<VecDeque<WorkEntry>>,
@@ -4064,7 +4141,7 @@ impl Am2SerialChainState {
     fn new(chain_id: u8) -> Self {
         Self {
             chain_id,
-            work_builder: dcentrald_stratum::WorkBuilder::new(),
+            work_builder: dcentrald_stratum::share_pipeline::WorkBuilder::new(),
             current_job: None,
             asic_job_id: 0,
             work_history: (0..128)
@@ -4127,7 +4204,8 @@ impl Am2SerialChainState {
             version_bits_per_midstate: vec![None],
             version_rolling_enabled: false,
         });
-        self.asic_job_id = self.asic_job_id.wrapping_add(AM2_SERIAL_JOB_ID_STEP);
+        self.asic_job_id =
+            dcentrald_common::next_asic_job_id(self.asic_job_id, AM2_SERIAL_JOB_ID_STEP);
         self.total_work += 1;
         if self.first_work_at.is_none() {
             self.first_work_at = Some(Instant::now());
@@ -4198,7 +4276,10 @@ impl Am2SerialChainState {
             }
             // AT-DASH: dedup-survivor — a genuinely distinct nonce for this chain.
             self.unique_nonces = self.unique_nonces.saturating_add(1);
-            if self.seen_shares.len() > 8192 {
+            if dcentrald_common::should_clear_seen_shares(
+                self.seen_shares.len(),
+                dcentrald_common::DEFAULT_SEEN_SHARES_CAP,
+            ) {
                 self.seen_shares.clear();
             }
             if let Some((entry, rolled_version, achieved_difficulty)) =
@@ -4210,7 +4291,10 @@ impl Am2SerialChainState {
                         );
                     debug_assert_eq!(candidate_vbits_delta, vbits_delta);
                     let header = hybrid_build_header(candidate, rolled_version, nr.nonce);
-                    if dcentrald_stratum::validate_full_header(&header, &candidate.share_target) {
+                    if dcentrald_stratum::share_pipeline::validate_full_header(
+                        &header,
+                        &candidate.share_target,
+                    ) {
                         let achieved = am2_hybrid_achieved_difficulty_from_header(&header);
                         Some((candidate.clone(), rolled_version, achieved))
                     } else {
@@ -4960,14 +5044,30 @@ fn detected_dspic_fw_allows_voltage_commands(detected_fw: u8, trust_degraded_fw:
     dspic_voltage_command_allowed(detected_firmware, trust_degraded_fw)
 }
 
+fn observe_am2_endpoint_firmware(
+    i2c: &I2cServiceHandle,
+    presence: &Am2HashboardPresence,
+    endpoint_slot: &mut Option<VoltageControllerEndpoint>,
+) -> Result<u8> {
+    let endpoint = discover_am2_controller_endpoint(i2c, presence)?;
+    let firmware = endpoint
+        .observed_firmware()
+        .context("AM2 controller endpoint omitted firmware evidence")?;
+    *endpoint_slot = Some(endpoint);
+    Ok(firmware)
+}
+
+#[cfg(test)]
 fn is_shift_left_pic_artifact(buf: &[u8]) -> bool {
     buf.len() >= 2 && buf.windows(2).all(|w| w[1] == w[0].wrapping_shl(1))
 }
 
+#[cfg(test)]
 fn is_repeated_known_fw_pic_artifact(buf: &[u8]) -> bool {
     buf.len() > 1 && is_known_pic_fw(buf[0]) && buf.iter().all(|&b| b == buf[0])
 }
 
+#[cfg(test)]
 fn classify_pic_reply(buf: &[u8]) -> &'static str {
     if buf.is_empty() {
         "empty"
@@ -4986,6 +5086,7 @@ fn classify_pic_reply(buf: &[u8]) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn format_pic_probe_samples(samples: &[String]) -> String {
     samples
         .iter()
@@ -4999,86 +5100,23 @@ fn format_pic_probe_samples(samples: &[String]) -> String {
         .join(" | ")
 }
 
+#[cfg(test)]
 fn parse_hybrid_pic_fw_reply(buf: &[u8]) -> Option<u8> {
-    // REVISED 2026-04-26 (.139 direct i2cget evidence): fw0x86 short/bare
-    // GET_VERSION is a one-byte response. Bulk reads on xiic can return the
-    // real first byte followed by a synthesized shift-left tail, e.g.
-    // `[0x86, 0x0C, 0x18, 0x30, 0x60]`. Keep rejecting multi-byte shift-left
-    // artifacts here, but accept a single known firmware byte from the
-    // one-byte short transaction path.
-    if buf.is_empty()
-        || buf.iter().all(|&b| b == 0x00)
-        || buf.iter().all(|&b| b == 0xFF)
-        || is_shift_left_pic_artifact(buf)
-        || is_repeated_known_fw_pic_artifact(buf)
-    {
-        return None;
-    }
-    // VNish-RE'd GET_VERSION response (cgminer disasm 2026-04-25 VMA 0x0537a8):
-    // The dsPIC returns `[0x05, 0x17, FW, ?, checksum]` where index 0 is LEN
-    // (5), index 1 is cmd echo (0x17), index 2 is the firmware byte. VNish
-    // requires `rx[0]==0x05 && rx[1]==0x17`.
-    if buf.len() >= 3 && buf[0] == 0x05 && buf[1] == 0x17 && is_known_pic_fw(buf[2]) {
-        return Some(buf[2]);
-    }
-    //  (2026-05-23) — bosminer-plus-tuner 0.9.0 strace-derived shape:
-    // 4-byte response `[0x17, FW, 0x00, CKSUM]` where index 0 is cmd echo,
-    // **index 1 is the firmware byte** (NOT index 2 like the older patterns),
-    // index 2 is status (always 0x00 in observed traces), index 3 is the
-    // additive checksum `(0x04 + 0x17 + FW + 0x00) & 0xFF` (implicit LEN=4
-    // in the request frame). Live evidence: bosminer-strace-init-full.log
-    // line 13178-13184 reads `[17 89 00 A5]` after the `[55 AA 04 17 00 1B]`
-    // request → fw=0x89, checksum 0x04+0x17+0x89+0x00 = 0xA4… hmm. Actually
-    // checksum semantics for the response are still being characterized
-    // (the request-side `LEN+CMD+sum(PAYLOAD)` rule doesn't reproduce
-    // 0xA5 = response[3] exactly from `4+0x17+0x89+0` = 0xA4). For safety
-    // we DO NOT validate the response checksum here — we accept any 4-byte
-    // reply whose shape matches `[0x17, <known-fw>, 0x00, *]`. This length
-    // pattern is disambiguated from the older `[0x17, status, version, ...]`
-    // 3-byte shape by checking buf[1] is a known fw byte AND buf[2] == 0x00
-    // (the older shape has buf[1] == 0x00 and buf[2] == fw, so these never
-    // collide). Cannot accidentally fire on the older shape because that
-    // shape has buf[1] == 0x00 which fails `is_known_pic_fw(buf[1])`.
-    if buf.len() >= 4 && buf[0] == 0x17 && is_known_pic_fw(buf[1]) && buf[2] == 0x00 {
-        return Some(buf[1]);
-    }
-    // Older / alternative framed response: `[0x17, status, version, ?, ?]`
-    if buf.len() >= 3 && buf[0] == 0x17 && buf[1] == 0x00 && is_known_pic_fw(buf[2]) {
-        return Some(buf[2]);
-    }
-    if buf.len() >= 3 && buf[0] == 0x17 && is_known_pic_fw(buf[2]) {
-        return Some(buf[2]);
-    }
-    // FW86 short/bare replies can put the firmware byte first. The bus-noise
-    // patterns that made this unsafe are rejected above.
-    if is_known_pic_fw(buf[0]) {
-        return Some(buf[0]);
-    }
-    None
+    dcentrald_hal::platform::am2_controller::parse_am2_pic_firmware_reply(buf)
 }
-
+#[cfg(test)]
 fn pic_get_version_transaction_steps(
     frame: &[u8],
     read_len: usize,
     flush_first: bool,
 ) -> Vec<I2cTransactionStep> {
-    let mut steps = vec![I2cTransactionStep::SetTimeout(10)];
-    if flush_first {
-        steps.extend([
-            I2cTransactionStep::WriteByteByByte(vec![0u8; 16]),
-            I2cTransactionStep::SleepMs(10),
-        ]);
-    }
-    steps.extend([
-        I2cTransactionStep::WriteByteByByte(frame.to_vec()),
-        I2cTransactionStep::SleepMs(100),
-    ]);
-    for _ in 0..read_len {
-        steps.push(I2cTransactionStep::Read(1));
-    }
-    steps
+    dcentrald_hal::platform::am2_controller::am2_get_version_transaction_steps(
+        frame,
+        read_len,
+        flush_first,
+    )
 }
-
+#[cfg(test)]
 fn collect_single_byte_reads(reads: Vec<Vec<u8>>) -> Vec<u8> {
     reads
         .into_iter()
@@ -5091,9 +5129,12 @@ fn collect_single_byte_reads(reads: Vec<Vec<u8>>) -> Vec<u8> {
 /// `I2C_NUM_RETRIES = 15` spaced `I2C_RETRY_DELAY = 100 ms` on a hard bus
 /// error (EIO) — it never injects a speculative zero-byte parser flush between
 /// tries (the flush is what wedges the dsPIC MSSP parser → all-FF).
+#[cfg(test)]
 const PIC_GET_VERSION_CLEAN_RETRIES: u32 = 15;
+#[cfg(test)]
 const PIC_GET_VERSION_RETRY_DELAY_MS: u64 = 100;
 
+#[cfg(test)]
 fn pic_read_fw_version_service(i2c: &I2cServiceHandle, addr: u8) -> Result<u8> {
     // Service-only three-phase probing: write -> quiet window -> byte-wise read.
     // Do not use I2C_RDWR here; it changes the `a lab unit` dsPIC failure mode.
@@ -5169,7 +5210,8 @@ fn pic_read_fw_version_service(i2c: &I2cServiceHandle, addr: u8) -> Result<u8> {
         for attempt in 1..=PIC_GET_VERSION_CLEAN_RETRIES {
             // R1/R5: always a clean whole-frame write + 1-byte read; never a
             // speculative zero-flush before it.
-            let reply = match i2c.transaction(
+            let reply = match i2c.transaction_mutating(
+                I2cMutationLabel::QueryPrelude,
                 addr,
                 pic_get_version_transaction_steps(frame, read_len, false),
             ) {
@@ -5239,14 +5281,16 @@ fn pic_read_fw_version_service(i2c: &I2cServiceHandle, addr: u8) -> Result<u8> {
 fn pic_dumy_read_fw_byte(i2c: &I2cServiceHandle, addr: u8) -> Result<u8> {
     let mut samples = Vec::new();
     for attempt in 1..=3 {
-        let r1 = i2c.transaction(
+        let r1 = i2c.transaction_mutating(
+            I2cMutationLabel::QueryPrelude,
             addr,
             vec![
                 I2cTransactionStep::SetTimeout(10),
                 I2cTransactionStep::Read(1),
             ],
         );
-        let r2 = i2c.transaction(
+        let r2 = i2c.transaction_mutating(
+            I2cMutationLabel::QueryPrelude,
             addr,
             vec![I2cTransactionStep::SleepMs(20), I2cTransactionStep::Read(1)],
         );
@@ -5274,14 +5318,197 @@ fn pic_dumy_read_fw_byte(i2c: &I2cServiceHandle, addr: u8) -> Result<u8> {
     ))
 }
 
-fn teardown_am2_power_after_failed_pic_preflight(
-    shutdown: &CancellationToken,
-    psu_arc: &Option<Arc<Mutex<Apw121215a>>>,
-    psu_hb_handle: &mut Option<std::thread::JoinHandle<()>>,
-) {
-    shutdown.cancel();
+async fn stop_am2_runtime_feeders_bounded(
+    config: &DcentraldConfig,
+    runtime_threads: &mut RuntimeThreadGuard,
+    reason: &str,
+) -> bool {
+    let summary = runtime_threads.stop_and_join(AM2_FEEDER_STOP_TIMEOUT).await;
+    if summary.any_timed_out() {
+        error!(
+            reason,
+            timeout_ms = AM2_FEEDER_STOP_TIMEOUT.as_millis(),
+            "AM2 feeder shutdown deadline expired; asserting transport-independent hard stop"
+        );
+        // Never take the PSU mutex here: the timed-out feeder may still own
+        // it.  PWR_CONTROL is an independent GPIO path, and leaving both the
+        // PIC and PSU feeder loops cancelled preserves the hardware backstop.
+        // A transport call already in flight may complete once after this
+        // point, but the post-sleep/post-lock cancellation fences prevent a
+        // subsequent intentional feed.
+        force_am2_home_hard_stop(config, reason);
+        false
+    } else {
+        true
+    }
+}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Am2PowerShutdownEvidence {
+    feeders_quiesced: bool,
+    hard_stop_asserted: bool,
+    psu_present: bool,
+    psu_shutdown_succeeded: Option<bool>,
+}
+
+impl Am2PowerShutdownEvidence {
+    fn completed_gracefully(self) -> bool {
+        self.feeders_quiesced && self.psu_shutdown_succeeded.unwrap_or(true)
+    }
+
+    fn hard_stop_after_timeout(psu_present: bool) -> Self {
+        Self {
+            feeders_quiesced: false,
+            hard_stop_asserted: true,
+            psu_present,
+            psu_shutdown_succeeded: None,
+        }
+    }
+}
+
+fn finalize_am2_dispatch_shutdown(
+    dispatch_result: Result<()>,
+    shutdown_evidence: Am2PowerShutdownEvidence,
+) -> Result<()> {
+    if shutdown_evidence.completed_gracefully() {
+        return dispatch_result;
+    }
+
+    let detail = format!(
+        "AM2 dispatch ended but shutdown did not complete gracefully: {:?}",
+        shutdown_evidence
+    );
+    match dispatch_result {
+        Ok(()) => Err(anyhow::anyhow!(detail)),
+        Err(dispatch_error) => Err(dispatch_error.context(detail)),
+    }
+}
+
+#[cfg(test)]
+mod am2_power_shutdown_evidence_tests {
+    use super::{
+        finalize_am2_dispatch_shutdown, pic0x89_clean_stop_owner_policy, Am2PowerShutdownEvidence,
+        Pic0x89CleanStopOwnerPolicy,
+    };
+
+    #[test]
+    fn exact_pic0x89_identity_can_never_select_legacy_clean_stop_fallback() {
+        assert_eq!(
+            pic0x89_clean_stop_owner_policy(true, true),
+            Pic0x89CleanStopOwnerPolicy::Endpoint
+        );
+        assert_eq!(
+            pic0x89_clean_stop_owner_policy(true, false),
+            Pic0x89CleanStopOwnerPolicy::RefuseMissingExactEndpoint
+        );
+        assert_eq!(
+            pic0x89_clean_stop_owner_policy(false, false),
+            Pic0x89CleanStopOwnerPolicy::LegacyCompatibility
+        );
+    }
+
+    #[test]
+    fn graceful_shutdown_evidence_preserves_dispatch_success() {
+        let evidence = Am2PowerShutdownEvidence {
+            feeders_quiesced: true,
+            hard_stop_asserted: false,
+            psu_present: true,
+            psu_shutdown_succeeded: Some(true),
+        };
+
+        assert!(evidence.completed_gracefully());
+        assert!(finalize_am2_dispatch_shutdown(Ok(()), evidence).is_ok());
+    }
+
+    #[test]
+    fn timeout_evidence_cannot_be_reported_as_graceful_dispatch_success() {
+        let evidence = Am2PowerShutdownEvidence {
+            feeders_quiesced: false,
+            hard_stop_asserted: true,
+            psu_present: true,
+            psu_shutdown_succeeded: None,
+        };
+
+        assert!(!evidence.completed_gracefully());
+        let error = finalize_am2_dispatch_shutdown(Ok(()), evidence)
+            .expect_err("hard-stop fallback must be observable to the caller");
+        assert!(error.to_string().contains("did not complete gracefully"));
+    }
+
+    #[test]
+    fn failed_psu_plan_cannot_be_reported_as_graceful() {
+        let evidence = Am2PowerShutdownEvidence {
+            feeders_quiesced: true,
+            hard_stop_asserted: false,
+            psu_present: true,
+            psu_shutdown_succeeded: Some(false),
+        };
+
+        assert!(!evidence.completed_gracefully());
+    }
+}
+
+/// Reclaim every feeder before entering the PSU critical section.
+///
+/// A timeout deliberately skips `safe_shutdown_to_min`: a detached PSU
+/// feeder may still own the same mutex. The preceding hard stop removes the
+/// load independently and the cancelled feeder leaves the watchdog as a
+/// second cutoff path after any already in-flight transfer drains.
+async fn shutdown_am2_psu_after_feeders_bounded(
+    config: &DcentraldConfig,
+    runtime_threads: &mut RuntimeThreadGuard,
+    psu_arc: &Option<Arc<Mutex<Apw121215a>>>,
+    reason: &str,
+) -> Am2PowerShutdownEvidence {
+    let psu_present = psu_arc.is_some();
+    if !stop_am2_runtime_feeders_bounded(config, runtime_threads, reason).await {
+        warn!(
+            reason,
+            "skipping PSU mutex teardown after feeder timeout; hard stop is asserted and feeder loops are cancelled (an in-flight transfer may still complete once)"
+        );
+        return Am2PowerShutdownEvidence::hard_stop_after_timeout(psu_present);
+    }
+
+    shutdown_am2_psu_after_feeders_quiesced(psu_arc, reason)
+}
+
+fn shutdown_am2_psu_after_feeders_quiesced(
+    psu_arc: &Option<Arc<Mutex<Apw121215a>>>,
+    reason: &str,
+) -> Am2PowerShutdownEvidence {
+    let psu_present = psu_arc.is_some();
+    let mut psu_shutdown_succeeded = None;
     if let Some(psu_mutex) = psu_arc.as_ref() {
+        let mut psu_guard = psu_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        match psu_guard.safe_shutdown_to_min() {
+            Ok(()) => psu_shutdown_succeeded = Some(true),
+            Err(e) => {
+                psu_shutdown_succeeded = Some(false);
+                warn!(
+                    reason,
+                    error = %e,
+                    "PSU safe-direction shutdown failed after feeders quiesced"
+                );
+            }
+        }
+    }
+    Am2PowerShutdownEvidence {
+        feeders_quiesced: true,
+        hard_stop_asserted: false,
+        psu_present,
+        psu_shutdown_succeeded,
+    }
+}
+
+async fn teardown_am2_power_after_failed_pic_preflight(
+    config: &DcentraldConfig,
+    runtime_threads: &mut RuntimeThreadGuard,
+    psu_arc: &Option<Arc<Mutex<Apw121215a>>>,
+) {
+    if stop_am2_runtime_feeders_bounded(config, runtime_threads, "PIC preflight failure").await {
+        let Some(psu_mutex) = psu_arc.as_ref() else {
+            return;
+        };
         // FWSTAB-2: recover from a poisoned lock (a panic elsewhere while holding
         // the shared PSU mutex) instead of panicking again — this teardown is the
         // graceful safe-off path (watchdog-disable + set-voltage-min) and must
@@ -5289,17 +5516,9 @@ fn teardown_am2_power_after_failed_pic_preflight(
         // hardware watchdog + Apw121215a::Drop remain the ultimate backstops.)
         // All PSU-mutex lock sites in this file use the same poison-tolerant form.
         let mut psu_guard = psu_mutex.lock().unwrap_or_else(|e| e.into_inner());
-        if let Err(e) = psu_guard.watchdog(false) {
-            warn!(error = %e, "PSU watchdog disable failed after PIC preflight failure");
+        if let Err(e) = psu_guard.safe_shutdown_to_min() {
+            warn!(error = %e, "PSU safe-direction shutdown failed after PIC preflight failure");
         }
-        if let Err(e) = psu_guard.set_voltage_min() {
-            warn!(error = %e, "PSU set_voltage_min failed after PIC preflight failure");
-        }
-    }
-
-    if let Some(handle) = psu_hb_handle.take() {
-        let _ = handle.join();
-        info!("PSU heartbeat thread joined after PIC preflight failure");
     }
 
     // PWR_CONTROL gate is owned by `Apw121215a`; it auto-deasserts when
@@ -5332,7 +5551,16 @@ fn psu_heartbeat_loop(
             return;
         }
         std::thread::sleep(interval);
-        let result = { psu.lock().unwrap_or_else(|e| e.into_inner()).heartbeat() };
+        if shutdown.is_cancelled() {
+            info!("PSU heartbeat thread shutting down after sleep");
+            return;
+        }
+        let mut psu = psu.lock().unwrap_or_else(|e| e.into_inner());
+        if shutdown.is_cancelled() {
+            info!("PSU heartbeat thread shutting down after acquiring PSU lock");
+            return;
+        }
+        let result = psu.heartbeat();
         match result {
             Ok(()) => {
                 if consecutive_fails > 0 {
@@ -5366,6 +5594,11 @@ fn psu_heartbeat_loop(
 
 /// Spawn the 1 Hz post-ENABLE PIC heartbeat thread.
 ///
+/// The selected controller is issued by the retained opaque endpoint session;
+/// this function cannot reconstruct its bus, address, or firmware. Additional
+/// addresses are a separate experimental owner and remain independently
+/// evidence-gated debt.
+///
 /// `additional_addrs` is the H-heartbeat-0x22 (`DCENT_AM2_HEARTBEAT_ALL_ACTIVE_PICS`)
 /// extension: when EMPTY (the default / gate-OFF case) the thread heartbeats
 /// ONLY `addr` (the selected dsPIC) with byte-for-byte the same wire traffic
@@ -5376,20 +5609,18 @@ fn psu_heartbeat_loop(
 /// `JoinHandle`, one `CancellationToken` → the teardown contract is unchanged.
 fn spawn_pic_heartbeat_thread(
     i2c: I2cServiceHandle,
-    addr: u8,
-    fw: Option<u8>,
+    mut pic: Pic0x89Service,
     additional_addrs: Vec<u8>,
     shutdown: CancellationToken,
 ) -> Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("s19j-pic-hb".to_string())
         .spawn(move || {
+            let addr = pic.address();
             info!(
                 "PIC heartbeat running through AM2 I2C service (0x{:02X})",
                 addr
             );
-
-            let mut pic = Pic0x89Service::new_with_fw(i2c.clone(), addr, fw);
 
             // H-heartbeat-0x22: one extra Pic0x89Service per additional active
             // dsPIC (e.g. the effective chain dsPIC 0x22). fw is unknown for
@@ -5457,6 +5688,9 @@ fn spawn_pic_heartbeat_thread(
                 // the primary watchdog feed and its loop semantics are
                 // untouched.
                 for (idx, (extra_addr, extra_pic)) in extra_pics.iter_mut().enumerate() {
+                    if shutdown.is_cancelled() {
+                        break;
+                    }
                     match extra_pic.send_heartbeat() {
                         Ok(()) => {
                             if extra_fails[idx] > 0 {
@@ -5483,6 +5717,9 @@ fn spawn_pic_heartbeat_thread(
                     }
                 }
                 std::thread::sleep(Duration::from_millis(PIC_HEARTBEAT_INTERVAL_MS));
+                if shutdown.is_cancelled() {
+                    break;
+                }
             }
         })
         .context("Failed to spawn PIC heartbeat thread")
@@ -7596,7 +7833,7 @@ impl S19jHybridMiner {
             "=== AM2 SERIAL-WORK-DISPATCH MINING ACTIVE (BM1362 88-byte serial frames over the chain UART; FPGA WORK_TX FIFO bypassed) ==="
         );
 
-        let mut work_builder = dcentrald_stratum::WorkBuilder::new();
+        let mut work_builder = dcentrald_stratum::share_pipeline::WorkBuilder::new();
         let mut current_job: Option<dcentrald_stratum::types::JobTemplate> = None;
         let mut asic_job_id: u8 = 0;
         let mut work_history: Vec<VecDeque<WorkEntry>> = (0..128)
@@ -8247,7 +8484,10 @@ impl S19jHybridMiner {
                         // `total_nonces - unique_nonces` is the duplicate spam,
                         // the first number needed to crack the ~400x gap.
                         unique_nonces = unique_nonces.saturating_add(1);
-                        if seen_shares.len() > 8192 {
+                        if dcentrald_common::should_clear_seen_shares(
+                            seen_shares.len(),
+                            dcentrald_common::DEFAULT_SEEN_SHARES_CAP,
+                        ) {
                             seen_shares.clear();
                         }
                         if let Some((entry, rolled_version, achieved_difficulty)) =
@@ -8263,7 +8503,7 @@ impl S19jHybridMiner {
                                     rolled_version,
                                     nr.nonce,
                                 );
-                                if dcentrald_stratum::validate_full_header(
+                                if dcentrald_stratum::share_pipeline::validate_full_header(
                                     &header,
                                     &candidate.share_target,
                                 ) {
@@ -8571,41 +8811,9 @@ impl S19jHybridMiner {
             }
         }
 
-        // Graceful dsPIC teardown — stop the chip-rail regulation so BraiinsOS
-        // can restart cleanly. PWR_CONTROL itself is deasserted by the
-        // run-scope `Am2HomeHardStopGuard` when `run()` returns.
-        //
-        // Phase 3A (CE-010: now DEFAULT-ON, opt OUT via
-        // `DCENT_AM2_SAFE_TEARDOWN=0`): walk chip rail to floor + pulse
-        // HBx_RESET + 1.5 s rail-decay window BEFORE the formal
-        // disable_voltage. EE root cause for the AC-cycle-per-
-        // attempt blocker (
-        // F4 — corrected from F3 by Wave D RE-CORPUS-001 closure; F4 covers
-        // "AC-cycle-per-attempt root cause", F3 covers dsPIC stability):
-        // the prior minimal teardown left chip-rail caps holding
-        // residual charge past PWR_CONTROL deassert, so the next launch
-        // saw chips in a partial-bias state with addressing dirty.
-        if am2_safe_teardown_enabled() {
-            am2_safe_teardown_sequence(
-                i2c.as_ref(),
-                pic_addr,
-                pic_fw,
-                "serial-dispatch-clean-stop",
-            );
-        } else if let (Some(service), Some(fw)) = (i2c.as_ref(), pic_fw) {
-            let mut pic = Pic0x89Service::new_with_fw(service.clone(), pic_addr, Some(fw));
-            match pic.disable_voltage() {
-                Ok(()) => info!(
-                    addr = format_args!("0x{:02X}", pic_addr),
-                    "AM2 serial-dispatch: PIC voltage disabled on teardown"
-                ),
-                Err(e) => warn!(
-                    error = %e,
-                    addr = format_args!("0x{:02X}", pic_addr),
-                    "AM2 serial-dispatch: PIC voltage disable failed on teardown"
-                ),
-            }
-        }
+        // The run-scope owner performs dsPIC/PSU teardown only after it has
+        // cancelled and joined both heartbeat feeders. Keeping controller I/O
+        // out of this inner loop prevents a late heartbeat racing after disable.
 
         info!(
             total_work,
@@ -8633,7 +8841,8 @@ impl S19jHybridMiner {
     /// only when NEITHER chain has produced a nonce within the window — a true
     /// whole-unit stall). The freq-only autotuner is intentionally NOT wired
     /// here (it is single-synthetic-chain by design; dual-chain autotune is a
-    /// separate follow-up). Teardown disables voltage on BOTH chains' dsPICs.
+    /// separate follow-up). The run-scope owner disables voltage on BOTH
+    /// chains' dsPICs after heartbeat feeders are joined.
     ///
     /// SAFETY: this is reached ONLY behind `am2_dual_chain_ttys3_enabled()` AND
     /// only after the second chain successfully enumerated in `run()`. The
@@ -8647,10 +8856,10 @@ impl S19jHybridMiner {
         mut job_rx: mpsc::Receiver<dcentrald_stratum::types::JobTemplate>,
         share_tx: mpsc::Sender<dcentrald_stratum::types::ValidShare>,
         chip_count: u8,
-        i2c: Option<I2cServiceHandle>,
+        _i2c: Option<I2cServiceHandle>,
         pic_addr_a: u8,
         pic_addr_b: u8,
-        pic_fw: Option<u8>,
+        _pic_fw: Option<u8>,
         mut thermal_supervisor: Option<Am2ThermalSupervisor>,
         thermal_poll_ms: u64,
         watchdog_liveness: Arc<AtomicU64>,
@@ -9024,21 +9233,8 @@ impl S19jHybridMiner {
             }
         }
 
-        // Graceful dsPIC teardown for BOTH chains' controllers (cut-hash-
-        // before-noise). PWR_CONTROL itself is deasserted by the run-scope
-        // `Am2HomeHardStopGuard` when `run()` returns.
-        let mut teardown_addrs = vec![pic_addr_a, pic_addr_b];
-        teardown_addrs.sort_unstable();
-        teardown_addrs.dedup();
-        if let Some(service) = i2c.as_ref() {
-            disable_dspic_addrs_best_effort(
-                service,
-                &teardown_addrs,
-                pic_addr_a,
-                pic_fw,
-                "dual-chain-clean-stop",
-            );
-        }
+        // The run-scope owner disables both dsPICs only after heartbeat feeders
+        // are proven quiescent, preventing a post-disable keepalive race.
 
         info!(
             total_work = chain_a.total_work + chain_b.total_work,
@@ -9074,7 +9270,16 @@ impl S19jHybridMiner {
         am2_free_chain1_work_tx_irq_for_kernel_uart();
 
         let serial_devices = self.config.mining.resolved_serial_devices("/dev/ttyS2");
+        let passthrough = self.config.mining.passthrough;
         let planned_chain_contexts = build_am2_chain_plan(&serial_devices)?;
+        let am2_controller_plan = if passthrough {
+            None
+        } else {
+            Some(
+                discover_system_am2_controller_plan(&serial_devices)
+                    .context("AM2 controller endpoint plan discovery failed")?,
+            )
+        };
         log_am2_planned_chain_contexts(&planned_chain_contexts);
         let serial_device = am2_phase1_select_serial_device(&serial_devices, "/dev/ttyS2");
         if serial_devices.len() > 1 {
@@ -9092,7 +9297,6 @@ impl S19jHybridMiner {
         }
         let chip_count = self.config.mining.serial_chip_count.unwrap_or(126);
         let target_freq = self.config.mining.frequency_mhz;
-        let passthrough = self.config.mining.passthrough;
         if !passthrough && process_name_running("bosminer") {
             anyhow::bail!(
                 "refusing native S19j hybrid takeover while bosminer is still running; run /tmp/xil_prepare_dcentos_quiet.sh first and verify the fan guard is active before launching dcentrald"
@@ -9221,7 +9425,7 @@ impl S19jHybridMiner {
         // simply never opens an `Apw121215a` on it.
         // ================================================================
         let psu_arc: Option<Arc<Mutex<Apw121215a>>>;
-        let mut psu_hb_handle: Option<std::thread::JoinHandle<()>>;
+        let mut runtime_threads = RuntimeThreadGuard::new(self.shutdown.clone());
         // RAII guard for the "Loki bypass" path: owns PWR_CONTROL when
         // `psu_override.enabled` and the APW121215a path is skipped. Lives to
         // `run()` scope-end so its Drop deasserts PWR_CONTROL — the same
@@ -9245,7 +9449,6 @@ impl S19jHybridMiner {
         let wake_dspic_before_rail =
             am2_env_flag("DCENT_AM2_WAKE_DSPIC_BEFORE_RAIL") && am2_xil_25_fingerprint_matches();
         let mut deferred_rail_assert: Option<(Option<String>, String, f64)> = None;
-        let mut pic_hb_handle: Option<std::thread::JoinHandle<()>> = None;
         // PWR_CONTROL gate state is no longer tracked here. Ownership has
         // moved into `Apw121215a` (W2.A2): the PSU object asserts the gate
         // inside `cold_boot_sequence_gated` / `cold_boot_sequence_write_only`
@@ -9300,7 +9503,6 @@ impl S19jHybridMiner {
         if passthrough {
             info!("PASSTHROUGH MODE — skipping Phase 0 PSU bring-up (bosminer owns PSU)");
             psu_arc = None;
-            psu_hb_handle = None;
             _psu_bypass_gate = None;
         } else if psu_override_active {
             // -----------------------------------------------------------------
@@ -9489,7 +9691,6 @@ impl S19jHybridMiner {
                     t()
                 );
                 psu_arc = None;
-                psu_hb_handle = None;
             } else if am2_zero_psu_bytes_enabled() {
                 info!(
                     t_ms = t(),
@@ -9501,7 +9702,6 @@ impl S19jHybridMiner {
                     t()
                 );
                 psu_arc = None;
-                psu_hb_handle = None;
             } else {
                 // ----- Layer-2 (FIX-A) opportunistic smart-APW12 handshake -----
                 //
@@ -9534,8 +9734,10 @@ impl S19jHybridMiner {
                             psu_transport,
                         );
                         psu_arc = outcome.psu;
-                        psu_hb_handle = outcome.heartbeat;
-                        if psu_arc.is_some() && psu_hb_handle.is_some() {
+                        if let Some(handle) = outcome.heartbeat {
+                            runtime_threads.push("s19j-psu-heartbeat", handle);
+                        }
+                        if psu_arc.is_some() && runtime_threads.contains("s19j-psu-heartbeat") {
                             info!(
                                 t_ms = t(),
                                 "[T+{}] Phase 0 (b): smart-APW12 spoof handshake SUCCEEDED on Loki bus \
@@ -9584,7 +9786,6 @@ impl S19jHybridMiner {
                              skipping smart-APW12 handshake (this should not happen)"
                         );
                         psu_arc = None;
-                        psu_hb_handle = None;
                     }
                 }
             }
@@ -9750,7 +9951,8 @@ impl S19jHybridMiner {
             // Spawn the 1 Hz heartbeat BEFORE anything that could take >30 s.
             let psu_hb = psu.clone();
             let shutdown_hb = self.shutdown.clone();
-            psu_hb_handle = Some(
+            runtime_threads.push(
+                "s19j-psu-heartbeat",
                 std::thread::Builder::new()
                     .name("s19j-psu-hb".into())
                     .spawn(move || psu_heartbeat_loop(psu_hb, shutdown_hb, psu_heartbeat_interval))
@@ -9796,30 +9998,30 @@ impl S19jHybridMiner {
                 env_gate = "DCENT_AM2_DIAG_STOP_AFTER_PSU=1",
                 psu_override = psu_override_active,
                 psu_object_opened = psu_arc.is_some(),
-                psu_heartbeat_thread = psu_hb_handle.is_some(),
+                psu_heartbeat_thread = runtime_threads.contains("s19j-psu-heartbeat"),
                 "AM2 diagnostic stop after Phase 0 PSU path — stopping before \
                  dsPIC voltage enable, chain UART init, Stratum, or work dispatch"
             );
             force_am2_home_hard_stop(&self.config, "diag-stop-after-psu");
-            self.shutdown.cancel();
+            let feeders_quiesced = stop_am2_runtime_feeders_bounded(
+                &self.config,
+                &mut runtime_threads,
+                "diag-stop-after-psu",
+            )
+            .await;
 
-            if let Some(handle) = psu_hb_handle.take() {
-                let _ = handle.join();
-                info!("PSU heartbeat thread joined for Phase-0 diagnostic stop");
-            }
-
-            if let Some(psu_mutex) = psu_arc.as_ref() {
-                let mut psu_guard = psu_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                if let Err(psu_err) = psu_guard.watchdog(false) {
-                    warn!(
-                        error = %psu_err,
-                        "PSU watchdog disable failed during Phase-0 diagnostic stop"
+            if feeders_quiesced {
+                let Some(psu_mutex) = psu_arc.as_ref() else {
+                    anyhow::bail!(
+                        "DCENT_AM2_DIAG_STOP_AFTER_PSU=1: diagnostic stop after Phase 0 PSU path \
+                         (no dsPIC voltage enable, no chain UART init, no Stratum, no work dispatch)"
                     );
-                }
-                if let Err(psu_err) = psu_guard.set_voltage_min() {
+                };
+                let mut psu_guard = psu_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(psu_err) = psu_guard.safe_shutdown_to_min() {
                     warn!(
                         error = %psu_err,
-                        "PSU set_voltage_min failed during Phase-0 diagnostic stop"
+                        "PSU safe-direction shutdown failed during Phase-0 diagnostic stop"
                     );
                 }
             }
@@ -9895,6 +10097,7 @@ impl S19jHybridMiner {
         //
         // Skipped under `passthrough` (bosminer owns the chain).
         // ====================================================================
+        let mut am2_hashboard_presence: Vec<Am2HashboardPresence> = Vec::new();
         if !passthrough {
             use crate::runtime::hardware_info::{
                 read_hashboard_eeprom_for_energize_gate, EepromReadinessError,
@@ -9913,6 +10116,20 @@ impl S19jHybridMiner {
             for slot in 0u8..=2u8 {
                 match read_hashboard_eeprom_for_energize_gate(slot as usize, deadline) {
                     Ok(bytes) => {
+                        if let Some((plan, context)) =
+                            am2_controller_plan.as_ref().and_then(|plan| {
+                                plan.context_for_slot(slot).map(|context| (plan, context))
+                            })
+                        {
+                            match bind_am2_hashboard_presence(plan, context, bytes.clone()) {
+                                Ok(presence) => am2_hashboard_presence.push(presence),
+                                Err(error) => warn!(
+                                    slot,
+                                    error = %error,
+                                    "AM2 planned controller slot EEPROM could not bind endpoint presence evidence"
+                                ),
+                            }
+                        }
                         probes.push(classify_chain(slot, Some(&bytes)));
                     }
                     Err(EepromReadinessError::Timeout { .. }) => {
@@ -10115,6 +10332,9 @@ impl S19jHybridMiner {
             );
         }
         let mut heartbeat_pic_fw: Option<u8> = None;
+        let selected_pic_endpoint_required = am2_controller_plan.is_some();
+        let mut selected_pic_endpoint_session: Option<Pic0x89EndpointSession> = None;
+        let mut selected_pic_heartbeat_controller: Option<Pic0x89Service> = None;
         // : resolve the effective chain UART before all-active dsPIC
         // enable so a strict ACK failure on the target chain can block enum.
         // `selected_pic_addr` remains the selected PIC context derived from
@@ -10211,6 +10431,15 @@ impl S19jHybridMiner {
             let pic_i2c = i2c0_service
                 .as_ref()
                 .context("AM2 I2C service missing for PIC init")?;
+            let controller_presence = am2_hashboard_presence
+                .iter()
+                .find(|presence| presence.address() == selected_pic_addr)
+                .with_context(|| {
+                    format!(
+                        "AM2 selected controller 0x{selected_pic_addr:02X} lacks exact board-target, canonical slot/UART, and positive EEPROM presence evidence"
+                    )
+                })?;
+            let mut controller_endpoint: Option<VoltageControllerEndpoint> = None;
 
             // Read FW version via service-serialized write/sleep/read probes.
             // On .139 the observed FW is 0x86 (S19j framed variant); bosminer's
@@ -10736,7 +10965,11 @@ impl S19jHybridMiner {
             }
 
             let allow_trust_rail = am2_env_flag("DCENT_AM2_TRUST_RAIL_FALLBACK");
-            let detected_fw_result = pic_read_fw_version_service(pic_i2c, selected_pic_addr);
+            let detected_fw_result = observe_am2_endpoint_firmware(
+                pic_i2c,
+                controller_presence,
+                &mut controller_endpoint,
+            );
             let detected_fw_opt = match detected_fw_result {
                 Ok(fw) => Some(fw),
                 Err(e) if allow_trust_rail => {
@@ -10749,10 +10982,11 @@ impl S19jHybridMiner {
                 Err(e) => {
                     force_am2_home_hard_stop(&self.config, "pic-get-version-failed");
                     teardown_am2_power_after_failed_pic_preflight(
-                        &self.shutdown,
+                        &self.config,
+                        &mut runtime_threads,
                         &psu_arc,
-                        &mut psu_hb_handle,
-                    );
+                    )
+                    .await;
                     anyhow::bail!(
                         "PIC GET_VERSION failed at 0x{:02X}: dsPIC ACKs but returned no valid framed/short response. \
                          Refusing trust-rail fallback by default because production voltage control requires a validated PIC firmware byte. \
@@ -10917,7 +11151,11 @@ impl S19jHybridMiner {
                             reset_jump_reverify_max
                         ),
                     }
-                    match pic_read_fw_version_service(pic_i2c, selected_pic_addr) {
+                    match observe_am2_endpoint_firmware(
+                        pic_i2c,
+                        controller_presence,
+                        &mut controller_endpoint,
+                    ) {
                         Ok(fw) => {
                             info!(
                                 t_ms = t(),
@@ -11011,7 +11249,11 @@ impl S19jHybridMiner {
                             jump_reverify_max
                         ),
                     }
-                    match pic_read_fw_version_service(pic_i2c, selected_pic_addr) {
+                    match observe_am2_endpoint_firmware(
+                        pic_i2c,
+                        controller_presence,
+                        &mut controller_endpoint,
+                    ) {
                         Ok(fw) => {
                             info!(
                                 t_ms = t(),
@@ -11097,10 +11339,11 @@ impl S19jHybridMiner {
                 dspic_fw86_trust_degraded_override_enabled(),
             ) {
                 teardown_am2_power_after_failed_pic_preflight(
-                    &self.shutdown,
+                    &self.config,
+                    &mut runtime_threads,
                     &psu_arc,
-                    &mut psu_hb_handle,
-                );
+                )
+                .await;
                 anyhow::bail!(
                     "PIC 0x{:02X}: {}",
                     selected_pic_addr,
@@ -11109,8 +11352,31 @@ impl S19jHybridMiner {
             }
 
             heartbeat_pic_fw = Some(detected_fw);
-            let mut pic =
-                Pic0x89Service::new_with_fw(pic_i2c.clone(), selected_pic_addr, Some(detected_fw));
+            let endpoint = controller_endpoint.take().with_context(|| {
+                format!(
+                    "AM2 controller 0x{selected_pic_addr:02X} has no chain-plan-issued endpoint; trust-rail/model/address fallback cannot construct the voltage owner"
+                )
+            })?;
+            if endpoint.observed_firmware() != Some(detected_fw) {
+                anyhow::bail!(
+                    "AM2 controller endpoint firmware {:?} does not match the final observed firmware 0x{detected_fw:02X}",
+                    endpoint.observed_firmware()
+                );
+            }
+            selected_pic_endpoint_session = Some(
+                Pic0x89EndpointSession::new(pic_i2c.clone(), endpoint)
+                    .context("failed to bind chain-plan-issued AM2 Pic0x89 endpoint")?,
+            );
+            selected_pic_heartbeat_controller = Some(
+                selected_pic_endpoint_session
+                    .as_ref()
+                    .expect("just-installed AM2 Pic0x89 endpoint session")
+                    .controller(),
+            );
+            let pic = selected_pic_endpoint_session
+                .as_mut()
+                .expect("just-installed AM2 Pic0x89 endpoint session")
+                .controller_mut();
 
             // WAKE-DSPIC-BEFORE-RAIL (deferred rail-on, bosminer block B). The dsPIC
             // has now booted its SMPS app (RESET->JUMP->fw=0x89, Phase 0d + Rung-2
@@ -11689,27 +11955,24 @@ impl S19jHybridMiner {
                         "ENABLE_VOLTAGE failed in trust-rail mode; hard-stopping instead of blind chain init"
                     );
                     force_am2_home_hard_stop(&self.config, "trust-rail-enable-voltage-failed");
-                    self.shutdown.cancel();
+                    let feeders_quiesced = stop_am2_runtime_feeders_bounded(
+                        &self.config,
+                        &mut runtime_threads,
+                        "trust-rail-enable-voltage-failed",
+                    )
+                    .await;
 
-                    if let Some(psu_mutex) = psu_arc.as_ref() {
+                    if feeders_quiesced {
+                        let Some(psu_mutex) = psu_arc.as_ref() else {
+                            return Err(e).context("trust-rail ENABLE_VOLTAGE failed");
+                        };
                         let mut psu_guard = psu_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Err(psu_err) = psu_guard.watchdog(false) {
+                        if let Err(psu_err) = psu_guard.safe_shutdown_to_min() {
                             warn!(
                                 error = %psu_err,
-                                "PSU watchdog disable failed after trust-rail ENABLE failure"
+                                "PSU safe-direction shutdown failed after trust-rail ENABLE failure"
                             );
                         }
-                        if let Err(psu_err) = psu_guard.set_voltage_min() {
-                            warn!(
-                                error = %psu_err,
-                                "PSU set_voltage_min failed after trust-rail ENABLE failure"
-                            );
-                        }
-                    }
-
-                    if let Some(handle) = psu_hb_handle.take() {
-                        let _ = handle.join();
-                        info!("PSU heartbeat thread joined after trust-rail ENABLE failure");
                     }
 
                     return Err(e).context("trust-rail ENABLE_VOLTAGE failed");
@@ -12780,33 +13043,13 @@ impl S19jHybridMiner {
                 }
 
                 force_am2_home_hard_stop(&self.config, "diag-stop-after-dspic-enable");
-                self.shutdown.cancel();
-
-                if let Some(handle) = pic_hb_handle.take() {
-                    let _ = handle.join();
-                    info!("PIC heartbeat thread joined for dsPIC-enable diagnostic stop");
-                }
-
-                if let Some(handle) = psu_hb_handle.take() {
-                    let _ = handle.join();
-                    info!("PSU heartbeat thread joined for dsPIC-enable diagnostic stop");
-                }
-
-                if let Some(psu_mutex) = psu_arc.as_ref() {
-                    let mut psu_guard = psu_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Err(psu_err) = psu_guard.watchdog(false) {
-                        warn!(
-                            error = %psu_err,
-                            "PSU watchdog disable failed during dsPIC-enable diagnostic stop"
-                        );
-                    }
-                    if let Err(psu_err) = psu_guard.set_voltage_min() {
-                        warn!(
-                            error = %psu_err,
-                            "PSU set_voltage_min failed during dsPIC-enable diagnostic stop"
-                        );
-                    }
-                }
+                shutdown_am2_psu_after_feeders_bounded(
+                    &self.config,
+                    &mut runtime_threads,
+                    &psu_arc,
+                    "diag-stop-after-dspic-enable",
+                )
+                .await;
 
                 anyhow::bail!(
                     "DCENT_AM2_DIAG_STOP_AFTER_DSPIC_ENABLE=1: diagnostic stop after \
@@ -12866,13 +13109,17 @@ impl S19jHybridMiner {
             } else {
                 Vec::new()
             };
-            pic_hb_handle = Some(spawn_pic_heartbeat_thread(
-                heartbeat_i2c,
-                selected_pic_addr,
-                heartbeat_pic_fw,
-                heartbeat_additional_addrs,
-                self.shutdown.clone(),
-            )?);
+            runtime_threads.push(
+                "s19j-pic-heartbeat",
+                spawn_pic_heartbeat_thread(
+                    heartbeat_i2c,
+                    selected_pic_heartbeat_controller.take().context(
+                        "exact AM2 Pic0x89 endpoint-issued controller missing before heartbeat ownership handoff",
+                    )?,
+                    heartbeat_additional_addrs,
+                    self.shutdown.clone(),
+                )?,
+            );
 
             // Phase 3c: voltage settle window before chain UART activity.
             //
@@ -13130,82 +13377,6 @@ impl S19jHybridMiner {
                                 error = %e,
                                 "Post-ENABLE chain UART RX gate failed after opt-in fallback scan; tearing down PIC/PSU watchdog state before returning"
                             );
-                            if let (Some(service), Some(fw)) =
-                                (i2c0_service.as_ref(), heartbeat_pic_fw)
-                            {
-                                let mut pic = Pic0x89Service::new_with_fw(
-                                    service.clone(),
-                                    selected_pic_addr,
-                                    Some(fw),
-                                );
-                                let _ = pic.send_heartbeat();
-                                match pic.disable_voltage() {
-                                    Ok(()) => info!(
-                                        addr = format_args!("0x{:02X}", selected_pic_addr),
-                                        "PIC voltage disabled after chain UART RX gate failure"
-                                    ),
-                                    Err(disable_err) => warn!(
-                                        error = %disable_err,
-                                        addr = format_args!("0x{:02X}", selected_pic_addr),
-                                        "PIC voltage disable failed after chain UART RX gate failure"
-                                    ),
-                                }
-                            }
-                            force_am2_home_hard_stop(
-                                &self.config,
-                                "chain-uart-rx-gate-failed-after-fallback",
-                            );
-                            self.shutdown.cancel();
-
-                            if let Some(handle) = pic_hb_handle.take() {
-                                let _ = handle.join();
-                                info!(
-                                    "PIC heartbeat thread joined after chain UART RX gate failure"
-                                );
-                            }
-
-                            if let Some(psu_mutex) = psu_arc.as_ref() {
-                                let mut psu_guard =
-                                    psu_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                                if let Err(psu_err) = psu_guard.watchdog(false) {
-                                    warn!(
-                                        error = %psu_err,
-                                        "PSU watchdog disable failed after chain UART RX gate failure"
-                                    );
-                                }
-                                if let Err(psu_err) = psu_guard.set_voltage_min() {
-                                    warn!(
-                                        error = %psu_err,
-                                        "PSU set_voltage_min failed after chain UART RX gate failure"
-                                    );
-                                }
-                            }
-
-                            if let Some(handle) = psu_hb_handle.take() {
-                                let _ = handle.join();
-                                info!(
-                                    "PSU heartbeat thread joined after chain UART RX gate failure"
-                                );
-                            }
-
-                            // PWR_CONTROL gate auto-deasserts when the
-                            // surviving `psu_arc` reference is dropped on
-                            // return — owned by `Apw121215a::Drop`.
-
-                            return Err(e).context("Post-ENABLE chain UART RX gate failed");
-                        }
-                    } else {
-                        warn!(
-                            error = %e,
-                            "Post-ENABLE chain UART RX gate failed; fallback UART scan skipped (set DCENT_AM2_UART_FALLBACK_SCAN=1 for bounded lab sweep); tearing down PIC/PSU watchdog state before returning"
-                        );
-                        if let (Some(service), Some(fw)) = (i2c0_service.as_ref(), heartbeat_pic_fw)
-                        {
-                            let mut pic = Pic0x89Service::new_with_fw(
-                                service.clone(),
-                                selected_pic_addr,
-                                Some(fw),
-                            );
                             let _ = pic.send_heartbeat();
                             match pic.disable_voltage() {
                                 Ok(()) => info!(
@@ -13218,35 +13389,49 @@ impl S19jHybridMiner {
                                     "PIC voltage disable failed after chain UART RX gate failure"
                                 ),
                             }
+                            force_am2_home_hard_stop(
+                                &self.config,
+                                "chain-uart-rx-gate-failed-after-fallback",
+                            );
+                            shutdown_am2_psu_after_feeders_bounded(
+                                &self.config,
+                                &mut runtime_threads,
+                                &psu_arc,
+                                "chain-uart-rx-gate-failed-after-fallback",
+                            )
+                            .await;
+
+                            // PWR_CONTROL gate auto-deasserts when the
+                            // surviving `psu_arc` reference is dropped on
+                            // return — owned by `Apw121215a::Drop`.
+
+                            return Err(e).context("Post-ENABLE chain UART RX gate failed");
+                        }
+                    } else {
+                        warn!(
+                            error = %e,
+                            "Post-ENABLE chain UART RX gate failed; fallback UART scan skipped (set DCENT_AM2_UART_FALLBACK_SCAN=1 for bounded lab sweep); tearing down PIC/PSU watchdog state before returning"
+                        );
+                        let _ = pic.send_heartbeat();
+                        match pic.disable_voltage() {
+                            Ok(()) => info!(
+                                addr = format_args!("0x{:02X}", selected_pic_addr),
+                                "PIC voltage disabled after chain UART RX gate failure"
+                            ),
+                            Err(disable_err) => warn!(
+                                error = %disable_err,
+                                addr = format_args!("0x{:02X}", selected_pic_addr),
+                                "PIC voltage disable failed after chain UART RX gate failure"
+                            ),
                         }
                         force_am2_home_hard_stop(&self.config, "chain-uart-rx-gate-failed");
-                        self.shutdown.cancel();
-
-                        if let Some(handle) = pic_hb_handle.take() {
-                            let _ = handle.join();
-                            info!("PIC heartbeat thread joined after chain UART RX gate failure");
-                        }
-
-                        if let Some(psu_mutex) = psu_arc.as_ref() {
-                            let mut psu_guard = psu_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Err(psu_err) = psu_guard.watchdog(false) {
-                                warn!(
-                                    error = %psu_err,
-                                    "PSU watchdog disable failed after chain UART RX gate failure"
-                                );
-                            }
-                            if let Err(psu_err) = psu_guard.set_voltage_min() {
-                                warn!(
-                                    error = %psu_err,
-                                    "PSU set_voltage_min failed after chain UART RX gate failure"
-                                );
-                            }
-                        }
-
-                        if let Some(handle) = psu_hb_handle.take() {
-                            let _ = handle.join();
-                            info!("PSU heartbeat thread joined after chain UART RX gate failure");
-                        }
+                        shutdown_am2_psu_after_feeders_bounded(
+                            &self.config,
+                            &mut runtime_threads,
+                            &psu_arc,
+                            "chain-uart-rx-gate-failed",
+                        )
+                        .await;
 
                         // PWR_CONTROL gate auto-deasserts when the surviving
                         // `psu_arc` reference is dropped on return — owned
@@ -13494,27 +13679,13 @@ impl S19jHybridMiner {
                             );
                         }
                         force_am2_home_hard_stop(&self.config, "bm1362-init-failed");
-                        self.shutdown.cancel();
-
-                        if let Some(handle) = pic_hb_handle.take() {
-                            let _ = handle.join();
-                            info!("PIC heartbeat thread joined after init failure");
-                        }
-
-                        if let Some(psu_mutex) = psu_arc.as_ref() {
-                            let mut psu_guard = psu_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Err(e) = psu_guard.watchdog(false) {
-                                warn!(error = %e, "PSU watchdog disable failed after init failure");
-                            }
-                            if let Err(e) = psu_guard.set_voltage_min() {
-                                warn!(error = %e, "PSU set_voltage_min failed after init failure");
-                            }
-                        }
-
-                        if let Some(handle) = psu_hb_handle.take() {
-                            let _ = handle.join();
-                            info!("PSU heartbeat thread joined after init failure");
-                        }
+                        shutdown_am2_psu_after_feeders_bounded(
+                            &self.config,
+                            &mut runtime_threads,
+                            &psu_arc,
+                            "bm1362-init-failed",
+                        )
+                        .await;
 
                         // PWR_CONTROL gate auto-deasserts when the surviving
                         // `psu_arc` reference is dropped on return — owned by
@@ -13602,33 +13773,13 @@ impl S19jHybridMiner {
                 }
 
                 force_am2_home_hard_stop(&self.config, "diag-stop-after-bm1362-enum");
-                self.shutdown.cancel();
-
-                if let Some(handle) = pic_hb_handle.take() {
-                    let _ = handle.join();
-                    info!("PIC heartbeat thread joined for BM1362-enum diagnostic stop");
-                }
-
-                if let Some(handle) = psu_hb_handle.take() {
-                    let _ = handle.join();
-                    info!("PSU heartbeat thread joined for BM1362-enum diagnostic stop");
-                }
-
-                if let Some(psu_mutex) = psu_arc.as_ref() {
-                    let mut psu_guard = psu_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Err(psu_err) = psu_guard.watchdog(false) {
-                        warn!(
-                            error = %psu_err,
-                            "PSU watchdog disable failed during BM1362-enum diagnostic stop"
-                        );
-                    }
-                    if let Err(psu_err) = psu_guard.set_voltage_min() {
-                        warn!(
-                            error = %psu_err,
-                            "PSU set_voltage_min failed during BM1362-enum diagnostic stop"
-                        );
-                    }
-                }
+                shutdown_am2_psu_after_feeders_bounded(
+                    &self.config,
+                    &mut runtime_threads,
+                    &psu_arc,
+                    "diag-stop-after-bm1362-enum",
+                )
+                .await;
 
                 anyhow::bail!(
                     "DCENT_AM2_DIAG_STOP_AFTER_BM1362_ENUM=1: diagnostic stop after \
@@ -13979,7 +14130,7 @@ impl S19jHybridMiner {
             info!(
                 "Phase 9b: passthrough mode skips DCENT_OS PIC heartbeat; inherited firmware owns voltage watchdog"
             );
-        } else if pic_hb_handle.is_some() {
+        } else if runtime_threads.contains("s19j-pic-heartbeat") {
             info!("Phase 9b: PIC heartbeat already running from Phase 3d");
         } else {
             anyhow::bail!("PIC heartbeat was not started before ASIC init");
@@ -14106,10 +14257,42 @@ impl S19jHybridMiner {
                     "R-13 die-temp calibration opted in via env override (fail-safe: never reports below raw)"
                 );
             }
+            let thermal_pic = match pic0x89_clean_stop_owner_policy(
+                selected_pic_endpoint_required,
+                selected_pic_endpoint_session.is_some(),
+            ) {
+                Pic0x89CleanStopOwnerPolicy::Endpoint => Some(
+                    selected_pic_endpoint_session
+                        .as_ref()
+                        .expect("endpoint policy requires retained thermal session")
+                        .controller(),
+                ),
+                Pic0x89CleanStopOwnerPolicy::RefuseMissingExactEndpoint => {
+                    error!(
+                        addr = format_args!("0x{:02X}", selected_pic_addr),
+                        "exact AM2 endpoint session missing before thermal ownership handoff; refusing raw address/firmware reconstruction"
+                    );
+                    force_am2_home_hard_stop(
+                        &self.config,
+                        "thermal-supervisor-missing-exact-pic-endpoint",
+                    );
+                    anyhow::bail!(
+                        "exact AM2 endpoint session missing before thermal ownership handoff"
+                    );
+                }
+                Pic0x89CleanStopOwnerPolicy::LegacyCompatibility => {
+                    match (i2c0_service.as_ref(), heartbeat_pic_fw) {
+                        (Some(service), Some(fw)) => Some(Pic0x89Service::new_with_fw(
+                            service.clone(),
+                            selected_pic_addr,
+                            Some(fw),
+                        )),
+                        _ => None,
+                    }
+                }
+            };
             let mut sup = Am2ThermalSupervisor::new(
-                i2c0_service.clone(),
-                selected_pic_addr,
-                heartbeat_pic_fw,
+                thermal_pic,
                 self.config.thermal.hot_temp_c,
                 self.config.thermal.dangerous_temp_c,
                 die_cal_cfg,
@@ -14177,7 +14360,7 @@ impl S19jHybridMiner {
                             // primary's dsPIC addr if the path is unrecognized so
                             // teardown still disables a real controller.
                             let pic_addr_b = pic_addr_b.unwrap_or(selected_pic_addr);
-                            return self
+                            let dispatch_result = self
                                 .run_am2_dual_chain_serial_dispatch_loop(
                                     serial,
                                     serial_b,
@@ -14195,6 +14378,36 @@ impl S19jHybridMiner {
                                     pool_quality.clone(),
                                 )
                                 .await;
+                            let feeders_quiesced = stop_am2_runtime_feeders_bounded(
+                                &self.config,
+                                &mut runtime_threads,
+                                "dual-chain-dispatch-stop",
+                            )
+                            .await;
+                            let shutdown_evidence = if feeders_quiesced {
+                                let mut teardown_addrs = vec![selected_pic_addr, pic_addr_b];
+                                teardown_addrs.sort_unstable();
+                                teardown_addrs.dedup();
+                                if let Some(service) = i2c0_service.as_ref() {
+                                    disable_dspic_addrs_best_effort(
+                                        service,
+                                        &teardown_addrs,
+                                        selected_pic_addr,
+                                        heartbeat_pic_fw,
+                                        "dual-chain-clean-stop",
+                                    );
+                                }
+                                shutdown_am2_psu_after_feeders_quiesced(
+                                    &psu_arc,
+                                    "dual-chain-dispatch-stop",
+                                )
+                            } else {
+                                Am2PowerShutdownEvidence::hard_stop_after_timeout(psu_arc.is_some())
+                            };
+                            return finalize_am2_dispatch_shutdown(
+                                dispatch_result,
+                                shutdown_evidence,
+                            );
                         }
                         Err(e) => {
                             warn!(
@@ -14222,7 +14435,7 @@ impl S19jHybridMiner {
             info!(
                 "DCENT_AM2_SERIAL_WORK_DISPATCH=1 — routing work via the proven BM1362 88-byte serial frame over the chain UART (FPGA WORK_TX FIFO bypassed)"
             );
-            return self
+            let mut dispatch_result = self
                 .run_am2_serial_dispatch_loop(
                     serial,
                     job_rx,
@@ -14238,6 +14451,90 @@ impl S19jHybridMiner {
                     pool_quality.clone(),
                 )
                 .await;
+            let feeders_quiesced = stop_am2_runtime_feeders_bounded(
+                &self.config,
+                &mut runtime_threads,
+                "single-chain-dispatch-stop",
+            )
+            .await;
+            let shutdown_evidence = if feeders_quiesced {
+                // Phase 3A (CE-010): preserve the rail walk/reset/decay plan,
+                // but only after PIC and PSU feeders are both joined.
+                if am2_safe_teardown_enabled() {
+                    if let Err(error) = am2_safe_teardown_sequence(
+                        selected_pic_endpoint_session.as_mut(),
+                        selected_pic_endpoint_required,
+                        i2c0_service.as_ref(),
+                        selected_pic_addr,
+                        heartbeat_pic_fw,
+                        "serial-dispatch-clean-stop",
+                    ) {
+                        error!(
+                            error = %error,
+                            "AM2 safe teardown lost exact endpoint authority; forcing hard stop"
+                        );
+                        force_am2_home_hard_stop(
+                            &self.config,
+                            "safe-teardown-missing-exact-pic-endpoint",
+                        );
+                        dispatch_result = Err(error);
+                    }
+                } else {
+                    match pic0x89_clean_stop_owner_policy(
+                        selected_pic_endpoint_required,
+                        selected_pic_endpoint_session.is_some(),
+                    ) {
+                        Pic0x89CleanStopOwnerPolicy::Endpoint => {
+                            let pic = selected_pic_endpoint_session
+                                .as_mut()
+                                .expect("endpoint policy requires retained session")
+                                .controller_mut();
+                            if let Err(e) = pic.disable_voltage() {
+                                warn!(
+                                    error = %e,
+                                    addr = format_args!("0x{:02X}", selected_pic_addr),
+                                    "AM2 serial-dispatch PIC voltage disable failed after feeders quiesced"
+                                );
+                            }
+                        }
+                        Pic0x89CleanStopOwnerPolicy::RefuseMissingExactEndpoint => {
+                            error!(
+                                addr = format_args!("0x{:02X}", selected_pic_addr),
+                                "exact AM2 endpoint session missing at serial-dispatch clean stop; refusing raw address/firmware reconstruction"
+                            );
+                            force_am2_home_hard_stop(
+                                &self.config,
+                                "serial-dispatch-missing-exact-pic-endpoint",
+                            );
+                            dispatch_result = Err(anyhow::anyhow!(
+                                "exact AM2 endpoint session missing at serial-dispatch clean stop"
+                            ));
+                        }
+                        Pic0x89CleanStopOwnerPolicy::LegacyCompatibility => {
+                            if let (Some(service), Some(fw)) =
+                                (i2c0_service.as_ref(), heartbeat_pic_fw)
+                            {
+                                let mut pic = Pic0x89Service::new_with_fw(
+                                    service.clone(),
+                                    selected_pic_addr,
+                                    Some(fw),
+                                );
+                                if let Err(e) = pic.disable_voltage() {
+                                    warn!(
+                                        error = %e,
+                                        addr = format_args!("0x{:02X}", selected_pic_addr),
+                                        "AM2 legacy-compatible serial-dispatch PIC voltage disable failed after feeders quiesced"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                shutdown_am2_psu_after_feeders_quiesced(&psu_arc, "single-chain-dispatch-stop")
+            } else {
+                Am2PowerShutdownEvidence::hard_stop_after_timeout(psu_arc.is_some())
+            };
+            return finalize_am2_dispatch_shutdown(dispatch_result, shutdown_evidence);
         }
 
         // ---- Phase 10b: Mining loop (FPGA work dispatch + nonce collection) ----
@@ -14248,7 +14545,7 @@ impl S19jHybridMiner {
 
         log_bm1362_voltage_topology(fpga_chain_id, chip_count);
 
-        let mut work_builder = dcentrald_stratum::WorkBuilder::new();
+        let mut work_builder = dcentrald_stratum::share_pipeline::WorkBuilder::new();
         let mut current_job: Option<dcentrald_stratum::types::JobTemplate> = None;
         let mut asic_job_id: u8 = 0;
         let mut work_history: Vec<VecDeque<WorkEntry>> = (0..128)
@@ -14574,7 +14871,10 @@ impl S19jHybridMiner {
                         if !seen_shares.insert((work_id, nonce)) {
                             continue; // duplicate (FPGA RX FIFO re-surfaced this nonce)
                         }
-                        if seen_shares.len() > 8192 {
+                        if dcentrald_common::should_clear_seen_shares(
+                            seen_shares.len(),
+                            dcentrald_common::DEFAULT_SEEN_SHARES_CAP,
+                        ) {
                             seen_shares.clear();
                         }
 
@@ -14619,7 +14919,7 @@ impl S19jHybridMiner {
                                 None => candidate.version,
                             };
                             let header = hybrid_build_header(candidate, rolled_version, nonce);
-                            if dcentrald_stratum::validate_full_header(&header, &candidate.share_target) {
+                            if dcentrald_stratum::share_pipeline::validate_full_header(&header, &candidate.share_target) {
                                 Some((candidate.clone(), rolled_version, share_version_bits))
                             } else {
                                 None
@@ -14735,69 +15035,101 @@ impl S19jHybridMiner {
         }
 
         // ================================================================
-        // Graceful shutdown — disable PSU watchdog + output so bosminer can
-        // restart cleanly. Order matters: watchdog(false) first so the PSU
-        // doesn't trigger self-disable during the brief window between our
-        // disable() and the heartbeat thread stopping.
+        // Graceful shutdown — stop all heartbeat ownership, command the bulk
+        // rail toward minimum, then disarm its watchdog. If the minimum-ramp
+        // fails, the armed watchdog becomes the independent backstop after any
+        // already in-flight heartbeat transfer drains.
         // ================================================================
         info!("=== SHUTDOWN: graceful PSU teardown ===");
-        if let (Some(service), Some(fw)) = (i2c0_service.as_ref(), heartbeat_pic_fw) {
-            let mut pic = Pic0x89Service::new_with_fw(service.clone(), selected_pic_addr, Some(fw));
-            match pic.disable_voltage() {
-                Ok(()) => info!(
-                    addr = format_args!("0x{:02X}", selected_pic_addr),
-                    "PIC voltage disabled before heartbeat teardown"
-                ),
-                Err(e) => warn!(
-                    error = %e,
-                    addr = format_args!("0x{:02X}", selected_pic_addr),
-                    "PIC voltage disable failed during shutdown"
-                ),
+        let feeders_quiesced =
+            stop_am2_runtime_feeders_bounded(&self.config, &mut runtime_threads, "normal-shutdown")
+                .await;
+        let mut endpoint_authority_error: Option<anyhow::Error> = None;
+        let shutdown_evidence = if feeders_quiesced {
+            // No heartbeat can race after this disable: both feeder handles
+            // have been observed finished and joined before controller traffic.
+            match pic0x89_clean_stop_owner_policy(
+                selected_pic_endpoint_required,
+                selected_pic_endpoint_session.is_some(),
+            ) {
+                Pic0x89CleanStopOwnerPolicy::Endpoint => {
+                    let pic = selected_pic_endpoint_session
+                        .as_mut()
+                        .expect("endpoint policy requires retained session")
+                        .controller_mut();
+                    match pic.disable_voltage() {
+                        Ok(()) => info!(
+                            addr = format_args!("0x{:02X}", selected_pic_addr),
+                            "PIC voltage disabled after heartbeat feeders quiesced"
+                        ),
+                        Err(e) => warn!(
+                            error = %e,
+                            addr = format_args!("0x{:02X}", selected_pic_addr),
+                            "PIC voltage disable failed during shutdown"
+                        ),
+                    }
+                }
+                Pic0x89CleanStopOwnerPolicy::RefuseMissingExactEndpoint => {
+                    error!(
+                        addr = format_args!("0x{:02X}", selected_pic_addr),
+                        "exact AM2 endpoint session missing at normal shutdown; refusing raw address/firmware reconstruction"
+                    );
+                    force_am2_home_hard_stop(
+                        &self.config,
+                        "normal-shutdown-missing-exact-pic-endpoint",
+                    );
+                    endpoint_authority_error = Some(anyhow::anyhow!(
+                        "exact AM2 endpoint session missing at normal shutdown"
+                    ));
+                }
+                Pic0x89CleanStopOwnerPolicy::LegacyCompatibility => {
+                    if let (Some(service), Some(fw)) = (i2c0_service.as_ref(), heartbeat_pic_fw) {
+                        let mut pic = Pic0x89Service::new_with_fw(
+                            service.clone(),
+                            selected_pic_addr,
+                            Some(fw),
+                        );
+                        match pic.disable_voltage() {
+                            Ok(()) => info!(
+                                addr = format_args!("0x{:02X}", selected_pic_addr),
+                                "legacy-compatible PIC voltage disabled after heartbeat feeders quiesced"
+                            ),
+                            Err(e) => warn!(
+                                error = %e,
+                                addr = format_args!("0x{:02X}", selected_pic_addr),
+                                "legacy-compatible PIC voltage disable failed during shutdown"
+                            ),
+                        }
+                    }
+                }
             }
-        }
-        if let Some(handle) = pic_hb_handle.take() {
-            let _ = handle.join();
-            info!("PIC heartbeat thread joined");
-        }
-        if let Some(psu_mutex) = psu_arc {
-            // Poison-tolerant lock for the graceful cut-hash-before-noise
-            // teardown. The PSU heartbeat thread (psu_heartbeat_loop) holds the
-            // same Arc<Mutex<Apw121215a>>; if it panicked while holding the lock,
-            // a plain `.unwrap()` here would panic and skip BOTH the watchdog-off
-            // and the voltage ramp-to-minimum — leaving the rail at 15.2 V until
-            // the ~30s hardware watchdog cuts. Recover the inner guard so the
-            // safety teardown still runs. Matches the proven i2c.rs idiom.
-            let mut psu_guard = psu_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = psu_guard.watchdog(false) {
-                warn!(error = %e, "PSU watchdog disable failed");
-            } else {
-                info!("PSU watchdog disabled");
-            }
-            // Ramp voltage to PSU minimum so the rail isn't pinned at 15.2 V
-            // while the daemon exits. (Formerly `disable()`, renamed in
-            // Phase 13D — bosminer's `PSU: Disable` is a watchdog-off,
-            // which we already did one line above. What we want HERE is
-            // the voltage ramp-down.)
-            if let Err(e) = psu_guard.set_voltage_min() {
-                warn!(error = %e, "PSU set_voltage_min failed");
-            } else {
-                info!("PSU output ramped to minimum");
-            }
-            drop(psu_guard);
-        }
-        if let Some(handle) = psu_hb_handle.take() {
-            // Heartbeat loop checks `shutdown.is_cancelled()` each tick — up to
-            // 1 s to join. Don't block on join() past that.
-            let _ = handle.join();
-            info!("PSU heartbeat thread joined");
-        }
+            shutdown_am2_psu_after_feeders_quiesced(&psu_arc, "normal-shutdown")
+        } else {
+            // The bounded stop already asserted PWR_CONTROL independently.
+            // Do not touch PIC/I2C or the PSU mutex while a detached worker may
+            // still own either transport.
+            Am2PowerShutdownEvidence::hard_stop_after_timeout(psu_arc.is_some())
+        };
         // PWR_CONTROL gate auto-deasserts via `Apw121215a::Drop` when the
         // last `Arc<Mutex<Apw121215a>>` reference (held in `psu_arc`)
         // is dropped at the end of this function scope — after the
         // heartbeat thread has joined and released its clone above.
         // No explicit deassert here.
 
-        info!("=== SHUTDOWN COMPLETE ===");
+        if !shutdown_evidence.completed_gracefully() {
+            error!(
+                ?shutdown_evidence,
+                "AM2 shutdown used a hard-stop fallback or failed its PSU safe-direction plan"
+            );
+            anyhow::bail!(
+                "AM2 shutdown did not complete gracefully: {:?}",
+                shutdown_evidence
+            );
+        }
+        info!(?shutdown_evidence, "=== SHUTDOWN COMPLETE ===");
+        if let Some(error) = endpoint_authority_error {
+            return Err(error);
+        }
         if let Some(reason) = no_nonce_stall_reason {
             anyhow::bail!("{}", reason);
         }
@@ -14967,6 +15299,245 @@ mod tests {
     use crate::config::DcentraldConfig;
     use crate::config::PsuOverride;
     use dcentrald_hal::i2c::I2cTransactionStep;
+    use proptest::prelude::*;
+
+    const S19J_SOURCE: &str = include_str!("s19j_hybrid_mining.rs");
+
+    #[test]
+    fn am2_endpoint_migration_reuses_existing_eeprom_and_version_observations() {
+        let run = S19J_SOURCE
+            .split("pub async fn run(&mut self)")
+            .nth(1)
+            .expect("S19j run body");
+        let run = run
+            .split("fn log_am2_planned_chain_contexts")
+            .next()
+            .expect("bounded S19j run body");
+        assert_eq!(
+            run.matches("read_hashboard_eeprom_for_energize_gate(")
+                .count(),
+            1,
+            "the existing per-slot reader remains the only EEPROM transaction source"
+        );
+        assert_eq!(run.matches("bind_am2_hashboard_presence(").count(), 1);
+        assert!(!run.contains("observe_am2_hashboard_presence("));
+        assert_eq!(run.matches("observe_am2_endpoint_firmware(").count(), 3);
+        assert!(!run.contains("pic_read_fw_version_service("));
+    }
+
+    #[test]
+    fn selected_pic0x89_owner_has_no_raw_model_address_fallback() {
+        let start = S19J_SOURCE
+            .find("heartbeat_pic_fw = Some(detected_fw)")
+            .expect("selected Pic0x89 owner boundary");
+        let owner = &S19J_SOURCE[start..];
+        let owner = owner
+            .split("// WAKE-DSPIC-BEFORE-RAIL")
+            .next()
+            .expect("bounded selected owner");
+        assert!(owner.contains("controller_endpoint.take()"));
+        assert!(owner.contains("Pic0x89EndpointSession::new"));
+        assert!(!owner.contains("Pic0x89Service::new_with_fw"));
+        assert!(owner.contains("trust-rail/model/address fallback cannot construct"));
+    }
+
+    #[test]
+    fn selected_pic0x89_endpoint_session_is_retained_through_clean_stop() {
+        let run = S19J_SOURCE
+            .split("pub async fn run(&mut self)")
+            .nth(1)
+            .expect("S19j run body");
+        assert!(run.contains("let mut selected_pic_endpoint_session"));
+        assert!(run.contains("Option<Pic0x89EndpointSession>"));
+        assert!(run.contains("selected_pic_endpoint_session = Some("));
+        assert!(run.contains(".controller_mut()"));
+
+        let clean_stop_start = run
+            .rfind(".run_am2_serial_dispatch_loop(")
+            .expect("single-chain dispatch clean-stop boundary");
+        let clean_stop = &run[clean_stop_start..];
+        let clean_stop = clean_stop
+            .split("// ---- Phase 10b: Mining loop")
+            .next()
+            .expect("bounded single-chain clean stop");
+        assert!(clean_stop.contains("selected_pic_endpoint_session.as_mut()"));
+        assert!(clean_stop.contains("selected_pic_endpoint_required"));
+        assert!(clean_stop.contains("RefuseMissingExactEndpoint"));
+        assert!(clean_stop.contains("refusing raw address/firmware reconstruction"));
+
+        let exact_branch = clean_stop
+            .split("Pic0x89CleanStopOwnerPolicy::Endpoint =>")
+            .nth(1)
+            .expect("exact endpoint clean-stop branch");
+        let exact_branch = exact_branch
+            .split("Pic0x89CleanStopOwnerPolicy::RefuseMissingExactEndpoint")
+            .next()
+            .expect("bounded exact endpoint clean-stop branch");
+        assert!(exact_branch.contains(".controller_mut()"));
+        assert!(!exact_branch.contains("Pic0x89Service::new_with_fw"));
+    }
+
+    #[test]
+    fn normal_shutdown_exact_pic0x89_owner_cannot_reconstruct_raw_authority() {
+        let run = S19J_SOURCE
+            .split("pub async fn run(&mut self)")
+            .nth(1)
+            .expect("S19j run body");
+        let shutdown = run
+            .split("// Graceful shutdown")
+            .nth(1)
+            .expect("normal shutdown boundary");
+        let shutdown = shutdown
+            .split("if let Some(reason) = no_nonce_stall_reason")
+            .next()
+            .expect("bounded normal shutdown");
+        assert!(shutdown.contains("selected_pic_endpoint_required"));
+        assert!(shutdown.contains("selected_pic_endpoint_session.is_some()"));
+        assert!(shutdown.contains("RefuseMissingExactEndpoint"));
+        assert!(shutdown.contains("normal-shutdown-missing-exact-pic-endpoint"));
+        assert!(shutdown.contains("endpoint_authority_error"));
+
+        let exact_branch = shutdown
+            .split("Pic0x89CleanStopOwnerPolicy::Endpoint =>")
+            .nth(1)
+            .expect("normal-shutdown exact endpoint branch");
+        let exact_branch = exact_branch
+            .split("Pic0x89CleanStopOwnerPolicy::RefuseMissingExactEndpoint")
+            .next()
+            .expect("bounded normal-shutdown exact endpoint branch");
+        assert!(exact_branch.contains(".controller_mut()"));
+        assert!(!exact_branch.contains("Pic0x89Service::new_with_fw"));
+
+        let legacy_branch = shutdown
+            .split("Pic0x89CleanStopOwnerPolicy::LegacyCompatibility =>")
+            .nth(1)
+            .expect("normal-shutdown non-target compatibility branch");
+        assert!(legacy_branch.contains("Pic0x89Service::new_with_fw"));
+    }
+
+    #[test]
+    fn post_enable_uart_gate_failure_reuses_retained_pic0x89_controller() {
+        let run = S19J_SOURCE
+            .split("pub async fn run(&mut self)")
+            .nth(1)
+            .expect("S19j run body");
+        let failure_owner = run
+            .split("let rx_bytes_pre_init = match post_enable_chain_uart_probe(")
+            .nth(1)
+            .expect("post-ENABLE UART gate owner");
+        let failure_owner = failure_owner
+            .split("// Phase 3.5: post-ENABLE UART evidence")
+            .next()
+            .expect("bounded post-ENABLE UART gate owner");
+
+        assert_eq!(
+            failure_owner.matches("pic.disable_voltage()").count(),
+            2,
+            "both failure branches must reuse the retained endpoint controller"
+        );
+        assert_eq!(failure_owner.matches("pic.send_heartbeat()").count(), 2);
+        assert!(!failure_owner.contains("Pic0x89Service::new_with_fw"));
+        assert!(!failure_owner.contains("DspicService::new"));
+    }
+
+    #[test]
+    fn selected_pic0x89_heartbeat_owner_is_issued_by_retained_endpoint_session() {
+        let heartbeat = S19J_SOURCE
+            .split("fn spawn_pic_heartbeat_thread(")
+            .nth(1)
+            .expect("heartbeat owner");
+        let heartbeat = heartbeat
+            .split("fn log_am2_dispatch_snapshot")
+            .next()
+            .expect("bounded heartbeat owner");
+        assert!(heartbeat.contains("mut pic: Pic0x89Service"));
+
+        let selected_owner = heartbeat
+            .split("let mut extra_pics")
+            .next()
+            .expect("selected heartbeat owner before additional-address debt");
+        assert!(heartbeat.contains("match pic.send_heartbeat()"));
+        assert!(!selected_owner.contains("Pic0x89Service::new_with_fw"));
+        assert!(!selected_owner.contains("DspicService::new"));
+
+        let run = S19J_SOURCE
+            .split("pub async fn run(&mut self)")
+            .nth(1)
+            .expect("S19j run body");
+        let issuance = run
+            .split("selected_pic_heartbeat_controller = Some(")
+            .nth(1)
+            .expect("endpoint-issued heartbeat controller");
+        let issuance = issuance
+            .split("let pic = selected_pic_endpoint_session")
+            .next()
+            .expect("bounded heartbeat controller issuance");
+        assert!(issuance.contains("selected_pic_endpoint_session"));
+        assert!(issuance.contains(".controller()"));
+        let handoff = run
+            .split("spawn_pic_heartbeat_thread(")
+            .nth(1)
+            .expect("heartbeat ownership handoff");
+        let handoff = handoff
+            .split("// Phase 3c: voltage settle window")
+            .next()
+            .expect("bounded heartbeat ownership handoff");
+        assert!(handoff.contains("selected_pic_heartbeat_controller.take()"));
+        assert!(handoff
+            .contains("endpoint-issued controller missing before heartbeat ownership handoff"));
+        assert!(!handoff.contains("selected_pic_addr,"));
+        assert!(!handoff.contains("heartbeat_pic_fw,"));
+    }
+
+    #[test]
+    fn selected_pic0x89_thermal_owner_is_issued_by_retained_endpoint_session() {
+        let supervisor = S19J_SOURCE
+            .split("struct Am2ThermalSupervisor")
+            .nth(1)
+            .expect("thermal supervisor");
+        let supervisor = supervisor
+            .split("fn am2_slot_from_serial_device")
+            .next()
+            .expect("bounded thermal supervisor");
+        assert!(supervisor.contains("pic: Option<Pic0x89Service>"));
+        assert!(supervisor.contains("self.pic.as_mut()"));
+        assert!(!supervisor.contains("Pic0x89Service::new_with_fw"));
+        assert!(!supervisor.contains("DspicService::new"));
+
+        let run = S19J_SOURCE
+            .split("pub async fn run(&mut self)")
+            .nth(1)
+            .expect("S19j run body");
+        let handoff = run
+            .split("let thermal_pic = match pic0x89_clean_stop_owner_policy(")
+            .nth(1)
+            .expect("thermal ownership handoff");
+        let handoff = handoff
+            .split("let mut sup = Am2ThermalSupervisor::new(")
+            .next()
+            .expect("bounded thermal ownership handoff");
+        assert!(handoff.contains("selected_pic_endpoint_session"));
+        assert!(handoff.contains(".controller()"));
+        assert!(handoff.contains("RefuseMissingExactEndpoint"));
+        assert!(handoff.contains("thermal-supervisor-missing-exact-pic-endpoint"));
+
+        let exact_branch = handoff
+            .split("Pic0x89CleanStopOwnerPolicy::Endpoint =>")
+            .nth(1)
+            .expect("exact thermal endpoint branch");
+        let exact_branch = exact_branch
+            .split("Pic0x89CleanStopOwnerPolicy::RefuseMissingExactEndpoint")
+            .next()
+            .expect("bounded exact thermal endpoint branch");
+        assert!(exact_branch.contains(".controller()"));
+        assert!(!exact_branch.contains("Pic0x89Service::new_with_fw"));
+
+        let legacy_branch = handoff
+            .split("Pic0x89CleanStopOwnerPolicy::LegacyCompatibility =>")
+            .nth(1)
+            .expect("thermal non-target compatibility branch");
+        assert!(legacy_branch.contains("Pic0x89Service::new_with_fw"));
+    }
 
     /// Minimal valid `DcentraldConfig` for the freq-only autotuner
     /// gate/quiet-default tests. Every section has a serde default; a

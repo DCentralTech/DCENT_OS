@@ -95,21 +95,7 @@ impl FleetProfile {
 
     /// Save fleet profile to a JSON file.
     pub fn save(&self, path: &str) -> crate::Result<()> {
-        let tmp_path = format!("{}.tmp", path);
-
-        // Ensure parent directory exists
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                tracing::warn!(error = %e, "Failed to create fleet profile directory");
-            }
-        }
-
-        let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&tmp_path, &json)?;
-        if let Ok(f) = std::fs::File::open(&tmp_path) {
-            let _ = f.sync_all();
-        }
-        std::fs::rename(&tmp_path, path)?;
+        crate::durable_json::write_pretty(path, self)?;
         tracing::info!(
             path,
             chains = self.chains.len(),
@@ -430,20 +416,7 @@ impl ChipBinningDatabase {
 
     /// Save chip binning database to a JSON file.
     pub fn save(&self, path: &str) -> crate::Result<()> {
-        let tmp_path = format!("{}.tmp", path);
-
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                tracing::warn!(error = %e, "Failed to create binning database directory");
-            }
-        }
-
-        let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&tmp_path, &json)?;
-        if let Ok(f) = std::fs::File::open(&tmp_path) {
-            let _ = f.sync_all();
-        }
-        std::fs::rename(&tmp_path, path)?;
+        crate::durable_json::write_pretty(path, self)?;
         tracing::info!(
             path,
             chip_type = %self.chip_type,

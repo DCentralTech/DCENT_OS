@@ -12,6 +12,11 @@
 
 use crate::uio::UioDevice;
 use crate::Result;
+#[cfg(feature = "sim-hal")]
+use crate::{
+    platform::sim::{SimBoardProfile, SimChain, SimModel, TraceEvent},
+    platform::ChainAccess,
+};
 
 // ---------------------------------------------------------------------------
 // Common Block Register Offsets (+0x0000)
@@ -851,6 +856,9 @@ pub struct FpgaChain {
     pub chain_id: u8,
     /// True if this chain uses the am2 common-block layout.
     pub is_am2: bool,
+    /// Shared virtual ASIC-chain state for host-only legacy-driver tests.
+    #[cfg(feature = "sim-hal")]
+    sim_chain: Option<SimChain>,
 }
 
 impl FpgaChain {
@@ -878,6 +886,8 @@ impl FpgaChain {
             work_tx,
             chain_id,
             is_am2: false,
+            #[cfg(feature = "sim-hal")]
+            sim_chain: None,
         };
 
         // Verify FPGA is responding by reading version register
@@ -889,6 +899,64 @@ impl FpgaChain {
         );
 
         Ok(chain)
+    }
+
+    /// Open the unchanged S9/BM1387 driver byte path over Vec-backed FPGA
+    /// windows and an injected virtual chain. No device node or mmap is used.
+    #[cfg(feature = "sim-hal")]
+    pub fn open_sim(chain_id: u8) -> Result<Self> {
+        Self::open_sim_for_model(chain_id, SimModel::S9)
+    }
+
+    /// Model-selectable variant used by modern-driver golden tests. The S9
+    /// public helper above remains the legacy-path entry point required by A1.
+    #[cfg(feature = "sim-hal")]
+    pub fn open_sim_for_model(chain_id: u8, model: SimModel) -> Result<Self> {
+        let common = UioDevice::open_sim(format!("sim-chain{chain_id}-common"));
+        let cmd = UioDevice::open_sim(format!("sim-chain{chain_id}-cmd"));
+        let work_rx = UioDevice::open_sim(format!("sim-chain{chain_id}-work-rx"));
+        let work_tx = UioDevice::open_sim(format!("sim-chain{chain_id}-work-tx"));
+
+        // Reset-state values from the live-verified S9 s9io v1.0.2 map.
+        common.write_reg(REG_VERSION, 0x0090_1002);
+        common.write_reg(REG_BAUD, BAUD_REG_115200);
+        cmd.write_reg(REG_CMD_STAT, STAT_RX_EMPTY | STAT_TX_EMPTY);
+        work_rx.write_reg(REG_WORK_RX_STAT, STAT_RX_EMPTY);
+        work_tx.write_reg(REG_WORK_TX_STAT, STAT_TX_EMPTY);
+
+        Ok(Self {
+            common,
+            cmd,
+            work_rx,
+            work_tx,
+            chain_id,
+            is_am2: false,
+            sim_chain: Some(SimChain::new(chain_id, SimBoardProfile::for_model(model))),
+        })
+    }
+
+    #[cfg(feature = "sim-hal")]
+    pub fn set_sim_nonce_policy(&self, policy: crate::platform::sim::SimNoncePolicy) -> Result<()> {
+        self.sim_chain
+            .as_ref()
+            .ok_or_else(|| crate::HalError::Platform("not a simulated FPGA chain".to_string()))?
+            .set_nonce_policy(policy)
+    }
+
+    #[cfg(feature = "sim-hal")]
+    pub fn set_sim_next_nonce(&self, nonce: u32) -> Result<()> {
+        self.sim_chain
+            .as_ref()
+            .ok_or_else(|| crate::HalError::Platform("not a simulated FPGA chain".to_string()))?
+            .set_next_nonce(nonce)
+    }
+
+    #[cfg(feature = "sim-hal")]
+    pub fn drain_sim_trace(&self) -> Result<Vec<TraceEvent>> {
+        self.sim_chain
+            .as_ref()
+            .ok_or_else(|| crate::HalError::Platform("not a simulated FPGA chain".to_string()))?
+            .drain_trace()
     }
 
     /// Open an am2 chain via UIO.
@@ -1062,6 +1130,10 @@ impl FpgaChain {
     /// Baud rate = FPGA_CLK_HZ / (16 * (divisor + 1))
     pub fn set_baud(&self, divisor: u32) {
         self.common.write_reg(REG_BAUD, divisor);
+        #[cfg(feature = "sim-hal")]
+        if let Some(chain) = &self.sim_chain {
+            let _ = chain.set_baud(Self::baud_from_divisor(divisor));
+        }
     }
 
     /// Read the WORK_TIME/common+0x14 word.
@@ -1130,6 +1202,11 @@ impl FpgaChain {
     /// Matches the verified sequence from asic_comm_test.c:
     ///   CMD_CTRL = 0x03 (RST_TX | RST_RX) → delay → CMD_CTRL = 0x04 (IRQ_EN)
     pub fn reset_fifos(&self) {
+        #[cfg(feature = "sim-hal")]
+        if let Some(chain) = &self.sim_chain {
+            let _ = chain.clear_responses();
+        }
+
         // Reset CMD FIFOs
         self.cmd.write_reg(REG_CMD_CTRL, 0x03); // RST_TX | RST_RX
                                                 // Brief delay for FIFO reset to complete (1ms in C test tool)
@@ -1156,11 +1233,22 @@ impl FpgaChain {
     /// Write a 32-bit word to the CMD TX FIFO.
     pub fn write_cmd(&self, word: u32) {
         self.cmd.write_reg(REG_CMD_TX_FIFO, word);
+        #[cfg(feature = "sim-hal")]
+        if let Some(chain) = &self.sim_chain {
+            let _ = chain.send_command(&word.to_le_bytes());
+        }
     }
 
     /// Read a 32-bit word from the CMD RX FIFO.
     /// Returns None if the FIFO is empty.
     pub fn read_cmd_response(&self) -> Option<u32> {
+        #[cfg(feature = "sim-hal")]
+        if let Some(chain) = &self.sim_chain {
+            let mut bytes = [0_u8; 4];
+            let count = chain.read_response(&mut bytes).ok()?;
+            return (count == bytes.len()).then(|| u32::from_le_bytes(bytes));
+        }
+
         let stat = self.cmd.read_reg(REG_CMD_STAT);
         if stat & STAT_RX_EMPTY != 0 {
             return None;
@@ -1170,6 +1258,11 @@ impl FpgaChain {
 
     /// Check if the CMD RX FIFO has data.
     pub fn cmd_rx_has_data(&self) -> bool {
+        #[cfg(feature = "sim-hal")]
+        if let Some(chain) = &self.sim_chain {
+            return chain.has_response().unwrap_or(false);
+        }
+
         self.cmd.read_reg(REG_CMD_STAT) & STAT_RX_EMPTY == 0
     }
 
@@ -1180,6 +1273,11 @@ impl FpgaChain {
     /// corrupting concurrent AXI IIC transactions (PIC MSSP death spiral).
     /// Matches the devmem path (DevmemFpgaChain::write_work).
     pub fn write_work(&self, words: &[u32]) {
+        #[cfg(feature = "sim-hal")]
+        if let Some(chain) = &self.sim_chain {
+            let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+            let _ = chain.send_work(&bytes);
+        }
         for (i, &word) in words.iter().enumerate() {
             self.work_tx.write_reg(REG_WORK_TX_FIFO, word);
             if i % 4 == 3 && i + 1 < words.len() {
@@ -1192,6 +1290,18 @@ impl FpgaChain {
     /// Returns None if the FIFO is empty.
     /// Returns (word0, word1) -- the nonce and metadata.
     pub fn read_nonce(&self) -> Option<(u32, u32)> {
+        #[cfg(feature = "sim-hal")]
+        if let Some(chain) = &self.sim_chain {
+            let mut bytes = [0_u8; 8];
+            let count = chain.read_nonce(&mut bytes).ok()?;
+            if count == 0 {
+                return None;
+            }
+            return Some((
+                u32::from_be_bytes(bytes[0..4].try_into().ok()?),
+                u32::from_be_bytes(bytes[4..8].try_into().ok()?),
+            ));
+        }
         let stat = self.work_rx.read_reg(REG_WORK_RX_STAT);
         if stat & STAT_RX_EMPTY != 0 {
             return None;
@@ -1208,6 +1318,10 @@ impl FpgaChain {
 
     /// Check if the WORK RX FIFO has data (nonces available).
     pub fn work_rx_has_data(&self) -> bool {
+        #[cfg(feature = "sim-hal")]
+        if let Some(chain) = &self.sim_chain {
+            return chain.has_nonce().unwrap_or(false);
+        }
         self.work_rx.read_reg(REG_WORK_RX_STAT) & STAT_RX_EMPTY == 0
     }
 
@@ -1555,5 +1669,33 @@ mod tests {
         );
         assert_ne!(REG_WORK_TIME, am2_regs::REG_CTRL);
         assert_eq!(REG_WORK_TIME, am2_regs::REG_MIDSTATE_CNT_FLAG);
+    }
+
+    #[cfg(feature = "sim-hal")]
+    #[test]
+    fn s9_open_sim_keeps_fpga_api_and_injects_virtual_chain() {
+        use crate::platform::sim::{SimNoncePolicy, TraceEvent};
+
+        let chain = FpgaChain::open_sim(6).expect("Vec-backed S9 chain");
+        assert_eq!(chain.read_version(), 0x0090_1002);
+        chain.set_baud(BAUD_REG_1_5M);
+        chain
+            .set_sim_nonce_policy(SimNoncePolicy::Valid)
+            .expect("valid nonce policy");
+        chain.write_cmd(0x0403_0201);
+        chain.write_work(&[0x1122_3344, 0x5566_7788]);
+        assert!(chain.read_nonce().is_some());
+
+        let trace = chain.drain_sim_trace().expect("sim trace");
+        assert!(trace.iter().any(|event| matches!(
+            event,
+            TraceEvent::BaudChanged { baud, .. } if *baud == FpgaChain::baud_from_divisor(BAUD_REG_1_5M)
+        )));
+        assert!(trace
+            .iter()
+            .any(|event| matches!(event, TraceEvent::Command { .. })));
+        assert!(trace
+            .iter()
+            .any(|event| matches!(event, TraceEvent::Work { .. })));
     }
 }

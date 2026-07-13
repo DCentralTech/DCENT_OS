@@ -23,7 +23,7 @@
 //! The ASIC init sequence (chain_inactive, set_address, set_freq, open_core)
 //! is the same — only the register access method changes.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -37,6 +37,7 @@ use dcentrald_hal::stock_fpga_iic::StockFpgaI2c;
 use dcentrald_hal::stock_fpga_work::{StockFpgaDma, StockFpgaWorkEngine};
 
 use crate::config::DcentraldConfig;
+use crate::runtime::thread_guard::{sleep_until_cancelled, RuntimeThreadGuard, ThreadStopSummary};
 
 // ---------------------------------------------------------------------------
 // Stock FPGA chain numbering
@@ -71,44 +72,188 @@ const HW_DIFFICULTY: u64 = 256;
 // ---------------------------------------------------------------------------
 
 /// Process-global crash-panic teardown state for the stock-fpga (S9 BM1387)
-/// path. Holds the energized chain list so the `main()` panic hook can re-open
-/// the FPGA and cut their voltage. Mirrors the am2 `AM2_TEARDOWN_PARAMS` /
+/// path. Each chain bit is set immediately before its multi-write voltage-enable
+/// and cleared only after a completed disable, so uncertain outcomes, partial
+/// initialization, and later runs cannot leave the hook with a stale snapshot.
+/// Mirrors the am2 `AM2_TEARDOWN_PARAMS` /
 /// am3-aml `NOPIC_TEARDOWN_ARMED` / am3-bb `AM3BB_TEARDOWN_ARMED` pattern —
 /// the stock-fpga path was the one energizing path with NO panic-hook peer
 /// (prod-readiness hunt needs_more_thought #1).
-static STOCK_FPGA_TEARDOWN_ARMED: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+static STOCK_FPGA_ENERGIZED_CHAIN_MASK: AtomicU32 = AtomicU32::new(0);
 
-/// Arm the stock-fpga crash-panic teardown. Call once, right after the per-chain
-/// voltage is enabled (boards energized). Idempotent (`OnceLock::set`).
-fn arm_stock_fpga_teardown(chains: &[u8]) {
-    let _ = STOCK_FPGA_TEARDOWN_ARMED.set(chains.to_vec());
+fn stock_chain_bit(chain: u8) -> Option<u32> {
+    1u32.checked_shl(u32::from(chain))
+}
+
+fn mark_stock_chain_energized(mask: &AtomicU32, chain: u8) {
+    if let Some(bit) = stock_chain_bit(chain) {
+        mask.fetch_or(bit, Ordering::SeqCst);
+    }
+}
+
+fn clear_stock_chain_energized(mask: &AtomicU32, chain: u8) {
+    if let Some(bit) = stock_chain_bit(chain) {
+        mask.fetch_and(!bit, Ordering::SeqCst);
+    }
 }
 
 /// Best-effort cut-hash teardown for the `main()` crash panic hook on the
 /// stock-fpga (S9) path. No-op (allocation-free early return) unless a
-/// stock-fpga run armed it. Re-opens the FPGA (the running handle may be held by
+/// any energized bit exists. Re-opens the FPGA (the running handle may be held by
 /// the panicking thread — the Ok-path graceful shutdown re-opens the same way at
 /// `StockFpga::open()` below) and drives `enable_voltage(chain, false)` per
 /// energized chain to cut the rail. Swallows ALL errors — must NEVER re-panic
 /// from inside the panic hook.
 ///
 /// Why this matters: the release profile is `panic = "abort"`, so a panic runs
-/// NO `Drop`, and `StockMiner` has no Drop guard. Without this the only S9
+/// NO `Drop`; the ordinary-return guard cannot execute. Without this the only S9
 /// backstop after a panic mid-bringup is the ~60 s PIC heartbeat watchdog,
 /// leaving the boards energized in the meantime. Fans are left to the FPGA
 /// cooldown register the Ok path sets; the actual fire-risk mitigation is
 /// cutting the chip rail, which this does immediately.
 pub fn stock_fpga_panic_hook_best_effort_teardown() {
-    let Some(chains) = STOCK_FPGA_TEARDOWN_ARMED.get() else {
-        return;
-    };
-    if chains.is_empty() {
+    let energized = STOCK_FPGA_ENERGIZED_CHAIN_MASK.load(Ordering::SeqCst);
+    if energized == 0 {
         return;
     }
     if let Ok(fpga) = StockFpga::open() {
         let i2c = StockFpgaI2c::new(&fpga);
-        for &chain in chains {
-            let _ = i2c.enable_voltage(chain, false);
+        for chain in 0u8..32 {
+            let bit = 1u32 << u32::from(chain);
+            if energized & bit != 0 && i2c.enable_voltage(chain, false).is_ok() {
+                clear_stock_chain_energized(&STOCK_FPGA_ENERGIZED_CHAIN_MASK, chain);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StockVoltageTeardownEvidence {
+    software_attempted: bool,
+    all_commands_completed: bool,
+    transport_reentry_skipped: bool,
+    watchdog_fallback: bool,
+}
+
+/// Run-scope owner for energized stock-FPGA hash boards.
+///
+/// The release profile aborts on panic, so the process-global panic hook still
+/// covers that path. This guard covers every ordinary return, including the
+/// cold-chain refusal and failures after voltage enable. Callers explicitly
+/// invoke teardown on ordinary returns. Drop is a nonblocking last resort: it
+/// performs no transport I/O and preserves the already-armed PIC watchdog.
+struct StockRunSafetyGuard {
+    chains: Vec<u8>,
+    heartbeat_transport_quiesced: bool,
+    teardown_evidence: Option<StockVoltageTeardownEvidence>,
+}
+
+impl StockRunSafetyGuard {
+    fn new(chains: Vec<u8>) -> Self {
+        Self {
+            chains,
+            heartbeat_transport_quiesced: true,
+            teardown_evidence: None,
+        }
+    }
+
+    fn heartbeat_started(&mut self) {
+        self.heartbeat_transport_quiesced = false;
+    }
+
+    fn add_energized_chain(&mut self, chain: u8) {
+        if !self.chains.contains(&chain) {
+            self.chains.push(chain);
+        }
+    }
+
+    fn remove_deenergized_chain(&mut self, chain: u8) {
+        self.chains.retain(|candidate| *candidate != chain);
+    }
+
+    fn heartbeat_stop_observed(&mut self, summary: &ThreadStopSummary) {
+        self.heartbeat_transport_quiesced = !summary.any_timed_out();
+    }
+
+    fn teardown(&mut self, reason: &'static str) -> StockVoltageTeardownEvidence {
+        if let Some(evidence) = self.teardown_evidence {
+            return evidence;
+        }
+
+        let evidence = if self.chains.is_empty() {
+            StockVoltageTeardownEvidence {
+                software_attempted: false,
+                all_commands_completed: true,
+                transport_reentry_skipped: false,
+                watchdog_fallback: false,
+            }
+        } else if !self.heartbeat_transport_quiesced {
+            warn!(
+                reason,
+                energized_chains = ?self.chains,
+                software_attempted = false,
+                transport_reentry_skipped = true,
+                watchdog_fallback = true,
+                "Stock FPGA voltage teardown skipped because the heartbeat worker did not quiesce; avoiding re-entry into a possibly held FPGA I2C transport and relying on the stock PIC watchdog"
+            );
+            StockVoltageTeardownEvidence {
+                software_attempted: false,
+                all_commands_completed: false,
+                transport_reentry_skipped: true,
+                watchdog_fallback: true,
+            }
+        } else {
+            let mut completed = 0usize;
+            if let Ok(shutdown_fpga) = StockFpga::open() {
+                let shutdown_i2c = StockFpgaI2c::new(&shutdown_fpga);
+                for &chain in &self.chains {
+                    match shutdown_i2c.enable_voltage(chain, false) {
+                        Ok(()) => {
+                            completed += 1;
+                            clear_stock_chain_energized(&STOCK_FPGA_ENERGIZED_CHAIN_MASK, chain);
+                            info!(
+                                chain,
+                                reason, "Stock FPGA voltage-disable command completed"
+                            );
+                        }
+                        Err(error) => warn!(
+                            chain,
+                            reason,
+                            error = %error,
+                            "Stock FPGA voltage-disable command failed; PIC watchdog remains the safety net"
+                        ),
+                    }
+                }
+            } else {
+                warn!(
+                    reason,
+                    "Stock FPGA could not be reopened for voltage teardown; PIC watchdog remains the safety net"
+                );
+            }
+            let all_commands_completed = completed == self.chains.len();
+            StockVoltageTeardownEvidence {
+                software_attempted: true,
+                all_commands_completed,
+                transport_reentry_skipped: false,
+                watchdog_fallback: !all_commands_completed,
+            }
+        };
+
+        self.teardown_evidence = Some(evidence);
+        evidence
+    }
+}
+
+impl Drop for StockRunSafetyGuard {
+    fn drop(&mut self) {
+        if self.teardown_evidence.is_none() {
+            warn!(
+                energized_chains = ?self.chains,
+                heartbeat_transport_quiesced = self.heartbeat_transport_quiesced,
+                software_attempted = false,
+                watchdog_fallback = true,
+                "Stock run-scope owner dropped without explicit teardown; Drop performs no blocking transport I/O, so the already-armed PIC watchdog is the safety path"
+            );
         }
     }
 }
@@ -221,6 +366,7 @@ impl StockMiner {
         let i2c = StockFpgaI2c::new(&fpga);
 
         let mut initialized_chains: Vec<u8> = Vec::new();
+        let mut run_safety = StockRunSafetyGuard::new(Vec::new());
 
         for &chain_id in &detected_chains {
             info!(
@@ -285,14 +431,32 @@ impl StockMiner {
                 continue;
             }
 
-            // Enable voltage output
-            if let Err(e) = i2c.enable_voltage(chain_id, true) {
-                warn!(
-                    chain_id,
-                    error = %e,
-                    "Failed to enable voltage on chain {}",
-                    chain_id,
-                );
+            // A multi-write enable error cannot prove that no write reached the
+            // PIC. Mark possible energization BEFORE the first stage so panic
+            // and ordinary-return teardown remain conservative at every point.
+            mark_stock_chain_energized(&STOCK_FPGA_ENERGIZED_CHAIN_MASK, chain_id);
+            run_safety.add_energized_chain(chain_id);
+            if let Err(enable_error) = i2c.enable_voltage(chain_id, true) {
+                match i2c.enable_voltage(chain_id, false) {
+                    Ok(()) => {
+                        clear_stock_chain_energized(&STOCK_FPGA_ENERGIZED_CHAIN_MASK, chain_id);
+                        run_safety.remove_deenergized_chain(chain_id);
+                        warn!(
+                            chain_id,
+                            error = %enable_error,
+                            cleanup_completed = true,
+                            "Stock PIC voltage-enable returned an uncertain outcome; compensating disable completed"
+                        );
+                    }
+                    Err(disable_error) => warn!(
+                        chain_id,
+                        error = %enable_error,
+                        cleanup_error = %disable_error,
+                        possibly_energized = true,
+                        watchdog_fallback = true,
+                        "Stock PIC voltage-enable returned an uncertain outcome and compensating disable failed; retaining teardown ownership"
+                    ),
+                }
                 continue;
             }
 
@@ -316,14 +480,15 @@ impl StockMiner {
         }
 
         if initialized_chains.is_empty() {
-            bail!("No PICs initialized — cannot power hash boards");
+            let error = anyhow::anyhow!("No PICs initialized — cannot power hash boards");
+            let evidence = run_safety.teardown("no-pics-initialized");
+            warn!(?evidence, "Stock no-PIC initialization teardown evidence");
+            return Err(error);
         }
 
-        // prod-readiness hunt #16: the boards are now energized. Arm the
-        // crash-panic teardown so a panic from here on cuts the rail immediately
-        // (panic=abort bypasses Drop; StockMiner has no Drop guard; otherwise the
-        // only backstop is the ~60 s PIC watchdog). Mirrors the am2/am3 hooks.
-        arm_stock_fpga_teardown(&initialized_chains);
+        // Every possibly energized board is represented by both the ordinary-return
+        // guard and the allocation-free panic-hook bitmask. Both were updated
+        // before each multi-write per-chain enable above.
 
         // `--stock-fpga` bypasses `Daemon::run()`, so it must arm the shared
         // hardware watchdog kicker itself once voltage is enabled and the PIC
@@ -419,10 +584,13 @@ impl StockMiner {
                     Start bmminer or bosminer first to initialize ASICs, \
                     then kill it and restart dcentrald."
             );
-            return Err(anyhow::anyhow!(
+            let error = anyhow::anyhow!(
                 "Stock FPGA: no ASICs detected (cold boot not supported). \
                                          Pre-initialize with bmminer/bosminer first."
-            ));
+            );
+            let evidence = run_safety.teardown("cold-chain-refusal");
+            warn!(?evidence, "Stock cold-chain refusal teardown evidence");
+            return Err(error);
         }
         info!(
             "HASH_COUNTING_NUMBER = {} — ASICs appear initialized (passthrough mode)",
@@ -445,15 +613,29 @@ impl StockMiner {
             }
         }
 
-        // ---- Phase 5: Start PIC heartbeat thread ----
-        info!("--- Phase 5: Starting PIC heartbeat thread ---");
+        // Open every fallible mining transport before starting the heartbeat
+        // owner. An ordinary error here is handled by `run_safety` without
+        // racing a detached worker on the FPGA I2C registers.
+        info!("--- Phase 5: Opening DMA buffer interface ---");
+        let dma = match StockFpgaDma::open().context("Failed to open DMA buffer") {
+            Ok(dma) => dma,
+            Err(error) => {
+                let evidence = run_safety.teardown("dma-open-failed");
+                warn!(?evidence, "Stock DMA-open failure teardown evidence");
+                return Err(error);
+            }
+        };
+
+        // ---- Phase 6: Start PIC heartbeat thread ----
+        info!("--- Phase 6: Starting PIC heartbeat thread ---");
         let hb_chains = initialized_chains.clone();
         let hb_shutdown = self.shutdown.clone();
+        let mut runtime_threads = RuntimeThreadGuard::new(self.shutdown.clone());
 
         // The PIC heartbeat runs on a dedicated OS thread (not tokio) to guarantee
         // timing even when the async runtime is busy with work dispatch.
         // Stock PIC watchdog is ~1 minute. We send heartbeats every 5 seconds.
-        std::thread::Builder::new()
+        let heartbeat_handle = match std::thread::Builder::new()
             .name("stock-pic-heartbeat".to_string())
             .spawn(move || {
                 // Re-open FPGA in heartbeat thread (StockFpga is not Sync across threads
@@ -492,15 +674,24 @@ impl StockMiner {
                         }
                     }
 
-                    std::thread::sleep(Duration::from_millis(HEARTBEAT_INTERVAL_MS));
+                    if sleep_until_cancelled(
+                        &hb_shutdown,
+                        Duration::from_millis(HEARTBEAT_INTERVAL_MS),
+                    ) {
+                        info!("PIC heartbeat stopping during interval wait");
+                        break;
+                    }
                 }
-            })
-            .context("Failed to spawn PIC heartbeat thread")?;
-
-        // ---- Phase 6: Open DMA buffers ----
-        info!("--- Phase 6: Opening DMA buffer interface ---");
-        let dma = StockFpgaDma::open()
-            .context("Failed to open DMA buffer — is /dev/fpga_mem present?")?;
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                let evidence = run_safety.teardown("heartbeat-spawn-failed");
+                warn!(?evidence, "Stock heartbeat-spawn failure teardown evidence");
+                return Err(error).context("Failed to spawn PIC heartbeat thread");
+            }
+        };
+        runtime_threads.push("stock-pic-heartbeat", heartbeat_handle);
+        run_safety.heartbeat_started();
 
         // ---- Phase 7: Initialize work engine ----
         info!("--- Phase 7: Initializing DHASH accelerator + work engine ---");
@@ -593,7 +784,7 @@ impl StockMiner {
             detected_chains.len(), total_chips,
         );
 
-        let mut work_builder = dcentrald_stratum::WorkBuilder::new();
+        let mut work_builder = dcentrald_stratum::share_pipeline::WorkBuilder::new();
         let mut current_job: Option<dcentrald_stratum::types::JobTemplate> = None;
         let mut work_id_counter: u8 = 0;
 
@@ -788,7 +979,7 @@ impl StockMiner {
                         // In VIL mode the FPGA computes its own midstate from DMA coinbase.
                         // If CPU midstate doesn't match, shares are correctly rejected here
                         // rather than wasting pool bandwidth.
-                        let meets_target = dcentrald_stratum::work::validate_share(
+                        let meets_target = dcentrald_stratum::share_pipeline::validate_share(
                             &entry.midstate,
                             &entry.header_tail,
                             nonce,
@@ -865,38 +1056,19 @@ impl StockMiner {
         // Stop DHASH accelerator
         work_engine.stop();
 
-        // Disable PIC voltages
-        // Re-open FPGA for shutdown I2C (heartbeat thread may still hold old handle)
-        if let Ok(shutdown_fpga) = StockFpga::open() {
-            let shutdown_i2c = StockFpgaI2c::new(&shutdown_fpga);
-            for &chain in &initialized_chains {
-                if let Err(e) = shutdown_i2c.enable_voltage(chain, false) {
-                    warn!(
-                        chain,
-                        error = %e,
-                        "Failed to disable voltage on chain {} — PIC watchdog will cut power in ~60s",
-                        chain,
-                    );
-                } else {
-                    info!(chain, "Voltage disabled on chain {}", chain);
-                }
-            }
-        } else {
-            // prod-readiness hunt #5 (log-honesty): the FPGA re-open failed, so the
-            // per-chain software voltage-disable above was entirely SKIPPED. Without
-            // this branch the silent skip was invisible while "shutdown complete"
-            // still printed below. Surface it: the PIC watchdog (~60s) is the only
-            // thing cutting voltage now.
-            warn!(
-                "Stock FPGA shutdown: could not re-open the FPGA to disable chain \
-                 voltages — software did NOT cut the rail; the PIC watchdog (~60s) \
-                 is the only safety net. Do NOT warm-restart until power is off."
-            );
-        }
+        // Quiesce the heartbeat owner before reopening the shared FPGA I2C
+        // transport. All workers consume one total deadline. If the worker is
+        // wedged, skip transport re-entry and allow the stock PIC watchdog to
+        // remove hash power instead of risking a concurrent register sequence.
+        let heartbeat_stop = runtime_threads.stop_and_join(Duration::from_secs(3)).await;
+        run_safety.heartbeat_stop_observed(&heartbeat_stop);
+        let voltage_evidence = run_safety.teardown("normal-shutdown");
 
-        // Post-mining cooldown fan. The chips were just mining and are still hot,
-        // but the rail is already cut above, so cap at the configured home cap
-        // instead of the old hardcoded ~50% blast — the PWM-30 home cap is
+        // Post-mining cooldown fan. The chips were just mining and are still hot.
+        // Software disable commands may have completed, or a degraded teardown
+        // may still be waiting for the PIC watchdog; in either case keep airflow
+        // at the configured home cap instead of the old hardcoded ~50% blast —
+        // the PWM-30 home cap is
         // load-bearing (; cut-hash-before-noise) and
         // every sibling teardown (daemon.rs Step 7, NoPicPsuGuard, Am3BbRunSafetyGuard)
         // already honors it. fan_max_pwm is 0-100; REG_FAN_CONTROL duty (bits [23:16])
@@ -914,7 +1086,17 @@ impl StockMiner {
             cooldown_pct
         );
 
-        info!("Stock FPGA mining shutdown complete");
+        if voltage_evidence.all_commands_completed {
+            info!(
+                ?voltage_evidence,
+                "Stock FPGA mining shutdown complete; software disable commands completed, physical rail-off was not independently measured"
+            );
+        } else {
+            warn!(
+                ?voltage_evidence,
+                "Stock FPGA mining shutdown degraded; PIC watchdog cutoff is required before warm restart"
+            );
+        }
         Ok(())
     }
 }
@@ -951,4 +1133,46 @@ fn decode_hex_bytes(hex: &str) -> Vec<u8> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod energized_chain_mask_tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::{clear_stock_chain_energized, mark_stock_chain_energized, stock_chain_bit};
+
+    #[test]
+    fn possible_energization_is_visible_before_command_outcome() {
+        let mask = AtomicU32::new(0);
+        // Admission precedes the multi-write command. An error or panic after
+        // this point must retain possible-energization evidence.
+        mark_stock_chain_energized(&mask, 6);
+
+        assert_eq!(mask.load(Ordering::SeqCst), stock_chain_bit(6).unwrap());
+        // Model an uncertain enable error followed by a failed compensating
+        // disable: no clear occurs, so the panic/watchdog fallback remains armed.
+        assert_eq!(mask.load(Ordering::SeqCst), stock_chain_bit(6).unwrap());
+
+        // Only a completed disable clears ownership.
+        clear_stock_chain_energized(&mask, 6);
+        assert_eq!(mask.load(Ordering::SeqCst), 0);
+        assert_eq!(stock_chain_bit(32), None);
+    }
+
+    #[test]
+    fn retries_and_later_runs_evolve_without_a_stale_once_snapshot() {
+        let mask = AtomicU32::new(0);
+        mark_stock_chain_energized(&mask, 5);
+        mark_stock_chain_energized(&mask, 6);
+        mark_stock_chain_energized(&mask, 6);
+        clear_stock_chain_energized(&mask, 5);
+        mark_stock_chain_energized(&mask, 7);
+
+        let expected = stock_chain_bit(6).unwrap() | stock_chain_bit(7).unwrap();
+        assert_eq!(mask.load(Ordering::SeqCst), expected);
+
+        clear_stock_chain_energized(&mask, 6);
+        clear_stock_chain_energized(&mask, 7);
+        assert_eq!(mask.load(Ordering::SeqCst), 0);
+    }
 }

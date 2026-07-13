@@ -14,6 +14,7 @@ use crate::profile::TuningProfile;
 use crate::ChainHardwareIdentity;
 
 pub const AUTOTUNER_STATE_VERSION: u32 = 1;
+const MAX_AUTOTUNER_STATE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutotunerHardwareFingerprint {
@@ -215,18 +216,23 @@ impl AutotunerResumeState {
     pub fn save_atomic(&self, path: impl AsRef<Path>) -> crate::Result<()> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
+            // The atomic-file contract starts after the parent exists. Image
+            // provisioning should pre-create persistent state directories;
+            // create_dir_all does not fsync newly created ancestors here.
             std::fs::create_dir_all(parent)?;
         }
 
-        let tmp_path = path.with_extension("toml.tmp");
         let toml = toml::to_string_pretty(self).map_err(|err| {
             crate::AutoTunerError::Config(format!("state serialize error: {err}"))
         })?;
-        std::fs::write(&tmp_path, toml)?;
-        if let Ok(file) = std::fs::File::open(&tmp_path) {
-            let _ = file.sync_all();
-        }
-        std::fs::rename(&tmp_path, path)?;
+        dcentrald_common::atomic_file::atomic_write(
+            path,
+            toml.as_bytes(),
+            dcentrald_common::atomic_file::AtomicWriteOptions::state_file(
+                MAX_AUTOTUNER_STATE_BYTES,
+            ),
+        )
+        .map_err(dcentrald_common::atomic_file::AtomicWriteError::into_io_error)?;
         Ok(())
     }
 }
@@ -327,7 +333,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("state.toml");
 
+        let expected_bytes = toml::to_string_pretty(&state).expect("serialize expected state");
         state.save_atomic(&path).expect("save state");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read persisted bytes"),
+            expected_bytes,
+            "atomic migration must not change the serialized TOML"
+        );
         let loaded = AutotunerResumeState::load_if_hardware_matches(&path, &fingerprint)
             .expect("load state")
             .expect("matching fingerprint");

@@ -6,11 +6,11 @@ description = "Hardware Abstraction Layer for dcentrald - UIO, I2C, GPIO, Fan, W
 license = "GPL-3.0"
 
 [features]
-# Opt-in escape hatch for recovery binaries (pic-recovery, dspic-flash) and
-# diagnostic examples that legitimately need raw `I2cBus::open` access
-# outside of `dcentrald-hal::platform`. The main `dcentrald` daemon does NOT
-# enable this feature, so the only HAL-public bus constructor stays the
-# `I2cServiceHandle` family. See W2.3 single-I2C-owner lockdown 2026-05-07.
+# Opt-in research/test escape hatch for diagnostic examples that need raw
+# `I2cBus::open` access outside `dcentrald-hal::platform`. No shipped binary,
+# including the diagnostic-only `pic-recovery` package, enables this feature.
+# The default HAL surface exposes only the `I2cServiceHandle` family. See W2.3
+# single-I2C-owner lockdown 2026-05-07.
 recovery-tool = []
 
 # Opt-in dev/debug ABI for the bitmain_axi.ko IOCTL surface
@@ -33,6 +33,14 @@ recovery-tool = []
 # `cargo build --features axi-ioctl-debug` for QEMU rehosting tests.
 axi-ioctl-debug = []
 
+# Host-only virtual hardware backend for offline driver/runtime proofs.
+# This feature is intentionally absent from every default and firmware build
+# profile. Runtime use is guarded independently in `platform::sim`.
+sim-hal = [
+    "dep:dcentrald-silicon-profiles",
+    "dcentrald-silicon-profiles/experimental_chips",
+]
+
 [dependencies]
 nix.workspace = true
 thiserror.workspace = true
@@ -44,7 +52,7 @@ serde_json.workspace = true
 # `[workspace.dependencies]` entry + present in Cargo.lock — no new lockfile churn.
 toml.workspace = true
 libc = "0.2"
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tokio-util.workspace = true
 flate2 = "1"
 # W3.3 — the BeagleBone fan-mode refusal gate consumes the canonical
@@ -52,6 +60,9 @@ flate2 = "1"
 # minimal coupling: pulled in only for the public-API mode-check helper
 # `BeagleBoneFan::check_fan_mode_allowed`, no other usage.
 dcentrald-api-types = { path = "../dcentrald-api-types" }
+# HOME_FAN_PWM_SAFETY_MAX parity pin with FanCommand (cycle-3).
+dcentrald-common = { path = "../dcentrald-common" }
+dcentrald-silicon-profiles = { path = "../dcentrald-silicon-profiles", optional = true }
 
 # The PIC parser flush example uses raw bus access via the recovery escape
 # hatch (`I2cBus::open_for_recovery`) and is only buildable when the

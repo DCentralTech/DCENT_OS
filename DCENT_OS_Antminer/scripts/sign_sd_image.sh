@@ -136,6 +136,28 @@ if [ ! -f "$SIGNING_KEY" ]; then
     exit 1
 fi
 
+# CE-410: never release-sign an incomplete AM2 (or any) SD image that has a
+# completeness manifest. If a sibling .manifest.json exists, it must pass
+# dcent_sd_require_complete_manifest_for_signing before openssl runs.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# shellcheck source=lib/sd_image_signing_gate.sh
+. "$SCRIPT_DIR/lib/sd_image_signing_gate.sh"
+MANIFEST_CANDIDATE="${IMG_PATH}.manifest.json"
+if [ ! -f "$MANIFEST_CANDIDATE" ]; then
+    MANIFEST_CANDIDATE="${IMG_PATH%.img}.img.manifest.json"
+fi
+if [ -f "$MANIFEST_CANDIDATE" ]; then
+    if ! dcent_sd_require_complete_manifest_for_signing "$IMG_PATH" "$MANIFEST_CANDIDATE"; then
+        echo "ERROR: refusing to sign incomplete SD image (CE-410)" >&2
+        exit 1
+    fi
+elif echo "$IMG_PATH" | grep -Eiq 'am2|s19jpro'; then
+    # AM2 production images always emit a manifest; missing means incomplete lab.
+    echo "ERROR: refusing to sign AM2 SD image without completeness manifest (CE-410)" >&2
+    echo "       expected: ${IMG_PATH}.manifest.json" >&2
+    exit 1
+fi
+
 command -v openssl >/dev/null 2>&1 || {
     echo "ERROR: openssl is required to sign SD .img" >&2
     exit 1

@@ -383,7 +383,7 @@ impl S19jTapMiner {
             "=== TAP MINING ACTIVE — bosminer owns PSU/PIC/serial, dcentrald owns WORK_TX/WORK_RX only ==="
         );
 
-        let mut work_builder = dcentrald_stratum::WorkBuilder::new();
+        let mut work_builder = dcentrald_stratum::share_pipeline::WorkBuilder::new();
         let mut current_job: Option<dcentrald_stratum::types::JobTemplate> = None;
         // FPGA work_id is 8 bits. `u8` wraps
         // naturally at 0xFF via `wrapping_add`. We still AND with JOB_ID_MASK
@@ -609,7 +609,7 @@ impl S19jTapMiner {
                                     None => candidate.version,
                                 };
                                 let header = tap_build_header(candidate, rolled_version, nonce);
-                                if dcentrald_stratum::validate_full_header(
+                                if dcentrald_stratum::share_pipeline::validate_full_header(
                                     &header,
                                     &candidate.share_target,
                                 ) {

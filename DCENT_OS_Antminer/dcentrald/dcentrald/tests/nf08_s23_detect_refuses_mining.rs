@@ -68,8 +68,12 @@ fn s23_dual_keyed_only_behind_both_scaffold_gates() {
 
     // Env-free both-gates-on equivalent.
     let s = ChipRegistry::with_scaffold_drivers();
-    let a = s.detect(0x1372).expect("0x1372 resolves with scaffold drivers");
-    let b = s.detect(0x1373).expect("0x1373 resolves with scaffold drivers");
+    let a = s
+        .detect(0x1372)
+        .expect("0x1372 resolves with scaffold drivers");
+    let b = s
+        .detect(0x1373)
+        .expect("0x1373 resolves with scaffold drivers");
     assert_eq!(a.chip_name(), "BM1373");
     assert_eq!(b.chip_name(), "BM1373");
     // The driver reports its own canonical id regardless of the key it was

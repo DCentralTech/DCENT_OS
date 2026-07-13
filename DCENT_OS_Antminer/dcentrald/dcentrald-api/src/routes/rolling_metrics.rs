@@ -150,11 +150,7 @@ impl RollingMetrics {
         self.record_with_error_rate_availability(sample, true);
     }
 
-    pub fn record_with_error_rate_availability(
-        &mut self,
-        sample: MetricsSample,
-        available: bool,
-    ) {
+    pub fn record_with_error_rate_availability(&mut self, sample: MetricsSample, available: bool) {
         if self.error_rate_available.len() == self.ring.capacity() {
             self.error_rate_available.pop_front();
         }

@@ -40,7 +40,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -48,8 +48,10 @@ use serde::Deserialize;
 use dcentrald_api_types::thermal_model::FanMode;
 
 use super::config::{ChainTransport, PlatformConfig, VoltageControllerKind};
-use super::subtype::{classify_from_board_target, classify_with_probe, read_subtype};
-use super::{BoardType, ChainAccess, FanAccess, GpioAccess, Platform};
+use super::subtype::{
+    classify_from_board_target, classify_with_probe, read_subtype, VoltageControllerEndpoint,
+};
+use super::{BoardType, ChainAccess, FanAccess, FanCommandReceipt, GpioAccess, Platform};
 use crate::i2c::I2cBus;
 use crate::serial::SerialChain;
 use crate::{HalError, Result};
@@ -199,18 +201,191 @@ pub const CHAIN_UARTS_V2_0: [&str; 3] = ["/dev/ttyS1", "/dev/ttyS2", "/dev/ttyS4
 /// loader looks for under `/etc/dcentos/board_targets/<name>.toml`.
 pub const DEFAULT_BOARD_TARGET_V2_0: &str = "am3-bb-s19jpro";
 
+/// Exact device-tree model captured from the live LuxOS `a lab unit` unit.
+pub const S19J_IO_BOARD_V2_0_DT_MODEL: &str = "BeagleBone_Black_v2.1 on S19J_IO_BOARD_V2_0";
+
+/// Exact compatible token proving the BeagleBone Black AM335x carrier.
+pub const S19J_IO_BOARD_V2_0_DT_COMPATIBLE: &str = "ti,am335x-bone-black";
+
+/// Authoritative evidence that permits the S19J_IO_BOARD_V2_0 topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Am3BbIdentityEvidence {
+    /// DCENT_OS image-owned board-target marker.
+    BoardTargetMarker,
+    /// Exact live-captured LuxOS device-tree model + compatible token.
+    ExactDeviceTree,
+}
+
 /// Where the per-board-target TOML lives on a DCENT_OS rootfs.
 pub const BOARD_TARGET_DIR: &str = "/etc/dcentos/board_targets";
 
 /// Path to `/etc/dcentos/board_target` (the file naming the active target).
 pub const BOARD_TARGET_NAME_FILE: &str = "/etc/dcentos/board_target";
 
+fn dt_property_is_exact(raw: &[u8], expected: &str) -> bool {
+    raw.split(|byte| *byte == 0)
+        .next()
+        .is_some_and(|value| value == expected.as_bytes())
+}
+
+fn dt_compatible_has_exact_token(raw: &[u8], expected: &str) -> bool {
+    raw.split(|byte| *byte == 0)
+        .any(|value| value == expected.as_bytes())
+}
+
+/// Authorize the one production AM3-BeagleBone mining topology.
+///
+/// An explicit marker is authoritative: it must match exactly and cannot be
+/// rescued by unrelated device-tree evidence. With no marker, the exact
+/// live-captured LuxOS DT tuple is accepted so reversible host bring-up keeps
+/// working. Substring matches are deliberately rejected.
+pub fn authorize_am3_bb_identity(
+    marker: Option<&str>,
+    compatible: &[u8],
+    model: &[u8],
+) -> Result<Am3BbIdentityEvidence> {
+    if let Some(marker) = marker {
+        if marker == DEFAULT_BOARD_TARGET_V2_0 {
+            return Ok(Am3BbIdentityEvidence::BoardTargetMarker);
+        }
+        return Err(HalError::Platform(format!(
+            "BeagleBone: explicit board-target marker {marker:?} does not authorize {}",
+            DEFAULT_BOARD_TARGET_V2_0
+        )));
+    }
+
+    if dt_compatible_has_exact_token(compatible, S19J_IO_BOARD_V2_0_DT_COMPATIBLE)
+        && dt_property_is_exact(model, S19J_IO_BOARD_V2_0_DT_MODEL)
+    {
+        return Ok(Am3BbIdentityEvidence::ExactDeviceTree);
+    }
+
+    Err(HalError::Platform(format!(
+        "BeagleBone: {} identity not proven by an exact board-target marker or exact device-tree tuple",
+        DEFAULT_BOARD_TARGET_V2_0
+    )))
+}
+
+fn am3_bb_dspic_slot_for_uart(serial_device: &str) -> Option<usize> {
+    match serial_device {
+        "/dev/ttyS1" | "/dev/ttyO1" => Some(0),
+        "/dev/ttyS2" | "/dev/ttyO2" => Some(1),
+        "/dev/ttyS4" | "/dev/ttyO4" => Some(2),
+        _ => None,
+    }
+}
+
+fn bind_am3_bb_dspic_endpoint_from_observations(
+    marker: Option<&str>,
+    compatible: &[u8],
+    model: &[u8],
+    serial_device: &str,
+    observed_address: u8,
+    eeprom_bytes_by_slot: &[Option<Vec<u8>>],
+    firmware_reply: &[u8],
+) -> Result<VoltageControllerEndpoint> {
+    authorize_am3_bb_identity(marker, compatible, model)?;
+
+    let slot = am3_bb_dspic_slot_for_uart(serial_device).ok_or_else(|| {
+        HalError::Platform(format!(
+            "AM3-BB dsPIC endpoint UART is outside the exact S19J_IO_BOARD_V2_0 topology: {serial_device}"
+        ))
+    })?;
+    let address = 0x20u8 + slot as u8;
+    if observed_address != address {
+        return Err(HalError::Platform(format!(
+            "AM3-BB dsPIC observation address 0x{observed_address:02X} does not match {serial_device} endpoint 0x{address:02X}"
+        )));
+    }
+
+    let eeprom = eeprom_bytes_by_slot
+        .get(slot)
+        .and_then(Option::as_deref)
+        .ok_or_else(|| {
+            HalError::Platform(format!(
+                "AM3-BB slot {slot} has no retained pre-energize EEPROM observation"
+            ))
+        })?;
+    if eeprom.len() < 2
+        || eeprom.iter().all(|byte| *byte == 0x00)
+        || eeprom.iter().all(|byte| *byte == 0xFF)
+        || eeprom[..2] != [0x04, 0x11]
+    {
+        return Err(HalError::Platform(format!(
+            "AM3-BB slot {slot} EEPROM is blank, short, or outside the live-proven BHB42 family"
+        )));
+    }
+
+    // The exact `a lab unit` S19J_IO_BOARD_V2_0 trace proves fw=0x89 on all three
+    // hashboard controllers. Accept only reply shapes already admitted by the
+    // legacy direct-serial parser; this issuer must not broaden wire grammar.
+    let firmware = if firmware_reply.len() >= 3
+        && firmware_reply[0] == 0x05
+        && firmware_reply[1] == 0x17
+        && firmware_reply[2] == 0x89
+    {
+        0x89
+    } else if firmware_reply.len() >= 3 && firmware_reply[0] == 0x17 && firmware_reply[2] == 0x89 {
+        0x89
+    } else if firmware_reply.first() == Some(&0x89) {
+        0x89
+    } else {
+        return Err(HalError::Platform(format!(
+            "AM3-BB dsPIC endpoint did not retain an exact supported fw=0x89 GET_VERSION reply: {firmware_reply:02X?}"
+        )));
+    };
+
+    Ok(VoltageControllerEndpoint::from_observed_am2(
+        address, firmware,
+    ))
+}
+
+/// Reuse the standard daemon's existing EEPROM and GET_VERSION observations
+/// to issue one exact `a lab unit` AM3-BB dsPIC endpoint.
+///
+/// This function performs no I2C access. It reads only system-owned identity
+/// files, then binds the already-retained observations to the live-captured
+/// S19J_IO_BOARD_V2_0 UART/slot/address topology. `Ok(None)` means the current
+/// system is not AM3-BB; once exact AM3-BB identity is present, any topology,
+/// EEPROM, or firmware mismatch fails closed instead of falling back to a raw
+/// address constructor.
+pub fn try_bind_system_am3_bb_dspic_endpoint(
+    serial_device: &str,
+    observed_address: u8,
+    eeprom_bytes_by_slot: &[Option<Vec<u8>>],
+    firmware_reply: &[u8],
+) -> Result<Option<VoltageControllerEndpoint>> {
+    let marker = read_active_board_target_name()?;
+    let compatible = fs::read("/proc/device-tree/compatible").unwrap_or_default();
+    let model = fs::read("/proc/device-tree/model").unwrap_or_default();
+
+    let exact_identity = marker.as_deref() == Some(DEFAULT_BOARD_TARGET_V2_0)
+        || (marker.is_none()
+            && dt_compatible_has_exact_token(&compatible, S19J_IO_BOARD_V2_0_DT_COMPATIBLE)
+            && dt_property_is_exact(&model, S19J_IO_BOARD_V2_0_DT_MODEL));
+    if !exact_identity {
+        return Ok(None);
+    }
+
+    bind_am3_bb_dspic_endpoint_from_observations(
+        marker.as_deref(),
+        &compatible,
+        &model,
+        serial_device,
+        observed_address,
+        eeprom_bytes_by_slot,
+        firmware_reply,
+    )
+    .map(Some)
+}
+
 // ─── Board-target TOML schema (Phase B) ───
 //
 // Deserialized from `/etc/dcentos/board_targets/<name>.toml`. Mirrors
 // `DCENT_OS_Antminer/etc/board_target/am3-bb-s19jpro.toml`. Every field is
-// optional with a sensible default so a partial or stale TOML doesn't break
-// boot — missing pieces fall back to the `*_V2_0` consts above. Used by
+// optional at the schema layer so host tooling can inspect partial files.
+// Runtime admission separately requires the complete `[platform]` identity;
+// topology fields may then use the `*_V2_0` catalog defaults. Used by
 // `BeagleBonePlatform::run_cold_boot` (Phase C wires the `--am3-bb-mining`
 // daemon mode to call it).
 
@@ -534,7 +709,7 @@ impl BeagleBoneBoardTarget {
     /// explicit `dspic33ep-fw89`; stale configs with `apw12-uart-tunnel` still
     /// classify to [`VoltageControllerKind::Dspic33Ep`] because LuxOS ftrace
     /// proved hashboard controllers on bus 0.
-    pub fn classify_voltage_controller(&self) -> Option<VoltageControllerKind> {
+    pub(crate) fn classify_voltage_controller(&self) -> Option<VoltageControllerKind> {
         // Prefer the explicit `[platform].voltage_controller`, then the
         // `[i2c].psu_kind`.
         if let Some(vc) = self
@@ -550,16 +725,14 @@ impl BeagleBoneBoardTarget {
 }
 
 /// Load `/etc/dcentos/board_targets/<name>.toml` for `name`. Returns the
-/// parsed struct, or `None` if the file is absent / unreadable (the caller
-/// falls back to [`BeagleBoneBoardTarget::hardcoded_v2_0_defaults`]). A
-/// malformed TOML is logged and treated as "absent" — boot must not die on
-/// a stale config file.
+/// parsed struct, or `Ok(None)` if the file is absent. Unreadable or malformed
+/// explicit configuration is an error and never falls back to a topology.
 ///
 /// Side-effect-free apart from a `tracing` line and the file read; safe to
 /// call from `BeagleBonePlatform::new`. On non-Linux hosts the path won't
 /// exist, so this returns `None` — test harness uses
 /// [`parse_board_target_toml`] directly with a string.
-pub fn load_board_target(name: &str) -> Option<BeagleBoneBoardTarget> {
+pub fn load_board_target(name: &str) -> Result<Option<BeagleBoneBoardTarget>> {
     let path = format!("{}/{}.toml", BOARD_TARGET_DIR, name);
     match fs::read_to_string(&path) {
         Ok(s) => match parse_board_target_toml(&s) {
@@ -569,27 +742,22 @@ pub fn load_board_target(name: &str) -> Option<BeagleBoneBoardTarget> {
                     board_target = %name,
                     "BeagleBone: loaded board-target config"
                 );
-                Some(bt)
+                Ok(Some(bt))
             }
-            Err(e) => {
-                tracing::warn!(
-                    path = %path,
-                    error = %e,
-                    "BeagleBone: board-target TOML present but malformed — \
-                     falling back to hardcoded .79 defaults"
-                );
-                None
-            }
+            Err(e) => Err(HalError::Platform(format!(
+                "BeagleBone: board-target TOML {path} is malformed: {e}"
+            ))),
         },
-        Err(e) => {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::debug!(
                 path = %path,
-                error = %e,
-                "BeagleBone: no board-target config (LuxOS / non-DCENT_OS rootfs) — \
-                 using hardcoded .79 defaults"
+                "BeagleBone: board-target config is absent"
             );
-            None
+            Ok(None)
         }
+        Err(e) => Err(HalError::Platform(format!(
+            "BeagleBone: cannot read board-target TOML {path}: {e}"
+        ))),
     }
 }
 
@@ -602,20 +770,104 @@ pub fn parse_board_target_toml(s: &str) -> Result<BeagleBoneBoardTarget> {
 }
 
 /// Read `/etc/dcentos/board_target` (the file naming the active target).
-/// Returns the trimmed contents, defaulting to [`DEFAULT_BOARD_TARGET_V2_0`]
-/// when absent/empty. Host-safe (returns the default on non-Linux).
-pub fn read_active_board_target_name() -> String {
+/// Returns `Ok(None)` when absent. Empty or unreadable explicit markers are
+/// errors; this function never invents a board identity.
+pub fn read_active_board_target_name() -> Result<Option<String>> {
     match fs::read_to_string(BOARD_TARGET_NAME_FILE) {
         Ok(s) => {
             let t = s.trim();
             if t.is_empty() {
-                DEFAULT_BOARD_TARGET_V2_0.to_string()
+                Err(HalError::Platform(format!(
+                    "BeagleBone: {BOARD_TARGET_NAME_FILE} is present but empty"
+                )))
             } else {
-                t.to_string()
+                Ok(Some(t.to_string()))
             }
         }
-        Err(_) => DEFAULT_BOARD_TARGET_V2_0.to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(HalError::Platform(format!(
+            "BeagleBone: cannot read {BOARD_TARGET_NAME_FILE}: {e}"
+        ))),
     }
+}
+
+fn validate_supported_board_target(name: &str, target: &BeagleBoneBoardTarget) -> Result<()> {
+    if name != DEFAULT_BOARD_TARGET_V2_0 {
+        return Err(HalError::Platform(format!(
+            "BeagleBone: unsupported board-target config {name:?}"
+        )));
+    }
+    let platform = target.platform.as_ref().ok_or_else(|| {
+        HalError::Platform("BeagleBone: board-target TOML is missing [platform] identity".into())
+    })?;
+    let declarations = [
+        (
+            "board_target",
+            platform.board_target.as_deref(),
+            DEFAULT_BOARD_TARGET_V2_0,
+        ),
+        ("soc", platform.soc.as_deref(), "am335x"),
+        ("cpu", platform.cpu.as_deref(), "cortex-a8"),
+        (
+            "io_board",
+            platform.io_board.as_deref(),
+            "S19J_IO_BOARD_V2_0",
+        ),
+        (
+            "voltage_controller",
+            platform.voltage_controller.as_deref(),
+            "dspic33ep-fw89",
+        ),
+    ];
+    for (field, observed, expected) in declarations {
+        if observed != Some(expected) {
+            return Err(HalError::Platform(format!(
+                "BeagleBone: board-target [platform].{field} must be exactly {expected:?}, got {observed:?}"
+            )));
+        }
+    }
+    match target
+        .gpio
+        .board_enable_active
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "high" => {}
+        "low" => {
+            return Err(HalError::Platform(
+                "BeagleBone: the supported AM3-BB target requires active-high board-enable; active-low output setup is refused until the GPIO backend can establish an OFF level without a direction-change glitch"
+                    .into(),
+            ));
+        }
+        observed => {
+            return Err(HalError::Platform(format!(
+                "BeagleBone: board-target [gpio].board_enable_active must be exactly \"high\" or \"low\", got {observed:?}"
+            )));
+        }
+    }
+    if target.uart.chain_count != 3
+        || target.uart.chains.len() != 3
+        || !target
+            .uart
+            .chains
+            .iter()
+            .enumerate()
+            .all(|(index, chain)| usize::from(chain.index) == index)
+    {
+        return Err(HalError::Platform(format!(
+            "BeagleBone: {} UART geometry must declare exactly chains 0,1,2; got chain_count={} entries={:?}",
+            DEFAULT_BOARD_TARGET_V2_0,
+            target.uart.chain_count,
+            target
+                .uart
+                .chains
+                .iter()
+                .map(|chain| chain.index)
+                .collect::<Vec<_>>()
+        )));
+    }
+    Ok(())
 }
 
 // ─── Fan tach (W3.3) ───
@@ -638,6 +890,10 @@ const FAN_TACH_WINDOW: Duration = Duration::from_millis(1000);
 /// Pulses per revolution. 4-wire PC fans emit 2 pulses per revolution.
 const FAN_TACH_PULSES_PER_REV: u32 = 2;
 
+/// Maximum orderly shutdown budget before a wedged sysfs reader is detached
+/// in an explicitly unavailable state instead of blocking daemon teardown.
+const FAN_TACH_STOP_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// Lab-only override env flag. When set to `1`, the runtime accepts
 /// `FanMode::Advanced` / `FanMode::HashrateMax` despite the W3.3
 /// "real-tach but uncalibrated on this board" gate. Mirrors the
@@ -650,11 +906,10 @@ pub const BB_TACH_ACCEPT_DEGRADED_ENV: &str = "DCENT_AM3_BB_ACCEPT_DEGRADED_TACH
 /// BeagleBone AM335x platform.
 pub struct BeagleBonePlatform {
     config: PlatformConfig,
-    /// Active board-target name (`/etc/dcentos/board_target`, default
-    /// `am3-bb-s19jpro`). Phase B.
+    /// Authorized board-target name. Runtime construction requires an exact
+    /// marker or exact live-captured device-tree identity.
     board_target_name: String,
-    /// Parsed `/etc/dcentos/board_targets/<name>.toml`, or the hardcoded
-    /// `a lab unit` defaults when the file is absent (LuxOS units). Phase B.
+    /// Parsed target, or built-in `a lab unit` topology only for exact LuxOS DT evidence.
     board_target: BeagleBoneBoardTarget,
 }
 
@@ -687,14 +942,34 @@ impl BeagleBonePlatform {
 
         let mut config = PlatformConfig::s19j_beaglebone();
 
-        // Phase B (2026-05-12): load the per-board-target config. LuxOS
-        // units have no `/etc/dcentos/board_target` → defaults to
-        // `am3-bb-s19jpro`; LuxOS units also have no
-        // `/etc/dcentos/board_targets/<name>.toml` → falls back to the
-        // hardcoded `a lab unit` defaults.
-        let board_target_name = read_active_board_target_name();
-        let board_target = load_board_target(&board_target_name)
-            .unwrap_or_else(BeagleBoneBoardTarget::hardcoded_v2_0_defaults);
+        // Resolve identity before accepting any GPIO/UART/I2C topology. DCENT_OS
+        // uses the exact image-owned marker; reversible LuxOS bring-up may use
+        // the exact live-captured DT tuple. Missing evidence never manufactures
+        // `am3-bb-s19jpro`.
+        let marker = read_active_board_target_name()?;
+        let compatible = fs::read("/proc/device-tree/compatible").unwrap_or_default();
+        let dt_model = fs::read("/proc/device-tree/model").unwrap_or_default();
+        let identity = authorize_am3_bb_identity(marker.as_deref(), &compatible, &dt_model)?;
+        let board_target_name = DEFAULT_BOARD_TARGET_V2_0.to_string();
+        let board_target = match load_board_target(&board_target_name)? {
+            Some(target) => {
+                validate_supported_board_target(&board_target_name, &target)?;
+                target
+            }
+            None if identity == Am3BbIdentityEvidence::ExactDeviceTree => {
+                tracing::info!(
+                    board_target = %board_target_name,
+                    "BeagleBone: exact LuxOS device-tree evidence authorizes built-in .79 topology"
+                );
+                BeagleBoneBoardTarget::hardcoded_v2_0_defaults()
+            }
+            None => {
+                return Err(HalError::Platform(format!(
+                    "BeagleBone: exact marker {} requires its board-target TOML; refusing hardcoded fallback",
+                    DEFAULT_BOARD_TARGET_V2_0
+                )))
+            }
+        };
 
         // Voltage-controller classification. Two routes:
         //   1. `/etc/subtype` + `i2cdetect 0x20` probe (W2A.2 — the W4
@@ -704,8 +979,8 @@ impl BeagleBonePlatform {
         //      fw=0x89 dsPIC hashboard controllers on bus 0.
         // The board-target classification takes precedence when it
         // recognizes the PSU-kind string; otherwise we fall through to the
-        // subtype/probe path (which itself defaults to Dspic33Ep). No
-        // existing platform classification changes.
+        // subtype/probe path, which fails closed to NoPic when identity is
+        // missing or contradictory.
         let kind = if let Some(vc) = board_target.classify_voltage_controller() {
             tracing::info!(
                 board_target = %board_target_name,
@@ -1108,7 +1383,7 @@ struct PwmDutyPath {
 struct BeagleBoneFan {
     duty_paths: Vec<PwmDutyPath>,
     period_ns: u32,
-    tach: Arc<BeagleBoneFanTach>,
+    tach: BeagleBoneFanTach,
 }
 
 impl BeagleBoneFan {
@@ -1164,6 +1439,10 @@ impl BeagleBoneFan {
         ]
     }
 
+    fn duty_ns_for_pwm(&self, pwm: u8) -> u32 {
+        (u32::from(pwm.min(100)) * self.period_ns) / 100
+    }
+
     /// W3.3 — refuse `FanMode::Advanced` and `FanMode::HashrateMax` on
     /// am3-bb until per-fan tach calibration runs against live hardware.
     /// Operator override: `DCENT_AM3_BB_ACCEPT_DEGRADED_TACH=1`.
@@ -1204,41 +1483,89 @@ impl BeagleBoneFan {
 
 impl FanAccess for BeagleBoneFan {
     fn set_speed(&self, pwm: u8) {
-        let pwm_clamped = pwm.min(100) as u32;
-        let duty_ns = (pwm_clamped * self.period_ns) / 100;
-        let duty_str = duty_ns.to_string();
-
-        for duty_path in &self.duty_paths {
-            if Path::new(&duty_path.path).exists() {
-                if let Err(e) = fs::write(&duty_path.path, &duty_str) {
-                    tracing::error!(
-                        path = %duty_path.path,
-                        error = %e,
-                        "BeagleBone {} fan PWM write failed",
-                        duty_path.label
-                    );
-                }
-            }
+        if let Err(error) = self.set_speed_checked(pwm) {
+            tracing::error!(
+                %error,
+                "BeagleBone fan PWM command/readback failed"
+            );
         }
     }
 
-    fn get_rpm(&self) -> u32 {
-        // W3.3 — real GPIO falling-edge counter. Returns the average RPM
-        // across all populated fans. When the sampler hasn't ingested a
-        // full window yet, fall back to a small PWM-driven safety floor
-        // (NEVER 0 when PWM > 0).
-        let per_fan = self.tach.read_per_fan_rpm();
-        let live: Vec<u32> = per_fan.iter().filter(|&&r| r > 0).copied().collect();
-        if !live.is_empty() {
-            let sum: u32 = live.iter().sum();
-            return sum / live.len() as u32;
+    fn set_speed_checked(&self, pwm: u8) -> Result<FanCommandReceipt> {
+        let duty_ns = self.duty_ns_for_pwm(pwm);
+        let duty = duty_ns.to_string();
+        let existing_paths = self
+            .duty_paths
+            .iter()
+            .filter(|duty_path| Path::new(&duty_path.path).exists())
+            .collect::<Vec<_>>();
+        if existing_paths.is_empty() {
+            return Err(HalError::Fan(
+                "BeagleBone: no fan PWM path remains available for checked command".to_string(),
+            ));
         }
-        let pwm = self.get_speed_pwm();
-        if pwm == 0 {
+
+        // Every discovered physical command path participates in one command.
+        // A partial multi-path write is an error even if another path already
+        // reached the requested duty; callers must cut hash power rather than
+        // converting partial cooling into positive liveness evidence.
+        for duty_path in &existing_paths {
+            fs::write(&duty_path.path, &duty).map_err(|error| {
+                HalError::Fan(format!(
+                    "BeagleBone {} fan PWM write failed at {}: {error}",
+                    duty_path.label, duty_path.path
+                ))
+            })?;
+        }
+        for duty_path in existing_paths {
+            let observed = fs::read_to_string(&duty_path.path).map_err(|error| {
+                HalError::Fan(format!(
+                    "BeagleBone {} fan PWM readback failed at {}: {error}",
+                    duty_path.label, duty_path.path
+                ))
+            })?;
+            let observed = observed.trim().parse::<u32>().map_err(|error| {
+                HalError::Fan(format!(
+                    "BeagleBone {} fan PWM readback parse failed at {}: {error}",
+                    duty_path.label, duty_path.path
+                ))
+            })?;
+            if observed != duty_ns {
+                return Err(HalError::Fan(format!(
+                    "BeagleBone {} fan PWM readback mismatch at {}: requested {duty_ns}ns, observed {observed}ns",
+                    duty_path.label, duty_path.path
+                )));
+            }
+        }
+
+        let observed_pwm = pwm.min(100);
+        Ok(FanCommandReceipt {
+            requested_pwm: observed_pwm,
+            observed_pwm,
+        })
+    }
+
+    fn get_rpm(&self) -> u32 {
+        // Only measured channels participate. Zero is a real observation: it
+        // may mean the one-second window is still cold or a fan is stopped.
+        // Unavailable channels never become a PWM-derived positive RPM.
+        // The aggregate fails unavailable as zero unless all four physical
+        // channels are observable; averaging a partial set could mask a dead
+        // or disconnected fan.
+        let observations = self.tach.read_per_fan_observations();
+        if !observations.iter().all(|observation| observation.available) {
+            return 0;
+        }
+        let (sum, count) = observations
+            .iter()
+            .filter(|observation| observation.available)
+            .fold((0_u64, 0_u64), |(sum, count), observation| {
+                (sum + u64::from(observation.rpm), count + 1)
+            });
+        if count == 0 {
             0
         } else {
-            // Cold-start placeholder — sampler window is only 1 s.
-            900
+            (sum / count).min(u64::from(u32::MAX)) as u32
         }
     }
 
@@ -1277,84 +1604,221 @@ impl FanAccess for BeagleBoneFan {
     }
 
     fn tach_available(&self) -> bool {
-        // W3.3 — real GPIO falling-edge counter is online when the sampler
-        // thread successfully exported all 4 tach GPIOs.
+        // Real GPIO falling-edge evidence is available only after every
+        // channel completes an uninterrupted measurement window.
         self.tach.is_available()
     }
 }
 
 // ─── Fan tachometer (W3.3) ───
 
-/// Per-fan sliding-window tach counter. One sampler thread updates the
-/// atomics for all 4 fans; readers (`FanAccess::get_per_fan_rpm`) get a
-/// snapshot without locking.
+/// One truthful per-channel tach observation.
+///
+/// `available=false` and `rpm=0` is distinct from an available channel whose
+/// measured pulse window is zero. The public compatibility API still returns
+/// RPM values, while `tach_available()` stays false unless every physical
+/// channel is observable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BeagleBoneFanTachObservation {
+    available: bool,
+    rpm: u32,
+}
+
+/// Atomics shared with the sampler worker. Ownership of the worker itself is
+/// deliberately kept out of this `Arc` so cloning sampling state cannot detach
+/// or extend the thread lifetime.
+struct BeagleBoneFanTachState {
+    observations: [AtomicU32; 4],
+}
+
+impl BeagleBoneFanTachState {
+    const AVAILABLE_FLAG: u32 = 1 << 31;
+    const RPM_MASK: u32 = Self::AVAILABLE_FLAG - 1;
+
+    fn new() -> Self {
+        Self {
+            observations: std::array::from_fn(|_| AtomicU32::new(0)),
+        }
+    }
+
+    fn mark_all_unavailable(&self) {
+        for observation in &self.observations {
+            observation.store(0, Ordering::Release);
+        }
+    }
+
+    fn store_observation(&self, idx: usize, available: bool, rpm: u32) {
+        let packed = if available {
+            Self::AVAILABLE_FLAG | rpm.min(Self::RPM_MASK)
+        } else {
+            0
+        };
+        self.observations[idx].store(packed, Ordering::Release);
+    }
+
+    fn observation(&self, idx: usize) -> BeagleBoneFanTachObservation {
+        let packed = self.observations[idx].load(Ordering::Acquire);
+        let available = packed & Self::AVAILABLE_FLAG != 0;
+        BeagleBoneFanTachObservation {
+            available,
+            rpm: if available {
+                packed & Self::RPM_MASK
+            } else {
+                0
+            },
+        }
+    }
+}
+
+/// Clears availability whenever the worker exits, including unwind after a
+/// panic. A dead sampler must never leave stale RPM advertised as live.
+struct BeagleBoneFanTachExitGuard(Arc<BeagleBoneFanTachState>);
+
+impl Drop for BeagleBoneFanTachExitGuard {
+    fn drop(&mut self) {
+        self.0.mark_all_unavailable();
+    }
+}
+
+type BeagleBoneFanTachTask = Box<dyn FnOnce() + Send + 'static>;
+
+/// Per-fan sliding-window tach counter and sole owner of its sampler thread.
+/// Readers get lock-free snapshots; dropping the owner requests stop and joins
+/// within a fixed budget. A wedged worker is marked unavailable and detached
+/// with an error rather than stalling safety teardown indefinitely.
 struct BeagleBoneFanTach {
-    available: AtomicBool,
-    rpm: [AtomicU32; 4],
+    state: Arc<BeagleBoneFanTachState>,
     stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl BeagleBoneFanTach {
-    /// Boot the per-fan tach sampler. If GPIO export fails, returns a
-    /// disabled handle whose `is_available()` returns false.
-    fn start(gpio_pins: [u32; 4]) -> Arc<Self> {
+    /// Boot the per-fan tach sampler. GPIO preparation or worker-spawn failure
+    /// returns an owned, disabled sampler whose observations are unavailable
+    /// and zero. Spawn errors are surfaced in logs and never publish readiness.
+    fn start(gpio_pins: [u32; 4]) -> Self {
+        let value_paths = gpio_pins.map(|gpio| match Self::prepare_gpio_input(gpio) {
+            Ok(path) => Some(path),
+            Err(err) => {
+                tracing::warn!(
+                    gpio,
+                    error = %err,
+                    "BeagleBone fan-tach: GPIO preparation failed; channel unavailable"
+                );
+                None
+            }
+        });
+        Self::start_prepared(value_paths)
+    }
+
+    fn start_prepared(value_paths: [Option<String>; 4]) -> Self {
+        Self::start_prepared_with_spawner(value_paths, |task| {
+            thread::Builder::new()
+                .name("bb-fan-tach".to_string())
+                .spawn(task)
+        })
+    }
+
+    /// Spawner injection keeps failure and ownership tests host-safe without
+    /// weakening the production boundary.
+    fn start_prepared_with_spawner<F>(value_paths: [Option<String>; 4], spawner: F) -> Self
+    where
+        F: FnOnce(BeagleBoneFanTachTask) -> std::io::Result<JoinHandle<()>>,
+    {
+        let state = Arc::new(BeagleBoneFanTachState::new());
         let stop = Arc::new(AtomicBool::new(false));
-        let me = Arc::new(Self {
-            available: AtomicBool::new(false),
-            rpm: [
-                AtomicU32::new(0),
-                AtomicU32::new(0),
-                AtomicU32::new(0),
-                AtomicU32::new(0),
-            ],
-            stop: Arc::clone(&stop),
+        if !value_paths.iter().any(Option::is_some) {
+            return Self {
+                state,
+                stop,
+                worker: None,
+            };
+        }
+
+        let worker_state = Arc::clone(&state);
+        let worker_stop = Arc::clone(&stop);
+        let task: BeagleBoneFanTachTask = Box::new(move || {
+            let _exit_guard = BeagleBoneFanTachExitGuard(Arc::clone(&worker_state));
+            Self::run_sampler(worker_state, worker_stop, value_paths);
         });
 
-        let mut all_exported = true;
-        let mut value_paths: Vec<Option<String>> = Vec::with_capacity(4);
-        for &gpio in &gpio_pins {
-            match Self::prepare_gpio_input(gpio) {
-                Ok(path) => value_paths.push(Some(path)),
-                Err(err) => {
-                    tracing::warn!(
-                        gpio,
-                        error = %err,
-                        "BeagleBone fan-tach: GPIO export failed, falling back to \
-                         tach-unavailable for this fan."
-                    );
-                    value_paths.push(None);
-                    all_exported = false;
+        match spawner(task) {
+            Ok(worker) => Self {
+                state,
+                stop,
+                worker: Some(worker),
+            },
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "BeagleBone fan-tach: sampler spawn failed; all channels unavailable"
+                );
+                state.mark_all_unavailable();
+                Self {
+                    state,
+                    stop,
+                    worker: None,
                 }
             }
         }
-
-        if !value_paths.iter().any(|p| p.is_some()) {
-            return me;
-        }
-
-        let me_clone = Arc::clone(&me);
-        thread::Builder::new()
-            .name("bb-fan-tach".to_string())
-            .spawn(move || {
-                Self::run_sampler(me_clone, value_paths);
-            })
-            .ok();
-
-        me.available.store(all_exported, Ordering::Release);
-        me
     }
 
     fn is_available(&self) -> bool {
-        self.available.load(Ordering::Acquire)
+        self.worker.is_some()
+            && self.state.observations.iter().all(|observation| {
+                observation.load(Ordering::Acquire) & BeagleBoneFanTachState::AVAILABLE_FLAG != 0
+            })
+    }
+
+    fn read_per_fan_observations(&self) -> [BeagleBoneFanTachObservation; 4] {
+        std::array::from_fn(|idx| self.state.observation(idx))
     }
 
     fn read_per_fan_rpm(&self) -> [u32; 4] {
-        [
-            self.rpm[0].load(Ordering::Acquire),
-            self.rpm[1].load(Ordering::Acquire),
-            self.rpm[2].load(Ordering::Acquire),
-            self.rpm[3].load(Ordering::Acquire),
-        ]
+        self.read_per_fan_observations()
+            .map(|observation| observation.rpm)
+    }
+
+    /// Request sampler stop and consume its `JoinHandle` only after bounded
+    /// `is_finished()` evidence proves `join()` cannot wait on sysfs I/O. A
+    /// timeout fails the receipt and detaches the still-stopping worker rather
+    /// than blocking shutdown indefinitely.
+    fn stop_and_join(&mut self) -> bool {
+        self.stop_and_join_with_timeout(FAN_TACH_STOP_TIMEOUT)
+    }
+
+    fn stop_and_join_with_timeout(&mut self, timeout: Duration) -> bool {
+        self.stop.store(true, Ordering::Release);
+        self.state.mark_all_unavailable();
+        let Some(worker) = self.worker.take() else {
+            return true;
+        };
+        let deadline = Instant::now().checked_add(timeout);
+        while !worker.is_finished() {
+            let Some(deadline) = deadline else {
+                break;
+            };
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            thread::sleep(FAN_TACH_SAMPLE_INTERVAL.min(deadline.saturating_duration_since(now)));
+        }
+        if !worker.is_finished() {
+            tracing::error!(
+                timeout_ms = timeout.as_millis(),
+                "BeagleBone fan-tach: sampler stop timed out; detaching unavailable worker"
+            );
+            return false;
+        }
+        let joined = match worker.join() {
+            Ok(()) => true,
+            Err(_) => {
+                tracing::error!("BeagleBone fan-tach: sampler thread panicked during join");
+                false
+            }
+        };
+        joined
     }
 
     fn prepare_gpio_input(gpio: u32) -> Result<String> {
@@ -1363,35 +1827,76 @@ impl BeagleBoneFanTach {
         Ok(format!("/sys/class/gpio/gpio{}/value", gpio))
     }
 
-    fn run_sampler(me: Arc<Self>, value_paths: Vec<Option<String>>) {
-        let mut last_levels: [u8; 4] = [1, 1, 1, 1];
+    fn run_sampler(
+        state: Arc<BeagleBoneFanTachState>,
+        stop: Arc<AtomicBool>,
+        value_paths: [Option<String>; 4],
+    ) {
+        // `None` means no level has been observed yet (or the prior read
+        // failed). A first low sample is baseline state, not a falling edge.
+        let mut last_levels: [Option<u8>; 4] = [None; 4];
         let mut pulse_counts: [u32; 4] = [0; 4];
-        let mut window_start = Instant::now();
+        // Per-channel first-success time makes a complete window literal even
+        // if the worker is preempted before its first GPIO poll.
+        let mut valid_since: [Option<Instant>; 4] = [None; 4];
+        let mut window_start: Option<Instant> = None;
 
-        while !me.stop.load(Ordering::Acquire) {
+        while !stop.load(Ordering::Acquire) {
             for (idx, path_opt) in value_paths.iter().enumerate() {
                 let Some(path) = path_opt else { continue };
-                if let Some(level) = read_gpio_level(path) {
-                    if last_levels[idx] == 1 && level == 0 {
-                        pulse_counts[idx] = pulse_counts[idx].saturating_add(1);
+                match read_gpio_level(path) {
+                    Some(level) => {
+                        if valid_since[idx].is_none() {
+                            valid_since[idx] = Some(Instant::now());
+                        }
+                        observe_tach_level(&mut last_levels[idx], level, &mut pulse_counts[idx]);
                     }
-                    last_levels[idx] = level;
+                    None => {
+                        state.store_observation(idx, false, 0);
+                        pulse_counts[idx] = 0;
+                        last_levels[idx] = None;
+                        valid_since[idx] = None;
+                    }
                 }
             }
 
-            if window_start.elapsed() >= FAN_TACH_WINDOW {
-                let elapsed_ms = window_start.elapsed().as_millis().max(1) as u32;
+            let sample_window_start = window_start.get_or_insert_with(Instant::now);
+            if sample_window_start.elapsed() >= FAN_TACH_WINDOW {
+                let elapsed_ms = sample_window_start.elapsed().as_millis().max(1) as u32;
                 for (idx, pulse_count) in pulse_counts.iter_mut().enumerate() {
-                    let rpm = pulses_to_rpm(*pulse_count, elapsed_ms);
-                    me.rpm[idx].store(rpm, Ordering::Release);
+                    let available = valid_since[idx]
+                        .is_some_and(|since| since.elapsed() >= FAN_TACH_WINDOW)
+                        && last_levels[idx].is_some();
+                    let rpm = if available {
+                        pulses_to_rpm(*pulse_count, elapsed_ms)
+                    } else {
+                        0
+                    };
+                    state.store_observation(idx, available, rpm);
                     *pulse_count = 0;
                 }
-                window_start = Instant::now();
+                window_start = Some(Instant::now());
             }
 
             thread::sleep(FAN_TACH_SAMPLE_INTERVAL);
         }
     }
+}
+
+impl Drop for BeagleBoneFanTach {
+    fn drop(&mut self) {
+        let _ = self.stop_and_join();
+    }
+}
+
+/// Incorporate one GPIO level without inventing an edge before a baseline is
+/// known. After a read failure the caller resets `last_level` to `None`, so a
+/// later low recovery sample is also baseline rather than a fabricated pulse.
+fn observe_tach_level(last_level: &mut Option<u8>, level: u8, pulse_count: &mut u32) {
+    if matches!(*last_level, Some(1)) && level == 0 {
+        *pulse_count = pulse_count.saturating_add(1);
+    }
+    *last_level = Some(level);
 }
 
 /// Convert a falling-edge pulse count over `elapsed_ms` into RPM.
@@ -1517,6 +2022,36 @@ mod tests {
     use super::*;
     use crate::platform::config::{PicType, VoltageControl};
 
+    fn fan_test_dir(label: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "dcentos-beaglebone-fan-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn wait_for_condition(timeout: Duration, condition: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        condition()
+    }
+
+    fn disabled_test_tach() -> BeagleBoneFanTach {
+        BeagleBoneFanTach {
+            state: Arc::new(BeagleBoneFanTachState::new()),
+            stop: Arc::new(AtomicBool::new(true)),
+            worker: None,
+        }
+    }
+
     #[test]
     fn pinout_constants_match_s70cgminer_capture() {
         assert_eq!(GPIO_PLUG_DETECT, [51, 48, 47, 44]);
@@ -1603,6 +2138,70 @@ mod tests {
         assert!(paths.contains(&"/sys/class/pwm/pwmchip2/pwm0/duty_cycle".to_string()));
         assert!(paths.contains(&"/sys/class/pwm/pwm1/duty_ns".to_string()));
         assert!(paths.contains(&"/sys/class/pwm/pwm2/duty_ns".to_string()));
+    }
+
+    #[test]
+    fn checked_fan_command_writes_and_reads_every_discovered_path() {
+        let root = fan_test_dir("checked");
+        fs::create_dir_all(&root).expect("create fan fixture");
+        let front = root.join("front-duty");
+        let rear = root.join("rear-duty");
+        fs::write(&front, "0").expect("seed front duty");
+        fs::write(&rear, "0").expect("seed rear duty");
+        let fan = BeagleBoneFan {
+            duty_paths: vec![
+                PwmDutyPath {
+                    label: "front-test",
+                    path: front.to_string_lossy().into_owned(),
+                },
+                PwmDutyPath {
+                    label: "rear-test",
+                    path: rear.to_string_lossy().into_owned(),
+                },
+            ],
+            period_ns: BB_PWM_PERIOD_NS,
+            tach: disabled_test_tach(),
+        };
+
+        let receipt = fan
+            .set_speed_checked(30)
+            .expect("two-path checked fan command");
+        assert_eq!(receipt.requested_pwm(), 30);
+        assert_eq!(receipt.observed_pwm(), 30);
+        assert_eq!(fs::read_to_string(front).unwrap(), "30000");
+        assert_eq!(fs::read_to_string(rear).unwrap(), "30000");
+        fs::remove_dir_all(root).expect("remove fan fixture");
+    }
+
+    #[test]
+    fn checked_fan_command_surfaces_partial_multi_path_write() {
+        let root = fan_test_dir("partial");
+        fs::create_dir_all(&root).expect("create fan fixture");
+        let writable = root.join("writable-duty");
+        let failing = root.join("failing-duty");
+        fs::write(&writable, "0").expect("seed writable duty");
+        fs::create_dir(&failing).expect("create non-writable duty path");
+        let fan = BeagleBoneFan {
+            duty_paths: vec![
+                PwmDutyPath {
+                    label: "writable-test",
+                    path: writable.to_string_lossy().into_owned(),
+                },
+                PwmDutyPath {
+                    label: "failing-test",
+                    path: failing.to_string_lossy().into_owned(),
+                },
+            ],
+            period_ns: BB_PWM_PERIOD_NS,
+            tach: disabled_test_tach(),
+        };
+
+        let error = fan
+            .set_speed_checked(30)
+            .expect_err("partial command must not mint a receipt");
+        assert!(error.to_string().contains("failing-test"));
+        assert_eq!(fs::read_to_string(writable).unwrap(), "30000");
+        fs::remove_dir_all(root).expect("remove fan fixture");
     }
 
     #[test]
@@ -1696,6 +2295,214 @@ mod tests {
             BB_TACH_ACCEPT_DEGRADED_ENV,
             "DCENT_AM3_BB_ACCEPT_DEGRADED_TACH"
         );
+    }
+
+    #[test]
+    fn first_low_tach_sample_establishes_baseline_without_synthetic_edge() {
+        let mut last_level = None;
+        let mut pulses = 0;
+
+        observe_tach_level(&mut last_level, 0, &mut pulses);
+        assert_eq!(pulses, 0, "first low sample is not an observed 1->0 edge");
+        assert_eq!(last_level, Some(0));
+        observe_tach_level(&mut last_level, 1, &mut pulses);
+        assert_eq!(pulses, 0);
+        observe_tach_level(&mut last_level, 0, &mut pulses);
+        assert_eq!(pulses, 1, "a subsequently observed 1->0 is one edge");
+
+        // A failed read resets the baseline in the sampler. Pin the recovery
+        // behavior here so a low sample after failure cannot invent a pulse.
+        last_level = None;
+        observe_tach_level(&mut last_level, 0, &mut pulses);
+        assert_eq!(pulses, 1);
+    }
+
+    #[test]
+    fn fan_tach_spawn_failure_never_publishes_availability() {
+        let value_paths = std::array::from_fn(|idx| Some(format!("unused-tach-{idx}")));
+        let tach = BeagleBoneFanTach::start_prepared_with_spawner(value_paths, |_task| {
+            Err(std::io::Error::other("injected sampler spawn failure"))
+        });
+
+        assert!(tach.worker.is_none(), "failed spawn must retain no handle");
+        assert!(!tach.is_available());
+        assert!(
+            tach.read_per_fan_observations()
+                .iter()
+                .all(|observation| !observation.available && observation.rpm == 0),
+            "spawn failure must be truthful unavailable/zero, never stale-ready"
+        );
+    }
+
+    #[test]
+    fn fan_tach_owner_stop_consumes_join_handle() {
+        let root = fan_test_dir("tach-stop-join");
+        fs::create_dir_all(&root).expect("create tach fixture");
+        let value = root.join("value");
+        fs::write(&value, "1").expect("seed tach level");
+        let value_path = value.to_string_lossy().into_owned();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_worker = Arc::clone(&finished);
+        let mut tach = BeagleBoneFanTach::start_prepared_with_spawner(
+            std::array::from_fn(|_| Some(value_path.clone())),
+            move |task| {
+                thread::Builder::new()
+                    .name("bb-fan-tach-owner-test".to_string())
+                    .spawn(move || {
+                        task();
+                        finished_worker.store(true, Ordering::Release);
+                    })
+            },
+        );
+
+        assert!(tach.worker.is_some());
+        assert!(tach.stop_and_join(), "sampler must join without panic");
+        assert!(tach.worker.is_none(), "join handle must be consumed");
+        assert!(finished.load(Ordering::Acquire));
+        assert!(!tach.is_available());
+        fs::remove_dir_all(root).expect("remove tach fixture");
+    }
+
+    #[test]
+    fn fan_tach_stop_timeout_is_bounded_and_fails_receipt() {
+        let root = fan_test_dir("tach-stop-timeout");
+        fs::create_dir_all(&root).expect("create tach fixture");
+        let value = root.join("value");
+        fs::write(&value, "1").expect("seed tach level");
+        let value_path = value.to_string_lossy().into_owned();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_worker = Arc::clone(&finished);
+        let mut tach = BeagleBoneFanTach::start_prepared_with_spawner(
+            std::array::from_fn(|_| Some(value_path.clone())),
+            move |task| {
+                thread::Builder::new()
+                    .name("bb-fan-tach-timeout-test".to_string())
+                    .spawn(move || {
+                        // Deterministically model a sysfs read that does not
+                        // react to the owner's stop request within its budget.
+                        thread::sleep(Duration::from_millis(80));
+                        task();
+                        finished_worker.store(true, Ordering::Release);
+                    })
+            },
+        );
+
+        let started = Instant::now();
+        assert!(
+            !tach.stop_and_join_with_timeout(Duration::from_millis(10)),
+            "a non-cooperative worker must not mint a stop receipt"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(60),
+            "bounded stop must return before the injected worker unblocks"
+        );
+        assert!(tach.worker.is_none());
+        assert!(!tach.is_available());
+        assert!(wait_for_condition(Duration::from_millis(200), || finished
+            .load(Ordering::Acquire)));
+        fs::remove_dir_all(root).expect("remove tach fixture");
+    }
+
+    #[test]
+    fn fan_tach_owner_drop_stops_and_joins_worker() {
+        let root = fan_test_dir("tach-drop-join");
+        fs::create_dir_all(&root).expect("create tach fixture");
+        let value = root.join("value");
+        fs::write(&value, "1").expect("seed tach level");
+        let value_path = value.to_string_lossy().into_owned();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_worker = Arc::clone(&finished);
+        {
+            let tach = BeagleBoneFanTach::start_prepared_with_spawner(
+                std::array::from_fn(|_| Some(value_path.clone())),
+                move |task| {
+                    thread::Builder::new()
+                        .name("bb-fan-tach-drop-test".to_string())
+                        .spawn(move || {
+                            task();
+                            finished_worker.store(true, Ordering::Release);
+                        })
+                },
+            );
+            assert!(tach.worker.is_some());
+        }
+
+        assert!(
+            finished.load(Ordering::Acquire),
+            "owner drop must not return before sampler exits"
+        );
+        fs::remove_dir_all(root).expect("remove tach fixture");
+    }
+
+    #[test]
+    fn positive_pwm_never_synthesizes_nonzero_beaglebone_rpm() {
+        let root = fan_test_dir("tach-no-synthesis");
+        fs::create_dir_all(&root).expect("create tach fixture");
+        let duty = root.join("duty");
+        let value = root.join("value");
+        fs::write(&duty, "30000").expect("seed PWM 30 duty");
+        fs::write(&value, "1").expect("seed tach high level");
+        let value_path = value.to_string_lossy().into_owned();
+        let fan = BeagleBoneFan {
+            duty_paths: vec![PwmDutyPath {
+                label: "tach-no-synthesis-test",
+                path: duty.to_string_lossy().into_owned(),
+            }],
+            period_ns: BB_PWM_PERIOD_NS,
+            tach: BeagleBoneFanTach::start_prepared(std::array::from_fn(|_| {
+                Some(value_path.clone())
+            })),
+        };
+
+        assert_eq!(fan.get_speed_pwm(), 30);
+        assert!(wait_for_condition(
+            FAN_TACH_WINDOW + Duration::from_millis(500),
+            || fan.tach_available()
+        ));
+        assert_eq!(fan.get_rpm(), 0, "zero pulses must remain zero RPM");
+        assert_eq!(fan.get_per_fan_rpm(), vec![(0, 0), (1, 0), (2, 0), (3, 0)]);
+        drop(fan);
+        fs::remove_dir_all(root).expect("remove tach fixture");
+    }
+
+    #[test]
+    fn partial_tach_availability_cannot_mask_missing_fans_in_aggregate() {
+        let root = fan_test_dir("tach-partial-unavailable");
+        fs::create_dir_all(&root).expect("create tach fixture");
+        let duty = root.join("duty");
+        let value = root.join("value");
+        fs::write(&duty, "30000").expect("seed PWM 30 duty");
+        fs::write(&value, "1").expect("seed one tach high level");
+        let fan = BeagleBoneFan {
+            duty_paths: vec![PwmDutyPath {
+                label: "tach-partial-test",
+                path: duty.to_string_lossy().into_owned(),
+            }],
+            period_ns: BB_PWM_PERIOD_NS,
+            tach: BeagleBoneFanTach::start_prepared([
+                Some(value.to_string_lossy().into_owned()),
+                None,
+                None,
+                None,
+            ]),
+        };
+
+        assert!(wait_for_condition(
+            FAN_TACH_WINDOW + Duration::from_millis(500),
+            || fan.tach.read_per_fan_observations()[0].available
+        ));
+        assert!(
+            !fan.tach_available(),
+            "aggregate tach readiness requires all four physical channels"
+        );
+        assert_eq!(
+            fan.get_rpm(),
+            0,
+            "one observable fan must not mask three unavailable fans"
+        );
+        assert_eq!(fan.get_per_fan_rpm(), vec![(0, 0), (1, 0), (2, 0), (3, 0)]);
+        drop(fan);
+        fs::remove_dir_all(root).expect("remove tach fixture");
     }
 
     #[test]
@@ -1840,23 +2647,22 @@ mod tests {
     // ─── W2B (2026-05-09): voltage controller subtype routing ───
 
     #[test]
-    fn classify_with_probe_routes_bb_subtype_to_dspic_when_probe_misses() {
+    fn classify_with_probe_fails_closed_when_bb_probe_misses() {
         // On a non-Linux test host the 0x20 ACK probe always returns false,
-        // so a `BBCtrl_BHB42XXX` subtype must downgrade to the existing
-        // dsPIC33EP path (the no-regression guarantee for s19jpro and
-        // friends). This is the same invariant the subtype module tests,
+        // so a `BBCtrl_BHB42XXX` subtype must become non-energizing rather
+        // than guessing dsPIC. This is the same invariant the subtype module tests,
         // re-asserted at the BB platform layer for defense in depth.
         // (`classify_with_probe` is already in scope via the module-level
         // `use super::subtype::{...}`.)
         #[cfg(not(target_os = "linux"))]
         assert_eq!(
             classify_with_probe(Some("BBCtrl_BHB42XXX"), BB_I2C_BUS),
-            VoltageControllerKind::Dspic33Ep,
+            VoltageControllerKind::NoPic,
         );
     }
 
     #[test]
-    fn classify_with_probe_routes_missing_subtype_to_dspic_and_unknown_to_nopic() {
+    fn classify_with_probe_routes_missing_and_unknown_subtype_to_nopic() {
         // Belt-and-braces: the existing test in `subtype.rs` covers the
         // None-vs-present-unknown split for the shared classifier. This re-runs
         // the contract through the BB-specific I2C bus number to prove the
@@ -1864,7 +2670,7 @@ mod tests {
         // (`classify_with_probe` is in scope via the module-level `use`.)
         assert_eq!(
             classify_with_probe(None, BB_I2C_BUS),
-            VoltageControllerKind::Dspic33Ep,
+            VoltageControllerKind::NoPic,
         );
         assert_eq!(
             classify_with_probe(Some("not-a-real-subtype"), BB_I2C_BUS),
@@ -2048,8 +2854,8 @@ fan_max_pwm = 30
         );
     }
 
-    /// A partial / stale TOML must still parse — missing pieces fall back
-    /// to the hardcoded `a lab unit` defaults (boot must not die on a stale file).
+    /// A partial TOML remains schema-parseable for tooling, while runtime
+    /// admission separately rejects it when `[platform]` identity is absent.
     #[test]
     fn parse_board_target_toml_tolerates_partial_config() {
         let bt = parse_board_target_toml("[gpio]\nboard_enable = 7\n")
@@ -2089,15 +2895,156 @@ fan_max_pwm = 30
     #[test]
     fn load_board_target_returns_none_when_file_absent() {
         // Use a nonce name guaranteed not to exist.
-        assert!(load_board_target("definitely-not-a-real-board-target-xyzzy").is_none());
+        assert!(
+            load_board_target("definitely-not-a-real-board-target-xyzzy")
+                .expect("missing board-target is not a parse/read failure")
+                .is_none()
+        );
     }
 
-    /// `read_active_board_target_name` falls back to the `a lab unit` default when
-    /// `/etc/dcentos/board_target` is absent (every non-Linux host, and any
-    /// LuxOS unit).
+    /// Host absence must remain honest; exact DT evidence is evaluated by the
+    /// separate identity admission helper.
     #[test]
-    fn read_active_board_target_name_defaults_to_am3_bb_s19jpro() {
-        assert_eq!(read_active_board_target_name(), "am3-bb-s19jpro");
+    fn read_active_board_target_name_does_not_invent_am3_bb() {
+        assert_eq!(
+            read_active_board_target_name().expect("host absence is valid"),
+            None
+        );
+    }
+
+    #[test]
+    fn exact_marker_or_exact_live_dt_authorizes_am3_bb() {
+        assert_eq!(
+            authorize_am3_bb_identity(Some("am3-bb-s19jpro"), b"", b"").unwrap(),
+            Am3BbIdentityEvidence::BoardTargetMarker
+        );
+        assert_eq!(
+            authorize_am3_bb_identity(
+                None,
+                b"ti,am335x-bone-black\0ti,am335x-bone\0ti,am33xx\0",
+                b"BeagleBone_Black_v2.1 on S19J_IO_BOARD_V2_0\0",
+            )
+            .unwrap(),
+            Am3BbIdentityEvidence::ExactDeviceTree
+        );
+    }
+
+    #[test]
+    fn identity_substrings_and_contradictory_markers_fail_closed() {
+        assert!(authorize_am3_bb_identity(
+            None,
+            b"vendor,am335x-compatible-ish\0",
+            b"prefix S19J_IO_BOARD_V2_0 suffix\0",
+        )
+        .is_err());
+        assert!(authorize_am3_bb_identity(
+            Some("am3-bb-s19jpro-typo"),
+            b"ti,am335x-bone-black\0",
+            b"BeagleBone_Black_v2.1 on S19J_IO_BOARD_V2_0\0",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn am3_bb_dspic_endpoint_binds_exact_uart_eeprom_and_existing_fw_reply() {
+        let eeproms = [
+            Some(vec![0x04, 0x11, 0x42, 0x60, 0x01]),
+            Some(vec![0x04, 0x11, 0x42, 0x60, 0x02]),
+            Some(vec![0x04, 0x11, 0x42, 0x60, 0x03]),
+        ];
+        let endpoint = bind_am3_bb_dspic_endpoint_from_observations(
+            Some(DEFAULT_BOARD_TARGET_V2_0),
+            b"",
+            b"",
+            "/dev/ttyS2",
+            0x21,
+            &eeproms,
+            &[0x05, 0x17, 0x89, 0x00, 0x00],
+        )
+        .unwrap();
+        assert_eq!(endpoint.kind(), VoltageControllerKind::Dspic33Ep);
+        assert_eq!(endpoint.bus(), I2C_BUS_EEPROM_V2_0);
+        assert_eq!(endpoint.address(), 0x21);
+        assert_eq!(endpoint.observed_firmware(), Some(0x89));
+    }
+
+    #[test]
+    fn am3_bb_dspic_endpoint_refuses_unbound_or_widened_observations() {
+        let valid = [
+            Some(vec![0x04, 0x11, 0x42]),
+            Some(vec![0x04, 0x11, 0x42]),
+            Some(vec![0x04, 0x11, 0x42]),
+        ];
+        let bind = |uart: &str, address: u8, eeproms: &[Option<Vec<u8>>], reply: &[u8]| {
+            bind_am3_bb_dspic_endpoint_from_observations(
+                Some(DEFAULT_BOARD_TARGET_V2_0),
+                b"",
+                b"",
+                uart,
+                address,
+                eeproms,
+                reply,
+            )
+        };
+
+        assert!(bind("/dev/ttyS4", 0x23, &valid, &[0x89]).is_err());
+        assert!(bind("/dev/ttyS3", 0x22, &valid, &[0x89]).is_err());
+        assert!(bind("/dev/ttyS2", 0x21, &[None, None, None], &[0x89]).is_err());
+        assert!(bind(
+            "/dev/ttyS2",
+            0x21,
+            &[Some(vec![0x04, 0x11]), Some(vec![0x05, 0x11]), None],
+            &[0x89],
+        )
+        .is_err());
+        assert!(bind("/dev/ttyS2", 0x21, &valid, &[0x86]).is_err());
+        assert!(bind("/dev/ttyS2", 0x21, &valid, &[0x17, 0x89, 0x00]).is_err());
+        assert!(bind("/dev/ttyS2", 0x21, &valid, &[0x44, 0x17, 0x89]).is_err());
+    }
+
+    #[test]
+    fn runtime_target_validation_rejects_default_minted_partial_toml() {
+        let partial = parse_board_target_toml("[gpio]\nboard_enable = 7\n").unwrap();
+        assert!(validate_supported_board_target(DEFAULT_BOARD_TARGET_V2_0, &partial).is_err());
+
+        let mut declared = parse_board_target_toml(
+            r#"
+[platform]
+board_target = "am3-bb-s19jpro"
+soc = "am335x"
+cpu = "cortex-a8"
+io_board = "S19J_IO_BOARD_V2_0"
+voltage_controller = "dspic33ep-fw89"
+"#,
+        )
+        .unwrap();
+        validate_supported_board_target(DEFAULT_BOARD_TARGET_V2_0, &declared)
+            .expect("exact supported identity may use schema defaults");
+        let mut contradictory = declared.clone();
+        contradictory
+            .platform
+            .as_mut()
+            .expect("test target has platform")
+            .io_board = Some("S19J_IO_BOARD_V2_0-typo".into());
+        assert!(
+            validate_supported_board_target(DEFAULT_BOARD_TARGET_V2_0, &contradictory).is_err()
+        );
+        let mut active_low = declared.clone();
+        active_low.gpio.board_enable_active = "low".into();
+        let active_low_error =
+            validate_supported_board_target(DEFAULT_BOARD_TARGET_V2_0, &active_low)
+                .expect_err("active-low board-enable must fail before platform construction")
+                .to_string();
+        assert!(active_low_error.contains("active-low output setup is refused"));
+        let mut invalid_polarity = declared.clone();
+        invalid_polarity.gpio.board_enable_active = "lo".into();
+        let invalid_polarity_error =
+            validate_supported_board_target(DEFAULT_BOARD_TARGET_V2_0, &invalid_polarity)
+                .expect_err("malformed board-enable polarity must fail closed")
+                .to_string();
+        assert!(invalid_polarity_error.contains("must be exactly \"high\" or \"low\""));
+        declared.uart.chain_count = 4;
+        assert!(validate_supported_board_target(DEFAULT_BOARD_TARGET_V2_0, &declared).is_err());
     }
 
     /// `with_config_and_board_target` plumbs the `a lab unit` accessors through to

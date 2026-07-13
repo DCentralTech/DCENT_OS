@@ -75,10 +75,13 @@ bitaxe-touch     = ["bitaxe-gamma", "bap"]
 bitaxe-gt-touch  = ["bitaxe-gt",    "bap"]
 
 # ── DCENT_axe family (D-Central BM1397 SKUs) ──
-# Single 1x mirrors bitaxe-max (DS4432U + EMC2101); Quad/Hex mirror the Hex
-# boards (TPS546 + EMC2302 dual fan). Every DCENT_axe board ships the BAP
-# accessory header populated, so each pulls in `bap` like the Touch variants.
-dcent-axe-bm1397      = ["pins-bitaxe", "display-ssd1306", "dcentaxe-hal/power-ds4432u", "dcentaxe-hal/fan-emc2101", "bap"]
+# All three carry a TPS546D24A PMBus VRM (NO DS4432U, NO INA260 — verified from
+# the dcent-axe-BM1397 schematic netlist, PREFAB R-10 / FULL_PREFAB_REVIEW
+# 2026-07-11 M-6): Single pairs EMC2101, Quad/Hex pair EMC2302 dual fan. Every
+# DCENT_axe board ships the BAP accessory header populated, so each pulls in
+# `bap` like the Touch variants. (The power-*/fan-* HAL features are currently
+# inert — zero #[cfg] consumers — but must still tell the truth about the board.)
+dcent-axe-bm1397      = ["pins-bitaxe", "display-ssd1306", "dcentaxe-hal/power-tps546",  "dcentaxe-hal/fan-emc2101", "bap"]
 dcent-axe-quad-bm1397 = ["pins-bitaxe", "display-ssd1306", "dcentaxe-hal/power-tps546",  "dcentaxe-hal/fan-emc2302", "bap"]
 dcent-axe-hex-bm1397  = ["pins-bitaxe", "display-ssd1306", "dcentaxe-hal/power-tps546",  "dcentaxe-hal/fan-emc2302", "bap"]
 
@@ -93,6 +96,16 @@ stratum-v2 = ["dcentaxe-stratum-v2"]
 # "LoRa" surface would be a lying UI (project  "no lying UI"). Verify
 # against the `updateFitsSlot` OTA gate before shipping on a public board.
 lora = ["dep:dcentaxe-lora", "dcentaxe-hal/pins-lora"]
+
+# ── Meshtastic interop (opt-in ON TOP of `lora`; DEFAULT-OFF) ──
+# Lets a board run its SX1262 as a genuine Meshtastic Router (config-selected
+# radio mode). Pulls the AES-CTR channel-crypto + protobuf stack in
+# `dcentaxe-lora` — so a plain `$DCM`-only LoRa SKU pays ZERO AES bytes unless it
+# opts in (RAM/OTA budget rule). The Meshtastic path in `lora_task` is
+# `#[cfg(feature = "meshtastic")]`; runtime is further gated by the persisted
+# `MeshConfig` mesh mode (default-OFF, dormant until provisioned — same posture
+# as the `$DCM` owner-key gate). Verify against the `updateFitsSlot` OTA gate.
+meshtastic = ["lora", "dcentaxe-lora/meshtastic-interop"]
 
 # ── Research-only ASIC drivers (orthogonal — UNTESTED, default OFF) ──
 # KF1950 (WhatsMiner K-series). Forwards to dcentaxe-asic + dcentaxe-mining.

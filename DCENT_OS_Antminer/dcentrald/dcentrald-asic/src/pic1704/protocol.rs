@@ -115,9 +115,9 @@ pub const CTRL_DC_DC_OFF: u8 = 0x00;
 pub const CTRL_DC_DC_ON: u8 = 0x01;
 /// `REG_CONTROL`: heartbeat tick (rate-limited to 2 s).
 pub const CTRL_HEARTBEAT: u8 = 0x02;
-/// `REG_CONTROL`: hardware RESET. **Destructive** — gated behind the
-/// `recovery-tool` Cargo feature so the production daemon cannot link it.
-///.
+/// `REG_CONTROL`: hardware RESET. **Destructive protocol constant retained as
+/// data only.** Mutating helpers are research/test-only behind `recovery-tool`,
+/// which no shipped package enables..
 pub const CTRL_RESET: u8 = 0x80;
 
 // ===========================================================================

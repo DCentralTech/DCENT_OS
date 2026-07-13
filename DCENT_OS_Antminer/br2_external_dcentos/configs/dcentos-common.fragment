@@ -65,14 +65,15 @@ BR2_PACKAGE_DROPBEAR=y
 
 # =============================================================================
 # Hardware diagnostic tools — same set on every product.
-# i2c-tools  : PIC voltage controllers, TMP75 sensors, EEPROM dumps, PSU.
+# Raw I2C command utilities are excluded; dcentrald owns controller buses.
 # mtd-utils  : NAND flash partition read/write (nandwrite, ubiformat, etc.).
 # ethtool    : network diagnostics.
 # strace     : kernel/syscall tracing for FPGA / serial / I2C debugging.
 # util-linux : standard system utilities (lsblk, dmesg, etc.).
-# devmem is a BusyBox built-in (CONFIG_DEVMEM=y in busybox.config).
+# Zynq devmem remains a boot-lifecycle dependency until typed early-safety
+# helpers replace it; normal profiles, MCP, and REST do not invoke it.
 # =============================================================================
-BR2_PACKAGE_I2C_TOOLS=y
+# BR2_PACKAGE_I2C_TOOLS is not set
 BR2_PACKAGE_MTD=y
 BR2_PACKAGE_MTD_UBIFS_UTILS=y
 BR2_PACKAGE_ETHTOOL=y

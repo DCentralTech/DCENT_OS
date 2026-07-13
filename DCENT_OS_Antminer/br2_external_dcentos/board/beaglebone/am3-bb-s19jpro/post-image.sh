@@ -61,10 +61,12 @@ DCENT_OS am3-bb-s19jpro SD-card payload
 Status: native AM3 BB mining SD-card payload.
 
 This directory is intentionally not a NAND flasher. Add verified AM335x boot
-artifacts (MLO, u-boot.img, uImage, am335x-s19jpro.dtb or stock Bitmain DTB)
-from a lab-approved stock restore bundle, then write a raw SD image outside
-this post-image hook. Do not finalize AM335x media with Windows format/copy;
-MLO must remain the first real FAT file entry.
+artifacts (MLO, u-boot.img, uImage, and a carrier-aware DTB) from a lab-approved
+stock restore bundle, then write a raw SD image outside this post-image hook.
+The DTB must contain an S19J_IO_BOARD or am335x-boneblack-btm identity marker;
+the checked-in am335x-s19jpro.dts is legacy reference material and is not a
+build input. Do not finalize AM335x media with Windows format/copy; MLO must
+remain the first real FAT file entry.
 
 Boot media must use ramdisk.gz, the U-Boot legacy ramdisk wrapper around the
 raw CPIO. uramdisk.image.gz is kept for inspection and recovery only.

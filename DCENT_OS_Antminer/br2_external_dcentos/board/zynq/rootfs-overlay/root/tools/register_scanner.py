@@ -22,6 +22,11 @@ import time
 import json
 import collections
 
+from dcentos_asic_wire import (
+    crc5_bm13xx_command,
+    require_captured_bm1387_protocol_profile,
+)
+
 try:
     import fcntl
     import termios
@@ -101,38 +106,6 @@ PLL_FREQ_MAP = {
 # CRC5 for BM1387
 # ============================================================================
 
-def crc5_bm1387(data, bit_length=None):
-    """
-    Calculate CRC5 for BM1387 protocol.
-    Polynomial: 0x05 (x^5 + x^2 + 1)
-    Init: 0x1F
-    Operates bit-by-bit over the input data bytes.
-    If bit_length is None, process all bits in data.
-    """
-    crc = 0x1F  # 5-bit init = all ones
-    poly = 0x05
-
-    if bit_length is None:
-        bit_length = len(data) * 8
-
-    bit_index = 0
-    for byte in data:
-        for i in range(7, -1, -1):
-            if bit_index >= bit_length:
-                break
-            bit = (byte >> i) & 1
-            top_bit = (crc >> 4) & 1
-            crc = ((crc << 1) | bit) & 0x3F  # 6 bits to capture overflow
-            if top_bit ^ ((crc >> 5) & 1):
-                crc ^= poly
-            crc &= 0x1F
-            bit_index += 1
-            if bit_index >= bit_length:
-                break
-
-    return crc & 0x1F
-
-
 def build_read_register_cmd(chip_addr, reg_addr):
     """
     Build a BM1387 read register command.
@@ -143,7 +116,7 @@ def build_read_register_cmd(chip_addr, reg_addr):
     """
     # Command frame: TYPE(8) ADDR(8) REG(8) = 24 data bits, then CRC5
     cmd_data = bytes([CMD_READ_REGISTER, chip_addr, reg_addr])
-    crc = crc5_bm1387(cmd_data)
+    crc = crc5_bm13xx_command(cmd_data)
     # The 4th byte: upper 3 bits = length code (0 for short cmd), lower 5 bits = CRC5
     fourth_byte = (crc & 0x1F)
     return bytes([CMD_READ_REGISTER, chip_addr, reg_addr, fourth_byte])
@@ -153,22 +126,16 @@ def parse_read_response(response):
     """
     Parse a 7-byte BM1387 read register response.
     Format: [reg_addr, D3, D2, D1, D0, CRC_hi, CRC_lo]
-    Returns (reg_addr, value_u32, crc_ok) or None if invalid.
+    Returns (reg_addr, value_u32, integrity, raw_bytes) or None if invalid.
     """
-    if len(response) < READ_RESPONSE_LEN:
+    if len(response) != READ_RESPONSE_LEN:
         return None
 
     reg_addr = response[0]
     # Data is big-endian: MSB first
     value = (response[1] << 24) | (response[2] << 16) | (response[3] << 8) | response[4]
 
-    # Verify CRC5 over the response
-    # CRC is over first 5 bytes (40 bits)
-    resp_crc = response[5] & 0x1F  # CRC5 is in last bytes
-    calc_crc = crc5_bm1387(response[:5])
-    crc_ok = (calc_crc == resp_crc)
-
-    return (reg_addr, value, crc_ok)
+    return (reg_addr, value, "unverified", bytes(response[:READ_RESPONSE_LEN]))
 
 
 def decode_register(reg_addr, value):
@@ -249,6 +216,7 @@ class UARTInterface:
         self.timeout = timeout
         self.fd = None
         self.fobj = None
+        self.last_response_observation = None
 
     def open(self):
         """Open UART device and configure for BM1387 communication."""
@@ -291,6 +259,7 @@ class UARTInterface:
 
     def write(self, data):
         """Write raw bytes to UART."""
+        require_captured_bm1387_protocol_profile()
         if self.fobj:
             self.fobj.write(data)
             self.fobj.flush()
@@ -332,7 +301,7 @@ class UARTInterface:
     def read_register(self, chip_addr, reg_addr, retries=2):
         """
         Send a read register command and parse the response.
-        Returns (reg_addr, value_u32, crc_ok) or None.
+        Returns (reg_addr, value_u32, integrity, raw_bytes) or None.
         """
         cmd = build_read_register_cmd(chip_addr, reg_addr)
 
@@ -346,7 +315,16 @@ class UARTInterface:
             if len(resp) == READ_RESPONSE_LEN:
                 parsed = parse_read_response(resp)
                 if parsed is not None:
-                    return parsed
+                    self.last_response_observation = {
+                        "requested_register": reg_addr,
+                        "returned_register": parsed[0],
+                        "register_matches": parsed[0] == reg_addr,
+                        "response_integrity": parsed[2],
+                        "raw_response_hex": parsed[3].hex(),
+                        "raw_response_bytes": list(parsed[3]),
+                    }
+                    if parsed[0] == reg_addr:
+                        return parsed
 
             if attempt < retries:
                 time.sleep(0.02)
@@ -402,12 +380,7 @@ class MockUART:
     def read_register(self, chip_addr, reg_addr, retries=2):
         """Simulate register read."""
         value = self.chip_registers.get((chip_addr, reg_addr), 0xDEADBEEF)
-        crc = crc5_bm1387(bytes([reg_addr,
-                                  (value >> 24) & 0xFF,
-                                  (value >> 16) & 0xFF,
-                                  (value >> 8) & 0xFF,
-                                  value & 0xFF]))
-        return (reg_addr, value, True)
+        return (reg_addr, value, "simulated", b"")
 
     def queue_response(self, data):
         """Queue a raw response for the next read."""
@@ -417,6 +390,48 @@ class MockUART:
 # ============================================================================
 # Scanner Logic
 # ============================================================================
+
+def build_scan_entry(chip_addr, reg, result):
+    """Build one scan result without interpreting a mismatched register reply."""
+    entry = {
+        "register": reg,
+        "register_hex": "0x{:02X}".format(reg),
+        "chip_addr": chip_addr,
+        "responded": result is not None,
+        "returned_register": result[0] if result else None,
+        "value": None,
+        "value_hex": None,
+        "crc_ok": None,
+        "response_integrity": result[2] if result else None,
+        "raw_response_hex": result[3].hex() if result else None,
+        "raw_response_bytes": list(result[3]) if result else None,
+        "verified": False,
+        "evidence_status": "no_response",
+        "known": reg in KNOWN_REGISTERS,
+    }
+
+    if result is not None and result[0] != reg:
+        entry["evidence_status"] = "register_mismatch"
+    elif result is not None:
+        value = result[1]
+        entry["value"] = value
+        entry["value_hex"] = "0x{:08X}".format(value)
+        entry["evidence_status"] = "structural_candidate"
+        decoded = decode_register(reg, value)
+        entry["name"] = decoded["name"]
+        entry["description"] = decoded["description"]
+        entry["decoded"] = decoded["decoded"]
+    else:
+        entry["name"] = KNOWN_REGISTERS.get(reg, ("Unknown", ""))[0]
+        entry["description"] = ""
+        entry["decoded"] = ""
+
+    if "name" not in entry:
+        entry["name"] = KNOWN_REGISTERS.get(reg, ("Unknown", ""))[0]
+        entry["description"] = ""
+        entry["decoded"] = ""
+    return entry
+
 
 def scan_registers(uart, chip_addr, reg_start=0x00, reg_end=0xFF, reg_step=4,
                    verbose=False, progress=True):
@@ -437,37 +452,20 @@ def scan_registers(uart, chip_addr, reg_start=0x00, reg_end=0xFF, reg_step=4,
 
         result = uart.read_register(chip_addr, reg)
 
-        entry = {
-            "register": reg,
-            "register_hex": "0x{:02X}".format(reg),
-            "chip_addr": chip_addr,
-            "responded": result is not None,
-            "value": None,
-            "value_hex": None,
-            "crc_ok": None,
-            "known": reg in KNOWN_REGISTERS,
-        }
+        entry = build_scan_entry(chip_addr, reg, result)
 
-        if result is not None:
-            reg_returned, value, crc_ok = result
-            entry["value"] = value
-            entry["value_hex"] = "0x{:08X}".format(value)
-            entry["crc_ok"] = crc_ok
-
-            decoded = decode_register(reg, value)
-            entry["name"] = decoded["name"]
-            entry["description"] = decoded["description"]
-            entry["decoded"] = decoded["decoded"]
-
+        if result is not None and result[0] == reg:
+            value = result[1]
+            integrity = result[2]
             if verbose:
-                status = "OK" if crc_ok else "CRC_ERR"
+                status = integrity.upper()
                 known_tag = " *" if entry["known"] else ""
                 sys.stderr.write("  [0x{:02X}] = 0x{:08X} [{}]{} {}\n".format(
-                    reg, value, status, known_tag, decoded.get("decoded", "")))
-        else:
-            entry["name"] = KNOWN_REGISTERS.get(reg, ("Unknown", ""))[0] if reg in KNOWN_REGISTERS else ""
-            entry["description"] = ""
-            entry["decoded"] = ""
+                    reg, value, status, known_tag, entry.get("decoded", "")))
+        elif result is not None and verbose:
+            sys.stderr.write(
+                "  [0x{:02X}] returned register 0x{:02X}; value not interpreted\n".format(
+                    reg, result[0]))
 
         results.append(entry)
 
@@ -506,7 +504,7 @@ def format_table(results, show_empty=False):
         name = entry.get("name", "")[:20]
         if entry["responded"]:
             val_str = entry["value_hex"]
-            crc_str = "OK" if entry["crc_ok"] else "ERR"
+            crc_str = (entry.get("response_integrity") or "unknown").upper()
             decoded = entry.get("decoded", "")[:40]
         else:
             val_str = "---"
@@ -524,17 +522,20 @@ def format_summary(results):
     """Generate a summary of the scan."""
     responded = sum(1 for r in results if r["responded"])
     total = len(results)
-    crc_errors = sum(1 for r in results if r["responded"] and not r["crc_ok"])
+    integrity_unverified = sum(
+        1 for r in results
+        if r["responded"] and r.get("response_integrity") == "unverified"
+    )
     known_found = sum(1 for r in results if r["responded"] and r["known"])
     unknown_found = sum(1 for r in results if r["responded"] and not r["known"])
 
     lines = [
         "--- Scan Summary ---",
         "Total registers probed: {}".format(total),
-        "Registers that responded: {}".format(responded),
+        "Structural register-response candidates: {}".format(responded),
         "Known registers found: {}".format(known_found),
         "Unknown registers found: {}".format(unknown_found),
-        "CRC errors: {}".format(crc_errors),
+        "Responses with unverified integrity: {}".format(integrity_unverified),
     ]
     return "\n".join(lines)
 
@@ -560,22 +561,22 @@ def run_self_tests():
         return condition
 
     # --- Test 1: CRC5 known vectors ---
-    # BM1387 CRC5 over [0x54, 0x00, 0x00] should produce a known CRC
-    crc1 = crc5_bm1387(bytes([0x54, 0x00, 0x00]))
-    test("CRC5: read reg cmd [0x54,0x00,0x00]",
-         0 <= crc1 <= 0x1F,
+    # Captured BM1397/S21 command vector: body 52 05 00 00 -> trailer 0A.
+    crc1 = crc5_bm13xx_command(bytes([0x52, 0x05, 0x00, 0x00]))
+    test("CRC5: captured get-address command",
+         crc1 == 0x0A,
          "CRC5=0x{:02X}".format(crc1))
 
     # --- Test 2: CRC5 determinism ---
-    crc2a = crc5_bm1387(bytes([0x54, 0x04, 0x0C]))
-    crc2b = crc5_bm1387(bytes([0x54, 0x04, 0x0C]))
+    crc2a = crc5_bm13xx_command(bytes([0x54, 0x04, 0x0C]))
+    crc2b = crc5_bm13xx_command(bytes([0x54, 0x04, 0x0C]))
     test("CRC5: deterministic output",
          crc2a == crc2b,
          "crc_a=0x{:02X} crc_b=0x{:02X}".format(crc2a, crc2b))
 
     # --- Test 3: CRC5 different inputs produce different outputs ---
-    crc3a = crc5_bm1387(bytes([0x54, 0x00, 0x00]))
-    crc3b = crc5_bm1387(bytes([0x54, 0x00, 0x04]))
+    crc3a = crc5_bm13xx_command(bytes([0x54, 0x00, 0x00]))
+    crc3b = crc5_bm13xx_command(bytes([0x54, 0x00, 0x04]))
     test("CRC5: different input -> different CRC",
          crc3a != crc3b,
          "crc_00=0x{:02X} crc_04=0x{:02X}".format(crc3a, crc3b))
@@ -583,7 +584,7 @@ def run_self_tests():
     # --- Test 4: CRC5 range ---
     all_in_range = True
     for i in range(256):
-        c = crc5_bm1387(bytes([0x54, 0x00, i]))
+        c = crc5_bm13xx_command(bytes([0x54, 0x00, i]))
         if c < 0 or c > 0x1F:
             all_in_range = False
             break
@@ -618,17 +619,17 @@ def run_self_tests():
          "crc_byte=0x{:02X}".format(cmd7[3]))
 
     # --- Test 10: Parse response - valid ---
-    # Build a synthetic valid response
+    # Build a synthetic structural response. Its integrity stays unverified.
     reg_a = 0x0C
     val = 0x00680261  # PLL 600MHz
     resp_data = bytes([reg_a,
                        (val >> 24) & 0xFF, (val >> 16) & 0xFF,
                        (val >> 8) & 0xFF, val & 0xFF])
-    resp_crc = crc5_bm1387(resp_data)
-    full_resp = resp_data + bytes([resp_crc, 0x00])
+    full_resp = resp_data + bytes([0xA5, 0x5A])
     parsed = parse_read_response(full_resp)
-    test("Parse response: valid 7-byte response",
-         parsed is not None and parsed[0] == 0x0C and parsed[1] == 0x00680261,
+    test("Parse response: structural response remains unverified",
+         parsed is not None and parsed[0] == 0x0C and parsed[1] == 0x00680261
+         and parsed[2] == "unverified" and parsed[3] == full_resp,
          "parsed={}".format(parsed))
 
     # --- Test 11: Parse response - too short ---
@@ -685,7 +686,7 @@ def run_self_tests():
     # --- Test 19: Format summary ---
     summary = format_summary(results17)
     test("Format: summary contains counts",
-         "responded" in summary.lower() or "Registers" in summary,
+         "structural register-response candidates" in summary.lower(),
          "summary_len={}".format(len(summary)))
 
     # --- Test 20: Known register lookup ---
@@ -704,13 +705,13 @@ def run_self_tests():
          cmds_ok)
 
     # --- Test 22: CRC5 with all-zero input ---
-    crc_z = crc5_bm1387(bytes([0x00, 0x00, 0x00]))
+    crc_z = crc5_bm13xx_command(bytes([0x00, 0x00, 0x00]))
     test("CRC5: all-zero input produces valid CRC",
          0 <= crc_z <= 0x1F,
          "crc=0x{:02X}".format(crc_z))
 
     # --- Test 23: CRC5 with all-FF input ---
-    crc_f = crc5_bm1387(bytes([0xFF, 0xFF, 0xFF]))
+    crc_f = crc5_bm13xx_command(bytes([0xFF, 0xFF, 0xFF]))
     test("CRC5: all-0xFF input produces valid CRC",
          0 <= crc_f <= 0x1F,
          "crc=0x{:02X}".format(crc_f))
@@ -872,22 +873,7 @@ def main():
                     chip_results = []
                     for reg in reg_list:
                         result = uart.read_register(ca, reg)
-                        entry = {
-                            "register": reg,
-                            "register_hex": "0x{:02X}".format(reg),
-                            "chip_addr": ca,
-                            "responded": result is not None,
-                            "value": result[1] if result else None,
-                            "value_hex": "0x{:08X}".format(result[1]) if result else None,
-                            "crc_ok": result[2] if result else None,
-                            "known": True,
-                        }
-                        if result:
-                            dec = decode_register(reg, result[1])
-                            entry.update({"name": dec["name"], "description": dec["description"],
-                                          "decoded": dec["decoded"]})
-                        else:
-                            entry.update({"name": KNOWN_REGISTERS[reg][0], "description": "", "decoded": ""})
+                        entry = build_scan_entry(ca, reg, result)
                         chip_results.append(entry)
                     all_results[ca] = chip_results
             else:
@@ -917,22 +903,7 @@ def main():
                 results = []
                 for reg in reg_list:
                     result = uart.read_register(chip_addr, reg)
-                    entry = {
-                        "register": reg,
-                        "register_hex": "0x{:02X}".format(reg),
-                        "chip_addr": chip_addr,
-                        "responded": result is not None,
-                        "value": result[1] if result else None,
-                        "value_hex": "0x{:08X}".format(result[1]) if result else None,
-                        "crc_ok": result[2] if result else None,
-                        "known": True,
-                    }
-                    if result:
-                        dec = decode_register(reg, result[1])
-                        entry.update({"name": dec["name"], "description": dec["description"],
-                                      "decoded": dec["decoded"]})
-                    else:
-                        entry.update({"name": KNOWN_REGISTERS[reg][0], "description": "", "decoded": ""})
+                    entry = build_scan_entry(chip_addr, reg, result)
                     results.append(entry)
             else:
                 results = scan_registers(uart, chip_addr, reg_start, reg_end, reg_step,

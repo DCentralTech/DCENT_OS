@@ -317,6 +317,20 @@ impl BitAxeModel {
                 | Self::DcentAxeHexBm1397
         )
     }
+
+    /// Status-LED hardware kind (M-7, FULL_PREFAB_REVIEW_2026-07-11).
+    ///
+    /// `Sk6812` ONLY for the DCENT_axe BM1397 single board, whose 2026-07-11
+    /// netlist confirms D1 = SK6812MINI-E on GPIO4. Quad/Hex stay `PlainGpio`
+    /// until their own netlists exist (no speculative claims). NOTE: this is
+    /// honest metadata, not a shipped driver — see [`StatusLedKind`] and
+    /// `docs/STATUS_LED_SK6812_GAP.md`.
+    pub fn status_led_kind(&self) -> StatusLedKind {
+        match self {
+            Self::DcentAxeBm1397 => StatusLedKind::Sk6812,
+            _ => StatusLedKind::PlainGpio,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -361,6 +375,26 @@ pub enum AccessoryMode {
     None,
     BapTouch,
     W5500Lan,
+}
+
+/// Status-LED hardware kind (M-7, FULL_PREFAB_REVIEW_2026-07-11).
+///
+/// Most boards wire a plain push-pull LED to the status-LED GPIO. The
+/// DCENT_axe BM1397 single board instead places an SK6812MINI-E addressable
+/// one-wire LED (D1) on GPIO4 — driving it push-pull (today's `GpioController`
+/// path) never lights it, because SK6812 needs the RMT-timed one-wire
+/// protocol. This enum is HONEST METADATA ONLY: the RMT driver is NOT shipped
+/// (it is esp-idf/xtensa-only and cannot be host-verified — see
+/// `docs/STATUS_LED_SK6812_GAP.md`), and `main.rs` still drives GPIO4
+/// push-pull on every board (electrically harmless on an SK6812 DIN pin; the
+/// LED simply stays dark).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StatusLedKind {
+    /// Plain push-pull GPIO LED (every stock BitAxe / Nerd board).
+    PlainGpio,
+    /// SK6812MINI-E addressable one-wire LED — needs an RMT driver the
+    /// firmware does not ship yet (documented gap, LED stays dark).
+    Sk6812,
 }
 
 /// Retained proof level for a board-version row.
@@ -430,7 +464,7 @@ pub struct BoardVersionProfile {
 }
 
 impl BoardVersionProfile {
-    pub const ALL: [BoardVersionProfile; 26] = [
+    pub const ALL: [BoardVersionProfile; 29] = [
         Self {
             board_version: "2.2",
             device_model: "max",
@@ -834,6 +868,13 @@ impl BoardVersionProfile {
         // netlist (PREFAB_DESIGN_REVIEW_2026-07-08 R-10). The old Ds4432u +
         // has_ina260 row made `normalize_power_pins` treat GPIO10 as active-LOW,
         // which inverted fail-closed "power OFF" into driving the VRM rail ON.
+        //
+        // LEGACY ALIAS — the canonical board_version is `9010` (see the 9###
+        // registry rows below; BOARD_VERSION_REGISTRY.md §5 migration
+        // 900→9010 / 910→9040 / 920→9060). These 3-digit rows are kept so any
+        // NVS blob written before the migration still resolves; no fabricated
+        // board reports them (Phase 0), and `default_for_model` now points at
+        // the canonical 9### rows.
         Self {
             board_version: "900",
             device_model: "dcentaxe_bm1397",
@@ -874,6 +915,71 @@ impl BoardVersionProfile {
         // voltage domains (mirrors the Hex Ultra / Hex Supra topology).
         Self {
             board_version: "920",
+            device_model: "dcentaxe_hex_bm1397",
+            asic_model: "BM1397",
+            model: BitAxeModel::DcentAxeHexBm1397,
+            live_proof: LiveProof::Host,
+            fan_controller: FanControllerKind::Emc2302,
+            temp_sensor: TempSensorKind::Tmp1075,
+            power_controller: PowerControllerKind::Tps546,
+            has_ina260: false,
+            emc_internal_temp: false,
+            emc_ideality_factor: 0x12,
+            emc_beta_compensation: 0x00,
+            temp_offset_c: 10,
+            power_consumption_target_w: 72,
+            temp_flip: false,
+        },
+        // ── DCENT_axe `9###` registry rows (CANONICAL — BOARD_VERSION_REGISTRY.md §5) ──
+        // Wired live 2026-07-11 (operator-authorized, FULL_PREFAB_REVIEW_2026-07-11
+        // H-3): the dcent-axe-BM1397 hardware self-describes `board_version=9010`
+        // in its board_config.json, so provisioning must resolve it here instead
+        // of falling back to the model default / "custom board" lab bypass.
+        // Encoding is `9 C F R` (9=DCENT_axe namespace, C=0 BM1397, F=ASIC count,
+        // R=rev 0). Electrical profiles are byte-identical to the legacy
+        // 900/910/920 rows above (same boards, renumbered — clean Phase-0 rename).
+        // Keep these rows byte-parallel with the toolbox mirror
+        // `dcent-toolbox/.../core/board_catalog.py` `ESP_BOARD_VERSION_PROFILES`.
+        //
+        // 9010 — DCENT_axe BM1397 Single (canonical for legacy 900).
+        Self {
+            board_version: "9010",
+            device_model: "dcentaxe_bm1397",
+            asic_model: "BM1397",
+            model: BitAxeModel::DcentAxeBm1397,
+            live_proof: LiveProof::Host,
+            fan_controller: FanControllerKind::Emc2101,
+            temp_sensor: TempSensorKind::Emc2101,
+            power_controller: PowerControllerKind::Tps546,
+            has_ina260: false,
+            emc_internal_temp: false,
+            emc_ideality_factor: 0x12,
+            emc_beta_compensation: 0x00,
+            temp_offset_c: 0,
+            power_consumption_target_w: 12,
+            temp_flip: false,
+        },
+        // 9040 — DCENT_axe Quad BM1397 (canonical for legacy 910).
+        Self {
+            board_version: "9040",
+            device_model: "dcentaxe_quad_bm1397",
+            asic_model: "BM1397",
+            model: BitAxeModel::DcentAxeQuadBm1397,
+            live_proof: LiveProof::Host,
+            fan_controller: FanControllerKind::Emc2302,
+            temp_sensor: TempSensorKind::Tmp1075,
+            power_controller: PowerControllerKind::Tps546,
+            has_ina260: false,
+            emc_internal_temp: false,
+            emc_ideality_factor: 0x12,
+            emc_beta_compensation: 0x00,
+            temp_offset_c: 10,
+            power_consumption_target_w: 48,
+            temp_flip: false,
+        },
+        // 9060 — DCENT_axe Hex BM1397 (canonical for legacy 920).
+        Self {
+            board_version: "9060",
             device_model: "dcentaxe_hex_bm1397",
             asic_model: "BM1397",
             model: BitAxeModel::DcentAxeHexBm1397,
@@ -938,9 +1044,12 @@ impl BoardVersionProfile {
             BitAxeModel::NerdAxe => Self::find("601").unwrap(),
             BitAxeModel::NerdQaxePlus => Self::find("402").unwrap(),
             BitAxeModel::NerdQaxePP => Self::find("601").unwrap(),
-            BitAxeModel::DcentAxeBm1397 => Self::find("900").unwrap(),
-            BitAxeModel::DcentAxeQuadBm1397 => Self::find("910").unwrap(),
-            BitAxeModel::DcentAxeHexBm1397 => Self::find("920").unwrap(),
+            // Canonical `9###` registry rows (BOARD_VERSION_REGISTRY.md §5
+            // migration 900→9010 / 910→9040 / 920→9060). The legacy 3-digit
+            // rows stay resolvable via `find` for pre-migration NVS blobs.
+            BitAxeModel::DcentAxeBm1397 => Self::find("9010").unwrap(),
+            BitAxeModel::DcentAxeQuadBm1397 => Self::find("9040").unwrap(),
+            BitAxeModel::DcentAxeHexBm1397 => Self::find("9060").unwrap(),
         }
     }
 
@@ -1357,8 +1466,16 @@ impl BoardConfig {
             },
 
             // ── DCENT_axe family (BM1397) ──
+            // fan_pwm_pin honesty (FULL_PREFAB_REVIEW_2026-07-11 LOW): the
+            // DCENT_axe boards have NO ESP-driven fan-PWM line — the I2C fan
+            // controller (EMC2101 single / EMC2302 Quad+Hex) generates PWM
+            // itself, and GPIO11 is unconnected on the BM1397 netlist. The
+            // inherited `fan_pwm_pin: 11` was fictional; -1 = "no ESP PWM pin".
+            // The tach wire IS routed (GPIO14 / FAN_TACH net), so fan_tach_pin
+            // stays; `fan_tach_present` remains default-false opt-in (XPSAFE-7).
             // Single 1x: same chip envelope as the BitAxe Max BM1397.
             BitAxeModel::DcentAxeBm1397 => BoardConfig {
+                fan_pwm_pin: -1, // EMC2101 generates PWM; GPIO11 unconnected
                 default_frequency: 425.0,
                 default_voltage_mv: 1400,
                 max_voltage_mv: 1550,
@@ -1369,6 +1486,7 @@ impl BoardConfig {
             },
             // Quad 4x: single UART daisy chain, one parallel voltage domain.
             BitAxeModel::DcentAxeQuadBm1397 => BoardConfig {
+                fan_pwm_pin: -1, // EMC2302 generates PWM; no ESP PWM line
                 asic_count: 4,
                 default_frequency: 425.0,
                 default_voltage_mv: 1400,
@@ -1380,6 +1498,7 @@ impl BoardConfig {
             },
             // Hex 6x: single UART daisy chain, 3 series voltage domains (Hex-class).
             BitAxeModel::DcentAxeHexBm1397 => BoardConfig {
+                fan_pwm_pin: -1, // EMC2302 generates PWM; no ESP PWM line
                 asic_count: 6,
                 default_frequency: 425.0,
                 default_voltage_mv: 1400,
@@ -1667,21 +1786,135 @@ mod public_bitaxe_install_targets {
 mod dcent_axe_bm1397_variants {
     use super::*;
 
+    // Canonical `9###` registry versions (BOARD_VERSION_REGISTRY.md §5); the
+    // legacy 3-digit aliases are pinned separately below.
     const DCENT_AXE_BM1397: [(BitAxeModel, &str, u8, &str); 3] = [
-        (BitAxeModel::DcentAxeBm1397, "dcentaxe_bm1397", 1, "900"),
+        (BitAxeModel::DcentAxeBm1397, "dcentaxe_bm1397", 1, "9010"),
         (
             BitAxeModel::DcentAxeQuadBm1397,
             "dcentaxe_quad_bm1397",
             4,
-            "910",
+            "9040",
         ),
         (
             BitAxeModel::DcentAxeHexBm1397,
             "dcentaxe_hex_bm1397",
             6,
-            "920",
+            "9060",
         ),
     ];
+
+    // ── Legacy 900/910/920 aliases stay resolvable and byte-identical to the
+    // canonical 9### rows (same board, Phase-0 rename — a pre-migration NVS
+    // blob must keep resolving to the exact same hardware profile). ──
+    #[test]
+    fn legacy_900_family_aliases_resolve_identically_to_canonical_rows() {
+        for (legacy, canonical) in [("900", "9010"), ("910", "9040"), ("920", "9060")] {
+            let l = BoardVersionProfile::find(legacy)
+                .unwrap_or_else(|| panic!("legacy row {legacy} must stay resolvable"));
+            let c = BoardVersionProfile::find(canonical)
+                .unwrap_or_else(|| panic!("canonical row {canonical} must exist"));
+            assert_eq!(l.model, c.model, "{legacy}/{canonical}: model");
+            assert_eq!(
+                l.device_model, c.device_model,
+                "{legacy}/{canonical}: device_model"
+            );
+            assert_eq!(l.asic_model, c.asic_model, "{legacy}/{canonical}: asic");
+            assert_eq!(
+                l.fan_controller, c.fan_controller,
+                "{legacy}/{canonical}: fan"
+            );
+            assert_eq!(l.temp_sensor, c.temp_sensor, "{legacy}/{canonical}: temp");
+            assert_eq!(
+                l.power_controller, c.power_controller,
+                "{legacy}/{canonical}: power"
+            );
+            assert_eq!(l.has_ina260, c.has_ina260, "{legacy}/{canonical}: ina260");
+            assert_eq!(
+                l.emc_internal_temp, c.emc_internal_temp,
+                "{legacy}/{canonical}: emc_internal_temp"
+            );
+            assert_eq!(
+                l.emc_ideality_factor, c.emc_ideality_factor,
+                "{legacy}/{canonical}: ideality"
+            );
+            assert_eq!(
+                l.temp_offset_c, c.temp_offset_c,
+                "{legacy}/{canonical}: offset"
+            );
+            assert_eq!(
+                l.power_consumption_target_w, c.power_consumption_target_w,
+                "{legacy}/{canonical}: power target"
+            );
+            assert_eq!(l.temp_flip, c.temp_flip, "{legacy}/{canonical}: temp_flip");
+            assert_eq!(l.live_proof, c.live_proof, "{legacy}/{canonical}: proof");
+        }
+        // The model default is the CANONICAL row, not the legacy alias.
+        assert_eq!(
+            BoardVersionProfile::default_for_model(BitAxeModel::DcentAxeBm1397).board_version,
+            "9010"
+        );
+        assert_eq!(
+            BoardVersionProfile::default_for_model(BitAxeModel::DcentAxeQuadBm1397).board_version,
+            "9040"
+        );
+        assert_eq!(
+            BoardVersionProfile::default_for_model(BitAxeModel::DcentAxeHexBm1397).board_version,
+            "9060"
+        );
+    }
+
+    // ── fan_pwm_pin honesty (FULL_PREFAB_REVIEW_2026-07-11 LOW): DCENT_axe has
+    // no ESP-driven fan-PWM line (I2C fan controller generates PWM; GPIO11 is
+    // unconnected on the BM1397 netlist). Other boards keep their stock pin. ──
+    #[test]
+    fn dcentaxe_fan_pwm_pin_is_honest_minus_one() {
+        for (model, _key, _count, _ver) in DCENT_AXE_BM1397 {
+            let cfg = BoardConfig::for_model(model);
+            assert_eq!(
+                cfg.fan_pwm_pin, -1,
+                "{model:?}: fan PWM is generated by the I2C fan controller, \
+                 not an ESP GPIO — the pin claim must be -1"
+            );
+            // The tach input IS wired (FAN_TACH net / GPIO14) — unchanged.
+            assert_eq!(cfg.fan_tach_pin, 14, "{model:?}: tach pin unchanged");
+        }
+        // No collateral change to any other family's arm.
+        assert_eq!(BoardConfig::for_model(BitAxeModel::Max).fan_pwm_pin, 11);
+        assert_eq!(BoardConfig::for_model(BitAxeModel::Gamma).fan_pwm_pin, 11);
+        assert_eq!(
+            BoardConfig::for_model(BitAxeModel::HexUltra).fan_pwm_pin,
+            11
+        );
+        assert_eq!(BoardConfig::for_model(BitAxeModel::NerdNOS).fan_pwm_pin, -1);
+    }
+
+    // ── M-7 (FULL_PREFAB_REVIEW_2026-07-11): status-LED kind metadata. Only
+    // the netlist-confirmed BM1397 single carries the SK6812; everything else
+    // (including Quad/Hex, whose netlists don't exist yet) stays PlainGpio. ──
+    #[test]
+    fn status_led_kind_is_sk6812_only_for_the_netlist_confirmed_single() {
+        assert_eq!(
+            BitAxeModel::DcentAxeBm1397.status_led_kind(),
+            StatusLedKind::Sk6812
+        );
+        for model in [
+            BitAxeModel::Max,
+            BitAxeModel::Ultra,
+            BitAxeModel::Supra,
+            BitAxeModel::Gamma,
+            BitAxeModel::GammaTurbo,
+            BitAxeModel::NerdNOS,
+            BitAxeModel::DcentAxeQuadBm1397,
+            BitAxeModel::DcentAxeHexBm1397,
+        ] {
+            assert_eq!(
+                model.status_led_kind(),
+                StatusLedKind::PlainGpio,
+                "{model:?}: must stay PlainGpio (no speculative SK6812 claim)"
+            );
+        }
+    }
 
     // ── The three DCENT_axe SKUs resolve from their canonical device-model key ──
     #[test]
@@ -1855,9 +2088,9 @@ mod dcent_axe_bm1397_variants {
             BitAxeModel::NerdAxe => "601",
             BitAxeModel::NerdQaxePlus => "402",
             BitAxeModel::NerdQaxePP => "601",
-            BitAxeModel::DcentAxeBm1397 => "900",
-            BitAxeModel::DcentAxeQuadBm1397 => "910",
-            BitAxeModel::DcentAxeHexBm1397 => "920",
+            BitAxeModel::DcentAxeBm1397 => "9010",
+            BitAxeModel::DcentAxeQuadBm1397 => "9040",
+            BitAxeModel::DcentAxeHexBm1397 => "9060",
         }
     }
 
@@ -1983,6 +2216,9 @@ mod dcent_axe_bm1397_variants {
             ("900", DisplayKind::Ssd1306),
             ("910", DisplayKind::Ssd1306),
             ("920", DisplayKind::Ssd1306),
+            ("9010", DisplayKind::Ssd1306),
+            ("9040", DisplayKind::Ssd1306),
+            ("9060", DisplayKind::Ssd1306),
         ];
 
         assert_eq!(expected.len(), BoardVersionProfile::ALL.len());
@@ -2412,6 +2648,49 @@ mod dcent_axe_bm1397_variants {
                 live_proof: LiveProof::Host,
                 support: "experimental",
             },
+            // Canonical `9###` registry rows — byte-identical to 900/910/920.
+            Expected {
+                ver: "9010",
+                model: BitAxeModel::DcentAxeBm1397,
+                asic: "BM1397",
+                fan: FanControllerKind::Emc2101,
+                temp: TempSensorKind::Emc2101,
+                power: PowerControllerKind::Tps546,
+                has_ina260: false,
+                temp_flip: false,
+                temp_offset_c: 0,
+                power_target_w: 12,
+                live_proof: LiveProof::Host,
+                support: "experimental",
+            },
+            Expected {
+                ver: "9040",
+                model: BitAxeModel::DcentAxeQuadBm1397,
+                asic: "BM1397",
+                fan: FanControllerKind::Emc2302,
+                temp: TempSensorKind::Tmp1075,
+                power: PowerControllerKind::Tps546,
+                has_ina260: false,
+                temp_flip: false,
+                temp_offset_c: 10,
+                power_target_w: 48,
+                live_proof: LiveProof::Host,
+                support: "experimental",
+            },
+            Expected {
+                ver: "9060",
+                model: BitAxeModel::DcentAxeHexBm1397,
+                asic: "BM1397",
+                fan: FanControllerKind::Emc2302,
+                temp: TempSensorKind::Tmp1075,
+                power: PowerControllerKind::Tps546,
+                has_ina260: false,
+                temp_flip: false,
+                temp_offset_c: 10,
+                power_target_w: 72,
+                live_proof: LiveProof::Host,
+                support: "experimental",
+            },
         ];
 
         for expected in expected {
@@ -2539,8 +2818,9 @@ mod dcent_axe_bm1397_variants {
                 "{model:?}: fail-closed OFF must drive the EN pin LOW"
             );
         }
-        // The board-version rows themselves must agree with the resolved config.
-        for ver in ["900", "910", "920"] {
+        // The board-version rows themselves must agree with the resolved config
+        // (legacy 3-digit aliases AND the canonical 9### registry rows).
+        for ver in ["900", "910", "920", "9010", "9040", "9060"] {
             let p = BoardVersionProfile::find(ver).unwrap();
             assert_eq!(
                 p.power_controller,

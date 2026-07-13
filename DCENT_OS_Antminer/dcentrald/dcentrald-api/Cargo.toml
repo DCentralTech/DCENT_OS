@@ -65,6 +65,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # Test/fuzz-only surface for libFuzzer targets. Production builds leave this
 # off, so private parser helpers stay private to normal downstream crates.
 fuzzing = []
+# Offline/recovery research implementations that must never be reachable from
+# the normal daemon router. Enabling this feature does not mount the handlers;
+# a future repair image also needs an exclusive hardware-owner lifecycle.
+recovery-tool = []
 
 [dev-dependencies]
 proptest = { workspace = true }

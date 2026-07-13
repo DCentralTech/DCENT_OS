@@ -109,9 +109,13 @@ pub enum TxPriority {
 /// `Normal`, telemetry/identify is `Low`.
 pub fn tx_priority(kind: &MeshKind) -> TxPriority {
     match kind {
-        MeshKind::BlockFound(_) => TxPriority::High,
+        // Mining-critical: a found block (legacy beacon + Phase-4 fragments)
+        // and a fresh chain tip must not yield to telemetry under congestion.
+        MeshKind::BlockFound(_) | MeshKind::Tip(_) | MeshKind::BlockFragment(_) => TxPriority::High,
         MeshKind::Command(_) | MeshKind::Ack(_) => TxPriority::Normal,
-        MeshKind::Telemetry(_) | MeshKind::Identify(_) => TxPriority::Low,
+        // Routine informational beacons — a fresh copy supersedes an old one via
+        // the tracker, so they yield to block-found + control under congestion.
+        MeshKind::Telemetry(_) | MeshKind::Identify(_) | MeshKind::NetInfo(_) => TxPriority::Low,
     }
 }
 
@@ -326,6 +330,25 @@ mod tests {
         assert_eq!(q.len(), 2);
         assert!(matches!(q.pop().unwrap().kind, MeshKind::BlockFound(_)));
         assert!(matches!(q.pop().unwrap().kind, MeshKind::BlockFound(_)));
+    }
+
+    #[test]
+    fn tip_and_bfg_priority_are_high() {
+        use crate::mesh::{BlockFragment, Tip};
+        let tip = MeshKind::Tip(Tip {
+            prev_hash: [0; 32],
+            nbits: 0x1d00_ffff,
+            ntime: 1,
+            height: 1,
+        });
+        let bfg = MeshKind::BlockFragment(BlockFragment {
+            id: 1,
+            seq: 0,
+            total: 1,
+            bytes: vec![0xab],
+        });
+        assert_eq!(tx_priority(&tip), TxPriority::High);
+        assert_eq!(tx_priority(&bfg), TxPriority::High);
     }
 
     #[test]

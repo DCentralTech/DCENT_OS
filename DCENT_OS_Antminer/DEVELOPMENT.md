@@ -6,6 +6,11 @@ rules; this document goes deeper on architecture and the build.
 
 ## The big picture
 
+**Architecture navigation (decade-scale):** start at
+[`docs/architecture/`](docs/architecture/README.md) — composition model, module map,
+env-var surface, and the ranked offline backlog (ADR-0009..0012). Prefer that handbook
+over forking another mining path or inventing a new `DCENT_AM2_*` flag.
+
 This directory is the industrial Antminer member of the DCENT_OS family. It
 replaces the firmware on supported Bitmain Antminer control boards. The
 ESP32-S3 / Bitaxe-class member lives in `../dcentos-esp/`. The Antminer member
@@ -49,8 +54,11 @@ cd dcentrald
 cargo build --release --target armv7-unknown-linux-musleabihf   # Zynq (S9/S17/S19)
 cargo build --release --target aarch64-unknown-linux-musl       # Amlogic (S19j Pro/S21)
 
-# Build a flashable image (uses Docker, from the repo root):
-bash ../scripts/build_in_docker.sh
+# Build a production S9 image from the repository root. This requires the
+# restricted manifest inputs, release keys, and digest-pinned builder described
+# in docs/RC_BUILD_RUNBOOK.md:
+cd ..
+make release RELEASE_TARGET=s9
 
 # Dashboard:
 cd ../dashboard && npm install && npm run build
@@ -65,16 +73,19 @@ Docker image build handles the C toolchain for crates that need it.
   that is the supported from-source build, and it is all most contributors need. (A bare `cargo build`
   from `dcentrald/` builds the daemon stack via the workspace's `default-members`; it does **not** build
   the optional `pic-recovery` tool — see below.)
-- **The `pic-recovery` tool** (low-level dsPIC/FPGA recovery for a bricked board) embeds a stock Bitmain
-  FPGA bitstream that, like the image-build artifacts, is not redistributable. It is excluded from the
-  default workspace build; build it explicitly with `cargo build -p pic-recovery` after placing the
-  bitstream at `dcentrald/pic-recovery/firmware/stock_fpga_s9.bin` (extracted from your own unit).
+- **The optional `pic-recovery` package is diagnostic-only.** It is excluded from the default workspace
+  build and needs no vendor bitstream; build it explicitly with `cargo build -p pic-recovery`. Its only
+  hardware command is exact S9 PIC16 one-byte inspection after platform-identity and daemon-exclusivity
+  checks. `dspic-flash` exposes only an offline availability status. All software mutation routes remain
+  disabled; physical ICSP is the deterministic controller-flash recovery path.
 - **A full flashable firmware image** is different. DCENT_OS reuses some boot-critical, non-redistributable
   components from each miner's stock/BraiinsOS firmware (the SoC kernel, FPGA bitstream, FSBL/U-Boot). We
-  cannot ship those binaries in an open-source repo, so `build_in_docker.sh` expects them to be supplied
-  locally (it references per-platform kernel/FPGA artifacts that are not part of this repository). If you
+  cannot ship those binaries in an open-source repo, so the release capsule expects them to be supplied
+  locally and hash-valid against `scripts/build_inputs.manifest`. Only the S9 production capsule is admitted
+  today; direct packaging and `make dev` image generation are fail closed. If you
   just want to run DCENT_OS, **use the prebuilt, signed release images** rather than building one yourself.
-  Producing your own image means extracting those artifacts from the firmware already on your unit.
+  Producing your own S9 image means extracting those artifacts from firmware you are authorized to use and
+  following `docs/RC_BUILD_RUNBOOK.md`.
 
 ## Testing
 
@@ -115,8 +126,9 @@ they exist to prevent a class of physical damage and must not be weakened:
   (`0x50–0x57` on AM2). Reads still work; writes are denied to prevent board-identity corruption.
 - **Thermal fail-safe** — when board temp sensors are unavailable, the controller falls back to the
   SoC die temperature rather than mis-triggering an emergency.
-- **Destructive recovery is feature-gated** — PIC reset/erase/reflash ops live behind a Cargo
-  feature the shipping daemon does not enable, so they can't be invoked by accident.
+- **No shipped controller-recovery executor exists** — destructive protocol research remains behind a
+  Cargo feature with no runtime consumer, while the optional package is diagnostic-only and excluded
+  from default/release builds.
 - **Voltage envelopes** are bounded by per-chip silicon profiles with hard clamps you can't exceed
   from config.
 

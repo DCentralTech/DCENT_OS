@@ -14,7 +14,7 @@
 //! handles per-byte ack). The `Apw121215a` struct in this module implements that
 //! variant..
 
-use crate::i2c::{I2cBus, I2cServiceHandle, I2cTransactionStep};
+use crate::i2c::{I2cBus, I2cOperationIntent, I2cServiceHandle, I2cTransactionStep};
 use crate::psu_gpio_gate::PsuGpioGate;
 use crate::psu_gpio_i2c::GpioBitBangI2c;
 use crate::HalError;
@@ -1585,7 +1585,8 @@ impl Apw121215a {
             }
             ApwIo::Service(service) => {
                 let reads = service
-                    .transaction(
+                    .transaction_with_intent(
+                        I2cOperationIntent::ReadOnly,
                         self.addr,
                         vec![
                             I2cTransactionStep::Write(frame),
@@ -1778,7 +1779,12 @@ impl Apw121215a {
 
     /// One attempt at a write-only send (no reply parsing). Used by `tx`
     /// under the same 3× retry policy as `txrx`.
-    fn tx_once(&mut self, cmd: u8, payload: &[u8]) -> Result<()> {
+    fn tx_once_with_intent(
+        &mut self,
+        intent: I2cOperationIntent,
+        cmd: u8,
+        payload: &[u8],
+    ) -> Result<()> {
         let frame = build_apw12_frame(cmd, payload);
         let bus = self.bus;
         let addr = self.addr;
@@ -1845,19 +1851,31 @@ impl Apw121215a {
                 }
             }
             ApwIo::Service(service) => {
-                service
-                    .transaction(
-                        self.addr,
-                        vec![
-                            I2cTransactionStep::Write(frame),
-                            I2cTransactionStep::SleepMs(APW12_REPLY_DELAY_MS),
-                        ],
-                    )
-                    .map_err(|e| HalError::I2c {
-                        bus,
-                        addr,
-                        detail: format!("tx transaction(service): {}", e),
-                    })?;
+                if intent == I2cOperationIntent::SafeOff {
+                    service
+                        .write_bytes_with_intent(intent, self.addr, &frame)
+                        .map_err(|e| HalError::I2c {
+                            bus,
+                            addr,
+                            detail: format!("reserved safe-off tx(service): {}", e),
+                        })?;
+                    std::thread::sleep(std::time::Duration::from_millis(APW12_REPLY_DELAY_MS));
+                } else {
+                    service
+                        .transaction_with_intent(
+                            intent,
+                            self.addr,
+                            vec![
+                                I2cTransactionStep::Write(frame),
+                                I2cTransactionStep::SleepMs(APW12_REPLY_DELAY_MS),
+                            ],
+                        )
+                        .map_err(|e| HalError::I2c {
+                            bus,
+                            addr,
+                            detail: format!("tx transaction(service): {}", e),
+                        })?;
+                }
             }
         }
         if !service_io {
@@ -1870,9 +1888,18 @@ impl Apw121215a {
     /// Matches bosminer's tokio-retry wrapper (phase13d Ghidra evidence:
     /// `I2C transaction on hashboard X failed, retrying`).
     fn tx(&mut self, cmd: u8, payload: &[u8]) -> Result<()> {
+        self.tx_with_intent(I2cOperationIntent::UnclassifiedMutation, cmd, payload)
+    }
+
+    fn tx_with_intent(
+        &mut self,
+        intent: I2cOperationIntent,
+        cmd: u8,
+        payload: &[u8],
+    ) -> Result<()> {
         let mut last_err: Option<HalError> = None;
         for attempt in 1..=3 {
-            match self.tx_once(cmd, payload) {
+            match self.tx_once_with_intent(intent, cmd, payload) {
                 Ok(()) => return Ok(()),
                 Err(e @ HalError::I2c { .. }) if attempt < 3 => {
                     tracing::warn!(
@@ -2022,7 +2049,15 @@ impl Apw121215a {
 
     /// Enable / disable PSU watchdog (0x81). Payload: `0x00`=disable, `!0`=enable.
     pub fn watchdog(&mut self, enable: bool) -> Result<()> {
-        self.tx(APW12_CMD_WATCHDOG, &[if enable { 0x01 } else { 0x00 }])?;
+        // Standalone watchdog control is neutral policy, not SafeOff
+        // privilege. Only the coordinated minimum-ramp + disarm plan may use
+        // the reserved lane, because disarming alone can remove a cutoff.
+        let intent = I2cOperationIntent::NeutralControl;
+        self.tx_with_intent(
+            intent,
+            APW12_CMD_WATCHDOG,
+            &[if enable { 0x01 } else { 0x00 }],
+        )?;
         self.watchdog_armed = enable;
         Ok(())
     }
@@ -2053,8 +2088,12 @@ impl Apw121215a {
             return Ok(());
         }
         let primary = match self.heartbeat_mode {
-            ApwHeartbeatMode::Primary84 => self.tx(APW12_CMD_HEARTBEAT, &[]),
-            ApwHeartbeatMode::WatchdogTick81 => self.tx(APW12_CMD_WATCHDOG, &[0x02]),
+            ApwHeartbeatMode::Primary84 => {
+                self.tx_with_intent(I2cOperationIntent::KeepAlive, APW12_CMD_HEARTBEAT, &[])
+            }
+            ApwHeartbeatMode::WatchdogTick81 => {
+                self.tx_with_intent(I2cOperationIntent::KeepAlive, APW12_CMD_WATCHDOG, &[0x02])
+            }
         };
 
         match primary {
@@ -2063,7 +2102,11 @@ impl Apw121215a {
                 Ok(())
             }
             Err(primary_err) if matches!(self.heartbeat_mode, ApwHeartbeatMode::Primary84) => {
-                match self.tx(APW12_CMD_WATCHDOG, &[0x02]) {
+                match self.tx_with_intent(
+                    I2cOperationIntent::KeepAlive,
+                    APW12_CMD_WATCHDOG,
+                    &[0x02],
+                ) {
                     Ok(()) => {
                         self.heartbeat_mode = ApwHeartbeatMode::WatchdogTick81;
                         self.heartbeat_ticks.fetch_add(1, Ordering::Relaxed);
@@ -2101,9 +2144,38 @@ impl Apw121215a {
     /// watchdog-off (0x81/0x00), NOT a SetVoltage 0xFF.  Renamed per
     /// Phase 13D Ghidra evidence.
     pub fn set_voltage_min(&mut self) -> Result<()> {
-        self.tx(APW12_CMD_SET_VOLTAGE, &[0xFF])?;
+        self.tx_with_intent(I2cOperationIntent::SafeOff, APW12_CMD_SET_VOLTAGE, &[0xFF])?;
         self.dac = Some(0xFF);
         Ok(())
+    }
+
+    /// Command the bulk rail toward its minimum setpoint, then disarm the PSU
+    /// watchdog only after that safe-direction command completed.
+    ///
+    /// This deliberately replaces the unsafe `watchdog(false)` followed by
+    /// `set_voltage_min()` pattern: if the minimum-ramp fails, the watchdog
+    /// remains armed and can still act as the independent cutoff backstop.
+    /// Success is transport-command evidence, not measured rail voltage.
+    pub fn safe_shutdown_to_min(&mut self) -> Result<()> {
+        if let ApwIo::Service(service) = &self.io {
+            let min_frame = build_apw12_frame(APW12_CMD_SET_VOLTAGE, &[0xFF]);
+            let disarm_frame = build_apw12_frame(APW12_CMD_WATCHDOG, &[0x00]);
+            service.safe_off_transaction(
+                self.addr,
+                vec![
+                    I2cTransactionStep::Write(min_frame),
+                    I2cTransactionStep::SleepMs(APW12_REPLY_DELAY_MS),
+                    I2cTransactionStep::Write(disarm_frame),
+                    I2cTransactionStep::SleepMs(APW12_REPLY_DELAY_MS),
+                ],
+            )?;
+            self.dac = Some(0xFF);
+            self.watchdog_armed = false;
+            return Ok(());
+        }
+
+        self.set_voltage_min()?;
+        self.watchdog(false)
     }
 
     /// Bosminer-semantics "Disable" — disarm the watchdog (0x81/0x00).
@@ -2255,7 +2327,7 @@ impl Apw121215a {
                 "SetVoltageDac called before 5 stable heartbeat ticks",
             ));
         }
-        self.tx(APW12_CMD_SET_VOLTAGE, &[dac])?;
+        self.tx_with_intent(I2cOperationIntent::Energize, APW12_CMD_SET_VOLTAGE, &[dac])?;
         self.dac = Some(dac);
         Ok(())
     }
@@ -2272,7 +2344,7 @@ impl Apw121215a {
             voltage = format_args!("{:.3}V", v),
             "APW121215a SetVoltage (INIT BYPASS — 5-tick gate skipped)",
         );
-        self.tx(APW12_CMD_SET_VOLTAGE, &[dac])?;
+        self.tx_with_intent(I2cOperationIntent::Energize, APW12_CMD_SET_VOLTAGE, &[dac])?;
         self.dac = Some(dac);
         Ok(())
     }
@@ -2327,7 +2399,7 @@ impl Apw121215a {
         // transient PWM-only opcode. We deliberately use this constant here
         // (NOT a new 0x86 constant) because 's contract is
         // "transient only, never EEPROM".
-        self.tx(APW12_CMD_SET_VOLTAGE, &[dac])?;
+        self.tx_with_intent(I2cOperationIntent::Energize, APW12_CMD_SET_VOLTAGE, &[dac])?;
         self.dac = Some(dac);
         Ok(())
     }
@@ -3934,7 +4006,7 @@ mod tests {
 
         // APW121215f (fw=0x76) builds a DISTINCT frame: 16-bit (2-byte) checksum,
         // LEN = payload_len + 4. The DAC-byte form is `0x83, [N, 0]`.
-        let f = crate::psu_apw12_plus::build_apw121215f_frame(0x83, &[dac, 0x00]);
+        let f = crate::psu_apw12_plus::build_apw121215f_frame(0x83, &[dac, 0x00]).unwrap();
         // 2-byte payload + 2-byte cksum ⇒ total = preamble(2)+LEN(1)+CMD(1)+2+2 = 8.
         assert_eq!(f, vec![0x55, 0xAA, 0x06, 0x83, 0xC8, 0x00, 0x51, 0x01]);
         assert_eq!(
@@ -4341,6 +4413,40 @@ mod tests {
         // is invoked — and these gate-spec tests never call those.
         let (handle, _drop_guard) = crate::i2c::I2cServiceHandle::for_unit_tests();
         Apw121215a::with_io(ApwIo::Service(handle), 0, APW12_FRAMED_ADDR)
+    }
+
+    #[test]
+    fn apw121215a_safe_shutdown_is_one_ordered_worker_transaction() {
+        let (handle, rx) = crate::i2c::I2cServiceHandle::for_unit_tests();
+        let worker = std::thread::spawn(move || {
+            let request = rx.recv().expect("safe shutdown transaction");
+            let crate::i2c::I2cRequest::Transaction {
+                addr,
+                steps,
+                reply_tx,
+            } = request
+            else {
+                panic!("expected one compound transaction")
+            };
+            reply_tx.send(Ok(Vec::new())).unwrap();
+            (addr, steps)
+        });
+        let mut psu = Apw121215a::with_io(ApwIo::Service(handle), 0, APW12_FRAMED_ADDR);
+        psu.safe_shutdown_to_min().unwrap();
+        let (addr, steps) = worker.join().unwrap();
+
+        assert_eq!(addr, APW12_FRAMED_ADDR);
+        assert_eq!(
+            steps,
+            vec![
+                I2cTransactionStep::Write(build_apw12_frame(APW12_CMD_SET_VOLTAGE, &[0xFF],)),
+                I2cTransactionStep::SleepMs(APW12_REPLY_DELAY_MS),
+                I2cTransactionStep::Write(build_apw12_frame(APW12_CMD_WATCHDOG, &[0x00])),
+                I2cTransactionStep::SleepMs(APW12_REPLY_DELAY_MS),
+            ]
+        );
+        assert_eq!(psu.dac, Some(0xFF));
+        assert!(!psu.watchdog_armed);
     }
 
     /// Test 1: the wrapper `cold_boot_sequence` and the new

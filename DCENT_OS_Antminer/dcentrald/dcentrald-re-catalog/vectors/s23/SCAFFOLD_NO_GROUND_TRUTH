@@ -1,0 +1,4 @@
+S23 / BM1373 (enumerates provisionally as 0x1372) has no held firmware,
+capture, jig binary, or silicon sample. Do not create init golden vectors from
+the DCENT scaffold itself. The simulator slot is structural only and the real
+driver remains fail-closed behind the four-key ceremony.

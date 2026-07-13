@@ -379,6 +379,13 @@ pub struct AppState {
     pub power_calibration: Arc<std::sync::RwLock<PowerCalibration>>,
     /// Serialize runtime access to the smart PSU control bus.
     pub psu_lock: Arc<std::sync::Mutex<()>>,
+    /// Admission barrier shared with the mining engine. Direct API-owned fan
+    /// HAL writes (`POST /api/fan` plus the gRPC/MQTT bridge) and debug smart
+    /// PSU control must hold a lease through their final hardware readback.
+    /// Teardown can therefore close the control plane and drain those
+    /// in-flight calls before observing safe-off. Engine-owned mutations use
+    /// the engine's separate, ordered safety lifecycle.
+    pub hardware_mutation_gate: dcentrald_hal::platform::HardwareMutationGate,
     /// Live runtime autotuner status.
     pub autotuner_status_rx: watch::Receiver<AutotunerRuntimeStatus>,
     /// Live autotuner efficiency snapshot.
@@ -1261,14 +1268,242 @@ pub struct HardwareCapabilities {
     pub sleep_wake_supported: bool,
 }
 
+pub use dcent_schema::capability::IdentityConfidence as HardwareIdentityConfidence;
+
+fn unknown_hardware_identity_confidence() -> HardwareIdentityConfidence {
+    HardwareIdentityConfidence::Unknown
+}
+
+mod hardware_identity_confidence_wire {
+    use super::HardwareIdentityConfidence;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(
+        value: &HardwareIdentityConfidence,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match value {
+            HardwareIdentityConfidence::Exact => "exact",
+            HardwareIdentityConfidence::High => "high",
+            HardwareIdentityConfidence::Low => "low",
+            HardwareIdentityConfidence::Unknown => "unknown",
+        })
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<HardwareIdentityConfidence, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.trim().to_ascii_lowercase().as_str() {
+            "exact" => Ok(HardwareIdentityConfidence::Exact),
+            "high" => Ok(HardwareIdentityConfidence::High),
+            // Historical `medium` remains readable but maps to the canonical
+            // capability enum's conservative non-authorizing level.
+            "medium" | "low" => Ok(HardwareIdentityConfidence::Low),
+            "unknown" => Ok(HardwareIdentityConfidence::Unknown),
+            _ => Err(serde::de::Error::custom(
+                "identity confidence must be exact, high, medium, low, or unknown",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardwareIdentityClaim {
+    AsicFamily,
+    ControlBoard,
+    HashboardModel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclaredIdentitySource {
+    ConfigModel,
+    BoardTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedIdentitySource {
+    PlatformProbe,
+    HashboardEeprom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeasuredIdentitySource {
+    AsicEnumeration,
+}
+
+/// Evidence source whose variant makes the proof level impossible to confuse.
+///
+/// `config_model` and `board_target` can only deserialize as `declared`;
+/// `asic_enumeration` can only deserialize as `measured`. This prevents a raw
+/// source string from being relabeled as stronger evidence by a caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "level", content = "source", rename_all = "lowercase")]
+pub enum HardwareIdentityEvidenceSource {
+    Declared(DeclaredIdentitySource),
+    Observed(ObservedIdentitySource),
+    Measured(MeasuredIdentitySource),
+}
+
+impl HardwareIdentityEvidenceSource {
+    pub const fn level(self) -> HardwareIdentityEvidenceLevel {
+        match self {
+            Self::Declared(_) => HardwareIdentityEvidenceLevel::Declared,
+            Self::Observed(_) => HardwareIdentityEvidenceLevel::Observed,
+            Self::Measured(_) => HardwareIdentityEvidenceLevel::Measured,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HardwareIdentityEvidenceLevel {
+    Declared,
+    Observed,
+    Measured,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardwareCompositionToken {
+    pub generation: u64,
+    pub fingerprint: String,
+}
+
+impl HardwareCompositionToken {
+    pub fn new(generation: u64, fingerprint: impl Into<String>) -> Self {
+        Self {
+            generation,
+            fingerprint: fingerprint.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardwareIdentityEvidence {
+    pub claim: HardwareIdentityClaim,
+    #[serde(flatten)]
+    pub source: HardwareIdentityEvidenceSource,
+    pub source_value: String,
+    pub resolved_value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composition: Option<HardwareCompositionToken>,
+}
+
+impl HardwareIdentityEvidence {
+    pub fn declared_asic_config(model: impl Into<String>, chip: impl Into<String>) -> Self {
+        Self {
+            claim: HardwareIdentityClaim::AsicFamily,
+            source: HardwareIdentityEvidenceSource::Declared(DeclaredIdentitySource::ConfigModel),
+            source_value: model.into(),
+            resolved_value: chip.into(),
+            composition: None,
+        }
+    }
+
+    pub fn declared_asic_board_target(
+        board_target: impl Into<String>,
+        chip: impl Into<String>,
+    ) -> Self {
+        Self {
+            claim: HardwareIdentityClaim::AsicFamily,
+            source: HardwareIdentityEvidenceSource::Declared(DeclaredIdentitySource::BoardTarget),
+            source_value: board_target.into(),
+            resolved_value: chip.into(),
+            composition: None,
+        }
+    }
+
+    pub fn observed_control_board(value: impl Into<String>) -> Self {
+        let value = value.into();
+        Self {
+            claim: HardwareIdentityClaim::ControlBoard,
+            source: HardwareIdentityEvidenceSource::Observed(ObservedIdentitySource::PlatformProbe),
+            source_value: value.clone(),
+            resolved_value: value,
+            composition: None,
+        }
+    }
+
+    pub fn observed_hashboard_model(
+        source_value: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            claim: HardwareIdentityClaim::HashboardModel,
+            source: HardwareIdentityEvidenceSource::Observed(
+                ObservedIdentitySource::HashboardEeprom,
+            ),
+            source_value: source_value.into(),
+            resolved_value: model.into(),
+            composition: None,
+        }
+    }
+
+    pub fn measured_asic_enumeration(
+        chip_id: u16,
+        chip: impl Into<String>,
+        composition: HardwareCompositionToken,
+    ) -> Self {
+        Self {
+            claim: HardwareIdentityClaim::AsicFamily,
+            source: HardwareIdentityEvidenceSource::Measured(
+                MeasuredIdentitySource::AsicEnumeration,
+            ),
+            source_value: format!("0x{chip_id:04X}"),
+            resolved_value: chip.into(),
+            composition: Some(composition),
+        }
+    }
+
+    pub const fn level(&self) -> HardwareIdentityEvidenceLevel {
+        self.source.level()
+    }
+
+    fn legacy_source_tag(&self) -> String {
+        let prefix = match self.source {
+            HardwareIdentityEvidenceSource::Declared(DeclaredIdentitySource::ConfigModel) => {
+                "config_model"
+            }
+            HardwareIdentityEvidenceSource::Declared(DeclaredIdentitySource::BoardTarget) => {
+                "board_target"
+            }
+            HardwareIdentityEvidenceSource::Observed(ObservedIdentitySource::PlatformProbe) => {
+                "platform_probe"
+            }
+            HardwareIdentityEvidenceSource::Observed(ObservedIdentitySource::HashboardEeprom) => {
+                "hashboard_eeprom"
+            }
+            HardwareIdentityEvidenceSource::Measured(MeasuredIdentitySource::AsicEnumeration) => {
+                "asic_enumeration"
+            }
+        };
+        format!("{prefix}:{}->{}", self.source_value, self.resolved_value)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HardwareIdentification {
-    /// `high`, `medium`, `low`, or `unknown`.
-    #[serde(default)]
-    pub confidence: String,
-    /// Machine-readable evidence tags that contributed to the identity.
+    /// Compatibility confidence field, now a closed enum rather than a string.
+    #[serde(
+        default = "unknown_hardware_identity_confidence",
+        with = "hardware_identity_confidence_wire"
+    )]
+    pub confidence: HardwareIdentityConfidence,
+    /// Legacy tags retained for existing REST/MCP clients. New code must build
+    /// `evidence`; constructors derive this field deterministically.
     #[serde(default)]
     pub sources: Vec<String>,
+    /// Canonical typed evidence. Empty when deserializing a legacy snapshot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<HardwareIdentityEvidence>,
     /// Human-readable explanation for operators and support bundles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -1277,10 +1512,201 @@ pub struct HardwareIdentification {
 impl Default for HardwareIdentification {
     fn default() -> Self {
         Self {
-            confidence: "unknown".to_string(),
+            confidence: HardwareIdentityConfidence::Unknown,
             sources: Vec::new(),
+            evidence: Vec::new(),
             note: Some("hardware identity has not been resolved".to_string()),
         }
+    }
+}
+
+impl HardwareIdentification {
+    pub fn from_evidence(evidence: Vec<HardwareIdentityEvidence>, note: Option<String>) -> Self {
+        let confidence = Self::classify_confidence(&evidence);
+        let sources = evidence
+            .iter()
+            .map(HardwareIdentityEvidence::legacy_source_tag)
+            .collect();
+        Self {
+            confidence,
+            sources,
+            evidence,
+            note,
+        }
+    }
+
+    pub fn push_evidence(&mut self, evidence: HardwareIdentityEvidence) {
+        self.evidence.push(evidence);
+        self.confidence = Self::classify_confidence(&self.evidence);
+        self.sources = self
+            .evidence
+            .iter()
+            .map(HardwareIdentityEvidence::legacy_source_tag)
+            .collect();
+    }
+
+    pub fn clear_measured_asic_evidence(&mut self) {
+        self.evidence.retain(|evidence| {
+            evidence.claim != HardwareIdentityClaim::AsicFamily
+                || evidence.level() != HardwareIdentityEvidenceLevel::Measured
+        });
+        self.confidence = Self::classify_confidence(&self.evidence);
+        self.sources = self
+            .evidence
+            .iter()
+            .map(HardwareIdentityEvidence::legacy_source_tag)
+            .collect();
+    }
+
+    pub fn strongest_asic_evidence_level(&self) -> Option<HardwareIdentityEvidenceLevel> {
+        self.evidence
+            .iter()
+            .filter(|evidence| evidence.claim == HardwareIdentityClaim::AsicFamily)
+            .map(HardwareIdentityEvidence::level)
+            .max()
+    }
+
+    /// Highest-quality non-measured ASIC label, preserving evidence order as
+    /// the deterministic tie-breaker. Used when a measured composition is
+    /// revoked so presentation falls back to declarations/observations rather
+    /// than retaining a stale enumeration label.
+    pub fn best_non_measured_asic_resolved_value(&self) -> Option<&str> {
+        let strongest = self
+            .evidence
+            .iter()
+            .filter(|evidence| {
+                evidence.claim == HardwareIdentityClaim::AsicFamily
+                    && evidence.level() != HardwareIdentityEvidenceLevel::Measured
+            })
+            .map(HardwareIdentityEvidence::level)
+            .max()?;
+        self.evidence
+            .iter()
+            .find(|evidence| {
+                evidence.claim == HardwareIdentityClaim::AsicFamily && evidence.level() == strongest
+            })
+            .map(|evidence| evidence.resolved_value.as_str())
+    }
+
+    fn classify_confidence(evidence: &[HardwareIdentityEvidence]) -> HardwareIdentityConfidence {
+        let asic = evidence
+            .iter()
+            .filter(|evidence| evidence.claim == HardwareIdentityClaim::AsicFamily)
+            .collect::<Vec<_>>();
+        if asic
+            .iter()
+            .any(|evidence| evidence.level() == HardwareIdentityEvidenceLevel::Measured)
+        {
+            return HardwareIdentityConfidence::High;
+        }
+        if asic
+            .iter()
+            .any(|evidence| evidence.level() == HardwareIdentityEvidenceLevel::Observed)
+        {
+            return HardwareIdentityConfidence::Low;
+        }
+        if !asic.is_empty() {
+            let first = &asic[0].resolved_value;
+            if asic.len() >= 2
+                && asic
+                    .iter()
+                    .all(|evidence| evidence.resolved_value == *first)
+            {
+                return HardwareIdentityConfidence::Low;
+            }
+            return HardwareIdentityConfidence::Low;
+        }
+        if evidence
+            .iter()
+            .any(|evidence| evidence.level() == HardwareIdentityEvidenceLevel::Observed)
+        {
+            HardwareIdentityConfidence::Low
+        } else if evidence.is_empty() {
+            HardwareIdentityConfidence::Unknown
+        } else {
+            HardwareIdentityConfidence::Low
+        }
+    }
+}
+
+#[cfg(test)]
+mod hardware_identity_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn correlated_declarations_remain_low_and_keep_legacy_wire_tags() {
+        let identity = HardwareIdentification::from_evidence(
+            vec![
+                HardwareIdentityEvidence::declared_asic_config("s19jpro", "BM1362"),
+                HardwareIdentityEvidence::declared_asic_board_target("am2-s19j", "BM1362"),
+            ],
+            None,
+        );
+
+        assert_eq!(identity.confidence, HardwareIdentityConfidence::Low);
+        assert_eq!(
+            identity.strongest_asic_evidence_level(),
+            Some(HardwareIdentityEvidenceLevel::Declared)
+        );
+        assert_eq!(
+            identity.sources,
+            [
+                "config_model:s19jpro->BM1362",
+                "board_target:am2-s19j->BM1362",
+            ]
+        );
+        let wire = serde_json::to_value(identity).unwrap();
+        assert_eq!(wire["confidence"], "low");
+        assert_eq!(wire["evidence"][0]["level"], "declared");
+        assert_eq!(wire["evidence"][0]["source"], "config_model");
+    }
+
+    #[test]
+    fn measured_enumeration_is_the_only_high_asic_constructor() {
+        let identity = HardwareIdentification::from_evidence(
+            vec![HardwareIdentityEvidence::measured_asic_enumeration(
+                0x1387,
+                "BM1387",
+                HardwareCompositionToken::new(1, "test:am1-s9"),
+            )],
+            None,
+        );
+
+        assert_eq!(identity.confidence, HardwareIdentityConfidence::High);
+        assert_eq!(
+            identity.strongest_asic_evidence_level(),
+            Some(HardwareIdentityEvidenceLevel::Measured)
+        );
+        assert_eq!(identity.sources, ["asic_enumeration:0x1387->BM1387"]);
+    }
+
+    #[test]
+    fn legacy_exact_parses_but_has_no_typed_authority() {
+        let identity: HardwareIdentification = serde_json::from_value(serde_json::json!({
+            "confidence": "exact",
+            "sources": ["board_target:am1-s9->BM1387"]
+        }))
+        .unwrap();
+
+        assert_eq!(identity.confidence, HardwareIdentityConfidence::Exact);
+        assert!(identity.evidence.is_empty());
+        assert_eq!(identity.strongest_asic_evidence_level(), None);
+        assert_eq!(
+            serde_json::to_value(identity).unwrap()["confidence"],
+            "exact"
+        );
+    }
+
+    #[test]
+    fn measured_level_rejects_a_declared_source_kind() {
+        let result = serde_json::from_value::<HardwareIdentityEvidence>(serde_json::json!({
+            "claim": "asic_family",
+            "level": "measured",
+            "source": "config_model",
+            "source_value": "s9",
+            "resolved_value": "BM1387"
+        }));
+        assert!(result.is_err());
     }
 }
 
@@ -1782,6 +2208,23 @@ pub struct MinimalAppStateInputs {
 /// IMPORTANT: this function does NOT spawn any tasks or open any sockets. Use
 /// [`start_api_servers`] on the returned `Arc<AppState>` to bring the API up.
 pub fn build_minimal_app_state(inputs: MinimalAppStateInputs) -> Arc<AppState> {
+    build_minimal_app_state_with_hardware_mutation_gate(
+        inputs,
+        dcentrald_hal::platform::HardwareMutationGate::new_open(),
+    )
+}
+
+/// Build a minimal [`AppState`] with mutation admission owned by the caller.
+///
+/// Mining modes that mutate hardware outside the API runtime must pass the
+/// same gate to both owners. This prevents the API from minting an unrelated
+/// open admission domain that teardown cannot close and drain. Callers that
+/// do not own hardware should continue using [`build_minimal_app_state`],
+/// whose compatibility behavior remains open-by-default.
+pub fn build_minimal_app_state_with_hardware_mutation_gate(
+    inputs: MinimalAppStateInputs,
+    hardware_mutation_gate: dcentrald_hal::platform::HardwareMutationGate,
+) -> Arc<AppState> {
     let initial_state = MinerState {
         hashrate_ghs: 0.0,
         hashrate_5s_ghs: 0.0,
@@ -1898,6 +2341,7 @@ pub fn build_minimal_app_state(inputs: MinimalAppStateInputs) -> Arc<AppState> {
         power_rx,
         power_calibration,
         psu_lock,
+        hardware_mutation_gate,
         autotuner_status_rx,
         autotuner_efficiency_rx,
         autotuner_chip_health_rx,
@@ -2002,6 +2446,22 @@ mod reject_reason_tests {
 mod minimal_app_state_tests {
     use super::*;
 
+    fn minimal_inputs() -> MinimalAppStateInputs {
+        MinimalAppStateInputs {
+            api_config: ApiConfig::default(),
+            pool_url: String::new(),
+            pool_protocol: default_protocol(),
+            mode: OperatingMode::Standard,
+            firmware_version: "test".to_string(),
+            fan_pwm: 10,
+            network_block: NetworkBlockConfig::default(),
+            profile_path: "/tmp/profiles".to_string(),
+            control_board_label: "test-control".to_string(),
+            chip_type_label: "test-chip".to_string(),
+            external_state_rx: None,
+        }
+    }
+
     #[test]
     fn http_bind_addr_preserves_default_and_accepts_loopback_override() {
         let default = ApiConfig::default();
@@ -2015,21 +2475,51 @@ mod minimal_app_state_tests {
 
     #[test]
     fn minimal_app_state_keeps_mining_pipeline_snapshot_receiver_absent() {
-        let state = build_minimal_app_state(MinimalAppStateInputs {
-            api_config: ApiConfig::default(),
-            pool_url: String::new(),
-            pool_protocol: default_protocol(),
-            mode: OperatingMode::Standard,
-            firmware_version: "test".to_string(),
-            fan_pwm: 10,
-            network_block: NetworkBlockConfig::default(),
-            profile_path: "/tmp/profiles".to_string(),
-            control_board_label: "test-control".to_string(),
-            chip_type_label: "test-chip".to_string(),
-            external_state_rx: None,
-        });
+        let state = build_minimal_app_state(minimal_inputs());
 
         assert!(state.mining_pipeline_snapshot_rx.is_none());
+    }
+
+    #[test]
+    fn minimal_app_state_keeps_default_mutation_admission_open() {
+        let state = build_minimal_app_state(minimal_inputs());
+
+        let lease = state.hardware_mutation_gate.try_acquire().unwrap();
+        drop(lease);
+    }
+
+    #[test]
+    fn minimal_app_state_uses_the_owner_supplied_mutation_gate() {
+        let owner_gate = dcentrald_hal::platform::HardwareMutationGate::new_open();
+        let state = build_minimal_app_state_with_hardware_mutation_gate(
+            minimal_inputs(),
+            owner_gate.clone(),
+        );
+
+        let lease = state.hardware_mutation_gate.try_acquire().unwrap();
+        assert!(owner_gate
+            .close_and_drain(std::time::Duration::ZERO)
+            .is_err());
+        drop(lease);
+        owner_gate
+            .close_and_drain(std::time::Duration::ZERO)
+            .unwrap();
+        assert!(state.hardware_mutation_gate.try_acquire().is_err());
+    }
+
+    #[test]
+    fn minimal_app_state_preserves_closed_owner_admission() {
+        let owner_gate = dcentrald_hal::platform::HardwareMutationGate::new_closed();
+        let state = build_minimal_app_state_with_hardware_mutation_gate(
+            minimal_inputs(),
+            owner_gate.clone(),
+        );
+
+        assert!(owner_gate.try_acquire().is_err());
+        assert!(state.hardware_mutation_gate.try_acquire().is_err());
+        assert!(owner_gate
+            .close_and_drain(std::time::Duration::ZERO)
+            .is_ok());
     }
 
     #[test]
@@ -2057,19 +2547,7 @@ mod minimal_app_state_tests {
     /// lock. Audit observability is best-effort.
     #[test]
     fn push_audit_event_handles_poisoned_lock() {
-        let state = build_minimal_app_state(MinimalAppStateInputs {
-            api_config: ApiConfig::default(),
-            pool_url: String::new(),
-            pool_protocol: default_protocol(),
-            mode: OperatingMode::Standard,
-            firmware_version: "test".to_string(),
-            fan_pwm: 10,
-            network_block: NetworkBlockConfig::default(),
-            profile_path: "/tmp/profiles".to_string(),
-            control_board_label: "test-control".to_string(),
-            chip_type_label: "test-chip".to_string(),
-            external_state_rx: None,
-        });
+        let state = build_minimal_app_state(minimal_inputs());
 
         // Poison the audit_ring mutex by panicking inside a `lock()`
         // guard on a separate thread. The mutex is left in the poisoned

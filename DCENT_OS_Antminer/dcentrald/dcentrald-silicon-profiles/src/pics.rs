@@ -207,9 +207,9 @@ pub mod registers {
     /// CONTROL byte value: heartbeat tick (must be sent ≤ 2 s per
     /// ).
     pub const CONTROL_HEARTBEAT: u8 = 0x02;
-    /// CONTROL byte value: RESET. Destructive on am2 Zynq dsPIC fw=0x86;
-    /// `dcentrald` doesn't link this opcode by default (gated by the
-    /// `recovery-tool` Cargo feature on `dspic_flash`).
+    /// CONTROL byte value: RESET. Destructive protocol data only; no shipped
+    /// controller-recovery executor consumes this constant. Any future use
+    /// requires separate typed target authority and family-specific evidence.
     pub const CONTROL_RESET: u8 = 0x80;
 
     /// VERSION byte that indicates application mode (chip is healthy).
@@ -237,11 +237,12 @@ pub const BOOTLOADER_JUMP_SEQUENCE: &[(u8, u8)] = &[
 /// A26 (goldmine 2026-06-10): S21 PIC reset-timing constants lifted from the
 /// Bitmain S21 single-board-test jig `reset_pic@C96E0`.
 ///
-/// ⚠️ DATA ONLY — recorded for a future S21 PIC-reset path and deliberately
+/// ⚠️ DATA ONLY — recorded for future S21 controller research and deliberately
 /// **NOT** referenced by any live path in this crate or `dcentrald`. They
-/// pre-stage the timing budget without touching live S21 hardware. The
-/// destructive PIC RESET itself remains gated behind the `recovery-tool`
-/// Cargo feature in `dcentrald-asic`.
+/// preserve an evidence-backed timing budget without authorizing a reset.
+/// No shipped controller-recovery executor consumes them; any future mutation
+/// path requires the separate authority architecture (see
+/// ).
 ///
 /// Delay between asserting PIC RESET and the follow-up write.
 pub const S21_PIC_RESET_WRITE_WAIT_MS: u32 = 300;

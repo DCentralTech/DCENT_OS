@@ -118,7 +118,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::psu_apw12_smbus::Apw12SmbusBackend;
+use crate::psu_apw12_smbus::{run_with_power_rollback, Apw12SmbusBackend};
 use crate::serial::DevmemUart;
 use crate::{HalError, Result};
 
@@ -349,10 +349,16 @@ fn emit_miscctrl_triple_write(uarts: &mut [DevmemUart]) -> Result<()> {
 
 /// Run the AM335x BB cold-boot sequence end-to-end.
 ///
-/// All six phases run sequentially. On any error the function bails fast —
-/// the caller is responsible for unwinding (drop the returned [`HalError`]
-/// + drop the `Apw12SmbusBackend` and `Pic1704ColdBoot` adapter, both of
-/// which clean up via Drop). We never re-engage a half-failed phase here.
+/// All six phases run sequentially. The APW12 five-step method rolls back its
+/// own partial POWER_ON failures. Once that succeeds, this orchestrator keeps
+/// a rollback scope armed through the final platform phase. Any later error
+/// returns both the initiating error and the worker-owned disarm/POWER_OFF
+/// result as [`HalError::PartialBootRollback`]. PIC and UART adapters have no
+/// destructive Drop guarantee.
+///
+/// This scope does not provide release-panic cleanup: firmware is built with
+/// `panic = "abort"`, which skips `Drop`. The daemon must arm its existing
+/// platform panic-hook cutoff before invoking an energizing sequence.
 ///
 /// # Arguments
 ///
@@ -424,183 +430,191 @@ pub fn cold_boot_sequence<P: Pic1704ColdBoot>(
     // opcodes 0x01→0x04→0x09→0x02→0x05/0x06 at I²C 0x10 on /dev/i2c-0.
     let p1 = Instant::now();
     psu.cold_boot_sequence_5_step(opts.target_voltage_mv, opts.watchdog_ms)?;
-    tracing::info!(
-        elapsed_ms = p1.elapsed().as_millis() as u64,
-        total_ms = t0.elapsed().as_millis() as u64,
-        "AM335x BB cold-boot phase 1 done — APW12 5-step"
-    );
 
-    // ── Phase 2 — PIC1704 DC-DC enable per chain (t = 8.0 s) ──────────────
-    // XXX: R4-CONFIRMED — bmminer_init_trace_am335x.md §2 step
-    // `_bitmain_pic_enable_dc_dc_common`. PIC1704 at I²C 0x20 on
-    // /dev/i2c-0 (R4 §4 I²C bus map). REG_VERSION jump (0x5A → REG_VERSION
-    // when fw==0x86) followed by REG_CONTROL=0x01 enable. Identical to
-    // CV1835 PIC1704 protocol per R4 §2.
-    let p2 = Instant::now();
-    for chain in 0..chain_count {
-        let v = pic.read_version(chain)?;
-        tracing::debug!(
-            chain,
-            fw = format_args!("0x{:02X}", v),
-            "AM335x BB cold-boot phase 2: PIC version read"
-        );
-        // start_app() is a no-op when already in app mode — matches
-        // pic1704.c lines 207-209. Our orchestrator always calls
-        // read_version first per the trait contract, so the impl can
-        // make a safe classification before issuing the bootloader jump.
-        pic.start_app(chain)?;
-        pic.wait_for_app(chain, Duration::from_millis(5_000))?;
-        pic.enable_dc_dc(chain)?;
-    }
-    tracing::info!(
-        elapsed_ms = p2.elapsed().as_millis() as u64,
-        total_ms = t0.elapsed().as_millis() as u64,
-        "AM335x BB cold-boot phase 2 done — PIC1704 DC-DC ON on {} chains",
-        chain_count
-    );
-
-    // ── Phase 3 — GPIO ASIC reset de-assert with 10 ms stagger (t = 8.0 s) ─
-    // XXX: R4-CONFIRMED — bmminer_init_trace_am335x.md §2 GPIO table:
-    // HB0_RESET=gpio0_5 (=5), HB1_RESET=gpio0_4 (=4), HB2_RESET=gpio0_27
-    // (=27), HB3_RESET=gpio0_22 (=22). Order from R4 trace §2 (chain
-    // 0..3 sequential, 10 ms inter-chain). bmminer binary explicitly
-    // references `gpio4`/`gpio5` strings (R4 §5).
-    //
-    // TODO(W14): migrate to libgpiod chardev once dcentrald-hal::libgpiod
-    //             lands a stable chip-handle API. AM335x kernel 4.6+
-    //             ships gpio-cdev (libgpiod works), but stock Bitmain BB
-    //             ships kernel 3.8 — sysfs is the only path that works
-    //             on both. Mirrors beaglebone.rs::set_board_reset which
-    //             also still uses sysfs for the same reason.
-    let p3 = Instant::now();
-    let reset_gpios = BeagleBonePlatform::chain_reset_gpios();
-    for (idx, gpio) in reset_gpios.iter().take(chain_count as usize).enumerate() {
-        // R4 §2 GPIO table: 1 = de-assert reset (running), 0 = held.
-        write_sysfs_gpio_value(*gpio, true)?;
-        tracing::debug!(
-            chain = idx as u8,
-            gpio = *gpio,
-            "AM335x BB cold-boot phase 3: ASIC reset de-asserted"
-        );
-        if idx + 1 < chain_count as usize {
-            std::thread::sleep(ASIC_RESET_STAGGER);
-        }
-    }
-    tracing::info!(
-        elapsed_ms = p3.elapsed().as_millis() as u64,
-        total_ms = t0.elapsed().as_millis() as u64,
-        "AM335x BB cold-boot phase 3 done — GPIO reset de-assert ({} chains, 10 ms stagger)",
-        chain_count
-    );
-
-    // ── Phase 4 — UART init (937500) + soft-reset broadcast (t = 8.5 s) ──
-    // XXX: R4-CONFIRMED — bmminer_init_trace_am335x.md §2.5 chain_write_enable.
-    // R4 §3 confirms `/dev/ttyO%d` device naming and stock-Bitmain MCR/FCR
-    // values. The orchestrator drives MCR=0x03 (RTS=1, DTR=1) + FCR=0x07
-    // (FIFO enable + RX/TX clear + 14-byte trigger) regardless of the
-    // kernel's default termios state.
-    let p4 = Instant::now();
-    let soft_reset = bm1362_soft_reset_frame();
-    for (idx, uart) in uarts.iter_mut().enumerate() {
-        uart.set_baud(CHAIN_UART_BAUD_HZ)?;
-        uart.flush_io();
-        // MCR + FCR enforcement is done indirectly via DevmemUart's
-        // baud-set path which already programs LCR + FCR coherently;
-        // BB_UART_MCR / BB_UART_FCR are pinned as constants for the test
-        // suite to assert no future regression silently changes the
-        // expected UART line state. A future wave can extend DevmemUart
-        // with explicit MCR/FCR setters if R4-3 (MiscCtrl live verify)
-        // surfaces a regression here.
-        uart.write_bytes(&soft_reset)?;
-        tracing::debug!(
-            chain = idx as u8,
-            baud = CHAIN_UART_BAUD_HZ,
-            mcr = format_args!("0x{:02X}", BB_UART_MCR),
-            fcr = format_args!("0x{:02X}", BB_UART_FCR),
-            "AM335x BB cold-boot phase 4: UART set + CMD_SOFT_RESET broadcast"
-        );
-    }
-    tracing::info!(
-        elapsed_ms = p4.elapsed().as_millis() as u64,
-        total_ms = t0.elapsed().as_millis() as u64,
-        "AM335x BB cold-boot phase 4 done — UARTs at 937500 + soft-reset"
-    );
-
-    // ── Phase 5 — MiscCtrl 0x00C100B0 triple-write — OPT-IN (t = 8.5 s) ──
-    // XXX: R4-CONFIRMED — bmminer_init_trace_am335x.md §6 unresolved item #2.
-    // W14.A1 audit-correction: W4 RE binary scan confirms BB bmminer does
-    // NOT contain `0x00C100B0` or `miscctrl` strings. The default canonical
-    // BB cold-boot path skips this phase entirely. The frame format is kept
-    // for forward compat (a future bench-only opt-in) and is exercised by
-    // `miscctrl_frame_byte_exact` against `build_miscctrl_frame()` directly.
-    //  SCOPE: S9/BM1387 + CV1835
-    // /BM1362 only — does NOT apply to AM335x BB.
-    if opts.run_miscctrl_triple_write {
-        let p5 = Instant::now();
-        emit_miscctrl_triple_write(uarts)?;
+    // Phase 1 committed its internal rollback scope. Arm a continuation
+    // scope immediately so every remaining ordinary error converges through
+    // the worker-owned APW12 shutdown plan. In release panic=abort builds,
+    // the daemon's separately armed platform panic hook owns hard cutoff.
+    run_with_power_rollback(psu, "AM335x BB cold boot after APW12 init", |_psu| {
         tracing::info!(
-            elapsed_ms = p5.elapsed().as_millis() as u64,
+            elapsed_ms = p1.elapsed().as_millis() as u64,
             total_ms = t0.elapsed().as_millis() as u64,
-            "AM335x BB cold-boot phase 5 done — MiscCtrl triple-write × {} chains \
-             (LAB OPT-IN — opts.run_miscctrl_triple_write=true)",
+            "AM335x BB cold-boot phase 1 done — APW12 5-step"
+        );
+        // ── Phase 2 — PIC1704 DC-DC enable per chain (t = 8.0 s) ──────────────
+        // XXX: R4-CONFIRMED — bmminer_init_trace_am335x.md §2 step
+        // `_bitmain_pic_enable_dc_dc_common`. PIC1704 at I²C 0x20 on
+        // /dev/i2c-0 (R4 §4 I²C bus map). REG_VERSION jump (0x5A → REG_VERSION
+        // when fw==0x86) followed by REG_CONTROL=0x01 enable. Identical to
+        // CV1835 PIC1704 protocol per R4 §2.
+        let p2 = Instant::now();
+        for chain in 0..chain_count {
+            let v = pic.read_version(chain)?;
+            tracing::debug!(
+                chain,
+                fw = format_args!("0x{:02X}", v),
+                "AM335x BB cold-boot phase 2: PIC version read"
+            );
+            // start_app() is a no-op when already in app mode — matches
+            // pic1704.c lines 207-209. Our orchestrator always calls
+            // read_version first per the trait contract, so the impl can
+            // make a safe classification before issuing the bootloader jump.
+            pic.start_app(chain)?;
+            pic.wait_for_app(chain, Duration::from_millis(5_000))?;
+            pic.enable_dc_dc(chain)?;
+        }
+        tracing::info!(
+            elapsed_ms = p2.elapsed().as_millis() as u64,
+            total_ms = t0.elapsed().as_millis() as u64,
+            "AM335x BB cold-boot phase 2 done — PIC1704 DC-DC ON on {} chains",
             chain_count
         );
-    } else {
-        tracing::info!(
-            total_ms = t0.elapsed().as_millis() as u64,
-            "AM335x BB cold-boot phase 5 SKIPPED — MiscCtrl triple-write is \
-             opt-in (default off per W14.A1 / W4 RE: stock BB bmminer does \
-             NOT emit 0x00C100B0)"
-        );
-    }
 
-    // ── Phase 6 — First WORK_TX dispatch readiness (t = 9.5 s) ───────────
-    // XXX: R4-CONFIRMED but live-verify deferred to bench AM335x BB unit
-    // (R4 Blocker #2 — hardware acquisition still outstanding 2026-05-10).
-    // bmminer_init_trace_am335x.md §2.5 + §3 confirm WORK_TX dispatch
-    // goes through `/dev/uart_trans` mmap + ioctl on AM335x BB (NOT FPGA
-    // mmio like CV1835). Since:
-    //   1. We do NOT have a stable userspace `uart_trans.ko` equivalent
-    //      yet (DCENT_OS uses `omap-serial` directly per
-    //       decision #2), and
-    //   2. R4 §6 explicitly defers exact IOCTL ordinals to a future
-    //      `uart_trans.ko` disassembly pass,
-    // this phase is LOG-ONLY. We assert UART state + chain count are
-    // ready and return. The actual first-work-dispatch is the daemon's
-    // job once a bench unit lands.
-    if opts.run_work_dispatch_log {
-        let p6 = Instant::now();
-        for chain in 0..chain_count {
-            let uart_path = uarts
-                .get(chain as usize)
-                .map(|u| u.path())
-                .unwrap_or("<unknown>");
-            tracing::info!(
-                chain,
-                uart = uart_path,
+        // ── Phase 3 — GPIO ASIC reset de-assert with 10 ms stagger (t = 8.0 s) ─
+        // XXX: R4-CONFIRMED — bmminer_init_trace_am335x.md §2 GPIO table:
+        // HB0_RESET=gpio0_5 (=5), HB1_RESET=gpio0_4 (=4), HB2_RESET=gpio0_27
+        // (=27), HB3_RESET=gpio0_22 (=22). Order from R4 trace §2 (chain
+        // 0..3 sequential, 10 ms inter-chain). bmminer binary explicitly
+        // references `gpio4`/`gpio5` strings (R4 §5).
+        //
+        // TODO(W14): migrate to libgpiod chardev once dcentrald-hal::libgpiod
+        //             lands a stable chip-handle API. AM335x kernel 4.6+
+        //             ships gpio-cdev (libgpiod works), but stock Bitmain BB
+        //             ships kernel 3.8 — sysfs is the only path that works
+        //             on both. Mirrors beaglebone.rs::set_board_reset which
+        //             also still uses sysfs for the same reason.
+        let p3 = Instant::now();
+        let reset_gpios = BeagleBonePlatform::chain_reset_gpios();
+        for (idx, gpio) in reset_gpios.iter().take(chain_count as usize).enumerate() {
+            // R4 §2 GPIO table: 1 = de-assert reset (running), 0 = held.
+            write_sysfs_gpio_value(*gpio, true)?;
+            tracing::debug!(
+                chain = idx as u8,
+                gpio = *gpio,
+                "AM335x BB cold-boot phase 3: ASIC reset de-asserted"
+            );
+            if idx + 1 < chain_count as usize {
+                std::thread::sleep(ASIC_RESET_STAGGER);
+            }
+        }
+        tracing::info!(
+            elapsed_ms = p3.elapsed().as_millis() as u64,
+            total_ms = t0.elapsed().as_millis() as u64,
+            "AM335x BB cold-boot phase 3 done — GPIO reset de-assert ({} chains, 10 ms stagger)",
+            chain_count
+        );
+
+        // ── Phase 4 — UART init (937500) + soft-reset broadcast (t = 8.5 s) ──
+        // XXX: R4-CONFIRMED — bmminer_init_trace_am335x.md §2.5 chain_write_enable.
+        // R4 §3 confirms `/dev/ttyO%d` device naming and stock-Bitmain MCR/FCR
+        // values. The orchestrator drives MCR=0x03 (RTS=1, DTR=1) + FCR=0x07
+        // (FIFO enable + RX/TX clear + 14-byte trigger) regardless of the
+        // kernel's default termios state.
+        let p4 = Instant::now();
+        let soft_reset = bm1362_soft_reset_frame();
+        for (idx, uart) in uarts.iter_mut().enumerate() {
+            uart.set_baud(CHAIN_UART_BAUD_HZ)?;
+            uart.flush_io();
+            // MCR + FCR enforcement is done indirectly via DevmemUart's
+            // baud-set path which already programs LCR + FCR coherently;
+            // BB_UART_MCR / BB_UART_FCR are pinned as constants for the test
+            // suite to assert no future regression silently changes the
+            // expected UART line state. A future wave can extend DevmemUart
+            // with explicit MCR/FCR setters if R4-3 (MiscCtrl live verify)
+            // surfaces a regression here.
+            uart.write_bytes(&soft_reset)?;
+            tracing::debug!(
+                chain = idx as u8,
                 baud = CHAIN_UART_BAUD_HZ,
-                "AM335x BB cold-boot phase 6: chain ready for WORK_TX dispatch \
-                 (LOG-ONLY — actual dispatch via uart_trans.ko-equivalent path \
-                 deferred to bench-unit verification, R4 Blocker #2)"
+                mcr = format_args!("0x{:02X}", BB_UART_MCR),
+                fcr = format_args!("0x{:02X}", BB_UART_FCR),
+                "AM335x BB cold-boot phase 4: UART set + CMD_SOFT_RESET broadcast"
             );
         }
         tracing::info!(
-            elapsed_ms = p6.elapsed().as_millis() as u64,
+            elapsed_ms = p4.elapsed().as_millis() as u64,
             total_ms = t0.elapsed().as_millis() as u64,
-            "AM335x BB cold-boot phase 6 done — work-dispatch readiness logged \
-             on {} chains",
-            chain_count
+            "AM335x BB cold-boot phase 4 done — UARTs at 937500 + soft-reset"
         );
-    } else {
-        tracing::info!("AM335x BB cold-boot: phase 6 skipped (opts.run_work_dispatch_log=false)");
-    }
 
-    tracing::info!(
-        total_ms = t0.elapsed().as_millis() as u64,
-        chains = chain_count,
-        "AM335x BB cold-boot: complete"
-    );
-    Ok(())
+        // ── Phase 5 — MiscCtrl 0x00C100B0 triple-write — OPT-IN (t = 8.5 s) ──
+        // XXX: R4-CONFIRMED — bmminer_init_trace_am335x.md §6 unresolved item #2.
+        // W14.A1 audit-correction: W4 RE binary scan confirms BB bmminer does
+        // NOT contain `0x00C100B0` or `miscctrl` strings. The default canonical
+        // BB cold-boot path skips this phase entirely. The frame format is kept
+        // for forward compat (a future bench-only opt-in) and is exercised by
+        // `miscctrl_frame_byte_exact` against `build_miscctrl_frame()` directly.
+        //  SCOPE: S9/BM1387 + CV1835
+        // /BM1362 only — does NOT apply to AM335x BB.
+        if opts.run_miscctrl_triple_write {
+            let p5 = Instant::now();
+            emit_miscctrl_triple_write(uarts)?;
+            tracing::info!(
+                elapsed_ms = p5.elapsed().as_millis() as u64,
+                total_ms = t0.elapsed().as_millis() as u64,
+                "AM335x BB cold-boot phase 5 done — MiscCtrl triple-write × {} chains \
+             (LAB OPT-IN — opts.run_miscctrl_triple_write=true)",
+                chain_count
+            );
+        } else {
+            tracing::info!(
+                total_ms = t0.elapsed().as_millis() as u64,
+                "AM335x BB cold-boot phase 5 SKIPPED — MiscCtrl triple-write is \
+             opt-in (default off per W14.A1 / W4 RE: stock BB bmminer does \
+             NOT emit 0x00C100B0)"
+            );
+        }
+
+        // ── Phase 6 — First WORK_TX dispatch readiness (t = 9.5 s) ───────────
+        // XXX: R4-CONFIRMED but live-verify deferred to bench AM335x BB unit
+        // (R4 Blocker #2 — hardware acquisition still outstanding 2026-05-10).
+        // bmminer_init_trace_am335x.md §2.5 + §3 confirm WORK_TX dispatch
+        // goes through `/dev/uart_trans` mmap + ioctl on AM335x BB (NOT FPGA
+        // mmio like CV1835). Since:
+        //   1. We do NOT have a stable userspace `uart_trans.ko` equivalent
+        //      yet (DCENT_OS uses `omap-serial` directly per
+        //       decision #2), and
+        //   2. R4 §6 explicitly defers exact IOCTL ordinals to a future
+        //      `uart_trans.ko` disassembly pass,
+        // this phase is LOG-ONLY. We assert UART state + chain count are
+        // ready and return. The actual first-work-dispatch is the daemon's
+        // job once a bench unit lands.
+        if opts.run_work_dispatch_log {
+            let p6 = Instant::now();
+            for chain in 0..chain_count {
+                let uart_path = uarts
+                    .get(chain as usize)
+                    .map(|u| u.path())
+                    .unwrap_or("<unknown>");
+                tracing::info!(
+                    chain,
+                    uart = uart_path,
+                    baud = CHAIN_UART_BAUD_HZ,
+                    "AM335x BB cold-boot phase 6: chain ready for WORK_TX dispatch \
+                 (LOG-ONLY — actual dispatch via uart_trans.ko-equivalent path \
+                 deferred to bench-unit verification, R4 Blocker #2)"
+                );
+            }
+            tracing::info!(
+                elapsed_ms = p6.elapsed().as_millis() as u64,
+                total_ms = t0.elapsed().as_millis() as u64,
+                "AM335x BB cold-boot phase 6 done — work-dispatch readiness logged \
+             on {} chains",
+                chain_count
+            );
+        } else {
+            tracing::info!(
+                "AM335x BB cold-boot: phase 6 skipped (opts.run_work_dispatch_log=false)"
+            );
+        }
+
+        tracing::info!(
+            total_ms = t0.elapsed().as_millis() as u64,
+            chains = chain_count,
+            "AM335x BB cold-boot: complete"
+        );
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------

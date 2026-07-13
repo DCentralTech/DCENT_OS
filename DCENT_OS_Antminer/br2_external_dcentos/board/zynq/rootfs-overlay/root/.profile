@@ -1,9 +1,6 @@
 # DCENTos root profile
 [ -f ~/.bashrc ] && . ~/.bashrc
 
-# Add tools to PATH
-export PATH="/root/tools:$PATH"
-
 # Show system info on login
 DCENTOS_VER=$(cat /etc/dcentos-version 2>/dev/null || echo "dev")
 echo ""
@@ -21,12 +18,5 @@ else
     echo "[!!] No UIO devices found — FPGA bitstream may not be loaded"
 fi
 
-if command -v devmem > /dev/null 2>&1; then
-    FPGA_VER=$(devmem 0x43C00000 32 2>/dev/null)
-    if [ -n "$FPGA_VER" ]; then
-        echo "[OK] FPGA version: $FPGA_VER"
-    fi
-else
-    echo "[!!] devmem not available — install devmem2"
-fi
+echo "Hardware status: use miner-status (daemon-owned snapshot)"
 echo ""

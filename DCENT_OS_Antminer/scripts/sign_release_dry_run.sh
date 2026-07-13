@@ -5,8 +5,9 @@
 # the operator's host BEFORE they generate or expose a real signing key.
 # Uses a fresh ephemeral keypair (created in a temp dir, deleted on exit) to
 # build a tiny synthetic sysupgrade-<target>/ package, sign MANIFEST.json,
-# and verify the result with verify_sysupgrade_signature.sh - the same
-# verifier dcentrald and `dcent install` rely on.
+# and verify the result with the target-side verify_sysupgrade_signature.sh.
+# The Rust API parser is a separate implementation covered by unit and
+# real-artifact image-smoke tests.
 #
 # This script is intentionally:
 #   - Dev-only. REFUSES to run if DCENT_RELEASE_SIGNING_KEY is set
@@ -15,7 +16,7 @@
 #   - Self-contained. Does NOT invoke build_in_docker.sh or Docker; the
 #     rehearsal is "does this host's openssl + verify script produce a
 #     passing round-trip?", not "does the full Buildroot pipeline run?".
-#   - Reproducible. Emits a rehearsal report with ephemeral pubkey SHA,
+#   - Auditable. Emits a rehearsal report with ephemeral pubkey SHA,
 #     manifest SHA, package SHA, and signature length so the operator can
 #     compare against their real-key run.
 #
@@ -227,12 +228,12 @@ cat > "$MANIFEST" <<EOF_MANIFEST
   "board": "$TARGET",
   "board_target": "$TARGET",
   "version": "dry-run-rehearsal",
-  "payloads": [
-    { "path": "sysupgrade-$TARGET/kernel", "size": $KERNEL_SIZE, "sha256": "$KERNEL_SHA" },
-    { "path": "sysupgrade-$TARGET/root", "size": $ROOT_SIZE, "sha256": "$ROOT_SHA" },
-    { "path": "sysupgrade-$TARGET/METADATA", "size": $META_SIZE, "sha256": "$META_SHA" },
-    { "path": "sysupgrade-$TARGET/release_ed25519.pub", "size": $PUB_SIZE, "sha256": "$PUB_SHA" }
-  ]
+  "payloads": {
+    "kernel": { "path": "sysupgrade-$TARGET/kernel", "size": $KERNEL_SIZE, "sha256": "$KERNEL_SHA" },
+    "rootfs": { "path": "sysupgrade-$TARGET/root", "size": $ROOT_SIZE, "sha256": "$ROOT_SHA" },
+    "metadata": { "path": "sysupgrade-$TARGET/METADATA", "size": $META_SIZE, "sha256": "$META_SHA" },
+    "verification_key": { "path": "sysupgrade-$TARGET/release_ed25519.pub", "size": $PUB_SIZE, "sha256": "$PUB_SHA" }
+  }
 }
 EOF_MANIFEST
 MANIFEST_SHA=$(sha256sum -- "$MANIFEST" | awk '{print $1}')
@@ -271,7 +272,7 @@ log "package: size=$PKG_SIZE sha256=$PKG_SHA"
 log ""
 
 # --- 6. verify ---
-banner "Step 6 - verify via verify_sysupgrade_signature.sh (same code path as dcentrald)"
+banner "Step 6 - verify via the target-side Ed25519 shell verifier"
 VERIFY_LOG="$TMPDIR_REHEARSAL/verify.log"
 if ! sh -- "$VERIFY_SCRIPT" "$PKG" "$PUB_PEM" "$TARGET" > "$VERIFY_LOG" 2>&1; then
     log "FAIL: verify_sysupgrade_signature.sh rejected the rehearsal package"
@@ -295,12 +296,13 @@ log "  package:        $PKG"
 log "  verify log:     $VERIFY_LOG"
 log ""
 log "What this proves:"
-log "  - openssl + verify_sysupgrade_signature.sh round-trip works on this host."
-log "  - MANIFEST.json schema (product, board, payloads sha256+size) is accepted."
+log "  - openssl + the target-side verify_sysupgrade_signature.sh round-trip works on this host."
+log "  - The canonical object-valued payload registry is emitted."
 log "  - Raw Ed25519 signature is exactly 64 bytes."
 log "  - Tar layout (single sysupgrade-<board>/ dir) is correct."
 log ""
 log "What this does NOT prove:"
+log "  - dcentrald-api's Rust archive/parser contract accepts this package (covered separately in Rust/image-smoke CI)."
 log "  - The full Buildroot pipeline (build_in_docker.sh) produces a package."
 log "  - Your real Ed25519 key custody (HSM / Vault) is correct."
 log "  - dcentrald's at-rest DCENT_MANIFEST_PUBLIC_KEY_HEX pin matches your key."

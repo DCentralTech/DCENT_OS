@@ -712,6 +712,36 @@ impl FanAccess for AmlogicFan {
         }
     }
 
+    fn set_speed_checked(&self, pwm: u8) -> Result<super::FanCommandReceipt> {
+        let duty_ns = amlogic_pwm_percent_to_duty_ns(pwm, self.period_ns);
+        let duty = duty_ns.to_string();
+        fs::write(&self.rear_duty_path, &duty)
+            .map_err(|error| HalError::Fan(format!("rear fan PWM write: {error}")))?;
+        fs::write(&self.front_duty_path, &duty)
+            .map_err(|error| HalError::Fan(format!("front fan PWM write: {error}")))?;
+
+        for (label, path) in [
+            ("rear", &self.rear_duty_path),
+            ("front", &self.front_duty_path),
+        ] {
+            let observed = fs::read_to_string(path)
+                .map_err(|error| HalError::Fan(format!("{label} fan PWM readback: {error}")))?;
+            let observed = observed.trim().parse::<u32>().map_err(|error| {
+                HalError::Fan(format!("{label} fan PWM readback parse: {error}"))
+            })?;
+            if observed != duty_ns {
+                return Err(HalError::Fan(format!(
+                    "{label} fan PWM readback mismatch: requested {duty_ns}ns, observed {observed}ns"
+                )));
+            }
+        }
+
+        Ok(super::FanCommandReceipt {
+            requested_pwm: pwm,
+            observed_pwm: pwm,
+        })
+    }
+
     fn get_rpm(&self) -> u32 {
         // W3.2 (2026-05-07): real GPIO falling-edge tach on gpio447-450.
         // The legacy `900 + pwm*51` synthesized formula is gone — the
@@ -877,10 +907,21 @@ const GPIO_PINMUX_FIX: [u32; 2] = [476, 477];
 /// power. Native DCENT_OS must also replay the APW I2C sequence because there
 /// is no bosminer/BraiinsOS rootfs in the final boot.
 pub fn enable_psu() -> Result<()> {
-    enable_psu_gpio()?;
+    if let Err(enable_error) = enable_psu_gpio() {
+        return match disable_psu_checked() {
+            Ok(_) => Err(enable_error),
+            Err(rollback_error) => Err(HalError::Platform(format!(
+                "PSU GPIO enable failed ({enable_error}); checked rollback also failed ({rollback_error})"
+            ))),
+        };
+    }
     if let Err(e) = enable_psu_pmbus() {
-        let _ = disable_psu();
-        return Err(e);
+        return match disable_psu_checked() {
+            Ok(_) => Err(e),
+            Err(rollback_error) => Err(HalError::Platform(format!(
+                "PSU PMBus enable failed ({e}); checked rollback also failed ({rollback_error})"
+            ))),
+        };
     }
 
     // Wait for PSU to stabilize (APW PSU soft-start is ~1 second).
@@ -909,7 +950,7 @@ fn enable_psu_gpio() -> Result<()> {
         .map_err(|e| HalError::Platform(format!("PSU GPIO enable: {}", e)))?;
 
     std::thread::sleep(Duration::from_millis(50));
-    if !is_psu_enabled() {
+    if !read_psu_enabled_checked()? {
         return Err(HalError::Platform(format!(
             "PSU GPIO {} readback stayed LOW after enable",
             GPIO_PSU_ENABLE
@@ -968,15 +1009,34 @@ fn read_pmbus_status_word(bus: &mut I2cBus) -> Result<u16> {
     Ok(u16::from_le_bytes(buf))
 }
 
-/// Disable the APW PSU output (for shutdown/safety).
-pub fn disable_psu() -> Result<()> {
+/// Checked software safe-off evidence for GPIO437. This proves that the LOW
+/// sysfs write completed and a subsequent fallible sysfs read returned LOW; it
+/// does not claim an independently measured physical rail voltage.
+#[derive(Debug)]
+pub struct PsuSafeOffReceipt {
+    gpio: u32,
+    completed_at: Instant,
+}
+
+impl PsuSafeOffReceipt {
+    pub fn gpio(&self) -> u32 {
+        self.gpio
+    }
+
+    pub fn completed_at(&self) -> Instant {
+        self.completed_at
+    }
+}
+
+/// Disable the APW PSU output and require a checked LOW readback.
+pub fn disable_psu_checked() -> Result<PsuSafeOffReceipt> {
     let gpio_path = format!("/sys/class/gpio/gpio{}/value", GPIO_PSU_ENABLE);
     // Drive LOW to disable PSU (active HIGH,  Q10 — corrected 2026-05-21).
     fs::write(&gpio_path, "0")
         .map_err(|e| HalError::Platform(format!("PSU GPIO disable: {}", e)))?;
 
     std::thread::sleep(Duration::from_millis(50));
-    if is_psu_enabled() {
+    if read_psu_enabled_checked()? {
         return Err(HalError::Platform(format!(
             "PSU GPIO {} readback stayed HIGH after disable",
             GPIO_PSU_ENABLE
@@ -987,15 +1047,39 @@ pub fn disable_psu() -> Result<()> {
         "PSU GPIO {} driven LOW and read back LOW (PSU disabled)",
         GPIO_PSU_ENABLE
     );
-    Ok(())
+    Ok(PsuSafeOffReceipt {
+        gpio: GPIO_PSU_ENABLE,
+        completed_at: Instant::now(),
+    })
 }
 
-/// Check if the PSU is currently enabled.
-pub fn is_psu_enabled() -> bool {
+/// Compatibility wrapper for callers that do not yet consume typed evidence.
+pub fn disable_psu() -> Result<()> {
+    disable_psu_checked().map(|_| ())
+}
+
+/// Read GPIO437 without converting I/O or parse failures into a false `off`.
+pub fn read_psu_enabled_checked() -> Result<bool> {
     let gpio_path = format!("/sys/class/gpio/gpio{}/value", GPIO_PSU_ENABLE);
-    fs::read_to_string(&gpio_path)
-        .map(|v| v.trim() == "1") // Active HIGH: 1 = enabled (Wave 5 Q10, corrected 2026-05-21)
-        .unwrap_or(false)
+    let value = fs::read_to_string(&gpio_path)
+        .map_err(|error| HalError::Platform(format!("PSU GPIO readback: {error}")))?;
+    parse_psu_gpio_enabled(&value)
+}
+
+fn parse_psu_gpio_enabled(value: &str) -> Result<bool> {
+    match value.trim() {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        other => Err(HalError::Platform(format!(
+            "PSU GPIO readback was neither 0 nor 1: {other:?}"
+        ))),
+    }
+}
+
+/// Lossy telemetry compatibility helper. Safety decisions must use
+/// [`read_psu_enabled_checked`] or [`disable_psu_checked`].
+pub fn is_psu_enabled() -> bool {
+    read_psu_enabled_checked().unwrap_or(false)
 }
 
 /// Initialize GPIO pinmux to prevent I2C bus corruption (BOS-3528).
@@ -1229,6 +1313,46 @@ fn detect_amlogic_model() -> Result<PlatformConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_psu_gpio_parser_never_converts_unknown_data_to_off() {
+        assert_eq!(parse_psu_gpio_enabled("0\n").unwrap(), false);
+        assert_eq!(parse_psu_gpio_enabled("1\n").unwrap(), true);
+        for invalid in ["", "2", "off", "read error"] {
+            assert!(
+                parse_psu_gpio_enabled(invalid).is_err(),
+                "value={invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_fan_command_surfaces_partial_two_channel_write() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "dcentos-amlogic-fan-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let rear = root.join("rear_duty");
+        std::fs::write(&rear, "0").unwrap();
+        let front = root.join("missing-parent").join("front_duty");
+        let fan = AmlogicFan {
+            rear_duty_path: rear.to_string_lossy().into_owned(),
+            front_duty_path: front.to_string_lossy().into_owned(),
+            period_ns: AMLOGIC_PWM_PERIOD_NS,
+            tach_sources: Vec::new(),
+            sample_window: Duration::from_millis(1),
+        };
+
+        let result = fan.set_speed_checked(30);
+        assert!(result.is_err(), "front-channel failure must reject receipt");
+        assert_eq!(std::fs::read_to_string(&rear).unwrap(), "30000");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn apw_pmbus_enable_sequence_matches_extracted_uboot_preboot() {
@@ -1621,12 +1745,12 @@ mod tests {
         );
         // Readback treats HIGH as enabled.
         assert!(
-            src.contains("v.trim() == \"1\""),
-            "is_psu_enabled must treat \"1\" (HIGH) as enabled (active HIGH, Wave 5 Q10)"
+            src.contains("\"1\" => Ok(true)"),
+            "the checked GPIO parser must treat \"1\" (HIGH) as enabled (active HIGH, Wave 5 Q10)"
         );
         // The old active-LOW readback must be gone.
         assert!(
-            !src.contains("|v| v.trim() == \"0\") // Active LOW"),
+            !src.contains("\"0\" => Ok(true)"),
             "active-LOW readback must not be re-introduced (EE C1 regression guard)"
         );
     }

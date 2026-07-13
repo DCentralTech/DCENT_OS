@@ -114,6 +114,20 @@ case "$PACKAGE_VERSION" in
 esac
 echo "Version: ${PACKAGE_VERSION}"
 
+DCENT_PACKAGE_STATUS="${DCENT_PACKAGE_STATUS:-unvalidated_target_sysupgrade}"
+DCENT_BUILD_TARGET="${DCENT_BUILD_TARGET:-am2-s19jpro}"
+dcent_release_provenance_init
+CANONICAL_BUILD_TIME=$(printf '%s' "$DCENT_CREATED_AT_UTC" | sed 's/T/ /; s/Z/ UTC/')
+
+. "${PROJECT_ROOT}/scripts/lib/rootfs_ownership_ledger.sh"
+dcent_emit_rootfs_ownership_ledger \
+    "$ROOTFS" \
+    "${BINARIES_DIR}/rootfs-ownership.json" \
+    --post-build-script "board=${BR2_EXTERNAL_DCENTOS_PATH}/board/zynq/am2-s19jpro/post-build.sh" \
+    --post-build-script "common-prune=${BR2_EXTERNAL_DCENTOS_PATH}/board/common/prune-runtime-research-tools.sh" \
+    --overlay-root "zynq-base=${BR2_EXTERNAL_DCENTOS_PATH}/board/zynq/rootfs-overlay" \
+    --overlay-root "am2-s19jpro=${BR2_EXTERNAL_DCENTOS_PATH}/board/zynq/am2-s19jpro/rootfs-overlay"
+
 KERNEL=""
 if [ -n "${DCENT_AM2_S19J_KERNEL:-}" ] && [ -f "${DCENT_AM2_S19J_KERNEL}" ]; then
     KERNEL="${DCENT_AM2_S19J_KERNEL}"
@@ -178,7 +192,7 @@ fi
 cat > "$SUP_DIR/METADATA" << EOF
 DCENT_OS
 D-Central Technologies
-Build: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+Build: ${CANONICAL_BUILD_TIME}
 Board: ${BOARD_NAME}
 Kernel: BraiinsOS 4.4.x (am2-s17 / S19j Pro Zynq variant)
 Rootfs: DCENTos (Buildroot)
@@ -215,7 +229,7 @@ cat > "$SUP_DIR/MANIFEST.json" << EOF
   "board": "${BOARD_NAME}",
   "board_target": "${BOARD_NAME}",
   "version": "${PACKAGE_VERSION}",
-  "created_at_utc": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "created_at_utc": "${DCENT_CREATED_AT_UTC}",
   "payloads": {
     "kernel": {
       "path": "sysupgrade-${BOARD_NAME}/kernel",
@@ -298,7 +312,7 @@ dcent_write_sysupgrade_manifest
 dcent_sign_sysupgrade_manifest
 
 # Build tarball
-(cd "$STAGING" && tar cf "$OUTPUT_TAR" "sysupgrade-${BOARD_NAME}/")
+dcent_create_deterministic_tar "$OUTPUT_TAR" "$STAGING" "sysupgrade-${BOARD_NAME}"
 OUTPUT_SIZE=$(stat -c%s "$OUTPUT_TAR")
 OUTPUT_SHA256=$(sha256sum "$OUTPUT_TAR" | awk '{print $1}')
 
@@ -315,7 +329,7 @@ tar tf "$OUTPUT_TAR" | sed 's/^/  /'
 # -----------------------------------------------------------------------------
 cat > "${BINARIES_DIR}/BUILD_INFO.txt" << EOF
 === DCENTos am2-s19jpro Build Info ===
-Build date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+Build date: ${CANONICAL_BUILD_TIME}
 Board:      ${BOARD_NAME} (S19j Pro AM2 Zynq lane)
 Board family: ${BOARD_FAMILY}
 

@@ -2728,7 +2728,11 @@ mod tests {
         // A decimal date+pid+uptime shape (the weak fallback) — matches but is
         // rejected on release.
         let weak = "1750000000000000000012345678";
-        assert!(!is_proxy_header_trusted_for_image(Some(weak), true, Some(weak)));
+        assert!(!is_proxy_header_trusted_for_image(
+            Some(weak),
+            true,
+            Some(weak)
+        ));
         // Too-short hex is rejected on release.
         assert!(!is_proxy_header_trusted_for_image(
             Some("deadbeef"),
@@ -2751,7 +2755,11 @@ mod tests {
         ));
         // DEV/LAB is byte-identical to today: a weak nonce match is still
         // accepted there (no entropy requirement off-release).
-        assert!(is_proxy_header_trusted_for_image(Some(weak), false, Some(weak)));
+        assert!(is_proxy_header_trusted_for_image(
+            Some(weak),
+            false,
+            Some(weak)
+        ));
     }
 
     /// CE-114: the strong-nonce definition mirrors the init-script's

@@ -1,0 +1,3 @@
+{"schema":"dcent-saleae-enumeration-v1","model":"s17","strictness":"exact","provenance":"","source_sha256":"016d2a04ae5b7bc9f020750258c6974d80687bd391655f382cca6f0d556aff8a","analyzer":{"host_to_asic_channel":2,"asic_to_host_channel":3,"baud":115200}}
+{"event":"capture_command","bytes":[85,170,82,5,0,0,10],"occurrences":11}
+{"event":"capture_response","bytes":[170,85,19,151,24,0,0,0,6],"occurrences_per_command":48}

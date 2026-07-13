@@ -72,6 +72,15 @@ rumqttc.workspace = true
 [dev-dependencies]
 proptest = { workspace = true }
 
+[features]
+default = []
+# Host-only daemon emulation. Never enabled by Buildroot/release profiles.
+sim-hal = [
+    "dcentrald-hal/sim-hal",
+    "dcentrald-asic/sim-hal",
+    "dcentrald-stratum/mock-pool",
+]
+
 # W4.7 lint inheritance + grandfather override (DCENT_DevOps + DCENT_QA, 2026-05-07).
 # This crate has ~148 grandfathered unwrap/expect/panic occurrences in src/
 # (counted via `grep -rE '\.unwrap\(\)|\.expect\(|panic!' src/`). Lints are

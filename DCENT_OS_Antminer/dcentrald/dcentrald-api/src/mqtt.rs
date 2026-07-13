@@ -168,7 +168,10 @@ pub(crate) fn target_watts_cap_write_confirmed(runtime: &serde_json::Value) -> b
 /// CE-242: rejection string for an unconfirmed watt-cap write (config was
 /// persisted, so it applies on next restart; the live write was not proven).
 pub(crate) fn unconfirmed_target_watts_error(runtime: &serde_json::Value) -> String {
-    let status = runtime.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let status = runtime
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
     let message = runtime
         .get("message")
         .and_then(|v| v.as_str())

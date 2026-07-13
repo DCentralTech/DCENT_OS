@@ -149,7 +149,17 @@ fn make_minimal_inputs() -> dcentrald_api::MinimalAppStateInputs {
 fn grant_beta_identity(state: &Arc<dcentrald_api::AppState>) {
     let mut hw = state.hardware_info.lock().expect("hardware_info lock");
     hw.chip_type = "BM1387".to_string();
-    hw.identification.confidence = "exact".to_string();
+    hw.identification = dcentrald_api::HardwareIdentification::from_evidence(
+        vec![
+            dcentrald_api::HardwareIdentityEvidence::declared_asic_board_target("am1-s9", "BM1387"),
+            dcentrald_api::HardwareIdentityEvidence::measured_asic_enumeration(
+                0x1387,
+                "BM1387",
+                dcentrald_api::HardwareCompositionToken::new(1, "test:am1-s9"),
+            ),
+        ],
+        Some("test S9 enumeration evidence".to_string()),
+    );
 }
 
 async fn body_to_value(resp: axum::response::Response) -> (StatusCode, Value) {

@@ -18,8 +18,17 @@
  * Wave reference: AGENT B3 wave W10.x (am3-bb-s19jpro variant split-out
  *   from am3-bb base, 2026-05-09).
  *
+ * DCENT_REFERENCE_ONLY: bbctrl-s70
+ *
+ * This reconstruction describes the legacy BBCtrl/S70-style topology, not
+ * the live-captured S19J_IO_BOARD_V2_0 topology used by the active
+ * am3-bb-s19jpro board target.  It MUST NOT be compiled or packaged for that
+ * target.  In particular, its reset GPIOs and UART pin-control flags differ
+ * from the live `a lab unit` FDT.  It remains checked in only as reverse-engineering
+ * reference material until a source-equivalent carrier DTS is recovered.
+ *
  * ASIC:        BM1362 on BHB42xxx hashboards (AM335x carrier of the S19j
- *              Pro). Up to 4 chains supported per gpio-leds plug3 / rst3.
+ *              Pro). Legacy reconstruction exposes four chain slots.
  * Console:     UART1 (ttyO0) at 115200 8N1 (omap2plus default).
  * Hashboard:   UART2/3/5/6 (ttyO1..ttyO5) — DCENT_OS routes ASIC traffic
  *              through dcentrald userspace over kernel ttyS devices (NOT through
@@ -571,13 +580,13 @@
 
                 rst0 {
                     label = "rst0";
-                    gpios = <&gpio0 5 1>;   /* GPIO49 - Hash board 0 reset */
+                    gpios = <&gpio0 5 1>;   /* GPIO5 - legacy hash board 0 reset */
                     default-state = "on";
                 };
 
                 rst1 {
                     label = "res1";
-                    gpios = <&gpio0 4 1>;   /* GPIO60 - Hash board 1 reset */
+                    gpios = <&gpio0 4 1>;   /* GPIO4 - legacy hash board 1 reset */
                     default-state = "on";
                 };
 

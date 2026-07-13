@@ -9,13 +9,13 @@
 //!   2. run()    - Start mining pipeline, thermal loop, API server, watchdog
 //!   3. shutdown() - Graceful stop: disable voltages, cool down, close watchdog
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -25,7 +25,7 @@ use dcentrald_asic::chain::{
 };
 use dcentrald_asic::drivers::{ChipRegistry, MinerProfile, PicType};
 use dcentrald_asic::dspic::DspicService;
-use dcentrald_asic::pic::{PicController, PicFirmware};
+use dcentrald_asic::pic::{Pic16EndpointSession, PicController, PicFirmware, PicServiceController};
 use dcentrald_hal::fan::FanController;
 use dcentrald_hal::fpga_chain::FpgaChain;
 use dcentrald_hal::gpio::GpioController;
@@ -36,6 +36,9 @@ use dcentrald_hal::xadc::Xadc;
 use dcentrald_thermal::controller::{ThermalAction, ThermalController};
 use dcentrald_thermal::profiles::ThermalProfile;
 
+use crate::asic_identity_publication::{
+    DispatcherCompositionAuthority, EnumeratedMiningChainReceipt, ExpectedMiningChain,
+};
 use crate::config::DcentraldConfig;
 use crate::history::{self, HistoryBuffer};
 use crate::model;
@@ -50,11 +53,271 @@ use crate::runtime::notifications::{
     spawn_notification_stack, AlertEvent, RuntimeNotificationConfig, RuntimeWebhookConfig,
     NOTIFICATION_RELOAD_INTERVAL,
 };
+use crate::runtime::task_guard::RuntimeTaskGuard;
+use crate::runtime::thread_guard::{
+    join_thread_bounded, sleep_until_cancelled, RuntimeThreadGuard, ThreadStopOutcome,
+};
+use crate::voltage_mailbox::{voltage_command_mailbox, VoltageCommandSender, VoltageTrySendError};
 use crate::work_dispatcher::{VoltageCommand, VoltageCommandReply};
 
 const FAN_PWM_MAX: u8 = dcentrald_hal::fan::PWM_MAX;
 const FAN_PWM_QUIET_BOOT: u8 = dcentrald_hal::fan::PWM_QUIET_BOOT;
 const FAN_PWM_SAFETY_MAX: u8 = dcentrald_hal::fan::PWM_SAFETY_MAX;
+const COOLING_SPINUP_DWELL: Duration = Duration::from_secs(3);
+const COOLING_SPINUP_SAMPLES: usize = 3;
+const COOLING_SPINUP_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const PSU_WATCHDOG_THREAD_STOP_TIMEOUT: Duration = Duration::from_secs(3);
+const MINING_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+const WATCHDOG_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Covers the standard path's explicit 26.5 s worst-case bounded waits while
+/// still turning a wedged shutdown into a hardware reset. Unbounded transport
+/// calls remain protected because feeding stops at this absolute deadline.
+const WATCHDOG_TEARDOWN_GRACE: Duration = Duration::from_secs(30);
+/// Persisted PH-3 state has four scalar/optional fields and is normally under
+/// 128 bytes. A 1 KiB ceiling leaves ample schema-evolution room while refusing
+/// accidental/unbounded diagnostic payloads on the small `/data` filesystem.
+const RECOVERY_LADDER_STATE_MAX_BYTES: usize = 1024;
+
+fn pic16_service_for_endpoint(
+    sessions: &[Pic16EndpointSession],
+    address: u8,
+    firmware: Option<PicFirmware>,
+) -> Result<PicServiceController> {
+    let session = sessions
+        .iter()
+        .find(|session| session.address() == address)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no discovery-bound PIC16 endpoint session for I2C address 0x{address:02X}; refusing raw-address fallback"
+            )
+        })?;
+    Ok(match firmware {
+        Some(firmware) => session.service_with_firmware(firmware),
+        None => session.service(),
+    })
+}
+
+/// Initialization-time ownership of PIC endpoints that have successfully
+/// enabled their rails and therefore require watchdog heartbeats.
+///
+/// A poisoned mutex must not abort the daemon: the protected `Vec<u8>` remains
+/// structurally valid after unwinding, and losing its addresses would silently
+/// stop heartbeats to energized boards. Recover the retained membership with a
+/// loud error instead. Callers still decide whether an I2C operation succeeded;
+/// this container never grants hardware authority by itself.
+#[derive(Clone)]
+struct InitializedPicAddrs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl InitializedPicAddrs {
+    fn new(addrs: Vec<u8>) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(addrs)))
+    }
+
+    fn lock_recover(&self, operation: &'static str) -> std::sync::MutexGuard<'_, Vec<u8>> {
+        match self.0.lock() {
+            Ok(addrs) => addrs,
+            Err(poisoned) => {
+                error!(
+                    operation,
+                    retained_count = poisoned.get_ref().len(),
+                    "Initialized PIC ownership mutex was poisoned; recovering the structurally valid retained address list"
+                );
+                let addrs = poisoned.into_inner();
+                // The recovered guard proves exclusive access while the
+                // structurally valid Vec is retained. Clear the poison now so
+                // the 500ms heartbeat reader records this incident once rather
+                // than flooding logs forever.
+                self.0.clear_poison();
+                addrs
+            }
+        }
+    }
+
+    fn snapshot(&self, operation: &'static str) -> Vec<u8> {
+        self.lock_recover(operation).clone()
+    }
+
+    fn record_success(&self, addr: u8, operation: &'static str) {
+        self.lock_recover(operation).push(addr);
+    }
+
+    fn len(&self, operation: &'static str) -> usize {
+        self.lock_recover(operation).len()
+    }
+}
+
+#[derive(Debug)]
+enum RecoveryStatePersistError<E> {
+    Serialize(serde_json::Error),
+    Write(E),
+}
+
+fn persist_recovery_ladder_state_with_writer<E, F>(
+    path: &std::path::Path,
+    state: &dcentrald_api_types::hashrate_recovery::PersistedLadderState,
+    writer: F,
+) -> std::result::Result<
+    dcentrald_common::atomic_file::AtomicWriteOutcome,
+    RecoveryStatePersistError<E>,
+>
+where
+    F: FnOnce(
+        &std::path::Path,
+        &[u8],
+        dcentrald_common::atomic_file::AtomicWriteOptions,
+    ) -> std::result::Result<dcentrald_common::atomic_file::AtomicWriteOutcome, E>,
+{
+    // Preserve the prior serde_json::to_string byte contract exactly: compact
+    // JSON, UTF-8, and no trailing newline.
+    let json = serde_json::to_string(state).map_err(RecoveryStatePersistError::Serialize)?;
+    writer(
+        path,
+        json.as_bytes(),
+        dcentrald_common::atomic_file::AtomicWriteOptions::state_file(
+            RECOVERY_LADDER_STATE_MAX_BYTES,
+        ),
+    )
+    .map_err(RecoveryStatePersistError::Write)
+}
+
+fn persist_recovery_ladder_state(
+    path: &std::path::Path,
+    state: &dcentrald_api_types::hashrate_recovery::PersistedLadderState,
+) -> std::result::Result<
+    dcentrald_common::atomic_file::AtomicWriteOutcome,
+    RecoveryStatePersistError<dcentrald_common::atomic_file::AtomicWriteError>,
+> {
+    persist_recovery_ladder_state_with_writer(path, state, |path, bytes, options| {
+        dcentrald_common::atomic_file::atomic_write(path, bytes, options)
+    })
+}
+
+fn log_recovery_state_persist_failure(
+    action: &'static str,
+    error: &RecoveryStatePersistError<dcentrald_common::atomic_file::AtomicWriteError>,
+) {
+    match error {
+        RecoveryStatePersistError::Serialize(error) => tracing::error!(
+            action,
+            error = %error,
+            persistence_stage = "serialize",
+            target_published = false,
+            publication_durability_uncertain = false,
+            "PH-3 auto-recovery state persistence failed"
+        ),
+        RecoveryStatePersistError::Write(error) => tracing::error!(
+            action,
+            error = %error,
+            persistence_stage = %error.stage(),
+            target_published = error.target_published(),
+            publication_durability_uncertain = error.target_published(),
+            cleanup_error = ?error.cleanup_error(),
+            "PH-3 auto-recovery state persistence failed"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod recovery_state_persistence_tests {
+    use super::{
+        persist_recovery_ladder_state_with_writer, RecoveryStatePersistError,
+        RECOVERY_LADDER_STATE_MAX_BYTES,
+    };
+    use dcentrald_api_types::hashrate_recovery::PersistedLadderState;
+
+    const DAEMON_SOURCE: &str = include_str!("daemon.rs");
+
+    fn state() -> PersistedLadderState {
+        PersistedLadderState {
+            episode_active: true,
+            attempts: 2,
+            last_action_at_s: Some(123),
+            gave_up_at_s: None,
+        }
+    }
+
+    #[test]
+    fn injected_writer_receives_exact_bounded_legacy_json_bytes() {
+        let expected =
+            br#"{"episode_active":true,"attempts":2,"last_action_at_s":123,"gave_up_at_s":null}"#;
+        let result = persist_recovery_ladder_state_with_writer(
+            std::path::Path::new("recovery.json"),
+            &state(),
+            |path, bytes, options| {
+                assert_eq!(path, std::path::Path::new("recovery.json"));
+                assert_eq!(bytes, expected);
+                assert_eq!(options.max_bytes(), RECOVERY_LADDER_STATE_MAX_BYTES);
+                Err("injected-write-failure")
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(RecoveryStatePersistError::Write("injected-write-failure"))
+        ));
+        assert!(expected.len() < RECOVERY_LADDER_STATE_MAX_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn behavior_publishes_complete_exact_json_without_legacy_temp_file() {
+        let unique = format!(
+            "dcentrald-recovery-state-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("ladder.json");
+        std::fs::write(&target, b"old").unwrap();
+
+        let outcome = super::persist_recovery_ladder_state(&target, &state()).unwrap();
+        assert!(outcome.replaced_existing);
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            br#"{"episode_active":true,"attempts":2,"last_action_at_s":123,"gave_up_at_s":null}"#
+        );
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn source_centralizes_both_ph3_writes_and_keeps_restart_fail_closed() {
+        let start_marker = ["// PH-3: drive the auto-recovery", " ladder"].concat();
+        let start = DAEMON_SOURCE
+            .find(&start_marker)
+            .expect("PH-3 recovery block");
+        let end = DAEMON_SOURCE[start..]
+            .find("// Wait for shutdown signal")
+            .map(|offset| start + offset)
+            .expect("PH-3 recovery block end");
+        let block = &DAEMON_SOURCE[start..end];
+
+        assert_eq!(block.matches("persist_recovery_ladder_state(").count(), 2);
+        let legacy_temp = ["with_extension", "(\"tmp\")"].concat();
+        assert!(!block.contains(&legacy_temp));
+        assert!(!block.contains("std::fs::rename"));
+
+        let schedule_arm = block.find("LadderOutcome::ScheduleRestart").unwrap();
+        let persisted = block[schedule_arm..]
+            .find("persist_recovery_ladder_state(")
+            .map(|offset| schedule_arm + offset)
+            .unwrap();
+        let restart = block[schedule_arm..]
+            .find("schedule_daemon_restart(")
+            .map(|offset| schedule_arm + offset)
+            .unwrap();
+        assert!(persisted < restart);
+        assert!(block[persisted..restart].contains("Ok(outcome)"));
+        assert!(block.contains("NOT restarting (fail-closed)"));
+
+        assert!(DAEMON_SOURCE.contains("dcentrald_common::atomic_file::atomic_write"));
+        assert!(DAEMON_SOURCE.contains("publication_durability_uncertain"));
+        assert!(DAEMON_SOURCE.contains("target_published = error.target_published()"));
+    }
+}
 
 /// CRASH-SAFETY (BUG-9, 2026-06-05): hard upper bound on the 7-phase hardware
 /// bring-up (`init()`). The S9/am1 cold-boot path does blocking I²C/UART I/O
@@ -106,6 +369,64 @@ fn normalize_td003_signal(value: &str) -> String {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '+')
         .collect()
+}
+
+/// Legacy kernel-I2C smart-PSU access is proven only for an authoritative
+/// `am2-s17*` Buildroot board target plus an S17-family configured model.
+///
+/// The generic AM2/S19 path has documented cross-bus corruption, while CV,
+/// Amlogic, BeagleBone, and unknown platforms have no evidence for this raw
+/// bus-1 owner. A configured PSU override remains authoritative and disables
+/// probing entirely.
+fn legacy_kernel_smart_psu_path_allowed(
+    config_model: Option<&str>,
+    board_target: &str,
+    psu_override_active: bool,
+) -> bool {
+    let board_target = normalize_td003_signal(board_target);
+    if psu_override_active || !board_target.starts_with("am2s17") {
+        return false;
+    }
+    config_model
+        .map(normalize_td003_signal)
+        .is_some_and(|model| model.contains("s17") && !model.contains("s19"))
+}
+
+#[cfg(test)]
+mod legacy_smart_psu_path_tests {
+    use super::legacy_kernel_smart_psu_path_allowed;
+
+    #[test]
+    fn only_explicit_am2_s17_evidence_allows_legacy_kernel_i2c_psu() {
+        assert!(legacy_kernel_smart_psu_path_allowed(
+            Some("Antminer S17 Pro"),
+            "am2-s17pro-zynq",
+            false,
+        ));
+
+        for (model, board) in [
+            (Some("Antminer S19 Pro"), "am2-s17pro-zynq"),
+            (Some("Antminer S19j Pro"), "am2-s17pro-zynq"),
+            (Some("Antminer S17 Pro"), "am3-cv1835-s19"),
+            (Some("Antminer S17 Pro"), "unknown"),
+            (Some("Antminer S17 Pro"), ""),
+            (None, "am2-s17pro-zynq"),
+        ] {
+            assert!(
+                !legacy_kernel_smart_psu_path_allowed(model, board, false),
+                "unexpected legacy PSU admission for model={model:?}, board={board}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_psu_override_disables_legacy_probe_even_on_s17() {
+        assert!(!legacy_kernel_smart_psu_path_allowed(
+            Some("Antminer S17"),
+            "am2-s17-zynq",
+            true,
+        ));
+    }
 }
 
 fn td003_model_from_freeform_signal(signal: &str) -> Option<&'static str> {
@@ -187,6 +508,37 @@ fn read_first_trimmed(paths: &[&str]) -> String {
         .unwrap_or_default()
 }
 
+struct SystemPlatformIdentitySource;
+
+impl crate::daemon_lifecycle::PlatformIdentitySource for SystemPlatformIdentitySource {
+    fn capture_identity(&self) -> Result<crate::daemon_lifecycle::PlatformIdentitySnapshot> {
+        let optional_declared = |paths: &[&str]| {
+            let value = read_first_trimmed(paths);
+            (!value.is_empty()).then_some(value)
+        };
+
+        let declared_board_target = optional_declared(&["/etc/dcentos/board_target"]);
+        let board_desc = declared_board_target
+            .as_deref()
+            .and_then(dcentrald_common::BoardDesc::lookup);
+
+        Ok(crate::daemon_lifecycle::PlatformIdentitySnapshot {
+            declared_board_target,
+            board_desc,
+            declared_platform_marker: optional_declared(&[
+                "/etc/bos_platform",
+                "/etc/dcentos/platform",
+                "/etc/dcentos-platform",
+                "/proc/device-tree/model",
+            ]),
+            declared_subtype: optional_declared(&["/etc/subtype"]),
+            // This remains an observation of OS device signatures. It must not
+            // be promoted to measured hashboard or ASIC identity.
+            observed_control_board: detect_control_board(),
+        })
+    }
+}
+
 fn divergent_chip_policy_for_platform(
     enforce_on_xil25: bool,
     platform_marker: &str,
@@ -240,8 +592,8 @@ mod divergent_chip_policy_tests {
 }
 
 /// Decide whether this unit is an am1-s9 that must take the S9-only devmem I2C
-/// path (unbind xiic-i2c + AXI-IIC recovery + emergency PIC heartbeats to
-/// 0x55-0x57 + an I2C service WITHOUT the hashboard-EEPROM write denylist).
+/// path (unbind xiic-i2c + AXI-IIC recovery + an I2C service WITHOUT the
+/// hashboard-EEPROM write denylist).
 ///
 /// AUTHORITATIVE-FIRST: a non-empty `/etc/dcentos/board_target` (written by every
 /// Buildroot post-build) is definitive — only an `am1-s9*` target is S9; any
@@ -252,20 +604,321 @@ mod divergent_chip_policy_tests {
 /// would then devmem-write `[55 AA 16]` heartbeats to 0x55-0x57 — the am2 AT24C
 /// identity EEPROMs in the protected 0x50-0x57 range — and corrupt them.
 ///
-/// Only when board_target is ABSENT do we fall back to the control-board string,
-/// and BeagleBone/AM335x is NOT S9 (it has its own denylist-registering am3-bb
-/// path), so it is no longer folded into the S9 allowlist here.
-fn is_am1_s9_from_evidence(board_target: &str, control_board: &str) -> bool {
-    let bt = board_target.trim();
-    if !bt.is_empty() {
-        return bt.starts_with("am1-s9");
+/// Missing board_target is not identity evidence. The UIO-count-derived
+/// control-board string remains useful telemetry but cannot authorize a raw
+/// devmem transport or removal of the EEPROM write denylist.
+fn is_am1_s9_from_evidence(board_target: &str, _control_board: &str) -> bool {
+    board_target.trim().starts_with("am1-s9")
+}
+
+/// Existing single-owner I2C constructor selected from one identity snapshot.
+///
+/// This enum is the precise follow-on capability boundary: a future injected
+/// `SerializedI2cFactory` should consume this decision and return the sole
+/// `I2cServiceHandle`, owning any required S9 unbind/recovery. Endpoint drivers
+/// must not grow independent raw-bus constructors while that factory is moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StandardI2cTransport {
+    Am1S9Devmem,
+    AmlogicProtected,
+    KernelProtected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SerializedI2cRequest {
+    transport: StandardI2cTransport,
+    recover_am1_bus: bool,
+}
+
+impl SerializedI2cRequest {
+    fn new(transport: StandardI2cTransport, recover_am1_bus: bool) -> Result<Self> {
+        if recover_am1_bus && transport != StandardI2cTransport::Am1S9Devmem {
+            anyhow::bail!("AM1 AXI-IIC recovery was requested for non-S9 transport {transport:?}");
+        }
+        Ok(Self {
+            transport,
+            recover_am1_bus,
+        })
     }
-    control_board.starts_with("Zynq am1")
+}
+
+/// Sole-owner capability for the standard daemon's serialized bus-0 service.
+///
+/// The capability owns transport preparation as well as service construction:
+/// callers cannot recover/unbind S9 separately and cannot select a second raw
+/// bus constructor after receiving the handle.
+trait SerializedI2cFactory {
+    fn open_serialized_i2c(
+        &self,
+        request: SerializedI2cRequest,
+    ) -> Result<dcentrald_hal::i2c::I2cServiceHandle>;
+}
+
+/// Low-level operations behind the production factory. This is kept private to
+/// make exact ordering executable in host tests without touching miner device
+/// nodes. It is not an alternate daemon-side bus capability.
+trait SerializedI2cOperations {
+    type Handle;
+
+    fn recover_am1_bus_without_keepalive(&self);
+    fn unbind_kernel_i2c_driver(&self);
+    fn spawn_am1_devmem(&self) -> std::io::Result<Self::Handle>;
+    fn spawn_amlogic_protected(&self) -> std::io::Result<Self::Handle>;
+    fn spawn_kernel_protected(&self) -> std::io::Result<Self::Handle>;
+}
+
+fn open_serialized_i2c_with_operations<O: SerializedI2cOperations>(
+    operations: &O,
+    request: SerializedI2cRequest,
+) -> std::io::Result<O::Handle> {
+    match request.transport {
+        StandardI2cTransport::Am1S9Devmem => {
+            if request.recover_am1_bus {
+                operations.recover_am1_bus_without_keepalive();
+            }
+            operations.unbind_kernel_i2c_driver();
+            operations.spawn_am1_devmem()
+        }
+        StandardI2cTransport::AmlogicProtected => operations.spawn_amlogic_protected(),
+        StandardI2cTransport::KernelProtected => operations.spawn_kernel_protected(),
+    }
+}
+
+struct ProductionSerializedI2cOperations;
+
+impl SerializedI2cOperations for ProductionSerializedI2cOperations {
+    type Handle = dcentrald_hal::i2c::I2cServiceHandle;
+
+    fn recover_am1_bus_without_keepalive(&self) {
+        Daemon::recover_am1_i2c_bus_without_keepalive();
+    }
+
+    fn unbind_kernel_i2c_driver(&self) {
+        dcentrald_hal::i2c::unbind_kernel_i2c_driver();
+    }
+
+    fn spawn_am1_devmem(&self) -> std::io::Result<Self::Handle> {
+        dcentrald_hal::i2c::spawn_i2c_service(0, true)
+    }
+
+    fn spawn_amlogic_protected(&self) -> std::io::Result<Self::Handle> {
+        dcentrald_hal::platform::amlogic::spawn_amlogic_protected_i2c0_service()
+    }
+
+    fn spawn_kernel_protected(&self) -> std::io::Result<Self::Handle> {
+        dcentrald_hal::i2c::spawn_i2c_service_no_register_touch_with_denylist(
+            0,
+            HASHBOARD_EEPROM_WRITE_DENYLIST.to_vec(),
+        )
+    }
+}
+
+struct ProductionSerializedI2cFactory;
+
+impl SerializedI2cFactory for ProductionSerializedI2cFactory {
+    fn open_serialized_i2c(
+        &self,
+        request: SerializedI2cRequest,
+    ) -> Result<dcentrald_hal::i2c::I2cServiceHandle> {
+        open_serialized_i2c_with_operations(&ProductionSerializedI2cOperations, request)
+            .map_err(|error| anyhow::anyhow!("FATAL: failed to spawn I2C service thread: {error}"))
+    }
+}
+
+#[cfg(feature = "sim-hal")]
+impl SerializedI2cFactory for dcentrald_hal::platform::sim::SimPlatform {
+    fn open_serialized_i2c(
+        &self,
+        request: SerializedI2cRequest,
+    ) -> Result<dcentrald_hal::i2c::I2cServiceHandle> {
+        // Request validation is shared with production. Hardware-only recovery
+        // and unbind are intentionally absent; the simulator's existing method
+        // returns its sole shared in-memory service for bus 0.
+        let _ = SerializedI2cRequest::new(request.transport, request.recover_am1_bus)?;
+        self.open_i2c_service(0).map_err(Into::into)
+    }
+}
+
+fn standard_i2c_transport(
+    identity: &crate::daemon_lifecycle::PlatformIdentitySnapshot,
+    is_am1_s9: bool,
+) -> Result<StandardI2cTransport> {
+    let observed_family = if identity.observed_control_board.starts_with("Zynq") {
+        Some(dcentrald_common::BoardFamily::Zynq)
+    } else if identity.observed_control_board.starts_with("AML") {
+        Some(dcentrald_common::BoardFamily::Amlogic)
+    } else if identity.observed_control_board.starts_with("BeagleBone") {
+        Some(dcentrald_common::BoardFamily::BeagleBone)
+    } else if identity.observed_control_board.starts_with("CVITEK") {
+        Some(dcentrald_common::BoardFamily::Cvitek)
+    } else if identity.observed_control_board.starts_with("STM32") {
+        Some(dcentrald_common::BoardFamily::Stm32Mp15)
+    } else {
+        None
+    };
+
+    // BoardDesc is a typed control-board composition input here, not a miner
+    // product descriptor. Only its control-board family participates. ASIC,
+    // hashboard, voltage-controller, work-engine, storage, PSU, cooling, and
+    // network selection remain owned by their independent evidence boundaries.
+    if let (Some(board_desc), Some(observed_family)) = (identity.board_desc, observed_family) {
+        if board_desc.family != observed_family {
+            anyhow::bail!(
+                "declared BoardDesc {} ({:?}) contradicts observed control-board family {:?}; refusing serialized I2C transport selection",
+                board_desc.board_target,
+                board_desc.family,
+                observed_family
+            );
+        }
+    }
+
+    if is_am1_s9 {
+        Ok(StandardI2cTransport::Am1S9Devmem)
+    } else if identity.observed_control_board.starts_with("AML") {
+        Ok(StandardI2cTransport::AmlogicProtected)
+    } else {
+        Ok(StandardI2cTransport::KernelProtected)
+    }
+}
+
+#[cfg(test)]
+mod serialized_i2c_factory_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingOperations {
+        events: Mutex<Vec<&'static str>>,
+    }
+
+    impl RecordingOperations {
+        fn record(&self, event: &'static str) {
+            self.events.lock().unwrap().push(event);
+        }
+
+        fn snapshot(&self) -> Vec<&'static str> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl SerializedI2cOperations for RecordingOperations {
+        type Handle = &'static str;
+
+        fn recover_am1_bus_without_keepalive(&self) {
+            self.record("recover-am1");
+        }
+
+        fn unbind_kernel_i2c_driver(&self) {
+            self.record("unbind-kernel");
+        }
+
+        fn spawn_am1_devmem(&self) -> std::io::Result<Self::Handle> {
+            self.record("spawn-am1-devmem-bus0");
+            Ok("am1")
+        }
+
+        fn spawn_amlogic_protected(&self) -> std::io::Result<Self::Handle> {
+            self.record("spawn-amlogic-protected-bus0");
+            Ok("amlogic")
+        }
+
+        fn spawn_kernel_protected(&self) -> std::io::Result<Self::Handle> {
+            self.record("spawn-kernel-protected-bus0");
+            Ok("kernel")
+        }
+    }
+
+    #[test]
+    fn serialized_i2c_factory_production_delegation_preserves_s9_ordering() {
+        let operations = RecordingOperations::default();
+        let request = SerializedI2cRequest::new(StandardI2cTransport::Am1S9Devmem, true)
+            .expect("valid S9 recovery request");
+        assert_eq!(
+            open_serialized_i2c_with_operations(&operations, request).unwrap(),
+            "am1"
+        );
+        assert_eq!(
+            operations.snapshot(),
+            ["recover-am1", "unbind-kernel", "spawn-am1-devmem-bus0"]
+        );
+
+        let operations = RecordingOperations::default();
+        let request = SerializedI2cRequest::new(StandardI2cTransport::Am1S9Devmem, false)
+            .expect("valid S9 passthrough request");
+        open_serialized_i2c_with_operations(&operations, request).unwrap();
+        assert_eq!(
+            operations.snapshot(),
+            ["unbind-kernel", "spawn-am1-devmem-bus0"]
+        );
+    }
+
+    #[test]
+    fn serialized_i2c_factory_production_delegation_keeps_protected_branches_isolated() {
+        for (transport, expected_handle, expected_event) in [
+            (
+                StandardI2cTransport::AmlogicProtected,
+                "amlogic",
+                "spawn-amlogic-protected-bus0",
+            ),
+            (
+                StandardI2cTransport::KernelProtected,
+                "kernel",
+                "spawn-kernel-protected-bus0",
+            ),
+        ] {
+            let operations = RecordingOperations::default();
+            let request = SerializedI2cRequest::new(transport, false).unwrap();
+            assert_eq!(
+                open_serialized_i2c_with_operations(&operations, request).unwrap(),
+                expected_handle
+            );
+            assert_eq!(operations.snapshot(), [expected_event]);
+        }
+
+        assert!(SerializedI2cRequest::new(StandardI2cTransport::KernelProtected, true).is_err());
+        assert!(SerializedI2cRequest::new(StandardI2cTransport::AmlogicProtected, true).is_err());
+    }
+
+    #[cfg(feature = "sim-hal")]
+    #[test]
+    fn serialized_i2c_factory_simplatform_uses_existing_shared_service() {
+        use dcentrald_asic::dspic::{DspicFirmware, DspicService};
+        use dcentrald_hal::platform::sim::{SimModel, SimPlatform};
+
+        let platform = SimPlatform::new(SimModel::S19Pro);
+        let request = SerializedI2cRequest::new(StandardI2cTransport::KernelProtected, false)
+            .expect("valid simulated protected request");
+        let service = SerializedI2cFactory::open_serialized_i2c(&platform, request).unwrap();
+        service
+            .write_bytes(0x20, &[0x55, 0xAA, 0x15, 0x01])
+            .expect("existing simulated dsPIC service accepts enable");
+        assert!(platform.i2c_voltage_enabled().unwrap());
+
+        service.latch_terminal_safe_off();
+        let mut controller =
+            DspicService::new_with_firmware(service.clone(), 0x20, DspicFirmware::Fw89);
+        controller.disable_voltage().unwrap();
+        assert!(!platform.i2c_voltage_enabled().unwrap());
+        assert!(service
+            .write_bytes(0x20, &[0x55, 0xAA, 0x15, 0x01])
+            .is_err());
+    }
 }
 
 #[cfg(test)]
 mod is_am1_s9_evidence_tests {
-    use super::is_am1_s9_from_evidence;
+    use super::{is_am1_s9_from_evidence, standard_i2c_transport, StandardI2cTransport};
+    use crate::daemon_lifecycle::PlatformIdentitySnapshot;
+
+    fn identity(board_target: Option<&str>, control_board: &str) -> PlatformIdentitySnapshot {
+        PlatformIdentitySnapshot {
+            declared_board_target: board_target.map(str::to_string),
+            board_desc: board_target.and_then(dcentrald_common::BoardDesc::lookup),
+            declared_platform_marker: None,
+            declared_subtype: None,
+            observed_control_board: control_board.to_string(),
+        }
+    }
 
     #[test]
     fn board_target_overrides_the_control_board_heuristic() {
@@ -283,14 +936,13 @@ mod is_am1_s9_evidence_tests {
     }
 
     #[test]
-    fn falls_back_to_control_board_only_when_board_target_absent() {
-        assert!(is_am1_s9_from_evidence("", "Zynq am1-s9"));
+    fn missing_board_target_never_mints_destructive_transport_authority() {
+        assert!(!is_am1_s9_from_evidence("", "Zynq am1-s9"));
         assert!(!is_am1_s9_from_evidence("", "Zynq am2-s17"));
         // BeagleBone (AM335x, am3-bb) is NOT S9 — it has its own denylist path.
         assert!(!is_am1_s9_from_evidence("", "BeagleBone S9"));
         assert!(!is_am1_s9_from_evidence("am3-bb-s19jpro", "BeagleBone S9"));
-        // whitespace-only board_target is treated as absent.
-        assert!(is_am1_s9_from_evidence("   ", "Zynq am1-s9"));
+        assert!(!is_am1_s9_from_evidence("   ", "Zynq am1-s9"));
     }
 
     #[test]
@@ -300,6 +952,73 @@ mod is_am1_s9_evidence_tests {
         assert!(!is_am1_s9_from_evidence("am1-s15", "Zynq am1-s9"));
         assert!(!is_am1_s9_from_evidence("am1-s17", "Zynq am1-s9"));
     }
+
+    #[test]
+    fn platform_identity_snapshot_selects_the_existing_single_owner_i2c_transport() {
+        let s9 = identity(Some("am1-s9"), "Zynq am2-s17");
+        assert_eq!(
+            standard_i2c_transport(&s9, is_am1_s9_from_evidence(s9.board_target(), "ignored"))
+                .unwrap(),
+            StandardI2cTransport::Am1S9Devmem
+        );
+
+        let amlogic = identity(Some("am3-s21"), "AML Amlogic");
+        assert_eq!(
+            standard_i2c_transport(&amlogic, false).unwrap(),
+            StandardI2cTransport::AmlogicProtected
+        );
+
+        // A contradictory/unknown heuristic never removes the protected
+        // kernel path without an exact am1-s9 declaration.
+        for non_s9 in [
+            identity(Some("am2-s19pro"), "Zynq am1-s9"),
+            identity(None, "Zynq am1-s9"),
+            identity(Some("am3-bb-s19jpro"), "BeagleBone S9"),
+        ] {
+            assert_eq!(
+                standard_i2c_transport(&non_s9, false).unwrap(),
+                StandardI2cTransport::KernelProtected
+            );
+        }
+    }
+
+    #[test]
+    fn board_desc_runtime_input_rejects_control_board_family_contradictions() {
+        let declared_zynq_observed_amlogic = identity(Some("am1-s9"), "AML Amlogic");
+        let error = standard_i2c_transport(&declared_zynq_observed_amlogic, true).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("contradicts observed control-board family"));
+
+        let declared_amlogic_observed_zynq = identity(Some("am3-s21"), "Zynq am2-s17");
+        assert!(standard_i2c_transport(&declared_amlogic_observed_zynq, false).is_err());
+
+        let declared_bb_observed_zynq = identity(Some("am3-bb-s19jpro"), "Zynq am2-s17");
+        assert!(standard_i2c_transport(&declared_bb_observed_zynq, false).is_err());
+    }
+
+    #[test]
+    fn board_desc_runtime_input_does_not_select_unowned_machine_facets() {
+        // Unknown targets retain the exact legacy observed-family decision;
+        // BoardDesc is not required to invent a machine composition.
+        let unknown_amlogic = identity(Some("future-board"), "AML Amlogic");
+        assert!(unknown_amlogic.board_desc.is_none());
+        assert_eq!(
+            standard_i2c_transport(&unknown_amlogic, false).unwrap(),
+            StandardI2cTransport::AmlogicProtected
+        );
+
+        // Conversely, declared metadata alone does not force a transport when
+        // the OS has not observed a control-board family. This preserves the
+        // prior protected-kernel behavior and avoids collapsing BoardDesc's
+        // work/storage/controller fields into whole-miner authority.
+        let unobserved_amlogic = identity(Some("am3-s21"), "Unknown");
+        assert!(unobserved_amlogic.board_desc.is_some());
+        assert_eq!(
+            standard_i2c_transport(&unobserved_amlogic, false).unwrap(),
+            StandardI2cTransport::KernelProtected
+        );
+    }
 }
 
 fn clamp_fan_pwm(pwm: u8) -> u8 {
@@ -308,6 +1027,491 @@ fn clamp_fan_pwm(pwm: u8) -> u8 {
 
 fn fan_pwm_percent(pwm: u8) -> u8 {
     clamp_fan_pwm(pwm)
+}
+
+/// Collect one fan-tach snapshot only while availability remains stable across
+/// the read. A sampler can lose GPIO evidence between the readiness check and
+/// per-channel loads; treating the resulting zeroes as measured stopped fans
+/// would turn I/O loss into a false FanPanic. Re-readiness requires a complete
+/// measurement window, so an unavailable second check cannot ABA back to ready
+/// during this call.
+fn collect_fan_tach_evidence<Available, Read>(
+    mut available: Available,
+    read: Read,
+) -> (bool, Vec<u32>)
+where
+    Available: FnMut() -> bool,
+    Read: FnOnce() -> Vec<u32>,
+{
+    if !available() {
+        return (false, Vec::new());
+    }
+    let readings = read();
+    if readings.is_empty() || !available() {
+        return (false, Vec::new());
+    }
+    (true, readings)
+}
+
+#[cfg(test)]
+mod fan_tach_evidence_tests {
+    use super::collect_fan_tach_evidence;
+    use std::cell::Cell;
+
+    #[test]
+    fn availability_loss_during_read_discards_zeroes_as_unknown() {
+        let available = Cell::new(true);
+        let (admitted, readings) = collect_fan_tach_evidence(
+            || available.get(),
+            || {
+                available.set(false);
+                vec![0, 0, 0, 0]
+            },
+        );
+        assert!(!admitted);
+        assert!(readings.is_empty());
+    }
+
+    #[test]
+    fn stable_available_snapshot_preserves_per_fan_readings() {
+        let (admitted, readings) =
+            collect_fan_tach_evidence(|| true, || vec![1200, 1180, 1210, 1195]);
+        assert!(admitted);
+        assert_eq!(readings, [1200, 1180, 1210, 1195]);
+    }
+
+    #[test]
+    fn available_without_channels_is_not_tach_evidence() {
+        let (admitted, readings) = collect_fan_tach_evidence(|| true, Vec::new);
+        assert!(!admitted);
+        assert!(readings.is_empty());
+    }
+}
+
+fn identified_miner_profile(chip_id: u16) -> Result<&'static MinerProfile> {
+    if chip_id == 0 {
+        anyhow::bail!("ASIC identity is uninitialized; refusing model-specific defaults");
+    }
+    MinerProfile::for_chip(chip_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "identified ASIC ChipID 0x{chip_id:04X} has no MinerProfile; refusing S9 topology, voltage, and PLL defaults"
+        )
+    })
+}
+
+/// Resolve topology before ASIC enumeration only from evidence that is strong
+/// enough to authorize the standard daemon's model-specific hardware paths.
+///
+/// An exact `am1-s9` board target is authoritative for the S9 control-board
+/// wiring, so it may seed the topology required to reach enumeration. It does
+/// not prove that BM1387 silicon was observed; callers must not copy the
+/// returned profile's ChipID into the discovered-identity field.
+fn pre_enumeration_topology_profile(authoritative_am1_s9: bool) -> Result<&'static MinerProfile> {
+    if authoritative_am1_s9 {
+        return identified_miner_profile(0x1387);
+    }
+    anyhow::bail!(
+        "no supported ASIC profile or exact am1-s9 topology identity is available; refusing model-specific PIC, chain, GPIO, and UIO access"
+    )
+}
+
+fn validate_standard_daemon_topology(
+    profile: &MinerProfile,
+    effective_pic_type: PicType,
+    effective_pic_addrs: &[u8],
+) -> Result<()> {
+    let chain_count = usize::from(profile.chain_count);
+    if chain_count == 0 {
+        anyhow::bail!("{} topology declares zero chains", profile.name);
+    }
+    if chain_count != STANDARD_DAEMON_BOARD_SLOTS {
+        anyhow::bail!(
+            "{} topology declares {} chains but the standard daemon supports exactly {} board slots",
+            profile.name,
+            chain_count,
+            STANDARD_DAEMON_BOARD_SLOTS
+        );
+    }
+    if profile.chain_ids.len() != chain_count {
+        anyhow::bail!(
+            "{} topology has {} chain IDs for {} chains",
+            profile.name,
+            profile.chain_ids.len(),
+            chain_count
+        );
+    }
+    if profile.uio_bases.len() != chain_count {
+        anyhow::bail!(
+            "{} topology has {} UIO bases for {} chains; use the platform-specific daemon instead of placeholder UIO routing",
+            profile.name,
+            profile.uio_bases.len(),
+            chain_count
+        );
+    }
+    if !matches!(effective_pic_type, PicType::NoPic) && effective_pic_addrs.len() != chain_count {
+        anyhow::bail!(
+            "{} topology has {} PIC addresses for {} PIC-controlled chains",
+            profile.name,
+            effective_pic_addrs.len(),
+            chain_count
+        );
+    }
+    if profile
+        .chain_ids
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        != chain_count
+    {
+        anyhow::bail!("{} topology contains duplicate chain IDs", profile.name);
+    }
+    if profile
+        .uio_bases
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        != chain_count
+    {
+        anyhow::bail!("{} topology contains duplicate UIO bases", profile.name);
+    }
+    if effective_pic_addrs.iter().any(|&address| address > 0x7f) {
+        anyhow::bail!("{} topology contains a non-7-bit PIC address", profile.name);
+    }
+    if !matches!(effective_pic_type, PicType::NoPic)
+        && effective_pic_addrs
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != chain_count
+    {
+        anyhow::bail!("{} topology contains duplicate PIC addresses", profile.name);
+    }
+    Ok(())
+}
+
+fn validate_profile_platform_authority(
+    board_target: &str,
+    authoritative_am1_s9: bool,
+    profile: &MinerProfile,
+) -> Result<()> {
+    let board_target = board_target.trim().to_ascii_lowercase();
+    let target_chip_label = model::board_target_chip_label(&board_target).ok_or_else(|| {
+        anyhow::anyhow!(
+            "authoritative board target {board_target} does not identify an ASIC family"
+        )
+    })?;
+    let profile_chip_label = format!("BM{:04X}", profile.chip_id);
+    if target_chip_label != profile_chip_label {
+        anyhow::bail!(
+            "authoritative {board_target} identifies {target_chip_label}, contradicting configured {} ({profile_chip_label}) topology",
+            profile.name
+        );
+    }
+    if authoritative_am1_s9 {
+        return Ok(());
+    }
+    if board_target.starts_with("am2-") {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "authoritative board target {board_target} is not supported by the standard Zynq daemon topology path"
+    )
+}
+
+fn passthrough_miner_profile(chip_id: u16) -> Result<&'static MinerProfile> {
+    identified_miner_profile(chip_id).map_err(|error| {
+        anyhow::anyhow!(
+            "passthrough requires an explicit supported ASIC model because enumeration is skipped: {error}"
+        )
+    })
+}
+
+#[cfg(test)]
+mod identified_miner_profile_tests {
+    use super::{
+        identified_miner_profile, passthrough_miner_profile, pre_enumeration_topology_profile,
+        validate_profile_platform_authority, validate_standard_daemon_topology,
+    };
+    use dcentrald_asic::drivers::PicType;
+
+    #[test]
+    fn known_identity_resolves_and_unknown_or_zero_fail_closed() {
+        assert_eq!(
+            identified_miner_profile(0x1387).unwrap().name,
+            "Antminer S9"
+        );
+        for chip_id in [0, 0x1234, 0xFFFF] {
+            let error = identified_miner_profile(chip_id).unwrap_err().to_string();
+            assert!(
+                error.contains("refusing"),
+                "ChipID 0x{chip_id:04X} must fail closed: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn passthrough_never_invents_an_asic_identity() {
+        assert_eq!(
+            passthrough_miner_profile(0x1387).unwrap().name,
+            "Antminer S9"
+        );
+        for chip_id in [0, 0x1234, 0xFFFF] {
+            let error = passthrough_miner_profile(chip_id).unwrap_err().to_string();
+            assert!(error.contains("enumeration is skipped"));
+            assert!(error.contains("refusing"));
+        }
+    }
+
+    #[test]
+    fn only_authoritative_am1_s9_may_seed_an_absent_topology() {
+        assert_eq!(
+            pre_enumeration_topology_profile(true).unwrap().name,
+            "Antminer S9"
+        );
+        let error = pre_enumeration_topology_profile(false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refusing model-specific"));
+    }
+
+    #[test]
+    fn standard_daemon_admission_validates_every_indexed_topology_table() {
+        let s9 = identified_miner_profile(0x1387).unwrap();
+        validate_standard_daemon_topology(s9, PicType::Pic16F1704, s9.pic_addrs).unwrap();
+
+        let amlogic = identified_miner_profile(0x1368).unwrap();
+        let error = validate_standard_daemon_topology(amlogic, PicType::NoPic, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("UIO bases"));
+    }
+
+    #[test]
+    fn configured_profile_cannot_override_authoritative_platform_wiring() {
+        let s9 = identified_miner_profile(0x1387).unwrap();
+        let s19 = identified_miner_profile(0x1398).unwrap();
+        validate_profile_platform_authority("am1-s9", true, s9).unwrap();
+        validate_profile_platform_authority("am2-s19pro", false, s19).unwrap();
+        assert!(validate_profile_platform_authority("am1-s9", true, s19).is_err());
+        assert!(validate_profile_platform_authority("am2-s19pro", false, s9).is_err());
+        assert!(validate_profile_platform_authority("am3-s21", false, s19).is_err());
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CoolingReadiness {
+    Ready {
+        commanded_pwm: u8,
+        tach_rpm_by_physical_fan: Vec<Option<u32>>,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoardPresence {
+    Present,
+    Absent,
+    Unknown,
+}
+
+fn board_presence_from_sysfs_value(value: Option<&str>) -> BoardPresence {
+    match value.map(str::trim) {
+        Some("1") => BoardPresence::Present,
+        Some("0") => BoardPresence::Absent,
+        _ => BoardPresence::Unknown,
+    }
+}
+
+fn cooling_readiness_from_tach(
+    commanded_pwm: u8,
+    tach_rpm_by_physical_fan: &[Option<u32>],
+) -> CoolingReadiness {
+    if commanded_pwm > FAN_PWM_SAFETY_MAX {
+        CoolingReadiness::Unavailable {
+            reason: format!(
+                "spin-up PWM {commanded_pwm} exceeds home safety cap {FAN_PWM_SAFETY_MAX}"
+            ),
+        }
+    } else if !tach_rpm_by_physical_fan.iter().any(Option::is_some) {
+        CoolingReadiness::Unavailable {
+            reason: "fan variant exposes no observable physical-fan tach channel".into(),
+        }
+    } else if tach_rpm_by_physical_fan
+        .iter()
+        .flatten()
+        .any(|rpm| *rpm == 0)
+    {
+        CoolingReadiness::Unavailable {
+            reason: format!(
+                "one or more required physical-fan tach channels never showed motion: {tach_rpm_by_physical_fan:?}"
+            ),
+        }
+    } else {
+        CoolingReadiness::Ready {
+            commanded_pwm,
+            tach_rpm_by_physical_fan: tach_rpm_by_physical_fan.to_vec(),
+        }
+    }
+}
+
+fn hardware_bringup_permitted(cooling: &CoolingReadiness, presence: &[BoardPresence]) -> bool {
+    matches!(cooling, CoolingReadiness::Ready { .. })
+        && presence
+            .iter()
+            .any(|state| *state == BoardPresence::Present)
+}
+
+#[cfg(test)]
+mod hardware_preflight_policy_tests {
+    use super::{
+        board_presence_from_sysfs_value, cooling_readiness_from_tach, hardware_bringup_permitted,
+        BoardPresence, CoolingReadiness, COOLING_SPINUP_DWELL, COOLING_SPINUP_SAMPLES,
+        COOLING_SPINUP_SAMPLE_INTERVAL, FAN_PWM_SAFETY_MAX,
+    };
+
+    const DAEMON_SOURCE: &str = include_str!("daemon.rs");
+
+    #[test]
+    fn failed_or_malformed_presence_reads_are_unknown_never_present() {
+        assert_eq!(
+            board_presence_from_sysfs_value(None),
+            BoardPresence::Unknown
+        );
+        assert_eq!(
+            board_presence_from_sysfs_value(Some("")),
+            BoardPresence::Unknown
+        );
+        assert_eq!(
+            board_presence_from_sysfs_value(Some("garbage")),
+            BoardPresence::Unknown
+        );
+        assert_eq!(
+            board_presence_from_sysfs_value(Some("1")),
+            BoardPresence::Present
+        );
+        assert_eq!(
+            board_presence_from_sysfs_value(Some("0")),
+            BoardPresence::Absent
+        );
+    }
+
+    #[test]
+    fn bringup_requires_cooling_control_and_positive_board_presence() {
+        let ready = cooling_readiness_from_tach(FAN_PWM_SAFETY_MAX, &[None, Some(1_800)]);
+        let unavailable = CoolingReadiness::Unavailable {
+            reason: "fan-control unavailable".into(),
+        };
+
+        assert!(hardware_bringup_permitted(
+            &ready,
+            &[BoardPresence::Unknown, BoardPresence::Present]
+        ));
+        assert!(!hardware_bringup_permitted(
+            &ready,
+            &[BoardPresence::Unknown, BoardPresence::Absent]
+        ));
+        assert!(!hardware_bringup_permitted(
+            &unavailable,
+            &[BoardPresence::Present]
+        ));
+    }
+
+    #[test]
+    fn zero_tach_and_over_cap_commands_deny_cooling_readiness() {
+        let zero_tach = cooling_readiness_from_tach(FAN_PWM_SAFETY_MAX, &[Some(1_800), Some(0)]);
+        assert!(matches!(zero_tach, CoolingReadiness::Unavailable { .. }));
+        assert!(matches!(
+            cooling_readiness_from_tach(FAN_PWM_SAFETY_MAX + 1, &[Some(2_000)]),
+            CoolingReadiness::Unavailable { .. }
+        ));
+        assert!(matches!(
+            cooling_readiness_from_tach(FAN_PWM_SAFETY_MAX, &[None, None]),
+            CoolingReadiness::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn spinup_preflight_is_bounded_and_home_capped() {
+        assert!(COOLING_SPINUP_DWELL <= std::time::Duration::from_secs(3));
+        assert!(
+            COOLING_SPINUP_SAMPLE_INTERVAL * COOLING_SPINUP_SAMPLES as u32 <= COOLING_SPINUP_DWELL
+        );
+        assert!(FAN_PWM_SAFETY_MAX <= 30);
+    }
+
+    #[test]
+    fn source_orders_cooling_gpio_and_presence_before_endpoint_keepalive() {
+        // Anchor on the implementation's doc comment instead of reconstructing
+        // an obsolete single-line signature. `init` intentionally accepts the
+        // immutable platform-identity snapshot now.
+        let init_doc = ["    /// Initialize all hardware ", "and subsystems."].concat();
+        let init_doc = DAEMON_SOURCE.find(&init_doc).expect("init doc marker");
+        let init_signature = ["async fn ", "init("].concat();
+        let init = DAEMON_SOURCE[init_doc..]
+            .find(&init_signature)
+            .map(|offset| init_doc + offset)
+            .expect("init body");
+        let cooling = DAEMON_SOURCE[init..]
+            .find("P0: Cooling Readiness Preflight")
+            .map(|offset| init + offset)
+            .expect("cooling preflight marker");
+        let gpio = DAEMON_SOURCE[cooling..]
+            .find("Phase 2b: GPIO Controller Init")
+            .map(|offset| cooling + offset)
+            .expect("GPIO preflight marker");
+        let presence = DAEMON_SOURCE[gpio..]
+            .find("Phase 3: Hash Board Detection")
+            .map(|offset| gpio + offset)
+            .expect("presence preflight marker");
+        let heartbeat = DAEMON_SOURCE[presence..]
+            .find("Phase 0: Endpoint-Scoped PIC16 Heartbeats")
+            .map(|offset| presence + offset)
+            .expect("endpoint heartbeat marker");
+        assert!(cooling < gpio && gpio < presence && presence < heartbeat);
+
+        let pre_admission = &DAEMON_SOURCE[init..heartbeat];
+        assert!(!pre_admission.contains("[0x55, 0xAA, 0x16]"));
+        assert!(!pre_admission.contains("devmem_i2c_write("));
+        assert!(!pre_admission.contains(".heartbeat("));
+
+        let endpoint_slice = &DAEMON_SOURCE[heartbeat..];
+        let endpoint_slice = endpoint_slice
+            .split("Found {} hash board(s)")
+            .next()
+            .expect("endpoint heartbeat block");
+        assert!(endpoint_slice.contains("self.detected_board_indices"));
+        assert!(endpoint_slice.contains("discover_system_pic16_endpoint_with_heartbeat"));
+        assert!(endpoint_slice.contains("Pic16EndpointSession::new"));
+        assert!(!endpoint_slice.contains("i2c_svc.heartbeat("));
+        assert!(endpoint_slice.contains("if is_am1_s9"));
+        assert!(endpoint_slice.contains("DEFAULT_PIC_ADDRS.get(board_index)"));
+        assert!(!endpoint_slice.contains("self.pic_addrs()"));
+        assert!(!endpoint_slice.contains("configured_model_pic"));
+        assert!(!endpoint_slice.contains("miner_profile"));
+
+        let cooling_handoff = &DAEMON_SOURCE[cooling..heartbeat];
+        assert!(!cooling_handoff.contains("FAN_PWM_QUIET_BOOT"));
+        let legacy_runtime_drop = ["Fan mining boot", ": PWM"].concat();
+        assert!(!DAEMON_SOURCE.contains(&legacy_runtime_drop));
+
+        let legacy_assumption = ["assuming board is", " present"].concat();
+        assert!(!DAEMON_SOURCE.contains(&legacy_assumption));
+        assert!(DAEMON_SOURCE.contains("gpio.read_plug_detect()"));
+        assert!(DAEMON_SOURCE.contains("BoardPresence::Unknown"));
+        assert!(DAEMON_SOURCE.contains("latch_terminal_safe_off()"));
+    }
+
+    #[test]
+    fn standard_daemon_pic16_services_have_no_raw_constructor_fallback() {
+        let raw_new = ["PicServiceController", "::new("].concat();
+        let raw_new_with_firmware = ["PicServiceController", "::new_with_firmware("].concat();
+        assert!(!DAEMON_SOURCE.contains(&raw_new));
+        assert!(!DAEMON_SOURCE.contains(&raw_new_with_firmware));
+        assert!(DAEMON_SOURCE.contains("pic16_service_for_endpoint("));
+        assert!(DAEMON_SOURCE.contains("refusing raw-address fallback"));
+    }
 }
 
 fn normalize_fan_pwm_bounds(min_pwm: u8, max_pwm: u8) -> (u8, u8) {
@@ -327,9 +1531,15 @@ fn normalize_fan_pwm_bounds(min_pwm: u8, max_pwm: u8) -> (u8, u8) {
 /// is additive and can only ever LOWER the sleep PWM further — it never raises
 /// the fan (cut-hash-before-noise is preserved).
 fn effective_sleep_fan_pwm(sleep_fan_pwm: u8, cfg_fan_max_pwm: u8) -> u8 {
-    clamp_fan_pwm(sleep_fan_pwm)
-        .min(FAN_PWM_SAFETY_MAX)
-        .min(cfg_fan_max_pwm)
+    // Same policy language as hybrid park / thermal hard-stop (FanCommand).
+    dcentrald_common::FanCommand {
+        profile_max_pwm: cfg_fan_max_pwm
+            .min(FAN_PWM_SAFETY_MAX)
+            .min(clamp_fan_pwm(100)),
+        requested_pwm: clamp_fan_pwm(sleep_fan_pwm),
+        apply_home_safety_cap: true,
+    }
+    .effective_pwm()
 }
 
 /// THERM-3 (fail-closed defense-in-depth): the per-round result of a thermal
@@ -369,6 +1579,28 @@ fn thermal_emergency_active(latch: &AtomicBool) -> bool {
 /// daemon at startup and leave the miner running with NO hardware watchdog.
 pub(crate) fn watchdog_interval_secs(kick_interval_s: u64) -> u64 {
     kick_interval_s.max(1)
+}
+
+fn watchdog_teardown_kick_allowed(
+    deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> bool {
+    now < deadline
+}
+
+fn watchdog_stall_limit(
+    effective_timeout_s: u64,
+    kick_secs: u64,
+    expected_liveness_interval: Option<Duration>,
+) -> u64 {
+    let kick_secs = kick_secs.max(1);
+    let half_window_limit = ((effective_timeout_s / 2) / kick_secs).max(2);
+    let cadence_limit = expected_liveness_interval
+        .map(|interval| {
+            ((interval.as_secs_f64() / kick_secs as f64).ceil() as u64).saturating_add(2)
+        })
+        .unwrap_or(0);
+    half_window_limit.max(cadence_limit)
 }
 
 /// Pure safety-liveness gate for the watchdog kicker — decides, on each kick
@@ -579,6 +1811,47 @@ mod watchdog_interval_tests {
             "a permanently-hung safety loop must eventually withhold the watchdog kick"
         );
     }
+
+    #[test]
+    fn watchdog_teardown_grace_is_absolute_and_expires_fail_closed() {
+        let now = tokio::time::Instant::now();
+        let deadline = now + super::WATCHDOG_TEARDOWN_GRACE;
+
+        assert!(super::watchdog_teardown_kick_allowed(deadline, now));
+        assert!(super::watchdog_teardown_kick_allowed(
+            deadline,
+            deadline - std::time::Duration::from_nanos(1)
+        ));
+        assert!(!super::watchdog_teardown_kick_allowed(deadline, deadline));
+        assert!(!super::watchdog_teardown_kick_allowed(
+            deadline,
+            deadline + std::time::Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn watchdog_stall_limit_respects_slower_healthy_thermal_cadence() {
+        let limit = super::watchdog_stall_limit(2, 1, Some(std::time::Duration::from_secs(5)));
+        assert_eq!(limit, 7);
+
+        let mut last = 1_u64;
+        let mut stalls = 0_u64;
+        for _ in 0..6 {
+            let (kick, new_last, new_stalls) =
+                super::watchdog_kick_decision(1, last, stalls, limit);
+            assert!(
+                kick,
+                "a healthy 5s thermal cadence must not be withheld early"
+            );
+            last = new_last;
+            stalls = new_stalls;
+        }
+        let (kick, _, _) = super::watchdog_kick_decision(1, last, stalls, limit);
+        assert!(
+            !kick,
+            "a thermal loop stalled beyond cadence plus jitter must fail closed"
+        );
+    }
 }
 
 /// Arm the hardware `/dev/watchdog` and spawn the kicker task **iff** enabled in
@@ -606,13 +1879,20 @@ mod watchdog_interval_tests {
 /// Must be invoked from within a Tokio runtime context (all four call sites are:
 /// the three async `run()` paths directly, and the am3-bb blocking path via a
 /// `Handle::enter()` guard).
-pub(crate) fn spawn_watchdog_kicker(
+struct WatchdogKickerSetup {
+    watchdog: Watchdog,
+    kick_secs: u64,
+    stall_limit: u64,
+}
+
+type WatchdogDisarmResult = std::result::Result<(), String>;
+
+fn prepare_watchdog_kicker(
     watchdog: &crate::config::WatchdogConfig,
-    shutdown: CancellationToken,
-    safety_liveness: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
-) {
+    expected_liveness_interval: Option<Duration>,
+) -> Option<WatchdogKickerSetup> {
     if !watchdog.enabled {
-        return;
+        return None;
     }
     // NEW-4 (2026-06-10 adversarial pass): open the watchdog HERE (after init).
     // Open + set_timeout + an immediate kick + the kicker loop all happen
@@ -624,16 +1904,28 @@ pub(crate) fn spawn_watchdog_kicker(
         }
         Err(e) => {
             warn!(error = %e, "Watchdog not available — miner will not auto-recover from crashes (this is OK for development)");
-            return;
+            return None;
         }
     };
     // BUG FIX (2026-04-11): Apply timeout_s from config to hardware watchdog.
     // Was parsed from TOML but never sent to kernel driver.
-    #[cfg(unix)]
-    if let Err(e) = wd.set_timeout(watchdog.timeout_s) {
-        warn!(error = %e, timeout_s = watchdog.timeout_s,
-            "Failed to set watchdog timeout — using kernel default");
-    }
+    let effective_timeout_s = {
+        #[cfg(unix)]
+        {
+            match wd.set_timeout(watchdog.timeout_s) {
+                Ok(effective_timeout_s) => effective_timeout_s,
+                Err(e) => {
+                    warn!(error = %e, requested_timeout_s = watchdog.timeout_s,
+                        "Failed to set watchdog timeout — kernel default is unknown; supervision math conservatively retains the requested value");
+                    watchdog.timeout_s
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            watchdog.timeout_s
+        }
+    };
     // NEW-4: immediate kick so the freshly-opened WDT starts from a full timeout
     // (the kicker's first interval tick is one kick_interval away).
     #[cfg(unix)]
@@ -641,9 +1933,10 @@ pub(crate) fn spawn_watchdog_kicker(
     let kick_interval = watchdog.kick_interval_s as u64;
     info!(
         kick_interval_s = kick_interval,
-        timeout_s = watchdog.timeout_s,
-        "Watchdog armed (timeout={}s, kick={}s) — hardware will auto-reboot if dcentrald stops responding",
-        watchdog.timeout_s, kick_interval,
+        requested_timeout_s = watchdog.timeout_s,
+        effective_timeout_s,
+        "Watchdog armed (requested timeout={}s, effective timeout={}s, kick={}s) — hardware will auto-reboot if dcentrald stops responding",
+        watchdog.timeout_s, effective_timeout_s, kick_interval,
     );
     // Expert review fix: Use the owned Watchdog struct with persistent fd.
     // Previous code used std::fs::write which opens+closes /dev/watchdog every
@@ -657,10 +1950,32 @@ pub(crate) fn spawn_watchdog_kicker(
     // window (above the normal tick cadence) so scheduler jitter can't trip it; a
     // fresh (0) counter is "not yet started" and does not gate.
     let kick_secs = watchdog_interval_secs(kick_interval);
-    let stall_limit: u64 = (((watchdog.timeout_s as u64) / 2) / kick_secs).max(2);
-    let mut last_live: u64 = 0;
-    let mut stalls: u64 = 0;
-    tokio::spawn(async move {
+    let stall_limit = watchdog_stall_limit(
+        effective_timeout_s as u64,
+        kick_secs,
+        expected_liveness_interval,
+    );
+    Some(WatchdogKickerSetup {
+        watchdog: wd,
+        kick_secs,
+        stall_limit,
+    })
+}
+
+fn watchdog_kicker_loop(
+    setup: WatchdogKickerSetup,
+    shutdown: CancellationToken,
+    safety_liveness: Option<Arc<AtomicU64>>,
+    disarm_tx: Option<oneshot::Sender<WatchdogDisarmResult>>,
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    async move {
+        let WatchdogKickerSetup {
+            watchdog: wd,
+            kick_secs,
+            stall_limit,
+        } = setup;
+        let mut last_live: u64 = 0;
+        let mut stalls: u64 = 0;
         // Use the panic-safe `kick_secs` (>= 1), NOT the raw `kick_interval`:
         // tokio::time::interval panics on a zero Duration, and a validation-
         // bypassing kick_interval of 0 would otherwise crash the daemon here and
@@ -670,7 +1985,14 @@ pub(crate) fn spawn_watchdog_kicker(
             tokio::select! {
                 _ = shutdown.cancelled() => {
                     info!("Watchdog kicker stopping — sending magic close to disarm");
-                    let _ = wd.close_magic();
+                    let disarm_result = wd.close_magic().map_err(|error| error.to_string());
+                    match &disarm_result {
+                        Ok(()) => info!("Watchdog magic close completed"),
+                        Err(error) => error!(error, "Watchdog magic close failed; hardware watchdog remains armed"),
+                    }
+                    if let Some(disarm_tx) = disarm_tx {
+                        let _ = disarm_tx.send(disarm_result);
+                    }
                     return;
                 }
                 _ = interval.tick() => {
@@ -696,7 +2018,116 @@ pub(crate) fn spawn_watchdog_kicker(
                 }
             }
         }
-    });
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WatchdogIntent {
+    Mining,
+    Teardown { deadline: tokio::time::Instant },
+    Disarm,
+}
+
+#[derive(Debug)]
+enum WatchdogTaskReceipt {
+    NotOpenedByDaemon,
+    MagicCloseWriteCompleted,
+    MagicCloseWriteFailed(String),
+}
+
+fn owned_watchdog_kicker(
+    config: crate::config::WatchdogConfig,
+    expected_liveness_interval: Duration,
+    owner_shutdown: CancellationToken,
+    mut intent_rx: watch::Receiver<WatchdogIntent>,
+    safety_liveness: Arc<AtomicU64>,
+    receipt_tx: oneshot::Sender<WatchdogTaskReceipt>,
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    async move {
+        // Open only after RuntimeTaskGuard has accepted and spawned this future.
+        // Registration refusal therefore cannot leave an armed, unowned fd.
+        let Some(setup) = prepare_watchdog_kicker(&config, Some(expected_liveness_interval)) else {
+            let _ = receipt_tx.send(WatchdogTaskReceipt::NotOpenedByDaemon);
+            return;
+        };
+        let WatchdogKickerSetup {
+            watchdog: wd,
+            kick_secs,
+            stall_limit,
+        } = setup;
+        let mut last_live = 0_u64;
+        let mut stalls = 0_u64;
+        let mut interval = tokio::time::interval(Duration::from_secs(kick_secs));
+        let mut receipt_tx = Some(receipt_tx);
+
+        loop {
+            tokio::select! {
+                _ = owner_shutdown.cancelled() => {
+                    warn!("Watchdog task owner cancelled without explicit Disarm; leaving hardware watchdog armed");
+                    return;
+                }
+                changed = intent_rx.changed() => {
+                    if changed.is_err() {
+                        warn!("Watchdog intent owner disappeared without explicit Disarm; leaving hardware watchdog armed");
+                        return;
+                    }
+                    if matches!(*intent_rx.borrow_and_update(), WatchdogIntent::Disarm) {
+                        info!("Watchdog received explicit Disarm after bounded hardware teardown");
+                        let receipt = match wd.close_magic() {
+                            Ok(()) => WatchdogTaskReceipt::MagicCloseWriteCompleted,
+                            Err(error) => WatchdogTaskReceipt::MagicCloseWriteFailed(error.to_string()),
+                        };
+                        if let Some(receipt_tx) = receipt_tx.take() {
+                            let _ = receipt_tx.send(receipt);
+                        }
+                        return;
+                    }
+                }
+                _ = interval.tick() => {
+                    let should_kick = match *intent_rx.borrow() {
+                        WatchdogIntent::Mining => {
+                            let current = safety_liveness.load(Ordering::Relaxed);
+                            let (should_kick, new_last, new_stalls) =
+                                watchdog_kick_decision(current, last_live, stalls, stall_limit);
+                            last_live = new_last;
+                            stalls = new_stalls;
+                            should_kick
+                        }
+                        WatchdogIntent::Teardown { deadline } => {
+                            if watchdog_teardown_kick_allowed(
+                                deadline,
+                                tokio::time::Instant::now(),
+                            ) {
+                                true
+                            } else {
+                                error!(
+                                    grace_s = WATCHDOG_TEARDOWN_GRACE.as_secs(),
+                                    "Watchdog teardown deadline expired; WITHHOLDING kick so a wedged shutdown resets the SoC"
+                                );
+                                false
+                            }
+                        }
+                        WatchdogIntent::Disarm => false,
+                    };
+                    if should_kick {
+                        if let Err(error) = wd.kick() {
+                            error!(error = %error, "Watchdog kick failed — if this persists, the SoC may reboot");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn spawn_watchdog_kicker(
+    watchdog: &crate::config::WatchdogConfig,
+    shutdown: CancellationToken,
+    safety_liveness: Option<Arc<AtomicU64>>,
+) {
+    if let Some(setup) = prepare_watchdog_kicker(watchdog, None) {
+        tokio::spawn(watchdog_kicker_loop(setup, shutdown, safety_liveness, None));
+    }
 }
 
 /// THERMAL-8 pure tick (non-XADC / Amlogic twin of THERMAL-7): update the
@@ -1159,6 +2590,12 @@ const DEFAULT_UIO_BASES: [u8; 3] = [1, 5, 9];
 /// Overridden by `MinerProfile` when chip type is detected.
 const DEFAULT_I2C_BUS: u8 = 0;
 
+/// The standard Zynq daemon has three physical hash-board connectors and its
+/// GPIO/UIO lifecycle is written around those three slots. Four-chain and
+/// non-UIO platforms require their platform-specific daemon instead of being
+/// admitted through truncated or placeholder tables.
+const STANDARD_DAEMON_BOARD_SLOTS: usize = 3;
+
 // ---------------------------------------------------------------------------
 // Per-PIC heartbeat back-off state machine (WAVE-0 STABILIZE, 2026-06-05)
 // ---------------------------------------------------------------------------
@@ -1344,17 +2781,165 @@ pub(crate) use crate::runtime::job_declaration::{
     initial_job_declaration_status, job_declaration_config_to_sv2, spawn_job_declaration_supervisor,
 };
 
+/// Assert a thread's stop flag and wait only until `timeout` for it to finish.
+///
+/// `JoinHandle::join()` has no timeout and a PIC heartbeat can be blocked behind
+/// a wedged kernel I2C request. Polling `is_finished()` keeps teardown bounded;
+/// dropping an unfinished handle detaches it, while the asserted stop flag
+/// prevents another heartbeat if the kernel call eventually returns.
+async fn stop_thread_bounded(
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
+    timeout: Duration,
+) -> ThreadStopOutcome {
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    join_thread_bounded(handle, timeout).await
+}
+
+#[cfg(test)]
+mod init_heartbeat_ownership_tests {
+    use super::{stop_thread_bounded, Daemon, InitializedPicAddrs, ThreadStopOutcome};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn bounded_stop_signals_and_joins_a_responsive_init_heartbeat() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let observed_stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let thread_observed = observed_stop.clone();
+        let handle = std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            thread_observed.store(true, Ordering::Release);
+        });
+
+        assert_eq!(
+            stop_thread_bounded(stop, handle, Duration::from_secs(1)).await,
+            ThreadStopOutcome::Joined
+        );
+        assert!(observed_stop.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn bounded_stop_classifies_a_panicked_thread() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn(|| panic!("intentional test panic"));
+        assert_eq!(
+            stop_thread_bounded(stop, handle, Duration::from_secs(1)).await,
+            ThreadStopOutcome::Panicked
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_stop_times_out_without_waiting_for_a_stalled_thread() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let thread_release = release.clone();
+        let handle = std::thread::spawn(move || {
+            while !thread_release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+        assert_eq!(
+            stop_thread_bounded(stop, handle, Duration::from_millis(20)).await,
+            ThreadStopOutcome::TimedOut
+        );
+        release.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn initialized_pic_state_recovers_poison_without_losing_ownership() {
+        let state = InitializedPicAddrs::new(vec![0x20]);
+        let poison_target = state.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poison_target.0.lock().unwrap();
+            panic!("intentional initialized PIC state poison");
+        });
+
+        assert_eq!(state.snapshot("poison recovery test snapshot"), vec![0x20]);
+        assert!(!state.0.is_poisoned());
+        state.record_success(0x21, "poison recovery test update");
+        assert_eq!(
+            state.snapshot("poison recovery test final snapshot"),
+            vec![0x20, 0x21]
+        );
+    }
+
+    #[test]
+    fn production_initialized_pic_state_has_no_direct_lock_unwrap() {
+        let source = include_str!("daemon.rs");
+        let forbidden = ["initialized_pic_addrs", ".lock()", ".unwrap()"].concat();
+        assert!(!source.contains(&forbidden));
+    }
+
+    #[cfg(feature = "sim-hal")]
+    #[tokio::test]
+    async fn sim_init_heartbeat_stall_is_bounded_and_watchdog_removes_power() {
+        use super::{PicFirmware, PicType};
+        use dcentrald_hal::platform::sim::{SimModel, SimPlatform};
+
+        let platform = SimPlatform::new(SimModel::S19Pro);
+        let service = platform.open_i2c_service(0).unwrap();
+        service
+            .write_bytes(0x20, &[0x55, 0xAA, 0x15, 0x01])
+            .unwrap();
+        platform
+            .configure_controller_watchdog(Duration::from_millis(50))
+            .unwrap();
+        platform.arm_next_i2c_transfer_stall().unwrap();
+
+        let (stop, _pause, handle) = Daemon::start_init_heartbeat_thread(
+            InitializedPicAddrs::new(vec![0x20]),
+            PicFirmware::Unknown,
+            PicType::DsPic33EP,
+            service,
+        )
+        .unwrap();
+        assert!(platform
+            .wait_for_i2c_transfer_stall(Duration::from_secs(1))
+            .unwrap());
+
+        assert_eq!(
+            stop_thread_bounded(stop, handle, Duration::from_millis(20)).await,
+            ThreadStopOutcome::TimedOut
+        );
+        platform
+            .advance_i2c_time(Duration::from_millis(50))
+            .unwrap();
+        assert!(platform.controller_watchdog_expired().unwrap());
+        assert!(!platform.i2c_voltage_enabled().unwrap());
+
+        platform.release_i2c_transfer_stall().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!platform.i2c_voltage_enabled().unwrap());
+    }
+}
+
 /// Top-level daemon state machine.
 pub struct Daemon {
     config: DcentraldConfig,
     config_path: String,
     shutdown_token: CancellationToken,
+    /// Sole owner of asynchronous mining hardware tasks. Its standalone token
+    /// stops work dispatch and thermal actuation only after the watchdog enters
+    /// teardown grace; the management API token remains independent.
+    mining_tasks: RuntimeTaskGuard,
+    /// Independent fail-closed owner for the standard-path SoC watchdog. Owner
+    /// cancellation never means magic close; only an explicit Disarm intent
+    /// after bounded hardware teardown may produce a positive receipt.
+    watchdog_tasks: RuntimeTaskGuard,
+    watchdog_intent_tx: Option<watch::Sender<WatchdogIntent>>,
+    watchdog_receipt_rx: Option<oneshot::Receiver<WatchdogTaskReceipt>>,
+    /// Shutdown consumes hardware ownership and is not retry-safe. In
+    /// particular, a retry must not extend the watchdog teardown deadline.
+    shutdown_attempted: bool,
     /// Active mining chains (initialized during init phase, moved to WorkDispatcher in run).
     chains: Vec<Chain>,
     /// Fan controller (initialized during init phase, shared via Arc).
     fan: Option<Arc<FanController>>,
-    /// Watchdog (initialized during init phase).
-    watchdog: Option<Watchdog>,
     /// GPIO controller for direct AXI register access (board enable, plug detect, LEDs).
     /// Wrapped in Arc so the LED engine task and daemon can share it.
     gpio: Option<Arc<GpioController>>,
@@ -1377,14 +2962,34 @@ pub struct Daemon {
     miner_profile: Option<&'static MinerProfile>,
     /// Separate token for heartbeat thread shutdown. This is NOT the same as shutdown_token.
     /// The heartbeat thread must keep running DURING graceful shutdown (while voltage is
-    /// being disabled) and only stop AFTER voltage is safely off. The global shutdown_token
-    /// cancels mining tasks; this token is cancelled later by shutdown() after disable_voltage.
+    /// being disabled) and only stop AFTER voltage is safely off. The mining owner
+    /// is cancelled explicitly during shutdown; this heartbeat token is cancelled
+    /// later, after disable_voltage.
     heartbeat_shutdown_token: CancellationToken,
     /// v0.13.0: Single I2C service handle — the ONLY path to /dev/i2c-0.
     /// Spawned at the very start of init(), before Phase 0 emergency heartbeats.
     /// ALL I2C operations (init, heartbeat, shutdown) go through this handle.
     /// Matches BraiinsOS's AsyncI2cDev pattern: 1 fd, 1 thread, mpsc channel.
     i2c_service: Option<dcentrald_hal::i2c::I2cServiceHandle>,
+    /// Initialization-only PIC heartbeat ownership. These fields are installed
+    /// immediately after the OS thread is spawned, rather than returned only
+    /// after `init()` succeeds. If the bring-up future is cancelled or times
+    /// out, the lifecycle can therefore stop the thread and let the hardware
+    /// watchdog expire instead of orphaning a heartbeat producer.
+    init_heartbeat_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    init_heartbeat_handle: Option<std::thread::JoinHandle<()>>,
+    /// Runtime heartbeat ownership. The cancellation token is the stop
+    /// authority; retaining the handle lets shutdown distinguish a clean join,
+    /// panic, and bounded detach when I2C is wedged.
+    runtime_heartbeat_handle: Option<std::thread::JoinHandle<()>>,
+    /// Sole owner of the legacy smart-PSU watchdog feeder. Its cancellation
+    /// token is independent of the mining token so shutdown can first quiesce
+    /// this raw bus-1 owner, then touch shared shutdown hardware.
+    psu_watchdog_threads: RuntimeThreadGuard,
+    /// Preflight could not prove the state of already-energized hardware.
+    /// Shutdown must therefore report watchdog/fallback reliance even when no
+    /// positively detected slots are available for addressed software disable.
+    preflight_hardware_state_unknown: bool,
     /// Runtime voltage command sender serviced by the heartbeat/I2C thread.
     /// Shutdown and thermal safety use this to avoid opening a second /dev/i2c-0 fd.
     // SAFETY (wave 8, 2026-04-28): bounded sync_channel (capacity 64). Previously
@@ -1394,7 +2999,55 @@ pub struct Daemon {
     // growth. Capacity 64 is generous — voltage commands are rate-limited by the
     // I2C bus (~10ms/cmd) so 64 entries == ~640ms of backlog, well under the
     // observable thermal time constant.
-    voltage_cmd_tx: Option<std::sync::mpsc::SyncSender<VoltageCommand>>,
+    voltage_cmd_tx: Option<VoltageCommandSender>,
+    /// Generation authority for measured ASIC identity publication. It is
+    /// daemon-owned so a future dispatcher replacement invalidates older ports.
+    dispatcher_composition_authority: DispatcherCompositionAuthority,
+    /// Successful GetAddress results from this initialization generation.
+    /// Assumed model/profile fields never mint entries in this receipt set.
+    asic_enumeration_receipts: Vec<EnumeratedMiningChainReceipt>,
+}
+
+/// Production adapter for the injectable standard-daemon lifecycle boundary.
+///
+/// Keeping this adapter next to `Daemon` preserves private access to the legacy
+/// hardware implementation while the coordinator itself remains independently
+/// executable with simulated platforms and clocks.
+struct StandardPlatformLifecycle<'a> {
+    daemon: &'a mut Daemon,
+}
+
+struct BootProgressRecoveryPublisher {
+    boot_progress: Arc<dcentrald_api::BootProgressSnapshot>,
+}
+
+impl crate::daemon_lifecycle::PlatformLifecycle for StandardPlatformLifecycle<'_> {
+    async fn initialize_platform(
+        &mut self,
+        identity: &crate::daemon_lifecycle::PlatformIdentitySnapshot,
+    ) -> Result<()> {
+        self.daemon.init(identity).await
+    }
+
+    fn stop_initialization_keepalives(&mut self) {
+        self.daemon.signal_init_heartbeat_stop();
+    }
+
+    async fn safe_off_partial_platform(&mut self) -> Result<()> {
+        self.daemon.shutdown().await
+    }
+
+    async fn run_management_only(&mut self) -> Result<()> {
+        self.daemon.run_api_only().await
+    }
+}
+
+impl crate::daemon_lifecycle::RecoveryPublisher for BootProgressRecoveryPublisher {
+    fn publish_management_recovery(&mut self) -> Result<()> {
+        self.boot_progress
+            .record_now(dcentrald_api_types::firmware_boot_timeline::BootPhase::ServicesStart);
+        Ok(())
+    }
 }
 
 impl Daemon {
@@ -1404,13 +3057,24 @@ impl Daemon {
         config_path: String,
         shutdown_token: CancellationToken,
     ) -> Self {
+        // Mining hardware ownership is intentionally independent of the global
+        // signal/API token. shutdown() must first move the SoC watchdog into its
+        // bounded teardown grace, then explicitly stop these tasks. A child
+        // token would propagate SIGTERM early and freeze thermal liveness before
+        // the watchdog knows teardown is intentional.
+        let mining_tasks = RuntimeTaskGuard::new(CancellationToken::new());
+        let watchdog_tasks = RuntimeTaskGuard::new(CancellationToken::new());
         Self {
             config,
             config_path,
             shutdown_token,
+            mining_tasks,
+            watchdog_tasks,
+            watchdog_intent_tx: None,
+            watchdog_receipt_rx: None,
+            shutdown_attempted: false,
             chains: Vec::new(),
             fan: None,
-            watchdog: None,
             gpio: None,
             led_tx: None,
             led_status_rx: None,
@@ -1421,24 +3085,26 @@ impl Daemon {
             miner_profile: None,
             heartbeat_shutdown_token: CancellationToken::new(),
             i2c_service: None,
+            init_heartbeat_stop: None,
+            init_heartbeat_handle: None,
+            runtime_heartbeat_handle: None,
+            psu_watchdog_threads: RuntimeThreadGuard::new(CancellationToken::new()),
+            preflight_hardware_state_unknown: false,
             voltage_cmd_tx: None,
+            dispatcher_composition_authority: DispatcherCompositionAuthority::default(),
+            asic_enumeration_receipts: Vec::new(),
         }
     }
 
-    fn td003_destructive_write_refusal(&self) -> Option<Td003DestructiveWriteRefusal> {
-        let board_target = read_first_trimmed(&["/etc/dcentos/board_target"]);
-        let platform_marker = read_first_trimmed(&[
-            "/etc/bos_platform",
-            "/etc/dcentos/platform",
-            "/etc/dcentos-platform",
-            "/proc/device-tree/model",
-        ]);
-        let subtype = read_first_trimmed(&["/etc/subtype"]);
+    fn td003_destructive_write_refusal(
+        &self,
+        identity: &crate::daemon_lifecycle::PlatformIdentitySnapshot,
+    ) -> Option<Td003DestructiveWriteRefusal> {
         td003_destructive_write_refusal_from_signals(
             self.config.mining.model.as_deref(),
-            &board_target,
-            &platform_marker,
-            &subtype,
+            identity.board_target(),
+            identity.platform_marker(),
+            identity.subtype(),
         )
     }
 
@@ -1452,8 +3118,7 @@ impl Daemon {
             .trim()
             .to_string();
 
-        let initial_mode =
-            dcentrald_api::OperatingMode::from_config_str(&self.config.mode.active);
+        let initial_mode = dcentrald_api::OperatingMode::from_config_str(&self.config.mode.active);
 
         let initial_state = dcentrald_api::MinerState {
             hashrate_ghs: 0.0,
@@ -1622,6 +3287,7 @@ impl Daemon {
             power_rx,
             power_calibration,
             psu_lock,
+            hardware_mutation_gate: dcentrald_hal::platform::HardwareMutationGate::new_open(),
             autotuner_status_rx,
             autotuner_efficiency_rx,
             autotuner_chip_health_rx,
@@ -1675,72 +3341,66 @@ impl Daemon {
     // -----------------------------------------------------------------------
     // Profile-aware hardware constant accessors
     // -----------------------------------------------------------------------
-    // These methods return model-specific constants from MinerProfile when
-    // available, falling back to S9 defaults before chip detection completes.
+    // These methods consume a profile resolved at the lifecycle identity
+    // boundary. Missing profile state is an internal invariant violation, not
+    // permission to guess S9 topology.
+
+    fn required_topology_profile(&self) -> Result<&'static MinerProfile> {
+        self.miner_profile.ok_or_else(|| {
+            anyhow::anyhow!("topology was not admitted before a model-specific hardware accessor")
+        })
+    }
 
     /// Get the PIC I2C address for a given board index (0, 1, 2).
-    /// Returns the profile-specific address, or S9 default (0x55/0x56/0x57).
-    fn pic_addr_for_board(&self, board_idx: usize) -> u8 {
+    /// Returns the profile-specific address. No absent-profile default exists.
+    fn pic_addr_for_board(&self, board_idx: usize) -> Result<u8> {
         if let Some(addrs) = self.configured_model_pic_addrs_override() {
-            if board_idx < addrs.len() {
-                return addrs[board_idx];
+            if let Some(&address) = addrs.get(board_idx) {
+                return Ok(address);
             }
         }
-        if let Some(profile) = self.miner_profile {
-            if board_idx < profile.pic_addrs.len() {
-                return profile.pic_addrs[board_idx];
-            }
-        }
-        // Fallback to S9 defaults
-        DEFAULT_PIC_ADDRS.get(board_idx).copied().unwrap_or(0x55)
+        self.required_topology_profile()?
+            .pic_addrs
+            .get(board_idx)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("board slot {board_idx} has no admitted PIC endpoint"))
     }
 
     /// Get the chain ID for a given board index (0, 1, 2).
-    /// Returns the profile-specific chain ID, or S9 default (6/7/8).
-    fn chain_id_for_board(&self, board_idx: usize) -> u8 {
-        if let Some(profile) = self.miner_profile {
-            if board_idx < profile.chain_ids.len() {
-                return profile.chain_ids[board_idx];
-            }
-        }
-        DEFAULT_CHAIN_IDS.get(board_idx).copied().unwrap_or(6)
+    /// Returns the profile-specific chain ID. No absent-profile default exists.
+    fn chain_id_for_board(&self, board_idx: usize) -> Result<u8> {
+        self.required_topology_profile()?
+            .chain_ids
+            .get(board_idx)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("board slot {board_idx} has no admitted chain ID"))
     }
 
     /// Get the UIO base for a given board index (0, 1, 2).
-    fn uio_base_for_board(&self, board_idx: usize) -> u8 {
-        if let Some(profile) = self.miner_profile {
-            if board_idx < profile.uio_bases.len() {
-                return profile.uio_bases[board_idx];
-            }
-        }
-        DEFAULT_UIO_BASES.get(board_idx).copied().unwrap_or(1)
+    fn uio_base_for_board(&self, board_idx: usize) -> Result<u8> {
+        self.required_topology_profile()?
+            .uio_bases
+            .get(board_idx)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("board slot {board_idx} has no admitted UIO base"))
     }
 
     /// Get all PIC I2C addresses for detected boards.
-    fn pic_addrs(&self) -> &[u8] {
+    fn pic_addrs(&self) -> Result<&[u8]> {
         if let Some(addrs) = self.configured_model_pic_addrs_override() {
-            return addrs;
+            return Ok(addrs);
         }
-        if let Some(profile) = self.miner_profile {
-            return profile.pic_addrs;
-        }
-        &DEFAULT_PIC_ADDRS
+        Ok(self.required_topology_profile()?.pic_addrs)
     }
 
     /// Get all chain IDs.
-    fn chain_ids(&self) -> &[u8] {
-        if let Some(profile) = self.miner_profile {
-            return profile.chain_ids;
-        }
-        &DEFAULT_CHAIN_IDS
+    fn chain_ids(&self) -> Result<&[u8]> {
+        Ok(self.required_topology_profile()?.chain_ids)
     }
 
     /// Get the chain count for the detected profile.
-    fn chain_count(&self) -> u8 {
-        if let Some(profile) = self.miner_profile {
-            return profile.chain_count;
-        }
-        3 // S9 default
+    fn chain_count(&self) -> Result<u8> {
+        Ok(self.required_topology_profile()?.chain_count)
     }
 
     fn configured_model_key(&self) -> Option<&'static str> {
@@ -1802,14 +3462,11 @@ impl Daemon {
     }
 
     /// Get the expected chips per chain for the detected profile.
-    fn default_chips_per_chain(&self) -> u8 {
+    fn default_chips_per_chain(&self) -> Result<u8> {
         if let Some(chips) = self.configured_model_chip_count_hint() {
-            return chips;
+            return Ok(chips);
         }
-        if let Some(profile) = self.miner_profile {
-            return profile.chips_per_chain;
-        }
-        63 // S9 default
+        Ok(self.required_topology_profile()?.chips_per_chain)
     }
 
     /// Get the PIC type for the detected profile.
@@ -1825,115 +3482,90 @@ impl Daemon {
     /// today. The EEPROM authority never overrides toward dsPIC on a
     /// weak/absent signal — see
     /// [`crate::runtime::hardware_info::resolve_pic_type`].
-    fn pic_type(&self) -> PicType {
+    fn pic_type(&self) -> Result<PicType> {
         let declarative = if let Some(pic_type) = self.configured_model_pic_type_override() {
             pic_type
-        } else if let Some(profile) = self.miner_profile {
-            profile.pic_type
         } else {
-            PicType::Pic16F1704 // S9 default
+            self.required_topology_profile()?.pic_type
         };
-        resolve_pic_type_from_eeprom(declarative, self.chain_count() as usize)
+        Ok(resolve_pic_type_from_eeprom(
+            declarative,
+            self.chain_count()? as usize,
+        ))
     }
 
     /// Get the I2C bus number for PIC controllers.
-    fn i2c_bus(&self) -> u8 {
-        if let Some(profile) = self.miner_profile {
-            return profile.i2c_bus;
-        }
-        DEFAULT_I2C_BUS
+    fn i2c_bus(&self) -> Result<u8> {
+        Ok(self.required_topology_profile()?.i2c_bus)
     }
 
     /// Get the plug detect GPIO base.
-    fn plugo_gpio_base(&self) -> u32 {
-        if let Some(profile) = self.miner_profile {
-            return profile.plugo_gpio_base;
-        }
-        DEFAULT_PLUGO_GPIO_BASE
+    fn plugo_gpio_base(&self) -> Result<u32> {
+        Ok(self.required_topology_profile()?.plugo_gpio_base)
     }
 
     /// Get the enable GPIO base.
-    fn enable_gpio_base(&self) -> u32 {
-        if let Some(profile) = self.miner_profile {
-            return profile.enable_gpio_base;
-        }
-        DEFAULT_ENABLE_GPIO_BASE
+    fn enable_gpio_base(&self) -> Result<u32> {
+        Ok(self.required_topology_profile()?.enable_gpio_base)
     }
 
     /// Convert a chain_id back to a board index (0, 1, 2).
     /// S9: chain 6→0, 7→1, 8→2. S19: chain 1→0, 2→1, 3→2.
-    fn board_idx_for_chain(&self, chain_id: u8) -> usize {
-        self.chain_ids()
+    fn board_idx_for_chain(&self, chain_id: u8) -> Result<usize> {
+        self.chain_ids()?
             .iter()
             .position(|&c| c == chain_id)
-            .unwrap_or(0)
+            .ok_or_else(|| anyhow::anyhow!("chain {chain_id} is outside the admitted topology"))
     }
 
     /// Update the miner profile after chip detection.
     /// Called after Phase 6 enumeration when self.chip_id is set.
-    fn update_profile(&mut self) {
-        if self.chip_id != 0 {
-            self.miner_profile = MinerProfile::for_chip(self.chip_id);
-            if let Some(profile) = self.miner_profile {
-                let effective_chips_per_chain = self.default_chips_per_chain();
-                let effective_pic_type = self.pic_type();
-                let effective_pic_addrs = self.pic_addrs().to_vec();
-                let runtime_profile_key = self.configured_runtime_profile().map(|p| p.key());
-                info!(
-                    chip_id = format_args!("0x{:04X}", self.chip_id),
-                    model = profile.name,
+    fn update_profile(&mut self) -> Result<()> {
+        let profile = identified_miner_profile(self.chip_id)?;
+        self.miner_profile = Some(profile);
+        let effective_chips_per_chain = self.default_chips_per_chain()?;
+        let effective_pic_type = self.pic_type()?;
+        let effective_pic_addrs = self.pic_addrs()?.to_vec();
+        let runtime_profile_key = self.configured_runtime_profile().map(|p| p.key());
+        info!(
+                chip_id = format_args!("0x{:04X}", self.chip_id),
+                model = profile.name,
+                runtime_profile = ?runtime_profile_key,
+                chips_per_chain = effective_chips_per_chain,
+                pic_type = ?effective_pic_type,
+                pic_addrs = ?effective_pic_addrs,
+                default_freq = profile.default_freq_mhz,
+                "MinerProfile loaded — model-specific constants active for {}",
+                profile.name,
+        );
+
+        if matches!(
+            self.configured_model_key(),
+            Some("t17") | Some("s17+") | Some("t17+") | Some("t17e")
+        ) {
+            warn!(
+                    config_model = ?self.config.mining.model,
                     runtime_profile = ?runtime_profile_key,
-                    chips_per_chain = effective_chips_per_chain,
-                    pic_type = ?effective_pic_type,
-                    pic_addrs = ?effective_pic_addrs,
-                    default_freq = profile.default_freq_mhz,
-                    "MinerProfile loaded — model-specific constants active for {}",
-                    profile.name,
-                );
-
-                if matches!(
-                    self.configured_model_key(),
-                    Some("t17") | Some("s17+") | Some("t17+") | Some("t17e")
-                ) {
-                    warn!(
-                        config_model = ?self.config.mining.model,
-                        runtime_profile = ?runtime_profile_key,
-                        anchor_profile = profile.name,
-                        effective_chips_per_chain,
-                        effective_pic_type = ?effective_pic_type,
-                        effective_pic_addrs = ?effective_pic_addrs,
-                        "Legacy x17 runtime profile is layered on top of a shared chip-family anchor profile"
-                    );
-                }
-
-                // Assign per-chain PIC addresses from the profile.
-                // Maps chain_ids to pic_addrs by index: chain_ids[0]→pic_addrs[0], etc.
-                // NoPic models have empty pic_addrs → all chains get None.
-                for chain in &mut self.chains {
-                    let chain_idx = profile
-                        .chain_ids
-                        .iter()
-                        .position(|&id| id == chain.chain_id);
-                    chain.pic_type = effective_pic_type;
-                    chain.pic_address =
-                        chain_idx.and_then(|idx| effective_pic_addrs.get(idx).copied());
-                }
-            } else {
-                warn!(
-                    chip_id = format_args!("0x{:04X}", self.chip_id),
-                    "No MinerProfile for chip ID 0x{:04X} — using S9 defaults. \
-                     This ASIC type may not be fully supported.",
-                    self.chip_id,
-                );
-                // S9 fallback: chain 6→0x55, 7→0x56, 8→0x57
-                let fallback_pic_type = self.pic_type();
-                for chain in &mut self.chains {
-                    let idx = chain.chain_id.checked_sub(6).map(|i| i as usize);
-                    chain.pic_type = fallback_pic_type;
-                    chain.pic_address = idx.and_then(|i| DEFAULT_PIC_ADDRS.get(i).copied());
-                }
-            }
+                    anchor_profile = profile.name,
+                    effective_chips_per_chain,
+                    effective_pic_type = ?effective_pic_type,
+                    effective_pic_addrs = ?effective_pic_addrs,
+                    "Legacy x17 runtime profile is layered on top of a shared chip-family anchor profile"
+            );
         }
+
+        // Assign per-chain PIC addresses from the profile.
+        // Maps chain_ids to pic_addrs by index: chain_ids[0]→pic_addrs[0], etc.
+        // NoPic models have empty pic_addrs → all chains get None.
+        for chain in &mut self.chains {
+            let chain_idx = profile
+                .chain_ids
+                .iter()
+                .position(|&id| id == chain.chain_id);
+            chain.pic_type = effective_pic_type;
+            chain.pic_address = chain_idx.and_then(|idx| effective_pic_addrs.get(idx).copied());
+        }
+        Ok(())
     }
 
     /// Run the daemon through its full lifecycle.
@@ -1966,8 +3598,8 @@ impl Daemon {
                 error!(
                     error = %e,
                     "mining lifecycle errored after hardware init — running graceful \
-                     hardware-safe-off teardown (voltage cut, fans to idle, watchdog \
-                     disarmed) before reporting the error (no-brick #6)"
+                     hardware-safe-off teardown (voltage cut, fans to idle, explicit \
+                     watchdog close attempt) before reporting the error (no-brick #6)"
                 );
                 if let Err(te) = self.shutdown().await {
                     error!(
@@ -1994,7 +3626,11 @@ impl Daemon {
             return self.run_api_only().await;
         }
 
-        if let Some(refusal) = self.td003_destructive_write_refusal() {
+        let platform_identity = crate::daemon_lifecycle::PlatformIdentitySource::capture_identity(
+            &SystemPlatformIdentitySource,
+        )?;
+
+        if let Some(refusal) = self.td003_destructive_write_refusal(&platform_identity) {
             warn!(
                 model = refusal.model_name,
                 source = refusal.source,
@@ -2030,8 +3666,9 @@ impl Daemon {
         info!("Starting 7-phase init sequence: detect boards, wake voltage controllers, open FPGA registers, enumerate ASIC chips");
 
         // Phase 1-7: System Initialization
-        // init() returns the init heartbeat thread handles so we can stop it AFTER
-        // the mining heartbeat starts — closing the gap where no heartbeats flow.
+        // init() leaves its heartbeat guard owned by `self` so it can be stopped
+        // only AFTER the mining heartbeat starts, without losing cleanup authority
+        // across any fallible handoff step.
         //
         // CRASH-SAFETY (BUG-9, 2026-06-05): `init()` is the hardware bring-up that
         // can HANG or FAIL on real hardware (PIC/AXI-IIC/chip-UART wedge, PSU
@@ -2054,50 +3691,23 @@ impl Daemon {
         // mining loop. Here the API lives further down inside this function, so
         // an init failure must route through `run_api_only()` to bring it up.
         let init_timeout = resolve_init_timeout();
-        let init_result = match tokio::time::timeout(init_timeout, self.init()).await {
-            Ok(inner) => inner,
-            Err(_elapsed) => Err(anyhow::anyhow!(
-                "hardware bring-up (init) did not complete within {}s — the cold-boot \
-                 path is wedged (PIC/AXI-IIC/chip-UART timeout, PSU fault, or no \
-                 hash boards). Aborting bring-up so the management plane recovers.",
-                init_timeout.as_secs()
-            )),
+        let disposition = {
+            let mut recovery_publisher = BootProgressRecoveryPublisher {
+                boot_progress: Arc::clone(&boot_progress),
+            };
+            let mut platform = StandardPlatformLifecycle { daemon: self };
+            crate::daemon_lifecycle::initialize_or_recover(
+                &mut platform,
+                &platform_identity,
+                &mut recovery_publisher,
+                &crate::daemon_lifecycle::TokioLifecycleClock,
+                init_timeout,
+            )
+            .await?
         };
-        let (init_hb_stop, init_hb_handle) = match init_result {
-            Ok(handles) => handles,
-            Err(e) => {
-                error!(
-                    error = %e,
-                    timeout_s = init_timeout.as_secs(),
-                    "HARDWARE BRING-UP FAILED — running graceful hardware-safe-off \
-                     teardown, then falling back to MANAGEMENT-ONLY (API/dashboard \
-                     stay reachable; mining disabled until the operator acts). The \
-                     daemon will NOT hang and will NOT crash on a failed bring-up."
-                );
-                // (B-1) Defensive hardware-safe-off teardown BEFORE we park.
-                // `shutdown()` is fully Option-guarded so it is safe on whatever
-                // partial-init state we reached (it is the same teardown the
-                // no-brick #6 `Daemon::run()` wrapper would have run on this Err).
-                if let Err(te) = self.shutdown().await {
-                    error!(
-                        teardown_error = %te,
-                        "graceful teardown after bring-up failure also errored — the \
-                         PIC/dsPIC heartbeat watchdog (~5-64s) remains the hardware \
-                         safety net"
-                    );
-                }
-                // Record the failed phase for the boot-timeline surface so the
-                // dashboard can show WHERE bring-up stopped.
-                boot_progress.record_now(
-                    dcentrald_api_types::firmware_boot_timeline::BootPhase::ServicesStart,
-                );
-                // (B-2) Bring the management plane UP. `run_api_only()` spawns the
-                // API and parks on the shutdown token; it touches NO hardware.
-                // Returning its result keeps the process alive in management-only
-                // mode with the dashboard reachable — never an exit, never a hang.
-                return self.run_api_only().await;
-            }
-        };
+        if disposition == crate::daemon_lifecycle::BringupDisposition::ManagementOnlyStopped {
+            return Ok(());
+        }
 
         boot_progress
             .record_now(dcentrald_api_types::firmware_boot_timeline::BootPhase::ChainsEnumerated);
@@ -2137,23 +3747,10 @@ impl Daemon {
             let _ = led_tx.try_send(LedCommand::SetPattern(pattern));
         }
 
-        // Set fan speed to configured minimum when mining starts.
-        // The thermal PID controller will ramp up from here as needed,
-        // capped at fan_max_pwm (default 30 for home mining).
-        if mining_enabled && self.chains.iter().any(|c| c.mining) {
-            if let Some(ref fan) = self.fan {
-                let (fan_min_pwm, fan_max_pwm) = normalize_fan_pwm_bounds(
-                    self.config.thermal.fan_min_pwm,
-                    self.config.thermal.fan_max_pwm,
-                );
-                let boot_pwm = clamp_fan_pwm(fan_min_pwm.max(FAN_PWM_QUIET_BOOT));
-                fan.set_speed(boot_pwm);
-                info!(
-                    "Fan mining boot: PWM {} — thermal PID will adjust up to max {}",
-                    boot_pwm, fan_max_pwm
-                );
-            }
-        }
+        // Keep the bounded preflight spin-up command in force across the
+        // init→runtime handoff. The thermal task's first evidence-bearing tick
+        // is the only owner allowed to lower it; passthrough hardware may
+        // already be hot even though no current temperature sample exists yet.
 
         // Create channels for the mining pipeline
         let (job_tx, job_rx) = mpsc::channel::<dcentrald_stratum::types::JobTemplate>(32);
@@ -2350,8 +3947,7 @@ impl Daemon {
             })
             .collect();
 
-        let initial_mode =
-            dcentrald_api::OperatingMode::from_config_str(&self.config.mode.active);
+        let initial_mode = dcentrald_api::OperatingMode::from_config_str(&self.config.mode.active);
 
         let initial_state = dcentrald_api::MinerState {
             hashrate_ghs: 0.0,
@@ -2446,7 +4042,7 @@ impl Daemon {
         // during bring-up; this is the identity summary an operator sees first.
         {
             let inv_chip_id = self.config.mining.model_chip_id().unwrap_or(self.chip_id);
-            let inv_pic = match self.pic_type() {
+            let inv_pic = match self.pic_type()? {
                 PicType::Pic16F1704 => "pic16f1704",
                 PicType::DsPic33EP => "dspic33ep",
                 PicType::NoPic => "nopic",
@@ -2460,7 +4056,7 @@ impl Daemon {
                 chip_id = %format_args!("0x{:04X}", inv_chip_id),
                 pic = inv_pic,
                 chains = state_rx.borrow().chains.len(),
-                chips_per_chain = self.default_chips_per_chain(),
+                chips_per_chain = self.default_chips_per_chain()?,
                 frequency_mhz = self.config.mining.frequency_mhz,
                 psu = %inv_psu,
                 mode = %self.config.mode.active,
@@ -2478,7 +4074,7 @@ impl Daemon {
         let bootstrap_autotuner_capabilities =
             dcentrald_autotuner::autotuner_capabilities_for_chip_with_voltage_autotune(
                 self.config.mining.model_chip_id().unwrap_or(0),
-                match self.pic_type() {
+                match self.pic_type()? {
                     PicType::Pic16F1704 => "pic16",
                     PicType::DsPic33EP => "dspic",
                     PicType::NoPic => "nopic",
@@ -3371,6 +4967,7 @@ impl Daemon {
             power_rx: power_rx.clone(),
             power_calibration: power_calibration.clone(),
             psu_lock: psu_lock.clone(),
+            hardware_mutation_gate: dcentrald_hal::platform::HardwareMutationGate::new_open(),
             autotuner_status_rx: autotuner_status_rx.clone(),
             autotuner_efficiency_rx: autotuner_efficiency_rx.clone(),
             autotuner_chip_health_rx: autotuner_chip_health_rx.clone(),
@@ -4318,7 +5915,7 @@ impl Daemon {
         // Move chains from daemon into work dispatcher (it's the sole FPGA consumer)
         let dispatch_chains = std::mem::take(&mut self.chains);
         let dispatch_chip_id = self.chip_id;
-        let dispatch_shutdown = shutdown.clone();
+        let dispatch_shutdown = self.mining_tasks.cancellation_token();
         let dispatch_state_tx = state_tx.clone();
         let autotune_state_rx = dispatch_state_tx.subscribe();
         let worker_name = self.config.pool.worker.clone();
@@ -4343,13 +5940,11 @@ impl Daemon {
         // SAFETY (wave 8, 2026-04-28): bounded — see voltage_cmd_tx field comment.
         // Capacity 64 chosen to absorb a short I2C stall (~10ms/cmd × 64 = ~640ms)
         // without blocking the dispatcher loop or growing RAM unboundedly.
-        const VOLTAGE_CMD_QUEUE_CAPACITY: usize = 64;
-        let (voltage_cmd_tx, voltage_cmd_rx) =
-            std::sync::mpsc::sync_channel::<VoltageCommand>(VOLTAGE_CMD_QUEUE_CAPACITY);
+        let (voltage_cmd_tx, voltage_cmd_rx) = voltage_command_mailbox();
         self.voltage_cmd_tx = Some(voltage_cmd_tx.clone());
         // Clone sender for thermal emergency (cloned BEFORE move to dispatcher)
         let thermal_voltage_tx = self.voltage_cmd_tx.clone();
-        let thermal_pic_addrs: Vec<u8> = self.pic_addrs().to_vec();
+        let thermal_pic_addrs: Vec<u8> = self.pic_addrs()?.to_vec();
         let voltage_cmd_tx = self.voltage_cmd_tx.clone();
 
         // Gap 2: Shared XADC temperature for autotuner snapshots.
@@ -4363,7 +5958,7 @@ impl Daemon {
             PicFirmware::BraiinsOs => Some(0x03),
             PicFirmware::Unknown => None,
         };
-        let chain_eeprom_fingerprints = if matches!(self.pic_type(), PicType::NoPic) {
+        let chain_eeprom_fingerprints = if matches!(self.pic_type()?, PicType::NoPic) {
             read_hashboard_eeprom_fingerprints(dispatch_chains.len())
         } else {
             Vec::new()
@@ -4385,7 +5980,7 @@ impl Daemon {
             u8,
             dcentrald_silicon_profiles::bm1362::Bm1362HashboardSku,
         > = std::collections::HashMap::new();
-        if matches!(self.pic_type(), PicType::NoPic) {
+        if matches!(self.pic_type()?, PicType::NoPic) {
             for slot in 0..dispatch_chains.len() {
                 match read_hashboard_eeprom_preamble_for_slot(slot) {
                     Some(preamble) => {
@@ -4402,9 +5997,9 @@ impl Daemon {
                         // CE-011: record the BM1362 PVT-bearing SKU (if any) for
                         // ceiling-only autotuner registration. Non-BM1362 /
                         // table-less boards map to None and are skipped.
-                        if let Some(bm) = sku.and_then(
-                            dcentrald_autotuner::pvt_envelope::hashboard_to_bm1362_sku,
-                        ) {
+                        if let Some(bm) =
+                            sku.and_then(dcentrald_autotuner::pvt_envelope::hashboard_to_bm1362_sku)
+                        {
                             autotuner_chain_skus.insert(dispatch_chains[slot].chain_id, bm);
                         }
                     }
@@ -4436,10 +6031,20 @@ impl Daemon {
 
         // Deferred voltage reduction targets: chains left at 9400mV during init
         // because post-open-core I2C noise prevents 4-byte PIC writes.
-        let deferred_voltage_targets: Vec<(u8, u8)> = dispatch_chains
+        let deferred_voltage_targets: Vec<(u8, u8, u128)> = dispatch_chains
             .iter()
             .filter(|c| c.mining && c.voltage_mv >= 9400)
-            .filter_map(|c| c.pic_address.map(|pa| (c.chain_id, pa)))
+            .filter_map(|c| {
+                c.pic_address.map(|pic_addr| {
+                    let generation = self
+                        .voltage_cmd_tx
+                        .as_ref()
+                        .expect("voltage mailbox was installed above")
+                        .capture_generation(self.chip_id, pic_addr)
+                        .expect("new voltage mailbox has no pending disable or terminal latch");
+                    (c.chain_id, pic_addr, generation)
+                })
+            })
             .collect();
 
         // FIX (swarm review 2026-03-26): use hardware TicketMask difficulty,
@@ -4461,14 +6066,18 @@ impl Daemon {
                 PicFirmware::Unknown => dcentrald_hal::i2c::I2cPicFirmware::Unknown,
             };
 
-            if matches!(self.pic_type(), PicType::Pic16F1704) {
+            if matches!(self.pic_type()?, PicType::Pic16F1704) {
                 let predispatch_i2c_service = self.i2c_service.clone().ok_or_else(|| {
                     anyhow::anyhow!(
                         "pre-dispatch heartbeat: I2C service not initialized before start_mining()"
                     )
                 })?;
+                let predispatch_async_i2c = predispatch_i2c_service.async_handle();
                 for &addr in &self.initialized_pic_addrs_final {
-                    match predispatch_i2c_service.heartbeat(addr, predispatch_i2c_fw) {
+                    match predispatch_async_i2c
+                        .heartbeat(addr, predispatch_i2c_fw)
+                        .await
+                    {
                         Ok(()) => info!("PRE_DISPATCH_HB: PIC 0x{:02X} OK", addr),
                         Err(e) => warn!("PRE_DISPATCH_HB: PIC 0x{:02X} FAIL: {}", addr, e),
                     }
@@ -4550,6 +6159,39 @@ impl Daemon {
             0.93
         };
 
+        let expected_dispatcher_composition = dispatch_chains
+            .iter()
+            .filter(|chain| chain.mining)
+            .map(|chain| ExpectedMiningChain {
+                chain_id: chain.chain_id,
+                chip_count: chain.chip_count,
+            })
+            .collect();
+        let dispatcher_enumeration_receipts = self
+            .asic_enumeration_receipts
+            .iter()
+            .copied()
+            .filter(|receipt| {
+                dispatch_chains
+                    .iter()
+                    .any(|chain| chain.mining && chain.chain_id == receipt.chain_id())
+            })
+            .collect();
+        let identity_publication_port = match self.dispatcher_composition_authority.activate(
+            expected_dispatcher_composition,
+            dispatcher_enumeration_receipts,
+            Arc::clone(&hardware_info),
+        ) {
+            Ok(port) => Some(port),
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "Measured ASIC identity publication is not armed for this dispatcher composition"
+                );
+                None
+            }
+        };
+
         let mut dispatcher = crate::work_dispatcher::WorkDispatcher::new(
             job_rx,
             share_tx,
@@ -4576,6 +6218,7 @@ impl Daemon {
             curtailment_sleeping.clone(),
             self.config.mining.skip_board_temp,
         );
+        dispatcher.set_asic_identity_publication_port(identity_publication_port);
         let circuit_capacity = if dc_source_profile {
             None
         } else {
@@ -4589,9 +6232,13 @@ impl Daemon {
         // Default 4 (= 64-cycle threshold for BM1387's 8-bit ring) per
         // the analysis in
         dispatcher.set_stale_age_divisor(self.config.mining.stale_age_divisor);
-        tokio::spawn(async move {
+        if !self.mining_tasks.spawn("work-dispatcher", async move {
             dispatcher.run().await;
-        });
+        }) {
+            anyhow::bail!(
+                "work dispatcher task ownership already exists; refusing detached replacement"
+            );
+        }
 
         // ---- Stage-A OBSERVE-ONLY DPS-governor shadow (DEFAULT-OFF) ----
         //
@@ -5140,7 +6787,7 @@ impl Daemon {
         // by this gate — `am2_bm1362_family` is false for them.
         let effective_chip_id = self.config.mining.model_chip_id().unwrap_or(self.chip_id);
         let am2_bm1362_family =
-            effective_chip_id == 0x1362 && matches!(self.pic_type(), PicType::DsPic33EP);
+            effective_chip_id == 0x1362 && matches!(self.pic_type()?, PicType::DsPic33EP);
         let am2_freq_autotune_opted_in = self.config.autotuner.am2_frequency_autotune_enabled(
             std::env::var(dcentrald_autotuner::config::AM2_FREQUENCY_AUTOTUNE_ENV)
                 .ok()
@@ -5411,7 +7058,7 @@ impl Daemon {
                 }
             }
 
-            let pic_type = self.pic_type();
+            let pic_type = self.pic_type()?;
             // PERF-006/011: honor the default-OFF `DCENT_AM2_VOLTAGE_AUTOTUNE`
             // gate. Gate unset ⇒ identical conservative capability set as
             // `autotuner_capabilities_for_chip` (byte-identical behavior).
@@ -5592,14 +7239,33 @@ impl Daemon {
         // below increments this every tick, and the kicker withholds the WDT kick
         // if it stops advancing — so a hung thermal loop (the case where boards
         // stay energized with NO thermal supervision) triggers a SoC reboot rather
-        // than being fed forever. Only the standard daemon loop is gated; the
-        // hybrid/serial/am3-bb paths pass None (kick unconditionally).
-        let thermal_liveness = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        spawn_watchdog_kicker(
-            &self.config.watchdog,
-            shutdown.clone(),
-            Some(thermal_liveness.clone()),
+        // than being fed forever. The other mining modes retain path-local
+        // liveness counters but still need migration to this owned lifecycle.
+        let thermal_liveness = Arc::new(AtomicU64::new(0));
+        let (watchdog_intent_tx, watchdog_intent_rx) = watch::channel(WatchdogIntent::Mining);
+        let (watchdog_receipt_tx, watchdog_receipt_rx) = oneshot::channel();
+        let watchdog_owner_shutdown = self.watchdog_tasks.cancellation_token();
+        let watchdog_liveness_interval = Duration::from_secs_f32(thermal_pid_interval_secs(
+            self.config.thermal.pid_interval_s,
+        ));
+        let watchdog_future = owned_watchdog_kicker(
+            self.config.watchdog.clone(),
+            watchdog_liveness_interval,
+            watchdog_owner_shutdown,
+            watchdog_intent_rx,
+            thermal_liveness.clone(),
+            watchdog_receipt_tx,
         );
+        if !self
+            .watchdog_tasks
+            .spawn("soc-watchdog-kicker", watchdog_future)
+        {
+            anyhow::bail!(
+                "SoC watchdog task ownership is unavailable; refusing unowned watchdog supervision"
+            );
+        }
+        self.watchdog_intent_tx = Some(watchdog_intent_tx);
+        self.watchdog_receipt_rx = Some(watchdog_receipt_rx);
 
         // v0.12.0: ZERO devmem AXI IIC register writes. Kernel driver is sole owner.
         //
@@ -5610,15 +7276,6 @@ impl Daemon {
         //
         // Fix: remove restore_kernel_i2c_interrupts() entirely. The kernel driver
         // sets GIE, IER, and timing on its own during xiic_reinit(). Don't interfere.
-
-        // Step 1: Stop init heartbeat thread
-        if let Some(ref stop) = init_hb_stop {
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        if let Some(handle) = init_hb_handle {
-            let _ = handle.join();
-            info!("Init heartbeat thread stopped");
-        }
 
         // v0.13.0: I2C service already spawned at start of init(). Use the stored handle.
         let i2c_service = self.i2c_service.clone().ok_or_else(|| {
@@ -5644,6 +7301,7 @@ impl Daemon {
         // doesn't verify PIC health). Dead PICs waste I2C time with EIO errors.
         let hb_pic_addrs: Vec<u8> = self.initialized_pic_addrs_final.clone();
         let hb_pic_firmware = self.pic_firmware;
+        let mut runtime_heartbeat_ready_rx = None;
 
         if !hb_pic_addrs.is_empty() {
             let pic_count = hb_pic_addrs.len();
@@ -5679,15 +7337,18 @@ impl Daemon {
                 PicFirmware::Stock(_) => dcentrald_hal::i2c::I2cPicFirmware::Stock,
                 PicFirmware::Unknown => dcentrald_hal::i2c::I2cPicFirmware::Unknown,
             };
-            let hb_pic_type = self.pic_type();
+            let hb_pic_type = self.pic_type()?;
+            let hb_chip_id = self.chip_id;
             let hb_i2c_active = i2c_active_for_heartbeat;
             let hb_thermal_emergency_latch = thermal_emergency_latch.clone();
             let hb_deferred_target_mv = self.config.mining.voltage_mv;
             let hb_deferred_targets = deferred_voltage_targets.clone();
-            std::thread::Builder::new()
+            let (runtime_ready_tx, runtime_ready_rx) = tokio::sync::oneshot::channel();
+            let runtime_heartbeat_handle = std::thread::Builder::new()
                 .name("pic-heartbeat".to_string())
                 .spawn(move || {
                     let mut tick: u64 = 0;
+                    let mut runtime_ready_tx = Some(runtime_ready_tx);
                     let mut stable_heartbeat_ticks: u64 = 0;
                     let mut pending_voltage_targets = hb_deferred_targets;
                     let mut consecutive_failures: std::collections::HashMap<u8, u32> = hb_pic_addrs.iter()
@@ -5706,11 +7367,12 @@ impl Daemon {
 
                     loop {
                         if hb_shutdown_flag.is_cancelled() {
-                            info!("PIC heartbeat stopping — voltage controllers will auto-shutdown via PIC watchdog (~64s)");
+                            info!("PIC heartbeat stopping — voltage controllers will auto-shutdown via their hardware watchdog (~5-64s, controller-dependent)");
                             break;
                         }
 
                         tick += 1;
+                        let mut cycle_heartbeat_succeeded = false;
 
                         if matches!(hb_pic_type, PicType::Pic16F1704) {
                             // Signal work dispatcher to pause FPGA AXI reads.
@@ -5718,13 +7380,28 @@ impl Daemon {
                             // PICs to NACK (ISR=0xD2). 135ms pause loses zero nonces.
                             hb_i2c_active.store(true, std::sync::atomic::Ordering::Release);
                             std::thread::sleep(Duration::from_millis(15));
-                            while let Ok(cmd) = voltage_cmd_rx.try_recv() {
+                            while let Ok(delivery) = voltage_cmd_rx.try_recv() {
+                                let (cmd, completion) = delivery.into_parts();
+                                if hb_shutdown_flag.is_cancelled() {
+                                    completion.complete(Err(
+                                        "runtime heartbeat is stopping; command was not executed"
+                                            .to_string(),
+                                    ));
+                                    break;
+                                }
                                 let (result, reply_tx): (
                                     std::result::Result<VoltageCommandReply, String>,
                                     Option<tokio::sync::oneshot::Sender<std::result::Result<VoltageCommandReply, String>>>,
                                 ) = match cmd {
                                     VoltageCommand::SetVoltage { chain_id, chip_id, pic_addr, target_mv, reply_tx } => {
-                                        if thermal_emergency_active(&hb_thermal_emergency_latch) {
+                                        if voltage_cmd_rx.is_terminal_latched() {
+                                            warn!(
+                                                target_mv,
+                                                pic_addr = format_args!("0x{:02X}", pic_addr),
+                                                "Runtime voltage BLOCKED: terminal safe-off is latched"
+                                            );
+                                            (Err("terminal safe-off latched; refusing SetVoltage".to_string()), reply_tx)
+                                        } else if thermal_emergency_active(&hb_thermal_emergency_latch) {
                                             warn!(
                                                 target_mv,
                                                 pic_addr = format_args!("0x{:02X}", pic_addr),
@@ -5809,16 +7486,24 @@ impl Daemon {
                                     }
                                 };
 
-                                if let Some(tx) = reply_tx {
-                                    let _ = tx.send(result);
-                                } else if let Err(detail) = result {
-                                    warn!(error = %detail, "Runtime voltage command failed without waiting caller");
+                                debug_assert!(reply_tx.is_none());
+                                if let Err(detail) = &result {
+                                    warn!(error = %detail, "Runtime voltage command failed");
                                 }
+                                completion.complete(result);
                                 std::thread::sleep(Duration::from_millis(10));
+                            }
+
+                            if hb_shutdown_flag.is_cancelled() {
+                                hb_i2c_active.store(false, std::sync::atomic::Ordering::Release);
+                                break;
                             }
 
                             let now_secs = hb_thread_start.elapsed().as_secs();
                             for &addr in &hb_pic_addrs {
+                                if hb_shutdown_flag.is_cancelled() {
+                                    break;
+                                }
                                 let backoff = pic_backoff.entry(addr).or_default();
                                 let action = backoff.decide(now_secs);
                                 if action == HbAction::Skip {
@@ -5834,6 +7519,7 @@ impl Daemon {
                                 let hb_us = hb_t0.elapsed().as_micros();
 
                                 if result.is_ok() {
+                                    cycle_heartbeat_succeeded = true;
                                     let recovered = backoff.record_success();
                                     if recovered || *fails > 0 {
                                         info!("PIC 0x{:02X} heartbeat recovered after {} failures", addr, fails);
@@ -5859,6 +7545,17 @@ impl Daemon {
                                             addr, PIC_BACKOFF_FAIL_THRESHOLD, PIC_BACKOFF_REPROBE_SECS
                                         );
                                     }
+                                }
+                            }
+
+                            if hb_shutdown_flag.is_cancelled() {
+                                hb_i2c_active.store(false, std::sync::atomic::Ordering::Release);
+                                break;
+                            }
+
+                            if cycle_heartbeat_succeeded {
+                                if let Some(tx) = runtime_ready_tx.take() {
+                                    let _ = tx.send(());
                                 }
                             }
 
@@ -5889,6 +7586,9 @@ impl Daemon {
                                 && hb_deferred_target_mv > 0
                                 && hb_deferred_target_mv < 9400
                                 && !pending_voltage_targets.is_empty()
+                                && !thermal_emergency_active(&hb_thermal_emergency_latch)
+                                && !voltage_cmd_rx.is_terminal_latched()
+                                && !hb_shutdown_flag.is_cancelled()
                             {
                                 info!(
                                     stable_heartbeat_ticks,
@@ -5897,7 +7597,30 @@ impl Daemon {
                                     "Applying deferred voltage reduction after stable heartbeat window"
                                 );
                                 let mut still_pending = Vec::new();
-                                for &(chain_id, pic_addr) in &pending_voltage_targets {
+                                for (pending_idx, &(chain_id, pic_addr, generation)) in
+                                    pending_voltage_targets.iter().enumerate()
+                                {
+                                    if hb_shutdown_flag.is_cancelled()
+                                        || thermal_emergency_active(&hb_thermal_emergency_latch)
+                                        || voltage_cmd_rx.is_terminal_latched()
+                                    {
+                                        still_pending.extend_from_slice(
+                                            &pending_voltage_targets[pending_idx..],
+                                        );
+                                        break;
+                                    }
+                                    if !voltage_cmd_rx.permits_ordinary_generation(
+                                        hb_chip_id,
+                                        pic_addr,
+                                        generation,
+                                    ) {
+                                        warn!(
+                                            chain_id,
+                                            pic_addr = format_args!("0x{:02X}", pic_addr),
+                                            "Deferred voltage target superseded by a newer endpoint disable generation"
+                                        );
+                                        continue;
+                                    }
                                     let pic_val = PicController::voltage_to_pic(
                                         hb_deferred_target_mv as f64 / 1000.0
                                     );
@@ -5916,12 +7639,17 @@ impl Daemon {
                                                 error = %e,
                                                 "Deferred voltage failed — retry next tick"
                                             );
-                                            still_pending.push((chain_id, pic_addr));
+                                            still_pending.push((chain_id, pic_addr, generation));
                                         }
                                     }
                                     std::thread::sleep(Duration::from_millis(10));
                                 }
                                 pending_voltage_targets = still_pending;
+                            }
+
+                            if hb_shutdown_flag.is_cancelled() {
+                                hb_i2c_active.store(false, std::sync::atomic::Ordering::Release);
+                                break;
                             }
 
                             hb_i2c_active.store(false, std::sync::atomic::Ordering::Release);
@@ -5931,11 +7659,22 @@ impl Daemon {
 
                         hb_i2c_active.store(true, std::sync::atomic::Ordering::Release);
                         std::thread::sleep(Duration::from_millis(5));
+                        if hb_shutdown_flag.is_cancelled() {
+                            hb_i2c_active.store(false, std::sync::atomic::Ordering::Release);
+                            break;
+                        }
                         let _ = hb_i2c_svc.set_timeout(10); // 100ms
+                        if hb_shutdown_flag.is_cancelled() {
+                            hb_i2c_active.store(false, std::sync::atomic::Ordering::Release);
+                            break;
+                        }
 
                         if matches!(hb_pic_type, PicType::DsPic33EP) && tick.is_multiple_of(5) {
                             let now_s = hb_board_temp_time_base.elapsed().as_secs() as u32;
                             for &addr in &hb_pic_addrs {
+                                if hb_shutdown_flag.is_cancelled() {
+                                    break;
+                                }
                                 if let Some(chain_idx) = hb_pic_chain_map.get(&addr).copied() {
                                     let mut dspic = DspicService::new(hb_i2c_svc.clone(), addr);
                                     let hottest = dspic
@@ -5959,13 +7698,33 @@ impl Daemon {
                             }
                         }
 
-                        while let Ok(cmd) = voltage_cmd_rx.try_recv() {
+                        if hb_shutdown_flag.is_cancelled() {
+                            hb_i2c_active.store(false, std::sync::atomic::Ordering::Release);
+                            break;
+                        }
+
+                        while let Ok(delivery) = voltage_cmd_rx.try_recv() {
+                            let (cmd, completion) = delivery.into_parts();
+                            if hb_shutdown_flag.is_cancelled() {
+                                completion.complete(Err(
+                                    "runtime heartbeat is stopping; command was not executed"
+                                        .to_string(),
+                                ));
+                                break;
+                            }
                             let (result, reply_tx): (
                                 std::result::Result<VoltageCommandReply, String>,
                                 Option<tokio::sync::oneshot::Sender<std::result::Result<VoltageCommandReply, String>>>,
                             ) = match cmd {
                                 VoltageCommand::SetVoltage { chain_id, chip_id, pic_addr, target_mv, reply_tx } => {
-                                    if thermal_emergency_active(&hb_thermal_emergency_latch) {
+                                    if voltage_cmd_rx.is_terminal_latched() {
+                                        warn!(
+                                            target_mv,
+                                            pic_addr = format_args!("0x{:02X}", pic_addr),
+                                            "Runtime voltage BLOCKED: terminal safe-off is latched"
+                                        );
+                                        (Err("terminal safe-off latched; refusing SetVoltage".to_string()), reply_tx)
+                                    } else if thermal_emergency_active(&hb_thermal_emergency_latch) {
                                         warn!(
                                             target_mv,
                                             pic_addr = format_args!("0x{:02X}", pic_addr),
@@ -6093,15 +7852,23 @@ impl Daemon {
                                 }
                             };
 
-                            if let Some(tx) = reply_tx {
-                                let _ = tx.send(result);
-                            } else if let Err(detail) = result {
-                                warn!(error = %detail, "Runtime voltage command failed without waiting caller");
+                            debug_assert!(reply_tx.is_none());
+                            if let Err(detail) = &result {
+                                warn!(error = %detail, "Runtime voltage command failed");
                             }
+                            completion.complete(result);
+                        }
+
+                        if hb_shutdown_flag.is_cancelled() {
+                            hb_i2c_active.store(false, std::sync::atomic::Ordering::Release);
+                            break;
                         }
 
                         let now_secs = hb_thread_start.elapsed().as_secs();
                         for &addr in &hb_pic_addrs {
+                            if hb_shutdown_flag.is_cancelled() {
+                                break;
+                            }
                             let backoff = pic_backoff.entry(addr).or_default();
                             let action = backoff.decide(now_secs);
                             if action == HbAction::Skip {
@@ -6117,6 +7884,7 @@ impl Daemon {
                             let hb_us = hb_t0.elapsed().as_micros();
 
                             if result.is_ok() {
+                                cycle_heartbeat_succeeded = true;
                                 let recovered = backoff.record_success();
                                 if recovered || *fails > 0 {
                                     info!("PIC 0x{:02X} heartbeat recovered after {} failures", addr, fails);
@@ -6145,6 +7913,17 @@ impl Daemon {
                             }
                         }
 
+                        if hb_shutdown_flag.is_cancelled() {
+                            hb_i2c_active.store(false, std::sync::atomic::Ordering::Release);
+                            break;
+                        }
+
+                        if cycle_heartbeat_succeeded {
+                            if let Some(tx) = runtime_ready_tx.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+
                         hb_i2c_active.store(false, std::sync::atomic::Ordering::Release);
 
                         // 1000ms interval matching BraiinsOS (VOLTAGE_CTRL_HEART_BEAT_PERIOD).
@@ -6152,23 +7931,44 @@ impl Daemon {
                     }
                 })
                 .map_err(|e| anyhow::anyhow!("failed to spawn PIC heartbeat thread: {}", e))?;
+            self.runtime_heartbeat_handle = Some(runtime_heartbeat_handle);
+            runtime_heartbeat_ready_rx = Some(runtime_ready_rx);
+        }
+
+        // Runtime heartbeat ownership is established before the init guard is
+        // released. Keeping the guard on `self` across every fallible handoff
+        // step prevents an early return or future cancellation from detaching a
+        // live initialization heartbeat without asserting its stop flag.
+        if let Some(ready_rx) = runtime_heartbeat_ready_rx {
+            match tokio::time::timeout(Duration::from_secs(3), ready_rx).await {
+                Ok(Ok(())) => info!("Runtime heartbeat completed its first successful cycle"),
+                Ok(Err(_)) => {
+                    anyhow::bail!("runtime heartbeat exited before completing one successful cycle")
+                }
+                Err(_) => {
+                    anyhow::bail!("runtime heartbeat did not complete a successful cycle within 3s")
+                }
+            }
+        }
+        if !self.stop_init_heartbeat_bounded().await {
+            anyhow::bail!(
+                "initialization heartbeat ownership could not be reclaimed after runtime handoff"
+            );
         }
 
         // Deferred voltage reductions are now applied inside the heartbeat thread
         // after 5 consecutive stable heartbeat ticks. See heartbeat loop above.
 
-        // Init heartbeat thread was already stopped above (serial handoff).
+        // Init heartbeat has now been stopped after the runtime handoff.
         // Mining heartbeat thread is now the sole I2C user.
 
-        // ---- PSU Initialization (S17/S19 models with PMBus PSU on I2C bus 1) ----
-        // S9 has no PSU I2C — power is estimated from frequency/voltage tables.
-        // S17+ models have an APW PSU connected via I2C bus 1 at address 0x10.
-        // We probe first — if no PSU responds, we silently fall back to bypass mode.
-        // PSU GPIO bit-bang (bus 1, gpio 895/896) CORRUPTS kernel I2C bus 0 on S19 Pro.
-        // PSU watchdog: skip when PSU override is active (APW3/APW7 have no watchdog)
-        // or when PSU I2C is known to corrupt the bus (S19 Pro issue).
-        // dsPIC heartbeats (bus 0, addr 0x20-0x22) fail after PSU probe → watchdog cuts
-        // voltage after ~25s → nonces stop.
+        // ---- Legacy smart-PSU initialization (authoritative AM2-S17 only) ----
+        // Raw kernel bus-1 access is admitted only when board_target is am2-s17*
+        // AND the configured model is S17-family. S9 uses estimated power; S19,
+        // CV, Amlogic, BeagleBone, missing/unknown targets, and PSU overrides all
+        // fail closed to bypass mode. This boundary is load-bearing: the legacy
+        // bus-1 path corrupts kernel I2C bus 0 on S19 Pro, causing dsPIC heartbeat
+        // loss and watchdog rail cutoff.
         let psu_override_active = self
             .config
             .power
@@ -6176,8 +7976,16 @@ impl Daemon {
             .as_ref()
             .map(|o| o.enabled)
             .unwrap_or(false);
+        let legacy_psu_board_target = read_first_trimmed(&["/etc/dcentos/board_target"]);
+        let legacy_psu_path_allowed = legacy_kernel_smart_psu_path_allowed(
+            self.config.mining.model.as_deref(),
+            &legacy_psu_board_target,
+            psu_override_active,
+        );
         let mut detected_smart_psu_version: Option<String> = None;
-        let psu_available = if !psu_override_active && !matches!(self.pic_type(), PicType::NoPic) {
+        let psu_available = if legacy_psu_path_allowed
+            && !matches!(self.pic_type()?, PicType::NoPic)
+        {
             match psu_lock.lock() {
                 Ok(_guard) => match dcentrald_hal::psu::PsuController::open_kernel_only() {
                     Ok(mut psu) => match psu.get_version() {
@@ -6198,6 +8006,13 @@ impl Daemon {
                 Err(_) => false,
             }
         } else {
+            if !psu_override_active {
+                tracing::debug!(
+                    board_target = %legacy_psu_board_target,
+                    config_model = ?self.config.mining.model,
+                    "Legacy kernel-I2C smart-PSU probe/feed path is not proven for this platform; staying in bypass mode"
+                );
+            }
             false
         };
 
@@ -6213,16 +8028,16 @@ impl Daemon {
         }
 
         // ---- PSU watchdog feed thread ----
-        // Similar pattern to PIC heartbeat: a dedicated thread feeds the PSU watchdog
-        // every 20 seconds. On shutdown, it disables the watchdog so the PSU stays on
-        // (allowing fans to cool down). Uses its own I2C fd on bus 1 (separate from
-        // PIC heartbeat on bus 0 — no contention).
-        // NOTE: Skipped because psu_available=false — PSU probe disabled to prevent
-        // I2C bus 0 corruption on S19 Pro. See comment above.
+        // This legacy bus-1 owner is retained only behind a successful smart-PSU
+        // probe. The handle is owned by `psu_watchdog_threads`; shutdown must
+        // cancel and join it before any shared hardware teardown. Cancellation
+        // deliberately STOPS feeding without disarming: an armed PSU watchdog is
+        // a safety fallback, while disarming here could preserve energized rails
+        // after a later software safe-off failure.
         if psu_available {
-            let psu_shutdown = self.shutdown_token.clone();
+            let psu_shutdown = self.psu_watchdog_threads.cancellation_token();
             let psu_lock_for_watchdog = psu_lock.clone();
-            std::thread::Builder::new()
+            match std::thread::Builder::new()
                 .name("psu-watchdog".to_string())
                 .spawn(move || {
                     let mut psu = match dcentrald_hal::psu::PsuController::open_kernel_only() {
@@ -6236,23 +8051,41 @@ impl Daemon {
                         dcentrald_hal::psu::WATCHDOG_INTERVAL_S);
                     loop {
                         if psu_shutdown.is_cancelled() {
-                            tracing::info!("PSU watchdog: shutdown signal, disabling watchdog so PSU stays on for cooldown");
-                            if let Ok(_guard) = psu_lock_for_watchdog.lock() {
-                                let _ = psu.disable_watchdog();
-                            }
+                            tracing::info!("PSU watchdog feeder stopping; watchdog remains armed as the shutdown fallback");
                             break;
                         }
-                        if let Ok(_guard) = psu_lock_for_watchdog.lock() {
-                            if let Err(e) = psu.feed_watchdog() {
-                                tracing::warn!(error = %e, "PSU watchdog feed failed");
+                        match psu_lock_for_watchdog.try_lock() {
+                            Ok(_guard) => {
+                                if let Err(e) = psu.feed_watchdog() {
+                                    tracing::warn!(error = %e, "PSU watchdog feed failed");
+                                }
+                            }
+                            Err(std::sync::TryLockError::WouldBlock) => tracing::warn!(
+                                "PSU watchdog feed skipped because another owner holds the bus-1 transport lock; the hardware watchdog remains fail-safe"
+                            ),
+                            Err(std::sync::TryLockError::Poisoned(_)) => {
+                                tracing::error!("PSU watchdog transport lock is poisoned; stopping feeds so the hardware watchdog can cut power");
+                                break;
                             }
                         }
-                        std::thread::sleep(std::time::Duration::from_secs(
-                            dcentrald_hal::psu::WATCHDOG_INTERVAL_S
-                        ));
+                        if sleep_until_cancelled(
+                            &psu_shutdown,
+                            std::time::Duration::from_secs(
+                                dcentrald_hal::psu::WATCHDOG_INTERVAL_S,
+                            ),
+                        ) {
+                            tracing::info!("PSU watchdog feeder stopping during interval wait; watchdog remains armed");
+                            break;
+                        }
                     }
                 })
-                .ok();
+            {
+                Ok(handle) => self.psu_watchdog_threads.push("psu-watchdog", handle),
+                Err(error) => tracing::error!(
+                    error = %error,
+                    "Failed to spawn PSU watchdog feeder; the armed PSU watchdog may cut output unless another owner feeds it"
+                ),
+            }
         }
 
         // ---- Start thermal control loop ----
@@ -6262,7 +8095,7 @@ impl Daemon {
         //   3. Detects fan failures (fan spinning at 0 RPM = danger)
         //   4. Throttles frequency or shuts down if temps get dangerous
         // This keeps your chips alive and your house from burning down.
-        let thermal_shutdown = shutdown.clone();
+        let thermal_shutdown = self.mining_tasks.cancellation_token();
         // pid_interval_s captured as f32 for Duration::from_secs_f32 below (interval
         // is constructed inside the spawned task, after config is moved).
         let thermal_pid_interval_s = thermal_pid_interval_secs(self.config.thermal.pid_interval_s);
@@ -6316,7 +8149,7 @@ impl Daemon {
         let thermal_alert_tx = alert_tx.clone();
         let thermal_night_mode = self.config.thermal.night_mode.clone();
         let thermal_chip_id = self.chip_id;
-        let thermal_pic_type = self.pic_type();
+        let thermal_pic_type = self.pic_type()?;
         let thermal_emergency_latch = thermal_emergency_latch.clone();
         let thermal_skip_board_temp = self.config.mining.skip_board_temp;
         let thermal_has_xadc = !detect_control_board().starts_with("AML");
@@ -6328,7 +8161,7 @@ impl Daemon {
         let thermal_include_die_on_am2 = std::env::var(ENV_THERMAL_INCLUDE_DIE_ON_AM2)
             .map(|v| dcentrald_autotuner::config::env_flag_is_truthy(&v))
             .unwrap_or(false);
-        let thermal_restart_voltage_mv = match self.pic_type() {
+        let thermal_restart_voltage_mv = match self.pic_type()? {
             PicType::Pic16F1704 => 9400,
             _ => self
                 .miner_profile
@@ -6503,7 +8336,7 @@ impl Daemon {
         }
 
         let thermal_liveness_loop = thermal_liveness.clone();
-        tokio::spawn(async move {
+        if !self.mining_tasks.spawn("thermal-controller", async move {
             let mut controller = ThermalController::new(thermal_profile);
             // W8 parity: arm immersion / hydro mode (default-OFF → no-op).
             // `enable_immersion` is fail-closed: on an air-cooled-looking
@@ -6513,9 +8346,11 @@ impl Daemon {
             // byte-identical to the pre-immersion path. The controller emits the
             // matching `tracing` warning for the decision.
             controller.enable_immersion(&thermal_immersion_cfg, thermal_platform_looks_air_cooled);
-            if let Some(ref fan) = thermal_fan {
-                controller.set_tach_available(fan.tach_available());
-            }
+            controller.set_tach_available(
+                thermal_fan
+                    .as_ref()
+                    .is_some_and(|fan| fan.tach_available()),
+            );
             // Construct the supervisor when explicitly enabled in config OR when
             // THERMAL-8's per-platform default-enable resolved on (still default-off
             // unless the operator set the per-platform validation gate). When armed
@@ -6654,7 +8489,12 @@ impl Daemon {
                                         consecutive_xadc_failures.saturating_add(1);
                                     error!(error = %e, consecutive = consecutive_xadc_failures, "XADC temp read FAILED — keeping fan command within the home safety cap while board-temp supervision continues");
                                     if let Some(ref fan) = thermal_fan {
-                                        fan.set_speed(cfg_fan_max_pwm.min(dcentrald_hal::fan::PWM_SAFETY_MAX));
+                                        fan.set_speed(
+                                            dcentrald_common::FanCommand::emergency_cap(
+                                                cfg_fan_max_pwm,
+                                            )
+                                            .effective_pwm(),
+                                        );
                                     }
                                     45.0
                                 }
@@ -6773,8 +8613,9 @@ impl Daemon {
                                                     reply_tx: Some(reply_tx),
                                                 }) {
                                                     match &e {
-                                                        std::sync::mpsc::TrySendError::Full(_) => warn!(pic_addr = format_args!("0x{:02X}", addr), "voltage queue full, dropping DisableVoltage (curtailment sleep)"),
-                                                        std::sync::mpsc::TrySendError::Disconnected(_) => error!(pic_addr = format_args!("0x{:02X}", addr), "voltage worker thread dead — daemon shutdown imminent (curtailment sleep)"),
+                                                        VoltageTrySendError::Full(_) => warn!(pic_addr = format_args!("0x{:02X}", addr), "voltage mailbox full, rejecting DisableVoltage (curtailment sleep)"),
+                                                        VoltageTrySendError::Disconnected => error!(pic_addr = format_args!("0x{:02X}", addr), "voltage worker thread dead — daemon shutdown imminent (curtailment sleep)"),
+                                                        other => warn!(pic_addr = format_args!("0x{:02X}", addr), error = %other, "voltage mailbox rejected DisableVoltage (curtailment sleep)"),
                                                     }
                                                     warn!(pic_addr = format_args!("0x{:02X}", addr), error = %e, "Curtailment sleep: failed to queue voltage disable");
                                                     all_ok = false;
@@ -6893,8 +8734,9 @@ impl Daemon {
                                                     reply_tx: Some(reply_tx),
                                                 }) {
                                                     match &e {
-                                                        std::sync::mpsc::TrySendError::Full(_) => warn!(pic_addr = format_args!("0x{:02X}", addr), "voltage queue full, dropping SetVoltage (curtailment wake)"),
-                                                        std::sync::mpsc::TrySendError::Disconnected(_) => error!(pic_addr = format_args!("0x{:02X}", addr), "voltage worker thread dead — daemon shutdown imminent (curtailment wake)"),
+                                                        VoltageTrySendError::Full(_) => warn!(pic_addr = format_args!("0x{:02X}", addr), "voltage mailbox full, rejecting SetVoltage (curtailment wake)"),
+                                                        VoltageTrySendError::Disconnected => error!(pic_addr = format_args!("0x{:02X}", addr), "voltage worker thread dead — daemon shutdown imminent (curtailment wake)"),
+                                                        other => warn!(pic_addr = format_args!("0x{:02X}", addr), error = %other, "voltage mailbox rejected SetVoltage (curtailment wake)"),
                                                     }
                                                     warn!(pic_addr = format_args!("0x{:02X}", addr), error = %e, "Curtailment wake: failed to queue voltage enable");
                                                     all_ok = false;
@@ -7133,27 +8975,33 @@ impl Daemon {
                         // if that single value was the slowest fan reading 0 RPM, the
                         // supervisor saw `working_fans=0, total_fans=1` and fired a spurious
                         // FanPanic → EmergencyShutdown even when the other 3 fans were fine.
-                        let per_fan_rpms: Vec<u32> = thermal_fan
+                        let (tach_available, per_fan_rpms) = thermal_fan
                             .as_ref()
-                            .map(|f| {
-                                if f.tach_available() {
-                                    f.get_per_fan_rpm()
-                                        .into_iter()
-                                        .map(|(_, rpm)| rpm)
-                                        .collect()
-                                } else {
-                                    // No per-fan tach: a single aggregate reading is all
-                                    // we have. Wrap it so the supervisor still counts it
-                                    // as one fan rather than zero.
-                                    vec![f.get_rpm()]
-                                }
+                            .map(|fan| {
+                                collect_fan_tach_evidence(
+                                    || fan.tach_available(),
+                                    || {
+                                        fan.get_per_fan_rpm()
+                                            .into_iter()
+                                            .map(|(_, rpm)| rpm)
+                                            .collect()
+                                    },
+                                )
                             })
-                            .unwrap_or_default();
-                        // Single representative RPM for the controller's own tick: the
-                        // slowest fan (conservative — a stalled fan should still surface),
-                        // falling back to the aggregate reading when no per-fan data exists.
+                            .unwrap_or_else(|| (false, Vec::new()));
+                        controller.set_tach_available(tach_available);
+                        // Unavailable, warming, or concurrently lost tach is no
+                        // fan-count evidence. The supervisor interprets an
+                        // empty vector as unknown and continues temperature-
+                        // based protection; a fabricated zero would mean a
+                        // proven stopped fan and trigger FanPanic.
+                        // Single representative RPM for the controller's own
+                        // tick: the slowest fan, so a stalled fan still
+                        // surfaces. Use zero only as an ignored input while
+                        // tach availability is false; never present it to the
+                        // supervisor as a measured stopped fan.
                         let fan_rpm = if per_fan_rpms.is_empty() {
-                            thermal_fan.as_ref().map(|f| f.get_rpm()).unwrap_or(0)
+                            0
                         } else {
                             per_fan_rpms.iter().copied().min().unwrap_or(0)
                         };
@@ -7237,8 +9085,8 @@ impl Daemon {
                                 // `vec![min_rpm]`. The supervisor counts working fans
                                 // (rpm > 0) against `min_fans`; a single min-value element
                                 // made one slow/zero fan look like a total fan loss and
-                                // tripped a spurious FanPanic. When no per-fan tach exists,
-                                // `per_fan_rpms` already holds a single aggregate reading.
+                                // tripped a spurious FanPanic. Unavailable or warming
+                                // tach produces an empty vector, meaning no RPM evidence.
                                 fan_tach_rpms: per_fan_rpms.clone(),
                                 current_fan_pwm: controller.current_pwm(),
                                 hydro_inlet_c: None,
@@ -7798,8 +9646,9 @@ impl Daemon {
                                                         reply_tx: Some(reply_tx),
                                                     }) {
                                                         match &e {
-                                                            std::sync::mpsc::TrySendError::Full(_) => warn!(addr = format_args!("0x{:02X}", addr), "voltage queue full, dropping DisableVoltage (thermal emergency)"),
-                                                            std::sync::mpsc::TrySendError::Disconnected(_) => error!(addr = format_args!("0x{:02X}", addr), "voltage worker thread dead — daemon shutdown imminent (thermal emergency)"),
+                                                            VoltageTrySendError::Full(_) => warn!(addr = format_args!("0x{:02X}", addr), "voltage mailbox full, rejecting DisableVoltage (thermal emergency)"),
+                                                            VoltageTrySendError::Disconnected => error!(addr = format_args!("0x{:02X}", addr), "voltage worker thread dead — daemon shutdown imminent (thermal emergency)"),
+                                                            other => warn!(addr = format_args!("0x{:02X}", addr), error = %other, "voltage mailbox rejected DisableVoltage (thermal emergency)"),
                                                         }
                                                         round_ok = false;
                                                         error!(addr = format_args!("0x{:02X}", addr), error = %e, "Thermal emergency: failed to queue voltage disable");
@@ -7853,7 +9702,10 @@ impl Daemon {
                                     }
                                 }
                                 if let Some(ref fan) = thermal_fan {
-                                    fan.set_speed(cfg_fan_max_pwm.min(dcentrald_hal::fan::PWM_SAFETY_MAX));
+                                    fan.set_speed(
+                                        dcentrald_common::FanCommand::emergency_cap(cfg_fan_max_pwm)
+                                            .effective_pwm(),
+                                    );
                                 }
                                 // Fire webhook alert — non-blocking try_send so thermal loop is never stalled
                                 let _ = thermal_alert_tx.try_send(AlertEvent::EmergencyShutdown {
@@ -7892,8 +9744,9 @@ impl Daemon {
                                                         reply_tx: Some(reply_tx),
                                                     }) {
                                                         match &e {
-                                                            std::sync::mpsc::TrySendError::Full(_) => warn!(addr = format_args!("0x{:02X}", addr), "voltage queue full, dropping DisableVoltage (fan failure)"),
-                                                            std::sync::mpsc::TrySendError::Disconnected(_) => error!(addr = format_args!("0x{:02X}", addr), "voltage worker thread dead — daemon shutdown imminent (fan failure)"),
+                                                            VoltageTrySendError::Full(_) => warn!(addr = format_args!("0x{:02X}", addr), "voltage mailbox full, rejecting DisableVoltage (fan failure)"),
+                                                            VoltageTrySendError::Disconnected => error!(addr = format_args!("0x{:02X}", addr), "voltage worker thread dead — daemon shutdown imminent (fan failure)"),
+                                                            other => warn!(addr = format_args!("0x{:02X}", addr), error = %other, "voltage mailbox rejected DisableVoltage (fan failure)"),
                                                         }
                                                         round_ok = false;
                                                         error!(addr = format_args!("0x{:02X}", addr), error = %e, "Fan failure: failed to queue voltage disable");
@@ -7947,7 +9800,10 @@ impl Daemon {
                                     }
                                 }
                                 if let Some(ref fan) = thermal_fan {
-                                    fan.set_speed(cfg_fan_max_pwm.min(dcentrald_hal::fan::PWM_SAFETY_MAX));
+                                    fan.set_speed(
+                                        dcentrald_common::FanCommand::emergency_cap(cfg_fan_max_pwm)
+                                            .effective_pwm(),
+                                    );
                                 }
                                 // Fire webhook alert — non-blocking try_send
                                 let _ = thermal_alert_tx.try_send(AlertEvent::FanFailure {
@@ -7993,8 +9849,9 @@ impl Daemon {
                                                     reply_tx: Some(reply_tx),
                                                 }) {
                                                     match &e {
-                                                        std::sync::mpsc::TrySendError::Full(_) => warn!(addr = format_args!("0x{:02X}", addr), "voltage queue full, dropping SetVoltage (thermal restart)"),
-                                                        std::sync::mpsc::TrySendError::Disconnected(_) => error!(addr = format_args!("0x{:02X}", addr), "voltage worker thread dead — daemon shutdown imminent (thermal restart)"),
+                                                        VoltageTrySendError::Full(_) => warn!(addr = format_args!("0x{:02X}", addr), "voltage mailbox full, rejecting SetVoltage (thermal restart)"),
+                                                        VoltageTrySendError::Disconnected => error!(addr = format_args!("0x{:02X}", addr), "voltage worker thread dead — daemon shutdown imminent (thermal restart)"),
+                                                        other => warn!(addr = format_args!("0x{:02X}", addr), error = %other, "voltage mailbox rejected SetVoltage (thermal restart)"),
                                                     }
                                                     all_reenabled = false;
                                                     error!(addr = format_args!("0x{:02X}", addr), error = %e, "Thermal restart: failed to queue voltage re-enable");
@@ -8041,7 +9898,11 @@ impl Daemon {
                     }
                 }
             }
-        });
+        }) {
+            anyhow::bail!(
+                "thermal controller task ownership is unavailable; refusing unowned hardware control"
+            );
+        }
 
         // ---- Start state publisher task (WebSocket broadcast every 1s) ----
         let state_shutdown = shutdown.clone();
@@ -8269,53 +10130,42 @@ impl Daemon {
                                     // Persist the per-episode budget BEFORE
                                     // scheduling so it survives the respawn;
                                     // fail-closed (no restart) if persistence fails.
-                                    let persisted_ok = serde_json::to_string(
+                                    match persist_recovery_ladder_state(
+                                        &publisher_recovery_state_path,
                                         &ladder.persisted_state(),
-                                    )
-                                    .ok()
-                                    .map(|j| {
-                                        let tmp =
-                                            publisher_recovery_state_path.with_extension("tmp");
-                                        std::fs::write(&tmp, &j)
-                                            .and_then(|_| {
-                                                std::fs::rename(
-                                                    &tmp,
-                                                    &publisher_recovery_state_path,
-                                                )
-                                            })
-                                            .is_ok()
-                                    })
-                                    .unwrap_or(false);
-                                    if persisted_ok {
-                                        tracing::warn!(
-                                            attempt,
-                                            reason,
-                                            observed_ghs,
-                                            floor_ghs,
-                                            "PH-3 auto-recovery: scheduling graceful daemon restart"
-                                        );
-                                        crate::restart::schedule_daemon_restart(
-                                            reason,
-                                            Duration::from_secs(5),
-                                        );
-                                    } else {
-                                        tracing::error!(
-                                            "PH-3 auto-recovery: could not persist ladder budget — NOT restarting (fail-closed)"
-                                        );
+                                    ) {
+                                        Ok(outcome) => {
+                                            tracing::warn!(
+                                                attempt,
+                                                reason,
+                                                observed_ghs,
+                                                floor_ghs,
+                                                persisted_bytes = outcome.bytes_written,
+                                                replaced_existing = outcome.replaced_existing,
+                                                "PH-3 auto-recovery: durable ladder budget published; scheduling graceful daemon restart"
+                                            );
+                                            crate::restart::schedule_daemon_restart(
+                                                reason,
+                                                Duration::from_secs(5),
+                                            );
+                                        }
+                                        Err(error) => {
+                                            log_recovery_state_persist_failure(
+                                                "schedule-restart",
+                                                &error,
+                                            );
+                                            tracing::error!(
+                                                "PH-3 auto-recovery: ladder budget durability was not proven — NOT restarting (fail-closed)"
+                                            );
+                                        }
                                     }
                                 }
                                 LadderOutcome::GiveUp { attempts } => {
-                                    if let Ok(j) =
-                                        serde_json::to_string(&ladder.persisted_state())
-                                    {
-                                        let tmp =
-                                            publisher_recovery_state_path.with_extension("tmp");
-                                        let _ = std::fs::write(&tmp, &j).and_then(|_| {
-                                            std::fs::rename(
-                                                &tmp,
-                                                &publisher_recovery_state_path,
-                                            )
-                                        });
+                                    if let Err(error) = persist_recovery_ladder_state(
+                                        &publisher_recovery_state_path,
+                                        &ladder.persisted_state(),
+                                    ) {
+                                        log_recovery_state_persist_failure("give-up", &error);
                                     }
                                     let _ = publisher_alert_tx.try_send(
                                         crate::runtime::notifications::AlertEvent::HashrateRecoveryExhausted {
@@ -8358,11 +10208,23 @@ impl Daemon {
     /// 7. Chip configuration
     async fn init(
         &mut self,
-    ) -> Result<(
-        Option<Arc<std::sync::atomic::AtomicBool>>,
-        Option<std::thread::JoinHandle<()>>,
-    )> {
-        if let Some(refusal) = self.td003_destructive_write_refusal() {
+        identity: &crate::daemon_lifecycle::PlatformIdentitySnapshot,
+    ) -> Result<()> {
+        // Initialization is a composition boundary even when it later fails.
+        // Revoke the preceding engine lease before touching discovery state so
+        // management-only recovery can never retain an earlier dispatcher's
+        // Measured/High identity authorization.
+        if let Err(error) = self.dispatcher_composition_authority.invalidate_active() {
+            warn!(
+                error = %error,
+                "Could not revoke the preceding dispatcher composition at initialization start"
+            );
+        }
+        // An init retry is a new discovery generation. Never let successful
+        // receipts from an earlier, partially completed attempt survive it.
+        self.asic_enumeration_receipts.clear();
+
+        if let Some(refusal) = self.td003_destructive_write_refusal(identity) {
             anyhow::bail!(
                 "TD-003 destructive-write gate refused hardware init for {} from {} \
                  (Experimental feature / In development; exact promotion gates incomplete)",
@@ -8382,20 +10244,67 @@ impl Daemon {
         // bus 0 (output disabled / stuck safe-mode voltage -> ASICs under-powered ->
         // zero nonces), so recovery is gated to the `is_am1_s9` allowlist below and
         // must NOT be re-enabled broadly..
-        let control_board = detect_control_board();
+        let control_board = identity.observed_control_board.as_str();
         // AUTHORITATIVE-FIRST detection: /etc/dcentos/board_target decides the
         // S9-only devmem I2C path, NOT detect_control_board()'s fragile
         // uio_count<=14 heuristic (which misclassifies a boot-race am2 as am1-s9
         // and would corrupt the am2 hashboard EEPROMs at 0x55-0x57). See
         // is_am1_s9_from_evidence.
-        let board_target_for_i2c = read_first_trimmed(&["/etc/dcentos/board_target"]);
-        let is_am1_s9 = is_am1_s9_from_evidence(&board_target_for_i2c, &control_board);
+        let board_target_for_i2c = identity.board_target();
+        if board_target_for_i2c.is_empty() {
+            self.preflight_hardware_state_unknown = true;
+            self.signal_init_heartbeat_stop();
+            self.heartbeat_shutdown_token.cancel();
+            error!(
+                detected_control_board = %control_board,
+                passthrough = self.config.mining.passthrough,
+                rail_state_unknown = true,
+                "Authoritative /etc/dcentos/board_target is missing; refusing transport selection, endpoint keepalives, rail bring-up, and mining"
+            );
+            anyhow::bail!(
+                "authoritative board_target identity is missing; management-only fallback required"
+            );
+        }
+        let is_am1_s9 = is_am1_s9_from_evidence(board_target_for_i2c, control_board);
+
+        // Lifecycle topology admission. This must complete before bus recovery,
+        // transport startup, GPIO reads, endpoint keepalives, or UIO mapping.
+        // A configured supported model may provide a profile. With no such
+        // profile, only the exact authoritative am1-s9 board target is strong
+        // enough to seed pre-enumeration wiring. Seeding S9 topology here does
+        // NOT set `chip_id`; silicon identity remains unknown until enumeration.
+        if let Some(configured_chip_id) = self.config.mining.model_chip_id() {
+            self.miner_profile = Some(identified_miner_profile(configured_chip_id)?);
+        } else {
+            self.miner_profile = Some(pre_enumeration_topology_profile(is_am1_s9)?);
+        }
+        let admitted_profile = self.required_topology_profile()?;
+        let admitted_pic_type = self
+            .configured_model_pic_type_override()
+            .unwrap_or(admitted_profile.pic_type);
+        let admitted_pic_addrs = self
+            .configured_model_pic_addrs_override()
+            .unwrap_or(admitted_profile.pic_addrs);
+        validate_profile_platform_authority(board_target_for_i2c, is_am1_s9, admitted_profile)?;
+        validate_standard_daemon_topology(admitted_profile, admitted_pic_type, admitted_pic_addrs)?;
+        info!(
+            board_target = %board_target_for_i2c,
+            profile = admitted_profile.name,
+            profile_chip_id = format_args!("0x{:04X}", admitted_profile.chip_id),
+            discovered_chip_id = format_args!("0x{:04X}", self.chip_id),
+            source = if self.config.mining.model_chip_id().is_some() {
+                "configured-supported-model"
+            } else {
+                "authoritative-am1-s9-topology-only"
+            },
+            "Model-specific topology admitted before hardware access"
+        );
+
         let preserve_passthrough_i2c =
             self.config.mining.passthrough && self.config.mining.model.is_none();
-        if self.config.mining.model.is_none() && !preserve_passthrough_i2c && is_am1_s9 {
-            // Only run I2C recovery on S9 (no model hint) — S9 needs it for stuck AXI IIC.
-            self.send_emergency_heartbeats();
-        } else {
+        let recover_am1_bus =
+            self.config.mining.model.is_none() && !preserve_passthrough_i2c && is_am1_s9;
+        if !recover_am1_bus {
             info!(
                 passthrough = self.config.mining.passthrough,
                 model_hint = self.config.mining.model.is_some(),
@@ -8420,13 +10329,14 @@ impl Daemon {
         // gate let am2 (Zynq but not AML) through, which was the poisoning
         // vector. Switch to an explicit AM1/S9 allowlist: only boards we
         // positively identify as am1 take the unbind path.
-        let use_devmem_i2c = is_am1_s9;
+        let i2c_transport = standard_i2c_transport(identity, is_am1_s9)?;
+        let use_devmem_i2c = i2c_transport == StandardI2cTransport::Am1S9Devmem;
         if use_devmem_i2c {
             info!(
                 control_board = %control_board,
-                "AM1/S9 detected — unbinding kernel I2C driver for devmem AXI IIC path"
+                recover_am1_bus,
+                "AM1/S9 detected — serialized I2C factory will prepare the devmem AXI IIC path"
             );
-            dcentrald_hal::i2c::unbind_kernel_i2c_driver();
         } else {
             info!(
                 control_board = %control_board,
@@ -8440,18 +10350,8 @@ impl Daemon {
         // both store factory identity and must be defended from misrouted
         // writes. and
         // dcentrald_hal::platform::amlogic doc comment.
-        let is_am3_aml = control_board.starts_with("AML");
-        let i2c_svc = if use_devmem_i2c {
-            dcentrald_hal::i2c::spawn_i2c_service(0, true)
-        } else if is_am3_aml {
-            dcentrald_hal::platform::amlogic::spawn_amlogic_protected_i2c0_service()
-        } else {
-            dcentrald_hal::i2c::spawn_i2c_service_no_register_touch_with_denylist(
-                0,
-                HASHBOARD_EEPROM_WRITE_DENYLIST.to_vec(),
-            )
-        }
-        .map_err(|e| anyhow::anyhow!("FATAL: failed to spawn I2C service thread: {}", e))?;
+        let i2c_request = SerializedI2cRequest::new(i2c_transport, recover_am1_bus)?;
+        let i2c_svc = ProductionSerializedI2cFactory.open_serialized_i2c(i2c_request)?;
         self.i2c_service = Some(i2c_svc.clone());
         info!(
             use_devmem_i2c,
@@ -8468,42 +10368,114 @@ impl Daemon {
         // loaded from config to get the correct chain IDs, PIC addresses, etc.
         if let Some(chip_id) = self.config.mining.model_chip_id() {
             self.chip_id = chip_id;
-            self.update_profile();
+            self.update_profile()?;
             if let Some(profile) = self.miner_profile {
                 info!(
                     config_model = ?self.config.mining.model,
                     model = profile.name,
                     chip_id = format_args!("0x{:04X}", chip_id),
-                    chips_per_chain = self.default_chips_per_chain(),
+                    chips_per_chain = self.default_chips_per_chain()?,
                     chain_ids = ?profile.chain_ids,
                     pic_addrs = ?profile.pic_addrs,
                     "MinerProfile loaded from config model hint"
                 );
-            } else {
-                warn!(
-                    chip_id = format_args!("0x{:04X}", chip_id),
-                    "Config model set but no matching MinerProfile found"
-                );
             }
         }
 
-        // ---- Phase 0: EMERGENCY PIC HEARTBEATS ----
-        // Send heartbeats via the I2C service (not direct I2cBus::open).
-        info!("--- Phase 0: Emergency PIC Heartbeats (hot start safety) ---");
-        {
-            let mut success = 0u8;
-            let pic_addrs = self.pic_addrs().to_vec();
-            for &addr in &pic_addrs {
-                // PIC16 app-mode keepalive is 0x16. Do not inject the old 0x11
-                // legacy heartbeat into an already-live passthrough handoff.
-                if i2c_svc.write_bytes(addr, &[0x55, 0xAA, 0x16]).is_ok() {
-                    success += 1;
+        // ---- P0 cooling preflight (before any emergency heartbeat) ----
+        // A passthrough unit may already be energized by prior firmware. Prove
+        // fan-control ownership and tach motion before extending that state with
+        // a heartbeat. PWM write success alone is not cooling evidence.
+        info!("--- P0: Cooling Readiness Preflight ---");
+        let spinup_pwm =
+            clamp_fan_pwm(self.config.thermal.fan_max_pwm.max(20)).min(FAN_PWM_SAFETY_MAX);
+        let cooling_readiness = match FanController::open_discovered() {
+            Ok((discovery, fan)) => {
+                fan.set_speed(spinup_pwm);
+                let mut tach_rpm_by_physical_fan: Vec<Option<u32>> =
+                    vec![None; discovery.variant.physical_fan_count() as usize];
+                for sample_index in 0..COOLING_SPINUP_SAMPLES {
+                    tokio::time::sleep(COOLING_SPINUP_SAMPLE_INTERVAL).await;
+                    let snapshot = fan.get_tach_snapshot();
+                    for (observed_max, sample_rpm) in tach_rpm_by_physical_fan
+                        .iter_mut()
+                        .zip(snapshot.rpm_by_physical_fan.iter())
+                    {
+                        if let Some(sample_rpm) = sample_rpm {
+                            *observed_max = Some(observed_max.unwrap_or_default().max(*sample_rpm));
+                        }
+                    }
+                    info!(
+                        sample = sample_index + 1,
+                        samples = COOLING_SPINUP_SAMPLES,
+                        tach_rpm_by_physical_fan = ?snapshot.rpm_by_physical_fan,
+                        "Cooling preflight tach sample collected"
+                    );
                 }
+                let readiness = cooling_readiness_from_tach(spinup_pwm, &tach_rpm_by_physical_fan);
+                info!(
+                    uio_device = discovery.uio_number,
+                    variant = ?discovery.variant,
+                    commanded_pwm = spinup_pwm,
+                    dwell_ms = COOLING_SPINUP_DWELL.as_millis(),
+                    tach_rpm_by_physical_fan = ?tach_rpm_by_physical_fan,
+                    readiness = ?readiness,
+                    "Cooling preflight command/per-channel tach evidence collected; tach motion is not a physical-airflow-rate assertion"
+                );
+                if matches!(readiness, CoolingReadiness::Ready { .. }) {
+                    self.fan = Some(Arc::new(fan));
+                }
+                readiness
             }
-            info!(
-                success_count = success,
-                pic_addrs = ?pic_addrs,
-                "Emergency heartbeats to {} PIC(s)", success
+            Err(error) => CoolingReadiness::Unavailable {
+                reason: error.to_string(),
+            },
+        };
+
+        if let CoolingReadiness::Unavailable { reason } = &cooling_readiness {
+            self.preflight_hardware_state_unknown = true;
+            let transition = i2c_svc.latch_terminal_safe_off();
+            self.signal_init_heartbeat_stop();
+            self.heartbeat_shutdown_token.cancel();
+
+            let board_target = identity.board_target();
+            let psu_override_active = self
+                .config
+                .power
+                .psu_override
+                .as_ref()
+                .is_some_and(|override_cfg| override_cfg.enabled);
+            let hard_cut_allowed = legacy_kernel_smart_psu_path_allowed(
+                self.config.mining.model.as_deref(),
+                board_target,
+                psu_override_active,
+            );
+            let hard_cut_asserted = hard_cut_allowed
+                && match dcentrald_hal::platform::zynq::disable_psu_output() {
+                    Ok(()) => true,
+                    Err(error) => {
+                        error!(
+                            error = %error,
+                            board_target,
+                            "Cooling preflight failed and the proven AM2-S17 transport-independent hard cut also failed"
+                        );
+                        false
+                    }
+                };
+            error!(
+                error = %reason,
+                passthrough = self.config.mining.passthrough,
+                detected_slots_known = false,
+                board_target,
+                safety_generation = transition.generation(),
+                hard_cut_allowed,
+                hard_cut_asserted,
+                rail_state_unknown = !hard_cut_asserted,
+                controller_watchdog_state = "unknown; no new heartbeat was sent",
+                "Cooling preflight failed closed before any heartbeat, board detection, rail enable, or mining; entering management-only fallback"
+            );
+            anyhow::bail!(
+                "cooling preflight unavailable: fan-control/tach readiness not proven; management-only fallback required"
             );
         }
 
@@ -8560,29 +10532,20 @@ impl Daemon {
         // ---- Phase 2: Fan setup (home boot default) ----
         // The fan controller is the UIO device whose sysfs name is `fan-control`.
         // Braiins fan-control accepts PWM 0-100 and exposes tachometer feedback.
-        // Quiet Home Mode commands PWM 10. On AM2/XIL, live .25 evidence shows
+        // On AM2/XIL, live .25 evidence shows
         // the command register can be correct while the physical fan controller
         // still sits at a loud low-PWM/failsafe floor, so logs must report RPM.
-        info!("--- Phase 2: Fan Initialization (Quiet Home Mode) ---");
-        match FanController::open_discovered() {
-            Ok((discovery, fan)) => {
-                fan.set_speed(FAN_PWM_QUIET_BOOT);
-                let rpm = fan.get_rpm();
-                info!(
-                    uio_device = discovery.uio_number,
-                    variant = ?discovery.variant,
-                    pwm = FAN_PWM_QUIET_BOOT,
-                    rpm,
-                    "Fans commanded to home boot PWM {}/100 ({}% duty); max tach readback is {} RPM",
-                    FAN_PWM_QUIET_BOOT,
-                    fan_pwm_percent(FAN_PWM_QUIET_BOOT),
-                    rpm,
-                );
-                self.fan = Some(Arc::new(fan));
-            }
-            Err(e) => {
-                error!(error = %e, "Fan controller init FAILED — running without fan speed control! If hash boards are powered, fans will run at their hardware default. Check /sys/class/uio/*/name for fan-control; AM2 must not fall back to a guessed UIO number.");
-            }
+        info!("--- Phase 2: Fan Initialization (Preflight Command Retained) ---");
+        if let CoolingReadiness::Ready {
+            commanded_pwm,
+            tach_rpm_by_physical_fan,
+        } = &cooling_readiness
+        {
+            info!(
+                commanded_pwm,
+                tach_rpm_by_physical_fan = ?tach_rpm_by_physical_fan,
+                "Cooling readiness was established before any heartbeat or rail bring-up; retaining the proven home-capped command until thermal supervision assumes ownership"
+            );
         }
 
         // Cold boot: run fans at configured max during ASIC initialization.
@@ -8590,9 +10553,16 @@ impl Daemon {
         // Home miners need quiet boot. The thermal PID ramps up if needed.
         if !self.config.mining.passthrough {
             if let Some(ref fan) = self.fan {
-                let boot_max = clamp_fan_pwm(self.config.thermal.fan_max_pwm.max(20));
+                let boot_max =
+                    clamp_fan_pwm(self.config.thermal.fan_max_pwm.max(20)).min(FAN_PWM_SAFETY_MAX);
                 fan.set_speed(boot_max);
-                info!("Cold boot: fans set to PWM {} for init sequence", boot_max);
+                let rpm = fan.get_rpm();
+                info!(
+                    commanded_pwm = boot_max,
+                    max_tach_rpm = rpm,
+                    tach_motion_observed = rpm > 0,
+                    "Cold-boot fan command issued for init sequence; tach is observational and does not prove physical airflow"
+                );
             }
         }
 
@@ -8653,49 +10623,180 @@ impl Daemon {
         // is physically plugged in. We read 3 GPIO pins to see which slots have boards.
         // S9 has 3 slots (chain 6, 7, 8) but you can run with 1, 2, or 3 boards.
         info!("--- Phase 3: Hash Board Detection ---");
-        let plugo_base = self.plugo_gpio_base();
-        let enable_base = self.enable_gpio_base();
+        let plugo_base = self.plugo_gpio_base()?;
         info!("Checking PLUGO GPIO pins {} to {} — each pin tells us if a hash board is plugged into that slot", plugo_base, plugo_base + 2);
+
+        self.detected_board_indices.clear();
+        let direct_plug_detect = if is_am1_s9 {
+            self.gpio.as_ref().map(|gpio| gpio.read_plug_detect())
+        } else {
+            None
+        };
+        let mut slot_presence = [BoardPresence::Unknown; 3];
 
         for i in 0..3 {
             let gpio_num = plugo_base + i as u32;
             let gpio_path = format!("/sys/class/gpio/gpio{}/value", gpio_num);
-            let connected = std::fs::read_to_string(&gpio_path)
-                .map(|s| s.trim() == "1")
-                .unwrap_or_else(|_| {
-                    warn!(
-                        chain_id = self.chain_id_for_board(i),
-                        gpio = gpio_num,
-                        "PLUGO GPIO not exported in sysfs — assuming board is present (safe default)"
-                    );
-                    true
-                });
-
-            if connected {
-                self.detected_board_indices.push(i);
-                info!(
-                    chain_id = self.chain_id_for_board(i),
-                    gpio = gpio_num,
-                    connector = format_args!("J{}", self.chain_id_for_board(i)),
-                    "Hash board DETECTED in slot {} (GPIO {} = HIGH)",
-                    self.chain_id_for_board(i),
-                    gpio_num,
-                );
+            let (presence, source) = if let Some(direct) = direct_plug_detect.as_ref() {
+                (
+                    if direct[i] {
+                        BoardPresence::Present
+                    } else {
+                        BoardPresence::Absent
+                    },
+                    "direct-axi-gpio",
+                )
             } else {
-                info!(
-                    chain_id = self.chain_id_for_board(i),
-                    connector = format_args!("J{}", self.chain_id_for_board(i)),
-                    "No hash board in slot {} (GPIO {} = LOW) — empty slot, skipping",
-                    self.chain_id_for_board(i),
-                    gpio_num,
-                );
+                let value = std::fs::read_to_string(&gpio_path);
+                let presence = board_presence_from_sysfs_value(value.as_deref().ok());
+                if let Err(error) = &value {
+                    warn!(
+                        chain_id = self.chain_id_for_board(i)?,
+                        gpio = gpio_num,
+                        error = %error,
+                        "PLUGO GPIO read failed; slot presence is unknown and the slot will not be energized"
+                    );
+                } else if presence == BoardPresence::Unknown {
+                    warn!(
+                        chain_id = self.chain_id_for_board(i)?,
+                        gpio = gpio_num,
+                        value = %value.as_deref().unwrap_or_default().trim(),
+                        "PLUGO GPIO value is malformed; slot presence is unknown and the slot will not be energized"
+                    );
+                }
+                (presence, "sysfs")
+            };
+
+            slot_presence[i] = presence;
+            match presence {
+                BoardPresence::Present => {
+                    self.detected_board_indices.push(i);
+                    info!(
+                        chain_id = self.chain_id_for_board(i)?,
+                        gpio = gpio_num,
+                        source,
+                        connector = format_args!("J{}", self.chain_id_for_board(i)?),
+                        "Hash board positively detected; slot is eligible for hardware bring-up"
+                    );
+                }
+                BoardPresence::Absent => info!(
+                    chain_id = self.chain_id_for_board(i)?,
+                    gpio = gpio_num,
+                    source,
+                    connector = format_args!("J{}", self.chain_id_for_board(i)?),
+                    "Hash board slot is authoritatively absent; slot will be skipped"
+                ),
+                BoardPresence::Unknown => warn!(
+                    chain_id = self.chain_id_for_board(i)?,
+                    gpio = gpio_num,
+                    source,
+                    connector = format_args!("J{}", self.chain_id_for_board(i)?),
+                    "Hash board slot presence is unknown; fail-closed policy forbids energizing it"
+                ),
             }
         }
 
-        if self.detected_board_indices.is_empty() {
-            warn!("No hash boards detected in any slot — dcentrald will run in API-only mode (dashboard and REST API still available, just no mining)");
-            return Ok((None, None));
+        if !hardware_bringup_permitted(&cooling_readiness, &slot_presence) {
+            self.preflight_hardware_state_unknown = true;
+            let transition = i2c_svc.latch_terminal_safe_off();
+            self.signal_init_heartbeat_stop();
+            self.heartbeat_shutdown_token.cancel();
+
+            let board_target = identity.board_target();
+            let psu_override_active = self
+                .config
+                .power
+                .psu_override
+                .as_ref()
+                .is_some_and(|override_cfg| override_cfg.enabled);
+            let hard_cut_allowed = legacy_kernel_smart_psu_path_allowed(
+                self.config.mining.model.as_deref(),
+                board_target,
+                psu_override_active,
+            );
+            let hard_cut_asserted = hard_cut_allowed
+                && match dcentrald_hal::platform::zynq::disable_psu_output() {
+                    Ok(()) => true,
+                    Err(error) => {
+                        error!(
+                            error = %error,
+                            board_target,
+                            "Board-presence preflight denied bring-up and the proven AM2-S17 transport-independent hard cut also failed"
+                        );
+                        false
+                    }
+                };
+            error!(
+                slot_presence = ?slot_presence,
+                positively_present_slots = self.detected_board_indices.len(),
+                passthrough = self.config.mining.passthrough,
+                board_target,
+                safety_generation = transition.generation(),
+                hard_cut_allowed,
+                hard_cut_asserted,
+                rail_state_unknown = !hard_cut_asserted,
+                controller_watchdog_state = "no endpoint keepalive was sent; expiry timing and prior rail state are not proven",
+                "No positively present hash-board slot is eligible for bring-up; entering management-only fallback"
+            );
+            anyhow::bail!(
+                "hash-board presence not positively established for any slot; management-only fallback required"
+            );
         }
+
+        // ---- Phase 0: ENDPOINT-SCOPED PIC16 HEARTBEATS ----
+        // This runs only after cooling and positive per-slot presence evidence.
+        // Only authoritative AM1/S9 board identity admits its canonical endpoint
+        // table. Config/model hints cannot mint early keepalive authority: a
+        // guessed keepalive can prolong an already-energized unknown rail or
+        // address a different protocol. Other endpoints wait for typed init.
+        info!("--- Phase 0: Endpoint-Scoped PIC16 Heartbeats (post-presence) ---");
+        let mut heartbeat_success = 0u8;
+        let mut heartbeat_endpoints = Vec::new();
+        let mut pic16_endpoint_sessions = Vec::new();
+        if is_am1_s9 {
+            for &board_index in &self.detected_board_indices {
+                let Some(&addr) = DEFAULT_PIC_ADDRS.get(board_index) else {
+                    warn!(
+                        board_index,
+                        "Positive S9 slot has no canonical PIC address; no keepalive sent to that slot"
+                    );
+                    continue;
+                };
+                heartbeat_endpoints.push((board_index, addr));
+                match dcentrald_hal::platform::discover_system_pic16_endpoint_with_heartbeat(
+                    &i2c_svc, addr,
+                ) {
+                    Ok(endpoint) => match Pic16EndpointSession::new(i2c_svc.clone(), endpoint) {
+                        Ok(session) => {
+                            heartbeat_success += 1;
+                            pic16_endpoint_sessions.push(session);
+                        }
+                        Err(error) => warn!(
+                            board_index,
+                            i2c_addr = format_args!("0x{:02X}", addr),
+                            error = %error,
+                            "PIC16 heartbeat succeeded but endpoint session binding failed; address remains unauthorized"
+                        ),
+                    },
+                    Err(error) => warn!(
+                        board_index,
+                        i2c_addr = format_args!("0x{:02X}", addr),
+                        error = %error,
+                        "PIC16 endpoint heartbeat did not establish authority; later init will not use a raw-address fallback"
+                    ),
+                }
+            }
+        } else {
+            info!(
+                board_target = %board_target_for_i2c,
+                "Platform identity does not independently prove AM1/S9 PIC16 endpoints; relying on controller watchdog until typed controller initialization"
+            );
+        }
+        info!(
+            success_count = heartbeat_success,
+            endpoints = ?heartbeat_endpoints,
+            "Endpoint-scoped post-presence PIC16 keepalives complete"
+        );
 
         info!(
             boards = self.detected_board_indices.len(),
@@ -8722,7 +10823,7 @@ impl Daemon {
             info!("--- Phase 3b: Release Hash Board RESET (GPIO HIGH — passthrough mode) ---");
 
             for &idx in &self.detected_board_indices {
-                let gpio_num = self.enable_gpio_base() + idx as u32;
+                let gpio_num = self.enable_gpio_base()? + idx as u32;
                 let dir_path = format!("/sys/class/gpio/gpio{}/direction", gpio_num);
                 let val_path = format!("/sys/class/gpio/gpio{}/value", gpio_num);
                 let _ = std::fs::write(&dir_path, "out");
@@ -8737,10 +10838,10 @@ impl Daemon {
                 }
 
                 info!(
-                    chain_id = self.chain_id_for_board(idx),
+                    chain_id = self.chain_id_for_board(idx)?,
                     gpio = gpio_num,
                     "RESET released on chain {} (GPIO {} = HIGH)",
-                    self.chain_id_for_board(idx),
+                    self.chain_id_for_board(idx)?,
                     gpio_num,
                 );
             }
@@ -8757,8 +10858,8 @@ impl Daemon {
         info!("Opening FPGA register blocks via UIO — 4 memory-mapped regions per chain");
 
         for &idx in &self.detected_board_indices {
-            let chain_id = self.chain_id_for_board(idx);
-            let uio_base = self.uio_base_for_board(idx);
+            let chain_id = self.chain_id_for_board(idx)?;
+            let uio_base = self.uio_base_for_board(idx)?;
 
             info!(
                 chain_id,
@@ -8799,8 +10900,8 @@ impl Daemon {
                     }
 
                     let mut chain = Chain::new(fpga, chain_id);
-                    chain.pic_type = self.pic_type();
-                    chain.pic_address = self.pic_addrs().get(idx).copied();
+                    chain.pic_type = self.pic_type()?;
+                    chain.pic_address = self.pic_addrs()?.get(idx).copied();
 
                     // Hybrid mode: open serial command channel for am2-s17 platforms.
                     // On S19 Pro and similar, ASIC commands (GetAddress, register writes)
@@ -8833,7 +10934,7 @@ impl Daemon {
 
         if self.chains.is_empty() {
             warn!("No FPGA chains could be opened — no mining possible");
-            return Ok((None, None));
+            return Ok(());
         }
 
         // ---- Phase 4b: FPGA chain enable & baud rate ----
@@ -8876,15 +10977,14 @@ impl Daemon {
             }
         }
 
-        let assumed_chip_id = if self.chip_id != 0 {
-            self.chip_id
-        } else {
-            0x1387
-        };
+        if self.config.mining.passthrough {
+            passthrough_miner_profile(self.chip_id)?;
+        }
+        let assumed_chip_id = self.chip_id;
         let configured_chip_count_hint = self.configured_model_chip_count_hint();
         let assumed_chips = configured_chip_count_hint
             .or_else(|| MinerProfile::for_chip(assumed_chip_id).map(|p| p.chips_per_chain))
-            .unwrap_or(63);
+            .unwrap_or(0);
 
         for (chain_idx, chain) in self.chains.iter_mut().enumerate() {
             let ctrl = chain
@@ -8916,8 +11016,9 @@ impl Daemon {
             let fpga_midstate_cnt = (ctrl >> dcentrald_hal::fpga_chain::CTRL_MIDSTATE_SHIFT) & 0x03;
             chain.fpga_midstate_cnt = fpga_midstate_cnt as u8;
 
-            // Hot start chip assumption: use MinerProfile if already detected (e.g.
-            // from config model hint), otherwise fall back to S9 defaults (63 BM1387).
+            // Passthrough has already proven a supported model above. Cold boot may
+            // remain unidentified here; enumeration must supply its identity before
+            // any model-specific driver is selected.
             chain.chip_count = assumed_chips;
             chain.chip_id = assumed_chip_id;
 
@@ -9156,17 +11257,11 @@ impl Daemon {
             );
         }
 
-        // Set chip_id and profile at the daemon level (outside the chain iter_mut borrow)
-        {
-            let assumed_chip_id = if self.chip_id != 0 {
-                self.chip_id
-            } else {
-                0x1387
-            };
-            self.chip_id = assumed_chip_id;
-            if self.miner_profile.is_none() {
-                self.update_profile();
-            }
+        // A hot-start chain is only admitted with the explicit supported profile
+        // proven above. Cold boot intentionally remains profile-free until ASIC
+        // enumeration reports an identity.
+        if !hot_chain_indices.is_empty() && self.miner_profile.is_none() {
+            self.update_profile()?;
         }
 
         // Skip Phase 4c enumeration entirely
@@ -9199,21 +11294,21 @@ impl Daemon {
             info!("Hot start: sending PIC16 heartbeats via kernel I2C to preserve the live handoff state.");
             {
                 for &idx in &self.detected_board_indices {
-                    let addr = self.pic_addr_for_board(idx);
+                    let addr = self.pic_addr_for_board(idx)?;
 
                     if i2c_svc
                         .heartbeat(addr, dcentrald_hal::i2c::I2cPicFirmware::Unknown)
                         .is_ok()
                     {
                         info!(
-                            chain_id = self.chain_id_for_board(idx),
+                            chain_id = self.chain_id_for_board(idx)?,
                             pic_addr = format_args!("0x{:02X}", addr),
                             "PIC heartbeat sent (write-only)",
                         );
                         self.initialized_pic_addrs_final.push(addr);
                     } else {
                         warn!(
-                            chain_id = self.chain_id_for_board(idx),
+                            chain_id = self.chain_id_for_board(idx)?,
                             pic_addr = format_args!("0x{:02X}", addr),
                             "PIC heartbeat failed during hot start — voltage may drop",
                         );
@@ -9223,24 +11318,23 @@ impl Daemon {
         }
 
         // Collect PIC addresses from hot chains for heartbeats during cold boot waits.
-        // Uses Arc<Mutex<Vec>> so the init heartbeat thread can see newly-added
+        // Uses poison-aware shared ownership so the init heartbeat thread can see newly-added
         // cold boot PICs in real time. CE REVIEW FIX: Previously used a static Vec
         // snapshot — cold boot PICs never got heartbeats from the init thread.
-        let initialized_pic_addrs = Arc::new(std::sync::Mutex::new(
-            self.initialized_pic_addrs_final.clone(),
-        ));
+        let initialized_pic_addrs =
+            InitializedPicAddrs::new(self.initialized_pic_addrs_final.clone());
         let mixed_chip_platform = read_first_trimmed(&[
             "/etc/dcentos/platform",
             "/etc/bos_platform",
             "/etc/dcentos-platform",
         ]);
-        let mixed_chip_board_target = read_first_trimmed(&["/etc/dcentos/board_target"]);
+        let mixed_chip_board_target = identity.board_target();
         let mixed_chip_psu_hardware_variant =
             read_first_trimmed(&["/etc/dcentos/psu_hardware_variant"]);
         let mixed_chip_policy = divergent_chip_policy_for_platform(
             self.config.mining.enforce_mixed_chip_id_refusal_on_xil25,
             &mixed_chip_platform,
-            &mixed_chip_board_target,
+            mixed_chip_board_target,
             if mixed_chip_psu_hardware_variant.is_empty() {
                 None
             } else {
@@ -9252,7 +11346,7 @@ impl Daemon {
         // This is only needed when there are cold chains that still require the
         // longer bring-up path. Pure hot-start passthrough handoffs should avoid
         // a second direct-I2C heartbeat thread and let the runtime service take over.
-        let (init_hb_stop, init_hb_pause, init_hb_handle) = if !cold_chain_indices.is_empty() {
+        let init_hb_pause = if !cold_chain_indices.is_empty() {
             // G46 (no-brick / deterministic startup, gap-swarm 2026-05-28): if the OS
             // refuses to spawn the init-heartbeat thread (resource exhaustion), do NOT
             // panic — panic=abort would skip every Drop guard. Log it and proceed
@@ -9262,10 +11356,18 @@ impl Daemon {
             match Self::start_init_heartbeat_thread(
                 initialized_pic_addrs.clone(),
                 self.pic_firmware,
-                self.pic_type(),
+                self.pic_type()?,
                 i2c_svc.clone(),
             ) {
-                Ok((stop, pause, handle)) => (Some(stop), Some(pause), Some(handle)),
+                Ok((stop, pause, handle)) => {
+                    // Install ownership on `self` immediately. `init()` has many
+                    // fallible phases after this point and is itself wrapped in a
+                    // timeout. Keeping the handle only in local variables would
+                    // detach the heartbeat thread when that future is dropped.
+                    self.init_heartbeat_stop = Some(stop);
+                    self.init_heartbeat_handle = Some(handle);
+                    Some(pause)
+                }
                 Err(e) => {
                     error!(
                         error = %e,
@@ -9273,11 +11375,11 @@ impl Daemon {
                          Cold-chain PICs will rely on the PIC watchdog (cuts voltage if unfed) instead \
                          of the 500ms init heartbeat; NOT panicking, so shutdown guards still run."
                     );
-                    (None, None, None)
+                    None
                 }
             }
         } else {
-            (None, None, None)
+            None
         };
 
         if !cold_chain_indices.is_empty() {
@@ -9286,7 +11388,7 @@ impl Daemon {
             let cold_board_indices: Vec<usize> = cold_chain_indices
                 .iter()
                 .map(|&ci| self.board_idx_for_chain(self.chains[ci].chain_id))
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
 
             // ---- Phase 5: Bosminer-style reset_and_enumerate (cold chains only) ----
             //
@@ -9319,9 +11421,9 @@ impl Daemon {
             info!("--- Phase 5: Hash Board Reset for {} cold chain(s) (bosminer-matched sequence) ---", cold_chain_indices.len());
             info!("Sequence: PSU init -> disable IP core -> assert RESET -> PIC voltage init -> release RESET -> re-enable IP core -> enumerate");
 
-            // Step 5.0: Smart PSU initialization on safe kernel-I2C platforms.
-            // Non-smart PSUs still use override mode, and NoPic boards keep their
-            // existing GPIO-only PSU flow.
+            // Step 5.0: Legacy smart-PSU initialization. The same authoritative
+            // AM2-S17 predicate used by the later probe/feeder gates this early
+            // raw kernel bus-1 access. Overrides and unproven platforms bypass it.
             let skip_psu_init = self
                 .config
                 .power
@@ -9332,26 +11434,23 @@ impl Daemon {
             if skip_psu_init {
                 info!("Step 5.0: PSU override active — skipping I2C PSU init (non-smart PSU, no Loki needed)");
             }
-            if !skip_psu_init
-                && !matches!(self.pic_type(), PicType::NoPic)
-                && self.config.mining.model.is_some()
-            {
+            let smart_psu_board_target = identity.board_target();
+            let smart_psu_path_allowed = legacy_kernel_smart_psu_path_allowed(
+                self.config.mining.model.as_deref(),
+                smart_psu_board_target,
+                skip_psu_init,
+            );
+            if smart_psu_path_allowed && !matches!(self.pic_type()?, PicType::NoPic) {
                 info!("Step 5.0: Smart PSU initialization (kernel I2C APW path)");
-                let zynq_psu_gate_available = collect_hardware_info(&self.config)
-                    .control_board
-                    .starts_with("Zynq am2-s17");
-
-                if zynq_psu_gate_available {
-                    if let Err(e) = dcentrald_hal::platform::zynq::enable_psu_output() {
-                        warn!(error = %e, "Zynq PSU output gate enable failed before smart PSU init");
-                    } else {
-                        tracing::info!(
-                            output_gate_enabled =
-                                dcentrald_hal::platform::zynq::is_psu_output_enabled(),
-                            "Zynq PSU output gate asserted before smart PSU initialization"
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                    }
+                if let Err(e) = dcentrald_hal::platform::zynq::enable_psu_output() {
+                    warn!(error = %e, "Zynq PSU output gate enable failed before smart PSU init");
+                } else {
+                    tracing::info!(
+                        output_gate_enabled =
+                            dcentrald_hal::platform::zynq::is_psu_output_enabled(),
+                        "Zynq PSU output gate asserted before smart PSU initialization"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(500));
                 }
 
                 match dcentrald_hal::psu::PsuController::open_kernel_only() {
@@ -9410,6 +11509,12 @@ impl Daemon {
                         info!(error = %e, "Cannot open kernel I2C bus 1 for smart PSU — using bypass power");
                     }
                 }
+            } else if !skip_psu_init {
+                tracing::debug!(
+                    board_target = %smart_psu_board_target,
+                    config_model = ?self.config.mining.model,
+                    "Step 5.0: legacy kernel-I2C smart-PSU initialization is unproven for this platform; staying in bypass mode"
+                );
             }
 
             // Step 5.1: Disable FPGA IP core on cold chains (matches bosminer enter_reset)
@@ -9483,7 +11588,7 @@ impl Daemon {
             // spurious UART data even with GPIO HIGH.
             info!("Step 5.2: Releasing RESET on cold hash boards (GPIO HIGH — PICs reachable for I2C init)");
             for &idx in &cold_board_indices {
-                let gpio_num = self.enable_gpio_base() + idx as u32;
+                let gpio_num = self.enable_gpio_base()? + idx as u32;
                 let dir_path = format!("/sys/class/gpio/gpio{}/direction", gpio_num);
                 let val_path = format!("/sys/class/gpio/gpio{}/value", gpio_num);
                 let _ = std::fs::write(&dir_path, "out");
@@ -9496,10 +11601,10 @@ impl Daemon {
                     }
                 }
                 info!(
-                    chain_id = self.chain_id_for_board(idx),
+                    chain_id = self.chain_id_for_board(idx)?,
                     gpio = gpio_num,
                     "Chain {} RESET released (GPIO {} = HIGH) — PIC I2C now reachable",
-                    self.chain_id_for_board(idx),
+                    self.chain_id_for_board(idx)?,
                     gpio_num,
                 );
             }
@@ -9512,8 +11617,8 @@ impl Daemon {
             // before we even start cold_boot_init.
             info!("Step 5.2a: Refreshing heartbeats on cold chain PICs (prevent watchdog timeout during init)");
             for &idx in &cold_board_indices {
-                let pic_addr = self.pic_addr_for_board(idx);
-                match self.pic_type() {
+                let pic_addr = self.pic_addr_for_board(idx)?;
+                match self.pic_type()? {
                     PicType::DsPic33EP => {
                         let mut dspic = DspicService::new(i2c_svc.clone(), pic_addr);
                         let _ = dspic.send_heartbeat();
@@ -9544,8 +11649,8 @@ impl Daemon {
                 self.pic_firmware);
                 // Just try simple write-only disable_voltage on cold PICs (safe for I2C bus)
                 for &idx in &cold_board_indices {
-                    let pic_addr = self.pic_addr_for_board(idx);
-                    match self.pic_type() {
+                    let pic_addr = self.pic_addr_for_board(idx)?;
+                    match self.pic_type()? {
                         PicType::DsPic33EP => {
                             // FIX: Do NOT disable dsPIC voltage on cold boot.
                             // disable_voltage kills rails that may already be providing
@@ -9554,11 +11659,11 @@ impl Daemon {
                             info!("Step 5.2b: SKIP dsPIC disable (preserving PSU power-on state)");
                         }
                         _ => {
-                            let pic = dcentrald_asic::pic::PicServiceController::new_with_firmware(
-                                i2c_svc.clone(),
+                            let pic = pic16_service_for_endpoint(
+                                &pic16_endpoint_sessions,
                                 pic_addr,
-                                self.pic_firmware,
-                            );
+                                Some(self.pic_firmware),
+                            )?;
                             let _ = pic.disable_voltage(); // ignore errors — cold PICs may be dead
                         }
                     }
@@ -9566,58 +11671,59 @@ impl Daemon {
             } else {
                 info!("Step 5.2b: Detecting PIC firmware and disabling voltage on cold chains (DC-DC power cycle)");
                 for &idx in &cold_board_indices {
-                    let pic_addr = self.pic_addr_for_board(idx);
-                    match self.pic_type() {
+                    let pic_addr = self.pic_addr_for_board(idx)?;
+                    match self.pic_type()? {
                         PicType::DsPic33EP => {
                             // FIX: Skip dsPIC disable + detect entirely on cold boot.
                             // disable_voltage kills rails. detect_firmware uses I2C_RDWR (dangerous).
                             // cold_boot_init() in Step 5.3 handles everything write-only.
                             info!(
-                                chain_id = self.chain_id_for_board(idx),
+                                chain_id = self.chain_id_for_board(idx)?,
                                 "Step 5.2b: SKIP dsPIC disable+detect (write-only init in Step 5.3)",
                             );
                             info!(
                                 "dsPIC Step 5.2b skipped for chain {}",
-                                self.chain_id_for_board(idx)
+                                self.chain_id_for_board(idx)?
                             );
                         }
                         _ => {
-                            let mut pic = dcentrald_asic::pic::PicServiceController::new(
-                                i2c_svc.clone(),
+                            let mut pic = pic16_service_for_endpoint(
+                                &pic16_endpoint_sessions,
                                 pic_addr,
-                            );
+                                None,
+                            )?;
                             match pic.detect_firmware() {
                                 Ok(fw) => {
                                     if self.pic_firmware == PicFirmware::Unknown {
                                         self.pic_firmware = fw;
                                     }
-                                    let pic = dcentrald_asic::pic::PicServiceController::new_with_firmware(
-                                        i2c_svc.clone(),
+                                    let pic = pic16_service_for_endpoint(
+                                        &pic16_endpoint_sessions,
                                         pic_addr,
-                                        self.pic_firmware,
-                                    );
+                                        Some(self.pic_firmware),
+                                    )?;
                                     match pic.disable_voltage() {
                                         Ok(()) => info!(
-                                            chain_id = self.chain_id_for_board(idx),
+                                            chain_id = self.chain_id_for_board(idx)?,
                                             pic_addr = format_args!("0x{:02X}", pic_addr),
                                             firmware = %self.pic_firmware,
                                             "DC-DC disabled on chain {} — power cycling for clean cold start",
-                                            self.chain_id_for_board(idx),
+                                            self.chain_id_for_board(idx)?,
                                         ),
                                         Err(e) => info!(
-                                            chain_id = self.chain_id_for_board(idx),
+                                            chain_id = self.chain_id_for_board(idx)?,
                                             error = %e,
                                             "Could not disable voltage on chain {} — may be true cold boot (DC-DC never enabled)",
-                                            self.chain_id_for_board(idx),
+                                            self.chain_id_for_board(idx)?,
                                         ),
                                     }
                                 }
                                 Err(e) => info!(
-                                    chain_id = self.chain_id_for_board(idx),
+                                    chain_id = self.chain_id_for_board(idx)?,
                                     pic_addr = format_args!("0x{:02X}", pic_addr),
                                     error = %e,
                                     "PIC firmware detection failed on chain {} — skipping voltage disable",
-                                    self.chain_id_for_board(idx),
+                                    self.chain_id_for_board(idx)?,
                                 ),
                             }
                         }
@@ -9632,9 +11738,9 @@ impl Daemon {
             info!("Step 5.2c: Waiting 1s for capacitor discharge on cold chains (heartbeating hot chain PICs)...");
             tokio::time::sleep(Duration::from_secs(1)).await;
             {
-                let addrs = initialized_pic_addrs.lock().unwrap().clone();
+                let addrs = initialized_pic_addrs.snapshot("phase 5.2c heartbeat snapshot");
                 if !addrs.is_empty() {
-                    match self.pic_type() {
+                    match self.pic_type()? {
                         PicType::DsPic33EP => {
                             for &addr in &addrs {
                                 let mut dspic = DspicService::new(i2c_svc.clone(), addr);
@@ -9675,8 +11781,8 @@ impl Daemon {
             {
                 let mut found_any = false;
                 for &idx in &cold_board_indices {
-                    let addr = self.pic_addr_for_board(idx);
-                    match self.pic_type() {
+                    let addr = self.pic_addr_for_board(idx)?;
+                    match self.pic_type()? {
                         PicType::DsPic33EP => {
                             if let Ok(buf) = i2c_svc.read_bytes(addr, 1) {
                                 if let Some(&byte) = buf.first() {
@@ -9692,10 +11798,8 @@ impl Daemon {
                             }
                         }
                         _ => {
-                            let pic = dcentrald_asic::pic::PicServiceController::new(
-                                i2c_svc.clone(),
-                                addr,
-                            );
+                            let pic =
+                                pic16_service_for_endpoint(&pic16_endpoint_sessions, addr, None)?;
                             if let Ok(raw) = pic.read_raw() {
                                 info!(
                                     i2c_addr = format_args!("0x{:02X}", addr),
@@ -9735,24 +11839,24 @@ impl Daemon {
             // === Pass 1: Fast single-attempt init of cold chain PICs ===
             info!("Step 5.3c: Fast PIC init pass — trying each cold chain PIC once, skipping failures immediately");
             for &idx in &cold_board_indices {
-                let pic_addr = self.pic_addr_for_board(idx);
+                let pic_addr = self.pic_addr_for_board(idx)?;
                 info!(
-                    chain_id = self.chain_id_for_board(idx),
+                    chain_id = self.chain_id_for_board(idx)?,
                     i2c_addr = format_args!("0x{:02X}", pic_addr),
                     "PIC init (pass 1) on chain {} at I2C 0x{:02X}",
-                    self.chain_id_for_board(idx),
+                    self.chain_id_for_board(idx)?,
                     pic_addr,
                 );
 
                 let mut pic_ok = false;
-                match self.pic_type() {
+                match self.pic_type()? {
                     PicType::DsPic33EP => {
                         let mut dspic = DspicService::new(i2c_svc.clone(), pic_addr);
                         match dspic.cold_boot_init(dspic_init_voltage_mv) {
                             Ok(()) => {
                                 let dspic_v = dspic_init_voltage_mv as f64 / 1000.0;
                                 info!(
-                                    chain_id = self.chain_id_for_board(idx),
+                                    chain_id = self.chain_id_for_board(idx)?,
                                     firmware = %dspic.firmware(),
                                     voltage_mv = dspic_init_voltage_mv,
                                     voltage = format_args!("{:.2}V", dspic_v),
@@ -9763,7 +11867,7 @@ impl Daemon {
                             }
                             Err(e) => {
                                 warn!(
-                                    chain_id = self.chain_id_for_board(idx),
+                                    chain_id = self.chain_id_for_board(idx)?,
                                     i2c_addr = format_args!("0x{:02X}", pic_addr),
                                     error = %e,
                                     "dsPIC init failed (pass 1) — skipping to next, will retry later",
@@ -9772,10 +11876,8 @@ impl Daemon {
                         }
                     }
                     _ => {
-                        let mut pic = dcentrald_asic::pic::PicServiceController::new(
-                            i2c_svc.clone(),
-                            pic_addr,
-                        );
+                        let mut pic =
+                            pic16_service_for_endpoint(&pic16_endpoint_sessions, pic_addr, None)?;
                         match pic.cold_boot_init(initial_pic_val) {
                             Ok(()) => {
                                 if self.pic_firmware == PicFirmware::Unknown {
@@ -9786,7 +11888,7 @@ impl Daemon {
                                     );
                                 }
                                 info!(
-                                    chain_id = self.chain_id_for_board(idx),
+                                    chain_id = self.chain_id_for_board(idx)?,
                                     firmware = %self.pic_firmware,
                                     pic_value = initial_pic_val,
                                     voltage = format_args!("{:.2}V", voltage_v),
@@ -9797,7 +11899,7 @@ impl Daemon {
                             }
                             Err(e) => {
                                 warn!(
-                                    chain_id = self.chain_id_for_board(idx),
+                                    chain_id = self.chain_id_for_board(idx)?,
                                     i2c_addr = format_args!("0x{:02X}", pic_addr),
                                     error = %e,
                                     "PIC init failed (pass 1) — skipping to next PIC, will retry later",
@@ -9808,13 +11910,15 @@ impl Daemon {
                 }
 
                 if pic_ok {
-                    initialized_pic_addrs.lock().unwrap().push(pic_addr);
+                    initialized_pic_addrs
+                        .record_success(pic_addr, "phase 5.3 pass 1 PIC admission");
                     // Init heartbeat thread automatically picks up new PIC on next tick.
                     // Also send a manual heartbeat to all previously-initialized PICs now.
                     {
-                        let addrs = initialized_pic_addrs.lock().unwrap().clone();
+                        let addrs = initialized_pic_addrs
+                            .snapshot("phase 5.3 post-admission heartbeat snapshot");
                         if addrs.len() > 1 {
-                            match self.pic_type() {
+                            match self.pic_type()? {
                                 PicType::DsPic33EP => {
                                     for &addr in &addrs[..addrs.len() - 1] {
                                         let mut dspic = DspicService::new(i2c_svc.clone(), addr);
@@ -9849,8 +11953,9 @@ impl Daemon {
 
                     // Heartbeat all live PICs before each retry round
                     {
-                        let addrs = initialized_pic_addrs.lock().unwrap().clone();
-                        match self.pic_type() {
+                        let addrs =
+                            initialized_pic_addrs.snapshot("phase 5.3 retry heartbeat snapshot");
+                        match self.pic_type()? {
                             PicType::DsPic33EP => {
                                 for &addr in &addrs {
                                     let mut dspic = DspicService::new(i2c_svc.clone(), addr);
@@ -9869,26 +11974,26 @@ impl Daemon {
 
                     let mut still_failed: Vec<usize> = Vec::new();
                     for &idx in &failed_indices {
-                        let pic_addr = self.pic_addr_for_board(idx);
+                        let pic_addr = self.pic_addr_for_board(idx)?;
                         info!(
-                            chain_id = self.chain_id_for_board(idx),
+                            chain_id = self.chain_id_for_board(idx)?,
                             i2c_addr = format_args!("0x{:02X}", pic_addr),
                             retry_round,
                             "PIC retry {}/3 on chain {} at I2C 0x{:02X}",
                             retry_round,
-                            self.chain_id_for_board(idx),
+                            self.chain_id_for_board(idx)?,
                             pic_addr,
                         );
 
                         let mut pic_ok = false;
-                        match self.pic_type() {
+                        match self.pic_type()? {
                             PicType::DsPic33EP => {
                                 let mut dspic = DspicService::new(i2c_svc.clone(), pic_addr);
                                 match dspic.cold_boot_init(dspic_init_voltage_mv) {
                                     Ok(()) => {
                                         let dspic_v = dspic_init_voltage_mv as f64 / 1000.0;
                                         info!(
-                                            chain_id = self.chain_id_for_board(idx),
+                                            chain_id = self.chain_id_for_board(idx)?,
                                             firmware = %dspic.firmware(),
                                             retry_round,
                                             "dsPIC initialized on retry {} — voltage {:.2}V, output enabled",
@@ -9899,15 +12004,15 @@ impl Daemon {
                                     Err(e) => {
                                         if retry_round == 3 {
                                             error!(
-                                                chain_id = self.chain_id_for_board(idx),
+                                                chain_id = self.chain_id_for_board(idx)?,
                                                 i2c_addr = format_args!("0x{:02X}", pic_addr),
                                                 error = %e,
                                                 "dsPIC init FAILED after all retries on chain {} — this hash board won't mine. Check: PSU 6-pin cables, ribbon cable on J{}",
-                                                self.chain_id_for_board(idx), self.chain_id_for_board(idx),
+                                                self.chain_id_for_board(idx)?, self.chain_id_for_board(idx)?,
                                             );
                                         } else {
                                             warn!(
-                                                chain_id = self.chain_id_for_board(idx),
+                                                chain_id = self.chain_id_for_board(idx)?,
                                                 error = %e,
                                                 retry_round,
                                                 "dsPIC retry {}/3 failed — will try again",
@@ -9918,17 +12023,18 @@ impl Daemon {
                                 }
                             }
                             _ => {
-                                let mut pic = dcentrald_asic::pic::PicServiceController::new(
-                                    i2c_svc.clone(),
+                                let mut pic = pic16_service_for_endpoint(
+                                    &pic16_endpoint_sessions,
                                     pic_addr,
-                                );
+                                    None,
+                                )?;
                                 match pic.cold_boot_init(initial_pic_val) {
                                     Ok(()) => {
                                         if self.pic_firmware == PicFirmware::Unknown {
                                             self.pic_firmware = pic.firmware();
                                         }
                                         info!(
-                                            chain_id = self.chain_id_for_board(idx),
+                                            chain_id = self.chain_id_for_board(idx)?,
                                             firmware = %self.pic_firmware,
                                             retry_round,
                                             "PIC initialized on retry {} — voltage {:.2}V, output enabled",
@@ -9939,15 +12045,15 @@ impl Daemon {
                                     Err(e) => {
                                         if retry_round == 3 {
                                             error!(
-                                                chain_id = self.chain_id_for_board(idx),
+                                                chain_id = self.chain_id_for_board(idx)?,
                                                 i2c_addr = format_args!("0x{:02X}", pic_addr),
                                                 error = %e,
                                                 "PIC init FAILED after all retries on chain {} — this hash board won't mine. Check: PSU 6-pin cables, ribbon cable on J{}",
-                                                self.chain_id_for_board(idx), self.chain_id_for_board(idx),
+                                                self.chain_id_for_board(idx)?, self.chain_id_for_board(idx)?,
                                             );
                                         } else {
                                             warn!(
-                                                chain_id = self.chain_id_for_board(idx),
+                                                chain_id = self.chain_id_for_board(idx)?,
                                                 error = %e,
                                                 retry_round,
                                                 "PIC retry {}/3 failed — will try again",
@@ -9960,7 +12066,8 @@ impl Daemon {
                         }
 
                         if pic_ok {
-                            initialized_pic_addrs.lock().unwrap().push(pic_addr);
+                            initialized_pic_addrs
+                                .record_success(pic_addr, "phase 5.3 retry PIC admission");
                         } else {
                             still_failed.push(idx);
                         }
@@ -9970,7 +12077,7 @@ impl Daemon {
             }
 
             // Report final PIC init results
-            let pic_addr_count = initialized_pic_addrs.lock().unwrap().len();
+            let pic_addr_count = initialized_pic_addrs.len("phase 5.3 result accounting");
             if pic_addr_count == 0 {
                 error!("NO PICs initialized — all hash boards failed. Mining cannot proceed without voltage control.");
             } else {
@@ -9985,9 +12092,9 @@ impl Daemon {
                 );
                 for &idx in &failed_indices {
                     warn!(
-                    chain_id = self.chain_id_for_board(idx),
+                    chain_id = self.chain_id_for_board(idx)?,
                     "Chain {} has no PIC — ASIC chips have no voltage, mining disabled on this chain",
-                    self.chain_id_for_board(idx),
+                    self.chain_id_for_board(idx)?,
                 );
                 }
             }
@@ -10000,8 +12107,8 @@ impl Daemon {
             info!("Step 5.4: Waiting 2 seconds for DC-DC voltage to stabilize (RESET still asserted, ASICs not booting yet)...");
             for _ in 0..2 {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                let addrs = initialized_pic_addrs.lock().unwrap().clone();
-                match self.pic_type() {
+                let addrs = initialized_pic_addrs.snapshot("phase 5.4 heartbeat snapshot");
+                match self.pic_type()? {
                     PicType::DsPic33EP => {
                         for &addr in &addrs {
                             let mut dspic = DspicService::new(i2c_svc.clone(), addr);
@@ -10024,14 +12131,19 @@ impl Daemon {
             // and cut voltage. Only read cold-chain PICs (which went through full init
             // and can tolerate the parser reset in Phase 5.4c).
             info!("Step 5.4b: Verifying DC-DC voltage output via PIC readback (cold chain PICs only)...");
-            let addrs_for_readback: Vec<u8> = cold_board_indices
+            let admitted_readback_addrs = cold_board_indices
                 .iter()
                 .map(|&idx| self.pic_addr_for_board(idx))
-                .filter(|addr| initialized_pic_addrs.lock().unwrap().contains(addr))
+                .collect::<Result<Vec<_>>>()?;
+            let initialized_addrs_for_readback =
+                initialized_pic_addrs.snapshot("phase 5.4 voltage readback admission");
+            let addrs_for_readback: Vec<u8> = admitted_readback_addrs
+                .into_iter()
+                .filter(|addr| initialized_addrs_for_readback.contains(addr))
                 .collect();
             {
                 for &addr in &addrs_for_readback {
-                    match self.pic_type() {
+                    match self.pic_type()? {
                         PicType::DsPic33EP => {
                             let mut dspic = DspicService::new(i2c_svc.clone(), addr);
                             match dspic.read_voltage() {
@@ -10105,7 +12217,7 @@ impl Daemon {
 
             // Enable FPGA IP core on each chain (matching BraiinsOS exit_reset)
             for (&idx, &chain_idx) in cold_board_indices.iter().zip(cold_chain_indices.iter()) {
-                let gpio_num = self.enable_gpio_base() + idx as u32;
+                let gpio_num = self.enable_gpio_base()? + idx as u32;
                 let chain = &mut self.chains[chain_idx];
 
                 // GPIO HIGH (release reset) FIRST — ASICs need power before FPGA enables UART.
@@ -10141,11 +12253,11 @@ impl Daemon {
                 chain.fpga_midstate_cnt =
                     ((ctrl >> dcentrald_hal::fpga_chain::CTRL_MIDSTATE_SHIFT) & 0x03) as u8;
                 info!(
-                chain_id = self.chain_id_for_board(idx),
+                chain_id = self.chain_id_for_board(idx)?,
                 gpio = gpio_num,
                 ctrl = format_args!("0x{:08X}", ctrl),
                 "Chain {} exit_reset: GPIO {} = HIGH + FPGA CTRL=0x{:02X} (ENABLE={}, MIDSTATE_CNT={})",
-                self.chain_id_for_board(idx), gpio_num, ctrl,
+                self.chain_id_for_board(idx)?, gpio_num, ctrl,
                 if ctrl & 0x08 != 0 { "ON" } else { "OFF" },
                 (ctrl >> 1) & 0x03,
             );
@@ -10257,8 +12369,8 @@ impl Daemon {
             for i in 0..initial_boot_wait_secs {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 // Send PIC heartbeats during the wait to prevent watchdog timeout
-                let addrs = initialized_pic_addrs.lock().unwrap().clone();
-                match self.pic_type() {
+                let addrs = initialized_pic_addrs.snapshot("initial boot wait heartbeat snapshot");
+                match self.pic_type()? {
                     PicType::DsPic33EP => {
                         for &addr in &addrs {
                             let mut dspic = DspicService::new(i2c_svc.clone(), addr);
@@ -10315,8 +12427,9 @@ impl Daemon {
                     // Send PIC heartbeats before each enumeration attempt.
                     // enumerate_chips() blocks for ~500ms+ waiting for responses.
                     {
-                        let addrs = initialized_pic_addrs.lock().unwrap().clone();
-                        match self.pic_type() {
+                        let addrs = initialized_pic_addrs
+                            .snapshot("enumeration attempt heartbeat snapshot");
+                        match self.pic_type()? {
                             PicType::DsPic33EP => {
                                 for &addr in &addrs {
                                     let mut dspic = DspicService::new(i2c_svc.clone(), addr);
@@ -10349,8 +12462,9 @@ impl Daemon {
                         for _ in 0..retry_wait {
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             // Heartbeat during wait
-                            let addrs = initialized_pic_addrs.lock().unwrap().clone();
-                            match self.pic_type() {
+                            let addrs = initialized_pic_addrs
+                                .snapshot("enumeration retry heartbeat snapshot");
+                            match self.pic_type()? {
                                 PicType::DsPic33EP => {
                                     for &addr in &addrs {
                                         let mut dspic = DspicService::new(i2c_svc.clone(), addr);
@@ -10397,11 +12511,26 @@ impl Daemon {
                         pause.store(true, std::sync::atomic::Ordering::Release);
                     }
                     let enum_expected_chips_hint = self.configured_model_chip_count_hint();
-                    let enum_default_chips = self.default_chips_per_chain();
+                    let enum_default_chips = self.default_chips_per_chain()?;
                     let enum_min_chip_fraction = self.config.mining.min_chip_fraction;
                     let chain = &mut self.chains[chain_idx];
                     match chain.enumerate_chips() {
-                        Ok((count, chip_id)) => {
+                        Ok(report) => {
+                            let count = report.chip_count();
+                            let chip_id = report.chip_id();
+                            match report.measured_identity() {
+                                Ok(measured) => self.asic_enumeration_receipts.push(
+                                    EnumeratedMiningChainReceipt::from_successful_get_address(
+                                        chain.chain_id,
+                                        measured,
+                                    ),
+                                ),
+                                Err(reasons) => warn!(
+                                    chain_id = chain.chain_id,
+                                    ?reasons,
+                                    "GetAddress preserved mining geometry but is ineligible for Measured ASIC identity"
+                                ),
+                            }
                             let chip_name = match chip_id {
                                 0x1387 => "BM1387 (Antminer S9, 16nm)",
                                 0x1397 => "BM1397 (Antminer S17/T17, 7nm)",
@@ -10575,7 +12704,7 @@ impl Daemon {
                 }
 
                 // Load MinerProfile for detected chip — activates model-specific constants
-                self.update_profile();
+                self.update_profile()?;
             }
         } // end cold boot block (if !cold_chain_indices.is_empty())
 
@@ -10613,21 +12742,17 @@ impl Daemon {
             .chains
             .iter()
             .map(|c| {
-                (
+                Ok((
                     c.chain_id,
-                    self.pic_addr_for_board(self.board_idx_for_chain(c.chain_id)),
-                )
+                    self.pic_addr_for_board(self.board_idx_for_chain(c.chain_id)?)?,
+                ))
             })
-            .collect();
-        let phase7_pic_type = self.pic_type();
-        let assumed_chip_id = if self.chip_id != 0 {
-            self.chip_id
-        } else {
-            0x1387
-        };
+            .collect::<Result<Vec<_>>>()?;
+        let phase7_pic_type = self.pic_type()?;
+        let assumed_chip_id = self.chip_id;
         let assumed_chips = dcentrald_asic::drivers::MinerProfile::for_chip(assumed_chip_id)
             .map(|p| p.chips_per_chain)
-            .unwrap_or(63);
+            .unwrap_or(0);
         let min_chip_fraction = self.config.mining.min_chip_fraction;
         let configured_chip_count_hint = self.configured_model_chip_count_hint();
 
@@ -10844,7 +12969,8 @@ impl Daemon {
                     dcentrald_hal::i2c::bus_recovery_devmem();
                     std::thread::sleep(std::time::Duration::from_millis(50));
 
-                    let addrs = initialized_pic_addrs.lock().unwrap().clone();
+                    let addrs =
+                        initialized_pic_addrs.snapshot("phase 7 I2C recovery heartbeat snapshot");
                     for &addr in &addrs {
                         let mut recovered = false;
                         for attempt in 0..3u8 {
@@ -11012,7 +13138,8 @@ impl Daemon {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(200));
                     {
-                        let addrs = initialized_pic_addrs.lock().unwrap().clone();
+                        let addrs =
+                            initialized_pic_addrs.snapshot("phase 7 FPGA gap heartbeat snapshot");
                         for &addr in &addrs {
                             match i2c_svc.heartbeat(addr, phase7_i2c_fw) {
                                 Ok(()) => info!("PHASE7_GAP_HB: PIC 0x{:02X} OK", addr),
@@ -11062,7 +13189,8 @@ impl Daemon {
 
         // Fix G: Store the final list of successfully-initialized PIC addresses.
         // Only these PICs get heartbeats during mining — dead PICs are excluded.
-        self.initialized_pic_addrs_final = initialized_pic_addrs.lock().unwrap().clone();
+        self.initialized_pic_addrs_final =
+            initialized_pic_addrs.snapshot("mining heartbeat ownership handoff");
         info!(
             pic_count = self.initialized_pic_addrs_final.len(),
             addrs = %self.initialized_pic_addrs_final.iter()
@@ -11082,16 +13210,18 @@ impl Daemon {
             active_chains, total_chips, target_freq,
         );
 
-        Ok((init_hb_stop, init_hb_handle))
+        // Ownership stays on `self` through the complete fallible runtime
+        // heartbeat handoff. Error, cancellation, shutdown, and Drop therefore
+        // retain the authority required to assert the stop flag.
+        Ok(())
     }
 
-    /// Send emergency heartbeats to ALL PIC addresses using the unified PIC16 command set.
+    /// Recover the AM1 AXI-IIC transport without addressing any controller.
     ///
-    /// Called at the very start of init() before any other work. This buys time
-    /// for the full init sequence by resetting PIC watchdog timers immediately.
-    ///
-    /// All PIC16F1704 app-mode firmwares use heartbeat cmd 0x16.
-    fn send_emergency_heartbeats(&self) {
+    /// This runs before cooling and slot presence are proven, so it may reset
+    /// the transport and generate clocks at the reserved recovery address but
+    /// must never send a keepalive to guessed/default PIC endpoints.
+    fn recover_am1_i2c_bus_without_keepalive() {
         // Full I2C bus recovery sequence (3-agent design, 2026-04-08).
         //
         // When dcentrald is killed mid-I2C-transaction, two things can go wrong:
@@ -11106,13 +13236,13 @@ impl Daemon {
         //   Step 1: Unbind kernel xiic driver (exclusive hardware access)
         //   Step 2: SOFTR reset + restore timing (via reset_axi_iic_controller)
         //   Step 3: 9 SCL clock pulses (release stuck PIC SDA per I2C spec 3.1.16)
-        //   Step 4: Emergency heartbeats via devmem (kernel driver still unbound)
+        //   Step 4: Keep the kernel driver unbound for the devmem service
         //   Step 5: Rebind kernel driver
         //   Step 6: CRITICAL — restore timing AGAIN (rebind triggers xiic_probe →
         //           xiic_reinit → SOFTR → zeros timing we just set)
         //   Step 7: Restore GIE + IER for kernel interrupt handling
 
-        info!("--- I2C Bus Recovery (unbind → SOFTR → 9 SCL clocks → heartbeats → rebind → timing) ---");
+        info!("--- I2C Bus Recovery (unbind → SOFTR → 9 SCL clocks; no endpoint keepalive) ---");
 
         // Step 1: Unbind kernel xiic driver
         let _ = std::fs::write("/sys/bus/platform/drivers/xiic-i2c/unbind", "41600000.i2c");
@@ -11137,40 +13267,23 @@ impl Daemon {
             let _ = dcentrald_hal::i2c::devmem_clear_isr_tx_error();
         }
 
-        // Step 4: Emergency heartbeats via devmem (kernel driver still unbound)
-        let mut success = 0u8;
-        for &addr in self.pic_addrs() {
-            if dcentrald_hal::i2c::devmem_i2c_write(addr, &[0x55, 0xAA, 0x16]).is_ok() {
-                success += 1;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        info!(
-            success_count = success,
-            "Emergency heartbeats via devmem to {} PIC(s)", success,
-        );
-
         // v0.16.0: Do NOT rebind kernel xiic driver. The I2C service now runs in
         // devmem mode exclusively. Rebinding would trigger xiic_reinit → SOFTR →
         // zero timing registers, which is the root cause of the PIC heartbeat death
         // spiral. The kernel driver stays unbound for the entire process lifetime.
 
-        if success == 0 {
-            warn!("I2C bus recovery: controller reset OK but 0 PICs responding — PICs may be hard-stuck from killed mid-transaction. A power cycle will fix this. Mining will start on any PICs that come alive during init.");
-        } else {
-            info!(
-                "I2C bus recovery complete — controller reset, timing restored, {} PICs alive (kernel driver stays unbound)",
-                success
-            );
-        }
+        info!(
+            "I2C bus recovery complete — controller reset and timing restored without addressing any PIC endpoint (kernel driver stays unbound)"
+        );
     }
 
     /// Start a background heartbeat thread that keeps PICs alive during init.
     ///
-    /// Returns a (stop_flag, join_handle) tuple. Set stop_flag to true and call
-    /// join_handle.join() to cleanly stop the thread.
+    /// Returns stop/pause flags plus the join handle. The daemon owns the stop
+    /// authority and uses `stop_thread_bounded`; callers must not perform an
+    /// unbounded raw join during lifecycle handoff or teardown.
     ///
-    /// The PIC address list is shared via Arc<Mutex<Vec<u8>>> so that the main
+    /// The PIC address list uses poison-aware shared ownership so that the main
     /// init task can ADD newly-initialized cold boot PICs to the list at runtime.
     /// The thread picks up new addresses on its next 500ms tick automatically.
     ///
@@ -11180,7 +13293,7 @@ impl Daemon {
     /// Set pause=true during FPGA bursts (open-core, enumeration) to prevent
     /// AXI contention from corrupting I2C transactions and permanently wedging PICs.
     fn start_init_heartbeat_thread(
-        pic_addrs: Arc<std::sync::Mutex<Vec<u8>>>,
+        pic_addrs: InitializedPicAddrs,
         firmware: PicFirmware,
         pic_type: PicType,
         i2c_service: dcentrald_hal::i2c::I2cServiceHandle,
@@ -11218,15 +13331,14 @@ impl Daemon {
                         continue;
                     }
 
-                    let addrs: Vec<u8> = pic_addrs
-                        .lock()
-                        .map(|v| v.clone())
-                        .unwrap_or_default();
+                    let addrs = pic_addrs.snapshot("init heartbeat worker snapshot");
 
                     if !addrs.is_empty() {
                         if matches!(pic_type, PicType::Pic16F1704) {
                             for &addr in &addrs {
-                                if pause_clone.load(Ordering::Acquire) {
+                                if stop_clone.load(Ordering::Acquire)
+                                    || pause_clone.load(Ordering::Acquire)
+                                {
                                     break;
                                 }
                                 let hb_t0 = std::time::Instant::now();
@@ -11246,15 +13358,29 @@ impl Daemon {
                                         "INIT_HB_OK: PIC 0x{:02X} us={}", addr, hb_us,
                                     );
                                 }
+                                if stop_clone.load(Ordering::Acquire) {
+                                    break;
+                                }
                             }
                             std::thread::sleep(Duration::from_millis(500));
                             continue;
                         }
 
+                        if stop_clone.load(Ordering::Acquire) {
+                            break;
+                        }
                         let _ = init_i2c_service.set_timeout(10); // 100ms timeout
+                        if stop_clone.load(Ordering::Acquire) {
+                            break;
+                        }
                         for &addr in &addrs {
-                            // Re-check pause before each PIC (burst may start mid-tick)
-                            if pause_clone.load(Ordering::Acquire) { break; }
+                            // Re-check stop and pause before each PIC (either may
+                            // change while the previous service call is blocked).
+                            if stop_clone.load(Ordering::Acquire)
+                                || pause_clone.load(Ordering::Acquire)
+                            {
+                                break;
+                            }
                             let hb_t0 = std::time::Instant::now();
                             let result = match pic_type {
                                 PicType::DsPic33EP => {
@@ -11280,6 +13406,9 @@ impl Daemon {
                                     "INIT_HB_OK: PIC 0x{:02X} us={}", addr, hb_us,
                                 );
                             }
+                            if stop_clone.load(Ordering::Acquire) {
+                                break;
+                            }
                         }
                     }
                     std::thread::sleep(Duration::from_millis(500));
@@ -11293,12 +13422,69 @@ impl Daemon {
         Ok((stop, pause, handle))
     }
 
+    /// Signal an initialization heartbeat to stop without waiting for it.
+    ///
+    /// This is deliberately called before partial-init teardown after an
+    /// initialization error or timeout. If teardown itself wedges on the same
+    /// I2C service, the init thread must not keep feeding the PIC indefinitely;
+    /// stopping heartbeats lets the hardware watchdog cut the rail.
+    fn signal_init_heartbeat_stop(&self) {
+        if let Some(ref stop) = self.init_heartbeat_stop {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Stop and bounded-join any initialization heartbeat still owned by the
+    /// daemon. A worker blocked in a kernel I2C call cannot be killed safely;
+    /// after the bound expires its join handle is detached, but the stop flag
+    /// remains asserted so it cannot emit another heartbeat if the call returns.
+    async fn stop_init_heartbeat_bounded(&mut self) -> bool {
+        let stop = self.init_heartbeat_stop.take();
+        let handle = self.init_heartbeat_handle.take();
+        match (stop, handle) {
+            (Some(stop), Some(handle)) => {
+                match stop_thread_bounded(stop, handle, Duration::from_secs(2)).await {
+                    ThreadStopOutcome::Joined => {
+                        info!("Initialization heartbeat thread stopped and joined");
+                        true
+                    }
+                    ThreadStopOutcome::Panicked => {
+                        error!("Initialization heartbeat thread panicked while stopping");
+                        true
+                    }
+                    ThreadStopOutcome::TimedOut => {
+                        warn!(
+                            "Initialization heartbeat thread did not exit within 2s; \
+                             stop remains asserted and the handle was detached so shutdown \
+                             can continue toward the hardware-watchdog safety path"
+                        );
+                        false
+                    }
+                }
+            }
+            (Some(stop), None) => {
+                stop.store(true, std::sync::atomic::Ordering::Release);
+                true
+            }
+            (None, Some(handle)) => {
+                // Defensive impossible-state handling: never block shutdown on
+                // a handle for which the stop authority was lost.
+                warn!(
+                    finished = handle.is_finished(),
+                    "Initialization heartbeat handle existed without its stop flag; detaching"
+                );
+                false
+            }
+            (None, None) => true,
+        }
+    }
+
     /// Graceful shutdown sequence.
     ///
-    /// CRITICAL DESIGN: Heartbeats keep running throughout shutdown until voltage
-    /// is disabled. The heartbeat thread uses `heartbeat_shutdown_token` which is
-    /// NOT cancelled until step 5b below. This prevents PIC watchdog timeout during
-    /// shutdown, which was corrupting the I2C bus and requiring PSU power cycles.
+    /// During normal runtime shutdown, heartbeats keep running until the voltage
+    /// disable attempt completes. During partial-init failure, the initialization
+    /// heartbeat is deliberately stopped before teardown so the hardware watchdog
+    /// can cut power even if the same I2C service wedges the safe-off request.
     ///
     /// Sequence:
     /// 1. Cancel all Tokio tasks via CancellationToken (heartbeat thread still runs)
@@ -11314,36 +13500,183 @@ impl Daemon {
     /// 10. Close watchdog (write "V" then close fd)
     /// 11. Log "dcentrald stopped cleanly"
     async fn shutdown(&mut self) -> Result<()> {
+        if std::mem::replace(&mut self.shutdown_attempted, true) {
+            anyhow::bail!(
+                "shutdown was already attempted; refusing to consume hardware ownership or extend watchdog teardown grace twice"
+            );
+        }
+        // Identity authorization ends at shutdown admission, before any
+        // potentially slow or degraded hardware teardown. The dispatcher's
+        // owned session may still be unwinding; its later stale-token Drop is
+        // deliberately a no-op.
+        if let Err(error) = self.dispatcher_composition_authority.invalidate_active() {
+            warn!(
+                error = %error,
+                "Could not revoke the active dispatcher composition at shutdown start"
+            );
+        }
+        // Thermal liveness will intentionally stop below. Move the independent
+        // watchdog into an absolute-deadline teardown grace first, so a healthy
+        // bounded safe-off keeps receiving kicks while a wedged safe-off still
+        // ends in a hardware reset. This is not disarm authority.
+        if let Some(intent_tx) = self.watchdog_intent_tx.as_ref() {
+            let deadline = tokio::time::Instant::now() + WATCHDOG_TEARDOWN_GRACE;
+            if intent_tx
+                .send(WatchdogIntent::Teardown { deadline })
+                .is_err()
+            {
+                warn!("SoC watchdog task was unavailable at teardown admission; final receipt will determine whether it was never armed or failed closed");
+            }
+        }
+        self.mining_tasks.request_stop();
+        // Close mutation admission after requesting mining-task cancellation.
+        // A delayed or later-aborted dispatcher/thermal task cannot enqueue
+        // another SetVoltage while shutdown waits for task termination.
+        if let Some(i2c_service) = self.i2c_service.as_ref() {
+            let transition = i2c_service.latch_terminal_safe_off();
+            info!(
+                safety_generation = transition.generation(),
+                no_controller_mutation_stage_in_flight =
+                    transition.no_controller_mutation_stage_in_flight(),
+                "Latched terminal I2C safe-off barrier; this is software-stage evidence, not physical rail-off evidence"
+            );
+        }
+        if let Some(voltage_mailbox) = self.voltage_cmd_tx.as_ref() {
+            voltage_mailbox.latch_terminal();
+        }
+        // Quiesce every asynchronous mining hardware owner before voltage or
+        // controller teardown. This uses a standalone mining-only token, so
+        // global signal cancellation cannot preempt watchdog teardown admission
+        // and the API remains available for recovery. The watchdog kicker
+        // remains outside this group so stalled liveness still causes reboot.
+        let mining_stop = self
+            .mining_tasks
+            .stop_and_join(MINING_TASK_STOP_TIMEOUT)
+            .await;
+        let mining_quiescence_failed = mining_stop.any_timed_out();
+        if mining_quiescence_failed {
+            error!(
+                timeout_ms = MINING_TASK_STOP_TIMEOUT.as_millis(),
+                "Mining hardware task did not terminate after cancellation and abort; continuing fail-safe voltage teardown"
+            );
+        } else if mining_stop.any_panicked() {
+            warn!(
+                "Mining hardware task panicked; task ownership was reclaimed before hardware teardown"
+            );
+        }
+        // The legacy smart-PSU feeder owns a raw bus-1 transport. Reclaim it
+        // before latching terminal state or touching any shared shutdown
+        // hardware. A timed-out feeder may still be inside an ioctl while
+        // holding the API serialization lock, so that path must never re-enter
+        // PsuController. Use the GPIO output gate only with an authoritative
+        // am2-s17 board target; on every other board, stop feeding and preserve
+        // the already-armed PSU watchdog as the transport-independent fallback.
+        let mut psu_quiescence_failed = false;
+        if self.psu_watchdog_threads.contains("psu-watchdog") {
+            let psu_stop = self
+                .psu_watchdog_threads
+                .stop_and_join(PSU_WATCHDOG_THREAD_STOP_TIMEOUT)
+                .await;
+            if psu_stop.any_timed_out() {
+                psu_quiescence_failed = true;
+                let control_board = detect_control_board();
+                let board_target = read_first_trimmed(&["/etc/dcentos/board_target"]);
+                if legacy_kernel_smart_psu_path_allowed(
+                    self.config.mining.model.as_deref(),
+                    &board_target,
+                    false,
+                ) {
+                    match dcentrald_hal::platform::zynq::disable_psu_output() {
+                        Ok(()) => error!(
+                            control_board,
+                            board_target,
+                            feeder_timed_out = true,
+                            hard_cut_asserted = true,
+                            watchdog_fallback = true,
+                            "PSU watchdog feeder did not quiesce; asserted the proven am2-s17 GPIO output hard cut without re-entering its transport"
+                        ),
+                        Err(cut_error) => error!(
+                            control_board,
+                            board_target,
+                            error = %cut_error,
+                            feeder_timed_out = true,
+                            hard_cut_asserted = false,
+                            watchdog_fallback = true,
+                            "PSU watchdog feeder did not quiesce and the proven GPIO hard cut failed; the armed PSU watchdog is the remaining power-cut fallback"
+                        ),
+                    }
+                } else {
+                    error!(
+                        control_board,
+                        board_target,
+                        feeder_timed_out = true,
+                        hard_cut_available = false,
+                        watchdog_fallback = true,
+                        "PSU watchdog feeder did not quiesce; no platform-proven transport-independent hard cut exists, so shutdown will not re-enter the possibly held PSU transport"
+                    );
+                }
+            } else if psu_stop.any_panicked() {
+                warn!(
+                    watchdog_fallback = true,
+                    "PSU watchdog feeder panicked before shutdown; its transport is quiescent and the armed watchdog remains the fallback"
+                );
+            }
+        }
+
         info!("=== GRACEFUL SHUTDOWN SEQUENCE ===");
-        info!("Safely powering down — PIC heartbeats continue until voltage is disabled");
+        info!(
+            "Attempting software safe-off; the PIC/dsPIC watchdog remains the independent power-cut safety net"
+        );
 
         // prod-readiness hunt #1 (log-honesty): track whether SOFTWARE actually
-        // confirmed every chain de-energized. Every Step-5a/5b disable-failure
-        // branch sets this true; the final "Safe to unplug or restart" message is
-        // gated on it so we never tell the operator the rail is off (a direct
-        // warm-restart prompt) when in fact only the ~5-64 s PIC/dsPIC watchdog
-        // will cut power. Log-only: no rail/fan/PIC command or ordering changes.
-        let mut software_disable_failed = false;
+        // completed every software disable command. This is command-delivery
+        // evidence, not measured rail-off evidence. Every Step-5a/5b failure
+        // branch sets this true so the final log distinguishes a completed write
+        // from exclusive reliance on the ~5-64 s PIC/dsPIC watchdog.
+        let mut software_disable_failed =
+            self.preflight_hardware_state_unknown || mining_quiescence_failed;
+        if self.preflight_hardware_state_unknown {
+            warn!(
+                "Preflight terminated hardware bring-up before controller/slot state was fully discovered; shutdown cannot attest that all rails were de-energized by software"
+            );
+        }
 
         // Step 1-2: Stop work submission (CancellationToken already cancelled)
-        // NOTE: The heartbeat thread uses heartbeat_shutdown_token, NOT shutdown_token,
-        // so it continues sending heartbeats throughout this entire sequence.
+        // A runtime heartbeat uses heartbeat_shutdown_token and continues here.
+        // On partial-init failure, the init heartbeat may already be stopping so
+        // the controller watchdog can expire if this teardown wedges.
         info!("Step 1-2: Stopping work submission — no new jobs will be sent to ASICs");
-        info!("  (PIC heartbeat thread still running — preventing watchdog timeout)");
+        info!("  (runtime heartbeat remains active when available; init-failure teardown may already rely on controller watchdog cutoff)");
 
         // Step 3: Wait for in-flight nonces to arrive
         info!("Step 3: Waiting 500ms for any in-flight nonces to arrive from FPGA FIFOs...");
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Step 5a: Disable hash board voltages via PIC
-        // Heartbeats are STILL flowing — PICs accept voltage commands without watchdog risk.
+        // This is a bounded best-effort command. A stopped init heartbeat is an
+        // intentional fail-safe: if the command cannot execute, watchdog expiry
+        // still removes hash power.
         info!(
             "Step 5a: Disabling hash board voltages — telling each PIC to cut power to ASIC chips"
         );
         if let Some(ref tx) = self.voltage_cmd_tx {
             for &idx in &self.detected_board_indices {
-                let chain_id = self.chain_id_for_board(idx);
-                let pic_addr = self.pic_addr_for_board(idx);
+                let (chain_id, pic_addr) = match (
+                    self.chain_id_for_board(idx),
+                    self.pic_addr_for_board(idx),
+                ) {
+                    (Ok(chain_id), Ok(pic_addr)) => (chain_id, pic_addr),
+                    (chain_result, pic_result) => {
+                        error!(
+                            board_index = idx,
+                            chain_error = ?chain_result.err(),
+                            pic_error = ?pic_result.err(),
+                            "Could not resolve shutdown controller endpoint; watchdog remains armed"
+                        );
+                        software_disable_failed = true;
+                        continue;
+                    }
+                };
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 if let Err(e) = tx.try_send(VoltageCommand::DisableVoltage {
                     chain_id: Some(chain_id),
@@ -11352,15 +13685,21 @@ impl Daemon {
                     reply_tx: Some(reply_tx),
                 }) {
                     match &e {
-                        std::sync::mpsc::TrySendError::Full(_) => warn!(
+                        VoltageTrySendError::Full(_) => warn!(
                             chain_id,
                             pic_addr = format_args!("0x{:02X}", pic_addr),
-                            "voltage queue full, dropping DisableVoltage (graceful shutdown)"
+                            "voltage mailbox full, rejecting DisableVoltage (graceful shutdown)"
                         ),
-                        std::sync::mpsc::TrySendError::Disconnected(_) => error!(
+                        VoltageTrySendError::Disconnected => error!(
                             chain_id,
                             pic_addr = format_args!("0x{:02X}", pic_addr),
                             "voltage worker thread dead — daemon shutdown imminent (graceful shutdown)"
+                        ),
+                        other => warn!(
+                            chain_id,
+                            pic_addr = format_args!("0x{:02X}", pic_addr),
+                            error = %other,
+                            "voltage mailbox rejected DisableVoltage (graceful shutdown)"
                         ),
                     }
                     warn!(
@@ -11377,7 +13716,7 @@ impl Daemon {
                     Ok(Ok(Ok(_))) => {
                         info!(
                             chain_id,
-                            "Chain {} voltage DISABLED — ASIC chips powered down", chain_id,
+                            "Chain {} voltage-disable command completed (physical rail-off is not independently measured)", chain_id,
                         );
                     }
                     Ok(Ok(Err(detail))) => {
@@ -11414,53 +13753,74 @@ impl Daemon {
                 PicFirmware::Stock(_) => dcentrald_hal::i2c::I2cPicFirmware::Stock,
                 PicFirmware::Unknown => dcentrald_hal::i2c::I2cPicFirmware::Unknown,
             };
+            let shutdown_pic_type = self.pic_type();
             for &idx in &self.detected_board_indices {
-                let pic_addr = self.pic_addr_for_board(idx);
+                let (chain_id, pic_addr, pic_type) = match (
+                    self.chain_id_for_board(idx),
+                    self.pic_addr_for_board(idx),
+                    shutdown_pic_type.as_ref(),
+                ) {
+                    (Ok(chain_id), Ok(pic_addr), Ok(pic_type)) => (chain_id, pic_addr, *pic_type),
+                    (chain_result, pic_result, pic_type_result) => {
+                        error!(
+                            board_index = idx,
+                            chain_error = ?chain_result.err(),
+                            pic_error = ?pic_result.err(),
+                            pic_type_error = ?pic_type_result.err(),
+                            "Could not resolve fallback shutdown controller; watchdog remains armed"
+                        );
+                        software_disable_failed = true;
+                        continue;
+                    }
+                };
                 if let Some(i2c_svc) = shutdown_i2c_service.as_ref() {
-                    match self.pic_type() {
+                    match pic_type {
                         PicType::DsPic33EP => {
                             let mut dspic = DspicService::new(i2c_svc.clone(), pic_addr);
                             let _ = dspic.send_heartbeat();
                             if let Err(e) = dspic.disable_voltage() {
                                 warn!(
-                                    chain_id = self.chain_id_for_board(idx),
+                                    chain_id,
                                     pic_addr = format_args!("0x{:02X}", pic_addr),
                                     error = %e,
                                     "dsPIC failed to disable voltage on chain {} — watchdog will cut power anyway (hardware safety)",
-                                    self.chain_id_for_board(idx),
+                                    chain_id,
                                 );
                                 software_disable_failed = true;
                             } else {
                                 info!(
-                                    chain_id = self.chain_id_for_board(idx),
-                                    "Chain {} dsPIC voltage DISABLED — ASIC chips powered down",
-                                    self.chain_id_for_board(idx),
+                                    chain_id,
+                                    "Chain {} dsPIC voltage-disable command completed (physical rail-off is not independently measured)",
+                                    chain_id,
                                 );
                             }
                         }
                         _ => {
-                            let _ = i2c_svc.heartbeat(pic_addr, shutdown_i2c_fw);
-                            if let Err(e) = i2c_svc.disable_voltage(pic_addr, shutdown_i2c_fw) {
+                            let async_i2c = i2c_svc.async_handle();
+                            let _ = async_i2c.heartbeat(pic_addr, shutdown_i2c_fw).await;
+                            if let Err(e) =
+                                async_i2c.disable_voltage(pic_addr, shutdown_i2c_fw).await
+                            {
                                 warn!(
-                                    chain_id = self.chain_id_for_board(idx),
+                                    chain_id,
                                     pic_addr = format_args!("0x{:02X}", pic_addr),
                                     error = %e,
                                     "Failed to disable voltage on chain {} — PIC heartbeat will timeout and cut power in ~5s (stock) / ~10s (BraiinsOS) anyway (hardware safety)",
-                                    self.chain_id_for_board(idx),
+                                    chain_id,
                                 );
                                 software_disable_failed = true;
                             } else {
                                 info!(
-                                    chain_id = self.chain_id_for_board(idx),
-                                    "Chain {} voltage DISABLED — ASIC chips powered down",
-                                    self.chain_id_for_board(idx),
+                                    chain_id,
+                                    "Chain {} voltage-disable command completed (physical rail-off is not independently measured)",
+                                    chain_id,
                                 );
                             }
                         }
                     }
                 } else {
                     error!(
-                        chain_id = self.chain_id_for_board(idx),
+                        chain_id,
                         pic_addr = format_args!("0x{:02X}", pic_addr),
                         "I2C service missing during shutdown — PIC watchdog will cut voltage in ~64s (hardware safety net)",
                     );
@@ -11470,13 +13830,34 @@ impl Daemon {
             }
         }
 
-        // Step 5b: NOW stop the heartbeat thread. Voltage is disabled, so PIC watchdog
-        // timeout no longer matters (there's nothing for the PIC to protect).
-        info!("Step 5b: Stopping PIC heartbeat thread — voltage is safely off");
+        // Step 5b: Stop heartbeat ownership. If software safe-off was not
+        // confirmed, this is what permits the hardware watchdog to cut voltage.
+        if software_disable_failed {
+            warn!(
+                "Step 5b: Stopping PIC heartbeat thread — voltage was NOT confirmed off; controller watchdog cutoff is now the safety path"
+            );
+        } else {
+            info!(
+                "Step 5b: Stopping PIC heartbeat thread — software disable commands completed; physical rail-off was not independently measured"
+            );
+        }
         self.heartbeat_shutdown_token.cancel();
-        // Give the heartbeat thread 2 seconds to notice and exit cleanly.
-        // It checks is_cancelled() every 500ms, so 2s is generous.
-        tokio::time::sleep(Duration::from_millis(2000)).await;
+        let mut heartbeat_owners_quiesced = true;
+        if let Some(handle) = self.runtime_heartbeat_handle.take() {
+            match join_thread_bounded(handle, Duration::from_secs(3)).await {
+                ThreadStopOutcome::Joined => info!("Runtime heartbeat thread stopped and joined"),
+                ThreadStopOutcome::Panicked => {
+                    error!("Runtime heartbeat thread panicked while stopping")
+                }
+                ThreadStopOutcome::TimedOut => {
+                    warn!(
+                        "Runtime heartbeat thread did not exit within 3s; its cancellation token remains asserted and the handle was detached"
+                    );
+                    heartbeat_owners_quiesced = false;
+                }
+            }
+        }
+        heartbeat_owners_quiesced &= self.stop_init_heartbeat_bounded().await;
 
         // Step 6: Wait for power discharge
         info!("Step 6: Waiting 2s for hash board capacitors to discharge...");
@@ -11508,18 +13889,85 @@ impl Daemon {
             );
         }
 
-        // Step 10: Close watchdog with magic close
-        // Writing "V" (magic close character) then closing the fd tells the
-        // watchdog to disarm. Without this, the watchdog would reboot the SoC.
-        if let Some(mut wd) = self.watchdog.take() {
-            let _ = wd.close_magic();
-            info!("Step 10: Watchdog disarmed (magic close) — SoC will NOT auto-reboot");
+        // Step 10: Explicitly disarm the independently owned SoC watchdog only
+        // after every hardware actor is quiescent and the software safe-off
+        // policy completed. Owner cancellation, abort, timeout, and Drop are
+        // deliberately not disarm authority.
+        let watchdog_disarm_allowed = !software_disable_failed
+            && !mining_quiescence_failed
+            && !psu_quiescence_failed
+            && heartbeat_owners_quiesced;
+        if !watchdog_disarm_allowed {
+            error!(
+                software_disable_failed,
+                mining_quiescence_failed,
+                psu_quiescence_failed,
+                heartbeat_owners_quiesced,
+                "Step 10: Refusing SoC watchdog disarm because shutdown safety evidence is incomplete"
+            );
+            return Err(anyhow::anyhow!(
+                "shutdown safety evidence is incomplete; SoC watchdog remains armed"
+            ));
+        }
+
+        if let Some(intent_tx) = self.watchdog_intent_tx.take() {
+            // A receiver may already have exited with NotOpenedByDaemon; the receipt,
+            // rather than send success alone, is the authoritative outcome.
+            let _ = intent_tx.send(WatchdogIntent::Disarm);
+        }
+        let watchdog_receipt = match self.watchdog_receipt_rx.take() {
+            Some(receipt_rx) => {
+                match tokio::time::timeout(WATCHDOG_TASK_STOP_TIMEOUT, receipt_rx).await {
+                    Ok(Ok(receipt)) => Some(receipt),
+                    Ok(Err(_)) => {
+                        return Err(anyhow::anyhow!(
+                            "SoC watchdog task ended without a disarm receipt; kernel watchdog state is unknown"
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(anyhow::anyhow!(
+                            "timed out after sending SoC watchdog Disarm; the irreversible magic-close outcome is unknown"
+                        ));
+                    }
+                }
+            }
+            None => None,
+        };
+
+        let magic_close_write_completed = match watchdog_receipt {
+            Some(WatchdogTaskReceipt::MagicCloseWriteCompleted) => {
+                info!("Step 10: Watchdog magic-close byte write completed and task exit will be observed; kernel timer state remains unmeasured");
+                true
+            }
+            Some(WatchdogTaskReceipt::NotOpenedByDaemon) => {
+                info!("Step 10: This daemon did not open the hardware watchdog (disabled, unavailable, or busy); pre-existing kernel watchdog state is unmeasured");
+                false
+            }
+            Some(WatchdogTaskReceipt::MagicCloseWriteFailed(error)) => {
+                return Err(anyhow::anyhow!(
+                    "SoC watchdog magic-close byte write failed ({error}); kernel watchdog state is unknown"
+                ));
+            }
+            None => {
+                info!("Step 10: Standard-path hardware watchdog was never started");
+                false
+            }
+        };
+
+        let watchdog_stop = self
+            .watchdog_tasks
+            .stop_and_join(WATCHDOG_TASK_STOP_TIMEOUT)
+            .await;
+        if watchdog_stop.any_timed_out() || watchdog_stop.any_panicked() {
+            return Err(anyhow::anyhow!(
+                "SoC watchdog task termination was not cleanly observed"
+            ));
         }
 
         info!("=== SHUTDOWN COMPLETE ===");
         // prod-readiness hunt #1: only attest "Safe to unplug or restart" when
-        // SOFTWARE actually confirmed every chain de-energized. If any disable
-        // branch failed (or the I2C service was missing), the rail is relying
+        // SOFTWARE completed every disable command. If any disable branch failed
+        // (or the I2C service was missing), the rail is relying
         // solely on the ~5-64 s PIC/dsPIC watchdog — do NOT prompt a warm restart.
         if software_disable_failed {
             warn!(
@@ -11529,7 +13977,15 @@ impl Daemon {
                  power is confirmed off (wait out the watchdog or AC-cycle)."
             );
         } else {
-            info!("All hash boards powered down, fans commanded to idle, watchdog disarmed. Safe to unplug or restart.");
+            if magic_close_write_completed {
+                info!(
+                    "All hash-board voltage-disable commands completed, fans were commanded to idle, the SoC watchdog magic-close write completed, and its task exit was observed. Kernel timer state and physical rail-off were not independently measured; observe the documented discharge/watchdog interval before a warm restart."
+                );
+            } else {
+                info!(
+                    "All hash-board voltage-disable commands completed and fans were commanded to idle. This daemon performed no SoC watchdog magic-close write; pre-existing kernel watchdog state and physical rail-off remain unmeasured."
+                );
+            }
         }
         Ok(())
     }
@@ -11765,6 +14221,22 @@ fn grpc_tuner_mode_to_autotuner(
             voltage_mv: req.manual_voltage_mv,
         }),
         _ => None,
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if let Some(i2c_service) = self.i2c_service.as_ref() {
+            let _ = i2c_service.latch_terminal_safe_off();
+        }
+        if let Some(voltage_mailbox) = self.voltage_cmd_tx.as_ref() {
+            voltage_mailbox.latch_terminal();
+        }
+        // Last-resort cancellation safety. Normal paths bounded-join this
+        // thread explicitly, but dropping a partially initialized daemon must
+        // never leave an initialization heartbeat producer intentionally live.
+        self.signal_init_heartbeat_stop();
+        self.heartbeat_shutdown_token.cancel();
     }
 }
 
@@ -12010,14 +14482,17 @@ mod td003_destructive_write_guard_tests {
         let start = DAEMON_RS
             .find("async fn run_lifecycle(&mut self)")
             .expect("run_lifecycle missing");
-        let guard = offset_after(DAEMON_RS, start, "self.td003_destructive_write_refusal()");
+        let guard = offset_after(DAEMON_RS, start, "self.td003_destructive_write_refusal(");
         let boot_progress = offset_after(DAEMON_RS, start, "let boot_progress");
-        let init_call = offset_after(DAEMON_RS, start, "self.init()");
+        let init_call = offset_after(DAEMON_RS, start, "initialize_or_recover(");
         assert!(
             guard < boot_progress,
             "TD-003 guard must run before boot-progress mining init starts"
         );
-        assert!(guard < init_call, "TD-003 guard must run before init()");
+        assert!(
+            guard < init_call,
+            "TD-003 guard must run before the injected platform lifecycle"
+        );
 
         let guard_body = &DAEMON_RS[guard..boot_progress];
         assert!(
@@ -12034,11 +14509,10 @@ mod td003_destructive_write_guard_tests {
         let guard = offset_after(
             DAEMON_RS,
             init_start,
-            "self.td003_destructive_write_refusal()",
+            "self.td003_destructive_write_refusal(",
         );
         for marker in [
-            "send_emergency_heartbeats",
-            "spawn_i2c_service",
+            "ProductionSerializedI2cFactory.open_serialized_i2c",
             "FanController::open_discovered",
             "GpioController::new",
             "FpgaChain::open",
@@ -12053,18 +14527,18 @@ mod td003_destructive_write_guard_tests {
 
     #[test]
     fn standard_non_s9_i2c_registers_hashboard_eeprom_denylist() {
-        let init_start = DAEMON_RS
-            .find("async fn init(")
-            .expect("init definition missing");
-        let devmem = offset_after(DAEMON_RS, init_start, "spawn_i2c_service(0, true)");
+        let factory_start = DAEMON_RS
+            .find("impl SerializedI2cOperations for ProductionSerializedI2cOperations")
+            .expect("production serialized-I2C operations missing");
+        let devmem = offset_after(DAEMON_RS, factory_start, "spawn_i2c_service(0, true)");
         let amlogic = offset_after(
             DAEMON_RS,
-            init_start,
+            factory_start,
             "spawn_amlogic_protected_i2c0_service()",
         );
         let generic = offset_after(
             DAEMON_RS,
-            init_start,
+            factory_start,
             "spawn_i2c_service_no_register_touch_with_denylist",
         );
         assert!(devmem < amlogic);

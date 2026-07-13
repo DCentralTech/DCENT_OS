@@ -25,9 +25,11 @@ use dcentrald_api::rest::{
     grpc_bridge_reboot, grpc_bridge_set_fan, grpc_bridge_set_pools,
 };
 use dcentrald_api::{
-    build_minimal_app_state, ApiConfig, AppState, MinimalAppStateInputs, NetworkBlockConfig,
+    build_minimal_app_state, build_minimal_app_state_with_hardware_mutation_gate, ApiConfig,
+    AppState, MinimalAppStateInputs, NetworkBlockConfig,
 };
 use dcentrald_api_types::OperatingMode;
+use dcentrald_hal::platform::{HardwareMutationGate, HardwareMutationGateOwner};
 
 fn base_inputs(chip: &str) -> MinimalAppStateInputs {
     MinimalAppStateInputs {
@@ -58,10 +60,26 @@ fn unknown_identity_state() -> Arc<AppState> {
 /// + `IdentityConfidence::Exact` → all mutating runtime caps are granted
 /// (PoolsRw / PowerControl / Reboot / AsicOptions / ConfigRw / Identify).
 fn granted_identity_state() -> Arc<AppState> {
-    let state = build_minimal_app_state(base_inputs("BM1387"));
+    granted_identity_state_with_gate(HardwareMutationGate::new_open())
+}
+
+fn granted_identity_state_with_gate(gate: HardwareMutationGate) -> Arc<AppState> {
+    let state = build_minimal_app_state_with_hardware_mutation_gate(base_inputs("BM1387"), gate);
     {
         let mut hw = state.hardware_info.lock().unwrap();
-        hw.identification.confidence = "exact".to_string();
+        hw.identification = dcentrald_api::HardwareIdentification::from_evidence(
+            vec![
+                dcentrald_api::HardwareIdentityEvidence::declared_asic_board_target(
+                    "am1-s9", "BM1387",
+                ),
+                dcentrald_api::HardwareIdentityEvidence::measured_asic_enumeration(
+                    0x1387,
+                    "BM1387",
+                    dcentrald_api::HardwareCompositionToken::new(1, "test:am1-s9"),
+                ),
+            ],
+            Some("test S9 enumeration evidence".to_string()),
+        );
     }
     state
 }
@@ -134,6 +152,31 @@ fn set_fan_passes_guard_on_granted_identity() {
             "granted identity must clear the PowerControl guard, got guard error: {err}"
         );
     }
+}
+
+#[test]
+fn set_fan_rejects_pending_mutation_admission_before_hal() {
+    let gate_owner = HardwareMutationGateOwner::new_pending();
+    let state = granted_identity_state_with_gate(gate_owner.gate());
+
+    let err = grpc_bridge_set_fan(&state, 50)
+        .expect_err("pending admission must reject the gRPC fan write before HAL access");
+    assert!(
+        err.contains("pending mining readiness"),
+        "expected pending-admission rejection, got: {err}"
+    );
+}
+
+#[test]
+fn set_fan_rejects_closed_mutation_admission_before_hal() {
+    let state = granted_identity_state_with_gate(HardwareMutationGate::new_closed());
+
+    let err = grpc_bridge_set_fan(&state, 50)
+        .expect_err("closed admission must reject the gRPC fan write before HAL access");
+    assert!(
+        err.contains("closed for teardown"),
+        "expected closed-admission rejection, got: {err}"
+    );
 }
 
 // ── reboot (Reboot) ────────────────────────────────────────────────────────

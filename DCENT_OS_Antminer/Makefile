@@ -173,22 +173,23 @@ flash-braiinsos:
 	@$(CURDIR)/scripts/flash_braiinsos.sh $(MINER_IP) $(BUILDROOT_DIR)/output/images/rootfs.squashfs
 
 # W1.2 (2026-05-07): production-build entry point. Fails closed when the
-# manifest pubkey pin is not exported. `RELEASE_TARGET` defaults to s9 but
-# can be overridden (`make release RELEASE_TARGET=am2-s19jpro`).
+# manifest pubkey pin is not exported. The first immutable-source capsule lane
+# is intentionally S9-only; other targets remain blocked until their Cargo and
+# boot-input paths use the same invocation boundary.
 #
 # `make release` ALWAYS builds a hardened RELEASE image (DCENT_RELEASE_IMAGE=1):
 # root login is locked ("*", no shared default password), the MCP control
 # server requires a bearer token for write/control tools and fails closed when
 # none is provisioned, and the image is stamped /etc/dcentos/release-image. The
-# unhardened DEV posture (root:dcentral, open MCP) is only produced by `make dev`
-# or by invoking scripts/build_in_docker.sh directly without this flag — those
-# are for bench/lab use, never for a unit you expose on an untrusted network.
+# historical unhardened DEV image posture (root:dcentral, open MCP) is not
+# currently packageable: its mutable direct-build lane is intentionally blocked
+# until a separate lab capsule provides equivalent ownership and isolation.
 RELEASE_TARGET ?= s9
 release:
 	@if [ -z "$$DCENT_MANIFEST_PUBLIC_KEY_HEX" ]; then \
 		echo "ERROR: 'make release' requires DCENT_MANIFEST_PUBLIC_KEY_HEX (64 hex chars)."; \
-		echo "       export DCENT_MANIFEST_PUBLIC_KEY_HEX=<hex64> first, or use 'make dev'"; \
-		echo "       for unsigned dev/lab builds. See release/README.md."; \
+		echo "       export DCENT_MANIFEST_PUBLIC_KEY_HEX=<hex64> first."; \
+		echo "       The legacy direct lab-image lane is disabled until it has its own capsule."; \
 		exit 1; \
 	fi
 	@if [ -z "$$DCENT_RELEASE_SIGNING_KEY" ]; then \
@@ -196,16 +197,26 @@ release:
 		echo "       Generate with scripts/generate_release_keypair.sh."; \
 		exit 1; \
 	fi
+	@if [ "$(RELEASE_TARGET)" != "s9" ]; then \
+		echo "ERROR: release capsule v1 supports RELEASE_TARGET=s9 only."; \
+		echo "       Other targets remain fail-closed until their capsule port lands."; \
+		exit 1; \
+	fi
 	@echo "release: running local verification gate (make verify) before build..."
 	@$(MAKE) verify
-	@DCENT_RELEASE_IMAGE=1 bash $(CURDIR)/scripts/build_in_docker.sh --target $(RELEASE_TARGET)
+	@bash $(CURDIR)/scripts/build_s9_release_capsule.sh
 
-# Dev/lab build — explicit opt-out of the manifest pubkey pin gate. Produces
-# an unsigned/lab package whose at-rest manifest verification fails open.
+# A direct lab package used to reuse mutable checkout, Cargo, and Buildroot
+# state. Binary receipt v4 intentionally rejects that weaker boundary. Keep the
+# public target fail-closed until a separate lab capsule owns the same source,
+# result, and cleanup lifecycles; contributors can still build/test dcentrald.
 DEV_TARGET ?= s9
 dev:
-	@DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 \
-		bash $(CURDIR)/scripts/build_in_docker.sh --target $(DEV_TARGET) --lab-unsigned
+	@echo "ERROR: make dev image packaging is temporarily unsupported." >&2
+	@echo "       Direct packaging cannot satisfy the invocation-bound binary receipt contract." >&2
+	@echo "       Use 'make test' for contributor builds; do not weaken the release capsule." >&2
+	@echo "       A future lab capsule must be explicit, isolated, and permanently marked non-release." >&2
+	@exit 2
 
 # Wave-A / SB-2 (2026-05-28): the workspace TEST gate that was MISSING. `make
 # release`/build_in_docker.sh run only `cargo build --release` (no tests), and

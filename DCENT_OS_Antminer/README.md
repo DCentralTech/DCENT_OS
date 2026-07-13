@@ -295,14 +295,15 @@ cd dcentrald
 cargo build --release --target armv7-unknown-linux-musleabihf   # Zynq (S9/S17/S19)
 # or aarch64-unknown-linux-musl for Amlogic (S19j Pro / S19k Pro / S21)
 
-# 2. Build a flashable image (Docker, from the repo root).
+# 2. Build a production S9 image through the immutable-source release capsule.
 #    NOTE: a full flashable image reuses non-redistributable SoC boot
 #    components (kernel / FPGA bitstream / U-Boot) that are NOT shipped in
 #    this repo — see DEVELOPMENT.md ("What builds from this repo, and what
 #    needs vendor artifacts"). Most users flash a prebuilt signed release
-#    image instead of building one.
+#    image instead of building one. Other production targets remain blocked
+#    until they implement the same capsule boundary.
 cd ..
-bash scripts/build_in_docker.sh
+make release RELEASE_TARGET=s9
 
 # 3. Plan the route before any write
 dcent doctor <MINER_IP>
@@ -327,6 +328,9 @@ make install-hooks
 
 `make release` runs `make verify` before building release artifacts; the hook-only
 `DCENT_SKIP_VERIFY=1` bypass does not skip release verification.
+The legacy direct `build_in_docker.sh` and `make dev` image lanes cannot satisfy
+the current receipt contract and are intentionally fail closed. See
+[`docs/RC_BUILD_RUNBOOK.md`](docs/RC_BUILD_RUNBOOK.md).
 
 DCENT_OS boots **management-only** on a fresh install (SSH + dashboard + API up, hash power off)
 until you explicitly configure and enable mining — so a fresh flash can't surprise-start a loud

@@ -17,4 +17,4 @@
   First boot: set the dashboard owner password before enabling mining.
   SSH `root` access is bootstrap/recovery only.
 
-  Type 'dcent-shell' for the interactive toolkit.
+  Type 'help-tools' for daemon-owned diagnostic snapshots.

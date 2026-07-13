@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "target": "am3-bb-s19jpro",
+  "evidence": {
+    "live_fdt_sha256": "574a6a9b3a9d540451f9a3dec9cc7a5e9e61dccd5531367605a7598e6308f38b",
+    "live_fdt_role": "read-only captured runtime evidence; not a reproducible build input",
+    "gpio59_polarity": "runtime contract corroborated by accepted-share bring-up; not claimed as direct electrical proof",
+    "plug_detect_order": "candidate mapping; intentionally not enforced by this gate",
+    "btm_scope": "ti,am335x-boneblack-btm is the distinct VNish/awesome boot lineage, not authorization for the live S19J_IO_BOARD_V2_0 GPIO contract",
+    "lineage_references": [
+      "../../",
+      "../../"
+    ]
+  },
+  "identity": {
+    "model": "BeagleBone_Black_v2.1 on S19J_IO_BOARD_V2_0",
+    "compatible": "ti,am335x-bone-black"
+  },
+  "gpio": {
+    "board_enable": 59,
+    "board_enable_active": "high",
+    "board_enable_safe_value": 0,
+    "asic_reset": [49, 60, 27, 22],
+    "asic_reset_active_low": true,
+    "asic_reset_safe_value": 1,
+    "fan_tach": [7, 20, 110, 112],
+    "ownership": {
+      "board_enable": "userspace-sysfs",
+      "reset_at_live_kernel_boot": "gpio-leds",
+      "reset_runtime_handoff": "requires validation on a pristine DCENT_OS cold boot",
+      "fan_tach": "userspace-sysfs-input"
+    }
+  },
+  "uart": {
+    "devices": ["/dev/ttyS1", "/dev/ttyS2", "/dev/ttyS4"],
+    "base_addresses": ["0x48022000", "0x48024000", "0x481a8000"],
+    "live_pinmux": {
+      "uart2": ["0x180", "0x30", "0x184", "0x08"],
+      "uart3": ["0x150", "0x31", "0x154", "0x09"],
+      "uart5": ["0x168", "0x31", "0x16c", "0x09"],
+      "uart6": ["0xc4", "0x34", "0xc0", "0x0c"]
+    },
+    "legacy_reference_pinmux": {
+      "uart2": ["0x180", "0x30", "0x184", "0x0"],
+      "uart3": ["0x150", "0x31", "0x154", "0x1"],
+      "uart5": ["0x168", "0x31", "0x16C", "0x1"],
+      "uart6": ["0xC4", "0x34", "0xC0", "0x4"]
+    }
+  },
+  "inventory": {
+    "dts_sources": [
+      "br2_external_dcentos/board/beaglebone/am3-bb-s19jpro/am335x-s19jpro.dts"
+    ],
+    "defconfigs": [
+      "br2_external_dcentos/configs/dcentos_am3_bb_defconfig",
+      "br2_external_dcentos/configs/dcentos_am3_bb_s19jpro_defconfig"
+    ],
+    "product_build_scripts": [
+      "scripts/build_am3_bb_s19jpro.sh",
+      "scripts/build_am3_bb_sd_resident_uboot_image.sh",
+      "scripts/build_am3_bb_sd_vnish_bootbin_image.sh"
+    ],
+    "dtb_contract_helper": "scripts/lib/am3_bb_dtb_contract.sh",
+    "dtb_policies": {
+      "scripts/build_am3_bb_s19jpro.sh": "s19j-io-v2",
+      "scripts/build_am3_bb_sd_resident_uboot_image.sh": "s19j-io-v2",
+      "scripts/build_am3_bb_sd_vnish_bootbin_image.sh": "vnish-btm"
+    }
+  },
+  "legacy_reference": {
+    "path": "br2_external_dcentos/board/beaglebone/am3-bb-s19jpro/am335x-s19jpro.dts",
+    "marker": "DCENT_REFERENCE_ONLY: bbctrl-s70",
+    "legacy_reset_gpio": [5, 4, 27, 22]
+  }
+}

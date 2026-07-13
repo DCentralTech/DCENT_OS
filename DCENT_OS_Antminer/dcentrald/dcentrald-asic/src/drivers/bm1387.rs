@@ -262,8 +262,10 @@ impl Bm1387Driver {
             return Ok(None);
         }
 
-        let r0 = chain.cmd.read_reg(fpga_chain::REG_CMD_RX_FIFO);
-        let _ = chain.cmd.read_reg(fpga_chain::REG_CMD_RX_FIFO);
+        let Some(r0) = chain.read_cmd_response() else {
+            return Ok(None);
+        };
+        let _ = chain.read_cmd_response();
         let bytes = crate::protocol::unpack_lsb_first(r0);
         Ok(Some(u32::from_be_bytes(bytes)))
     }
@@ -321,10 +323,10 @@ impl Bm1387Driver {
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         let current_misc = if chain.cmd_rx_has_data() {
-            let r0 = chain.cmd.read_reg(fpga_chain::REG_CMD_RX_FIFO);
+            let r0 = chain.read_cmd_response().unwrap_or_default();
             // Drain second response word (BM1387 always returns 2 words)
             if chain.cmd_rx_has_data() {
-                let _ = chain.cmd.read_reg(fpga_chain::REG_CMD_RX_FIFO);
+                let _ = chain.read_cmd_response();
             }
             let bytes = unpack_lsb_first(r0);
             u32::from_be_bytes(bytes)
@@ -452,10 +454,10 @@ impl Bm1387Driver {
                 continue;
             }
 
-            let r0 = chain.cmd.read_reg(fpga_chain::REG_CMD_RX_FIFO);
+            let r0 = chain.read_cmd_response().unwrap_or_default();
             // Drain second word
             if chain.cmd_rx_has_data() {
-                let _ = chain.cmd.read_reg(fpga_chain::REG_CMD_RX_FIFO);
+                let _ = chain.read_cmd_response();
             }
 
             let bytes = unpack_lsb_first(r0);
@@ -768,8 +770,8 @@ impl ChipDriver for Bm1387Driver {
             std::thread::sleep(std::time::Duration::from_millis(50));
 
             let pll_readback = if chain.cmd_rx_has_data() {
-                let r0 = chain.cmd.read_reg(fpga_chain::REG_CMD_RX_FIFO);
-                let _r1 = chain.cmd.read_reg(fpga_chain::REG_CMD_RX_FIFO);
+                let r0 = chain.read_cmd_response().unwrap_or_default();
+                let _r1 = chain.read_cmd_response();
                 let bytes = unpack_lsb_first(r0);
                 Some(u32::from_be_bytes(bytes))
             } else {
@@ -942,8 +944,8 @@ impl ChipDriver for Bm1387Driver {
         // to ensure clean state for the readback check.
         while chain.read_nonce().is_some() {}
         let readback = if chain.cmd_rx_has_data() {
-            let r0 = chain.cmd.read_reg(fpga_chain::REG_CMD_RX_FIFO);
-            let r1 = chain.cmd.read_reg(fpga_chain::REG_CMD_RX_FIFO);
+            let r0 = chain.read_cmd_response().unwrap_or_default();
+            let r1 = chain.read_cmd_response().unwrap_or_default();
             // Response word 0 contains the register value (LSB-first packed)
             // Unpack to bytes, then interpret as BE register value
             let bytes = unpack_lsb_first(r0);
@@ -1246,11 +1248,11 @@ impl ChipDriver for Bm1387Driver {
             // Drain WORK_RX in case nonce landed there
             let _ = chain.read_nonce();
             if chain.cmd_rx_has_data() {
-                let r0 = chain.cmd.read_reg(fpga_chain::REG_CMD_RX_FIFO);
+                let r0 = chain.read_cmd_response().unwrap_or_default();
                 // Drain r1 (CRC/status word) to prevent FIFO contamination of next CMD read.
                 // BM1387 register response is 2 FIFO words. Matches pattern at lines 470-471.
                 let _r1 = if chain.cmd_rx_has_data() {
-                    chain.cmd.read_reg(fpga_chain::REG_CMD_RX_FIFO)
+                    chain.read_cmd_response().unwrap_or_default()
                 } else {
                     0
                 };

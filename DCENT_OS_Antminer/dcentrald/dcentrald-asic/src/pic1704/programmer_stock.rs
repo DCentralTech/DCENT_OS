@@ -1,10 +1,10 @@
 //! PIC1704 stock bmminer reflash protocol — GHIDRA-EXTRACTED (W15.B).
 //!
 //! Implements the wire format extracted from Ghidra-decompiled stock
-//! bmminer source for the PIC1704 reflash sequence. This module ships
-//! ALONGSIDE [`super::programmer_v2`] (W14.C V2 theoretical/inferred
-//! REG_CMD 0x10-0x15 framed protocol) — the two are routed by
-//! [`super::reflash::route_by_seek_ack`].
+//! bmminer source for the PIC1704 reflash sequence. This research module is
+//! retained alongside [`super::programmer_v2`] (W14.C V2
+//! theoretical/inferred REG_CMD 0x10-0x15 framed protocol); host tests compare
+//! their routing through [`super::reflash::route_by_seek_ack`].
 //!
 //! ## Source of truth
 //!
@@ -45,18 +45,21 @@
 //!    (NOT 24-bit / 3 bytes) in the program-memory buffer
 //!    (`uStack_13b8`), per `_update_pic_app_program_1704.c` lines 64-65.
 //!
-//! ## Recovery-tool feature gate (TRIPLE)
+//! ## Research-only boundary
 //!
 //! 1. Module wrapped in `#![cfg(feature = "recovery-tool")]`.
-//! 2. Production `dcentrald` Cargo.toml does NOT enable `recovery-tool`.
-//! 3. CLI subcommand requires `--confirm-bricked` token + `--manifest`.
+//! 2. No shipped package enables `recovery-tool`; the diagnostic-only
+//!    `pic-recovery` package is not a consumer.
+//! 3. The historical CLI gates are not deployment authority. Any future
+//!    executor requires the separate controller-recovery authority contract.
 //!
 //! ## REG_VOLTAGE_L collision guard
 //!
 //! Stock SEEK leading byte `0x55` does NOT collide with REG_VOLTAGE_L
 //! (`0x10`) — but the W14.C V2 collision guard contract still applies
-//! at the CLI layer. Re-export [`super::programmer_v2::collision_guard`]
-//! so callers can pre-read REG_VERSION before any framed transaction.
+//! for any future authority layer. Re-export
+//! [`super::programmer_v2::collision_guard`] so research callers can validate
+//! REG_VERSION before constructing a framed transaction.
 
 #![cfg(feature = "recovery-tool")]
 
@@ -166,8 +169,8 @@ pub const STOCK_SEEK_MAX_WORDS: u32 = 0xFFFF;
 
 /// Errors emitted by host-side wire-format helpers in this module.
 ///
-/// I²C transport errors (NACK / EIO / etc.) are surfaced via the CLI
-/// transport layer; this enum is for pre-wire validation only.
+/// This enum covers pre-wire validation only. A future authorized transport
+/// layer must surface I²C failures separately and fail closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StockError {
     /// SEEK address exceeds the 16-bit address envelope the stock
@@ -179,8 +182,8 @@ pub enum StockError {
     /// WRITE batch is not exactly 16 bytes long.
     WriteBatchWrongSize,
     /// Bootloader version pre-check returned a non-bootloader byte.
-    /// Mirrors [`super::programmer_v2::FpError::NotInBootloader`] so
-    /// the CLI layer can use a unified error path.
+    /// Mirrors [`super::programmer_v2::FpError::NotInBootloader`] so a future
+    /// authority layer can use a unified error path.
     NotInBootloader,
     /// Hex application file failed to parse.
     HexParseError,
@@ -380,9 +383,8 @@ pub fn pack_words_msb_first(words: &[u16]) -> Vec<u8> {
 }
 
 /// Parse a stock-format hex application file (one 16-bit hex word per
-/// line, blank and comment lines skipped). Used by
-/// [`super::reflash`] CLI as a host-side helper for tests; production
-/// CLI in pic-recovery binary loads the file directly.
+/// line, blank and comment lines skipped). Retained as a host-side parser for
+/// protocol tests; no shipped controller-recovery CLI consumes it.
 ///
 /// Returns the raw 16-bit words in order. Caller is responsible for
 /// `pack_words_msb_first` to convert to wire bytes.
@@ -409,9 +411,9 @@ pub fn parse_hex_app_file(path: &Path) -> Result<Vec<u16>, StockError> {
     Ok(words)
 }
 
-/// Re-export the W14.C V2 collision guard so CLI callers don't need to
-/// reach across modules for the shared safety check. The guard refuses
-/// any framed transaction unless REG_VERSION reads as bootloader (0x86).
+/// Re-export the W14.C V2 collision guard for host tests and future authorized
+/// callers. The guard refuses any framed transaction unless REG_VERSION reads
+/// as bootloader (0x86).
 pub use super::programmer_v2::collision_guard;
 
 // === Tests (host-safe, no I²C bus required) ===

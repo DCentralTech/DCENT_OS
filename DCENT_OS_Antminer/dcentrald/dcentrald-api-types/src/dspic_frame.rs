@@ -210,6 +210,37 @@ pub fn decode_framed_sum(buf: &[u8]) -> Result<DspicFrame, DspicFrameError> {
     })
 }
 
+/// Decode a FRAMED-SUM reply body read after the wire preamble has already
+/// been consumed.
+///
+/// Linux I2C transactions used by some control boards write the request and
+/// then read only `[LEN, CMD, payload..., CKSUM]`; the device does not repeat
+/// the `[0x55, 0xAA]` preamble in that read. This adapter keeps those transport
+/// semantics out of board-specific code while reusing the canonical length,
+/// checksum, and opcode validation in [`decode_framed_sum`]. Length errors use
+/// canonical full-wire byte counts, including the reconstituted preamble.
+pub fn decode_framed_sum_reply_body(buf: &[u8]) -> Result<DspicFrame, DspicFrameError> {
+    // A NAK may be returned as a single byte, before any framed body exists.
+    if buf.first() == Some(&NAK_BYTE) {
+        return Err(DspicFrameError::NegativeAck);
+    }
+    // Two idle-high bytes are sufficient evidence that no reply was staged.
+    if buf.starts_with(&[0xFF, 0xFF]) {
+        return Err(DspicFrameError::BusNoise);
+    }
+    if buf.len() < 3 {
+        return Err(DspicFrameError::Truncated {
+            got: PREAMBLE.len() + buf.len(),
+            need: 5,
+        });
+    }
+
+    let mut wire = Vec::with_capacity(PREAMBLE.len() + buf.len());
+    wire.extend_from_slice(&PREAMBLE);
+    wire.extend_from_slice(buf);
+    decode_framed_sum(&wire)
+}
+
 fn opcode_from_u8(b: u8) -> Option<DspicOpcode> {
     use DspicOpcode::*;
     match b {
@@ -427,6 +458,42 @@ mod tests {
             assert_eq!(decoded.opcode, opcode);
             assert_eq!(decoded.payload, payload);
         }
+    }
+
+    #[test]
+    fn decode_framed_sum_reply_body_accepts_verified_am3_heartbeat() {
+        let decoded = decode_framed_sum_reply_body(&[0x06, 0x16, 0x01, 0x00, 0x00, 0x1D]).unwrap();
+        assert_eq!(decoded.opcode, DspicOpcode::Heartbeat);
+        assert_eq!(decoded.payload, [0x01, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn decode_framed_sum_reply_body_reuses_checksum_validation() {
+        let error =
+            decode_framed_sum_reply_body(&[0x06, 0x16, 0x01, 0x00, 0x00, 0x1E]).unwrap_err();
+        assert_eq!(
+            error,
+            DspicFrameError::CksumMismatch {
+                computed: 0x1D,
+                found: 0x1E,
+            }
+        );
+    }
+
+    #[test]
+    fn decode_framed_sum_reply_body_rejects_transport_failures() {
+        assert_eq!(
+            decode_framed_sum_reply_body(&[0xF5]),
+            Err(DspicFrameError::NegativeAck)
+        );
+        assert_eq!(
+            decode_framed_sum_reply_body(&[0xFF, 0xFF]),
+            Err(DspicFrameError::BusNoise)
+        );
+        assert_eq!(
+            decode_framed_sum_reply_body(&[0x06, 0x16]),
+            Err(DspicFrameError::Truncated { got: 4, need: 5 })
+        );
     }
 
     #[test]

@@ -20,19 +20,19 @@
 //! this decision; future agents must not "fix" the apparent placeholder
 //! TODO by relocating them..
 //!
-//! # RESET is gated at compile time
+//! # RESET is research/test-only
 //!
 //! The `reset()` method only exists when the `recovery-tool` Cargo feature
-//! is enabled. The production `dcentrald` binary never enables that
-//! feature, so calling `reset()` from the daemon is a **compile error**.
-//!. Although PIC1704 is a different
-//! chip family from the S19j Pro dsPIC that originally motivated the rule,
-//! the operator-facing safety boundary is identical: destructive resets
-//! belong in `pic-recovery`, not in `dcentrald`.
+//! is enabled. No shipped package enables that feature, so neither `dcentrald`
+//! nor the diagnostic-only `pic-recovery` package can link it. See
+//! . A future reset executor requires separate,
+//! typed controller-recovery authority; this method's feature gate alone is
+//! not sufficient authorization.
 
 use std::time::{Duration, Instant};
 
-use dcentrald_hal::i2c::I2cServiceHandle;
+use dcentrald_hal::i2c::{I2cMutationLabel, I2cServiceHandle};
+use dcentrald_hal::platform::{VoltageControllerEndpoint, VoltageControllerKind};
 use tracing::{debug, info, warn};
 
 use crate::AsicError;
@@ -194,12 +194,41 @@ pub struct Pic1704Service {
 }
 
 impl Pic1704Service {
+    /// Construct from a discovery-issued, bus-bound PIC1704 endpoint.
+    ///
+    /// This is the preferred constructor for production orchestration. The
+    /// opaque endpoint replaces caller-selected platform markers and raw
+    /// addresses with exact system identity plus presence evidence.
+    pub fn from_endpoint(
+        handle: I2cServiceHandle,
+        endpoint: VoltageControllerEndpoint,
+    ) -> Result<Self> {
+        if endpoint.kind() != VoltageControllerKind::Pic1704 {
+            return Err(AsicError::InvalidParameter(format!(
+                "{} endpoint cannot construct a PIC1704 service",
+                endpoint.kind().as_str()
+            )));
+        }
+        if endpoint.bus() != handle.bus() {
+            return Err(AsicError::InvalidParameter(format!(
+                "PIC1704 endpoint is bound to I2C bus {}, but service owns bus {}",
+                endpoint.bus(),
+                handle.bus()
+            )));
+        }
+        Ok(Self::from_parts(handle, endpoint.address()))
+    }
+
     /// Construct a `Pic1704Service` for one of the whitelisted platforms.
     ///
     /// The `_marker: P` argument is consumed only at compile time: it
     /// proves the caller is an authorized platform via the sealed
     /// `Pic1704Authorized` trait. There is no runtime cost.
     pub fn new<P: Pic1704Authorized>(handle: I2cServiceHandle, address: u8, _marker: P) -> Self {
+        Self::from_parts(handle, address)
+    }
+
+    fn from_parts(handle: I2cServiceHandle, address: u8) -> Self {
         Self {
             i2c: handle,
             address,
@@ -354,7 +383,7 @@ impl Pic1704Service {
             "PIC1704 start_app: writing 0x5A→VERSION, 0x01→CONTROL",
         );
         self.i2c
-            .transaction(self.address, start_app_steps())
+            .transaction_mutating(I2cMutationLabel::Recovery, self.address, start_app_steps())
             .map_err(|e| AsicError::Pic {
                 addr: self.address,
                 detail: format!("start_app transaction: {}", e),
@@ -377,12 +406,21 @@ impl Pic1704Service {
             addr = format_args!("0x{:02X}", self.address),
             enable, "PIC1704 enable_dc_dc",
         );
-        self.i2c
-            .transaction(self.address, enable_dc_dc_steps(enable))
-            .map_err(|e| AsicError::Pic {
-                addr: self.address,
-                detail: format!("enable_dc_dc transaction: {}", e),
-            })?;
+        let result = if enable {
+            self.i2c.transaction_mutating(
+                I2cMutationLabel::Energize,
+                self.address,
+                enable_dc_dc_steps(true),
+            )
+        } else {
+            self.i2c
+                .disable_pic1704_dc_dc(self.address)
+                .map(|_| Vec::new())
+        };
+        result.map_err(|e| AsicError::Pic {
+            addr: self.address,
+            detail: format!("enable_dc_dc transaction: {}", e),
+        })?;
         Ok(())
     }
 
@@ -399,7 +437,7 @@ impl Pic1704Service {
         }
         self.last_heartbeat = Some(now);
         self.i2c
-            .transaction(self.address, heartbeat_steps())
+            .transaction_mutating(I2cMutationLabel::KeepAlive, self.address, heartbeat_steps())
             .map_err(|e| AsicError::Pic {
                 addr: self.address,
                 detail: format!("heartbeat transaction: {}", e),
@@ -408,23 +446,21 @@ impl Pic1704Service {
     }
 
     /// Internal accessor for the I²C service handle, gated to the
-    /// `recovery-tool` feature so production builds can't reach the
-    /// raw handle. Used by [`super::programmer`] to issue programmer
-    /// transactions without re-implementing the rate-limit / state-cache
-    /// bookkeeping that lives in this struct.
+    /// research/test-only `recovery-tool` feature. No shipped package enables
+    /// it. Used by [`super::programmer`] host tests and protocol research.
     #[cfg(feature = "recovery-tool")]
     pub(super) fn i2c_handle(&self) -> &I2cServiceHandle {
         &self.i2c
     }
 
-    /// **Destructive** hardware RESET. Compiled out of the production
-    /// `dcentrald` binary — only `pic-recovery` (which enables the
-    /// `recovery-tool` feature) can call this.
+    /// **Destructive** hardware RESET retained for protocol research. It only
+    /// exists behind `recovery-tool`, which no shipped package enables.
     ///
     /// Even though PIC1704 is a different chip family than the S19j Pro
     /// dsPIC that originally motivated the no-RESET rule, the
-    /// operator-facing rule is the same: destructive resets belong in
-    /// `pic-recovery`, not in `dcentrald`..
+    /// safety rule is the same: no runtime consumer may call this without a
+    /// separate controller-recovery authority architecture. See
+    /// .
     #[cfg(feature = "recovery-tool")]
     pub fn reset(&mut self) -> Result<()> {
         warn!(
@@ -432,7 +468,8 @@ impl Pic1704Service {
             "PIC1704 RESET (recovery-tool only) — DESTRUCTIVE",
         );
         self.i2c
-            .transaction(
+            .transaction_mutating(
+                I2cMutationLabel::Recovery,
                 self.address,
                 super::protocol::write_register_steps(
                     super::protocol::REG_CONTROL,
@@ -455,7 +492,11 @@ impl Pic1704Service {
     fn read_register(&self, reg: u8, len: usize) -> Result<Vec<u8>> {
         let mut reads = self
             .i2c
-            .transaction(self.address, read_register_steps(reg, len))
+            .transaction_mutating(
+                I2cMutationLabel::QueryPrelude,
+                self.address,
+                read_register_steps(reg, len),
+            )
             .map_err(|e| AsicError::Pic {
                 addr: self.address,
                 detail: format!("read_register 0x{:02X}: {}", reg, e),

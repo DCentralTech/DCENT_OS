@@ -24,6 +24,8 @@ mod derived_metrics;
 // only when a board opts into the `lora` feature (byte-identical image otherwise).
 #[cfg(feature = "lora")]
 mod lora_task;
+#[cfg(feature = "lora")]
+mod mesh_solo_runtime;
 mod mcp;
 mod metrics_render;
 mod mqtt;
@@ -2447,6 +2449,11 @@ fn main() {
         let (share_tx, share_rx) = mpsc::channel::<MiningEvent>();
         let nominal_hashrate_ghs =
             expected_hashrate_ghs(asic_model, config.target_frequency, asic_count);
+
+        // Solo mesh empty-block path: park a NewJob sender for the LoRa task
+        // (fail-closed until mesh config enables solo_mesh_empty).
+        #[cfg(feature = "lora")]
+        mesh_solo_runtime::park_event_tx(event_tx.clone());
 
         // Primary stratum thread
         let stratum_config = config.stratum.clone();

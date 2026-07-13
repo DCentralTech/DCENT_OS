@@ -1,0 +1,142 @@
+{
+  "schema_version": 1,
+  "algorithm": {
+    "id": "bm13xx-host-command-crc5",
+    "width": 5,
+    "polynomial_hex": "05",
+    "initial_value_hex": "1f",
+    "reflect_input": false,
+    "reflect_output": false,
+    "xor_output_hex": "00",
+    "bit_order": "msb-first",
+    "coverage": "command body only; exclude 55aa preamble and CRC trailer"
+  },
+  "positive_vectors": [
+    {
+      "id": "sniff-bm1397-get-address",
+      "direction": "host-to-asic",
+      "body_hex": "52050000",
+      "trailer_hex": "0a",
+      "full_frame_hex": "55aa520500000a",
+      "evidence": [
+        {
+          "kind": "independent-sniff",
+          "path": "",
+          "lines": "2,7"
+        },
+        {
+          "kind": "dcent-live-command-with-108-responses",
+          "path": "",
+          "lines": "15,138"
+        }
+      ]
+    },
+    {
+      "id": "sniff-bm1397-chain-inactive",
+      "direction": "host-to-asic",
+      "body_hex": "53050000",
+      "trailer_hex": "03",
+      "full_frame_hex": "55aa5305000003",
+      "evidence": [{"kind": "independent-sniff", "path": "", "lines": "2,9-11"}]
+    },
+    {
+      "id": "sniff-bm1397-set-address-zero",
+      "direction": "host-to-asic",
+      "body_hex": "40050000",
+      "trailer_hex": "1c",
+      "full_frame_hex": "55aa400500001c",
+      "evidence": [{"kind": "independent-sniff", "path": "", "lines": "2,12"}]
+    },
+    {
+      "id": "sniff-bm1397-clock-order-control-zero",
+      "direction": "host-to-asic",
+      "body_hex": "5109008000000000",
+      "trailer_hex": "1c",
+      "full_frame_hex": "55aa51090080000000001c",
+      "evidence": [{"kind": "independent-sniff", "path": "", "lines": "2,13"}]
+    },
+    {
+      "id": "sniff-bm1397-clock-order-control-one",
+      "direction": "host-to-asic",
+      "body_hex": "5109008400000000",
+      "trailer_hex": "11",
+      "full_frame_hex": "55aa510900840000000011",
+      "evidence": [{"kind": "independent-sniff", "path": "", "lines": "2,14"}]
+    },
+    {
+      "id": "sniff-bm1397-ordered-clock-enable",
+      "direction": "host-to-asic",
+      "body_hex": "5109002000000001",
+      "trailer_hex": "02",
+      "full_frame_hex": "55aa510900200000000102",
+      "evidence": [{"kind": "independent-sniff", "path": "", "lines": "2,15"}]
+    },
+    {
+      "id": "sniff-bm1397-core-clock-control",
+      "direction": "host-to-asic",
+      "body_hex": "5109003c80008074",
+      "trailer_hex": "10",
+      "full_frame_hex": "55aa5109003c8000807410",
+      "evidence": [{"kind": "independent-sniff", "path": "", "lines": "2,16"}]
+    },
+    {
+      "id": "sniff-bm1397-ticket-mask-zero",
+      "direction": "host-to-asic",
+      "body_hex": "5109001400000000",
+      "trailer_hex": "1c",
+      "full_frame_hex": "55aa51090014000000001c",
+      "evidence": [{"kind": "independent-sniff", "path": "", "lines": "2,17"}]
+    },
+    {
+      "id": "sniff-bm1397-pll3-parameter",
+      "direction": "host-to-asic",
+      "body_hex": "51090068c0700111",
+      "trailer_hex": "00",
+      "full_frame_hex": "55aa51090068c070011100",
+      "evidence": [{"kind": "independent-sniff", "path": "", "lines": "2,18-19"}]
+    },
+    {
+      "id": "sniff-bm1397-fast-uart",
+      "direction": "host-to-asic",
+      "body_hex": "510900280600000f",
+      "trailer_hex": "18",
+      "full_frame_hex": "55aa510900280600000f18",
+      "evidence": [{"kind": "independent-sniff", "path": "", "lines": "2,20"}]
+    },
+    {
+      "id": "sniff-bm1397-misc-control",
+      "direction": "host-to-asic",
+      "body_hex": "5109001800007a31",
+      "trailer_hex": "15",
+      "full_frame_hex": "55aa5109001800007a3115",
+      "evidence": [{"kind": "independent-sniff", "path": "", "lines": "2,21"}]
+    },
+    {
+      "id": "sniff-bm1397-pll0-divider",
+      "direction": "host-to-asic",
+      "body_hex": "510900700f0f0f00",
+      "trailer_hex": "19",
+      "full_frame_hex": "55aa510900700f0f0f0019",
+      "evidence": [{"kind": "independent-sniff", "path": "", "lines": "2,22-23"}]
+    },
+    {
+      "id": "sniff-bm1397-pll0-parameter",
+      "direction": "host-to-asic",
+      "body_hex": "5109000840a00225",
+      "trailer_hex": "16",
+      "full_frame_hex": "55aa5109000840a0022516",
+      "evidence": [{"kind": "independent-sniff", "path": "", "lines": "2,24-25"}]
+    }
+  ],
+  "negative_vectors": [
+    {
+      "id": "am3-live-bm1362-response-trailer-is-not-command-crc",
+      "direction": "asic-to-host",
+      "body_hex": "136203000000",
+      "observed_trailer_hex": "0d",
+      "full_frame_hex": "aa551362030000000d",
+      "assertion": "command_crc_must_not_equal_observed_trailer",
+      "evidence": [{"kind": "dcent-live-accepted-share-capture", "path": "DCENT_OS_Antminer/dcentrald/dcentrald/src/am3_bb_mining.rs", "lines": "5116-5120,5187-5200"}]
+    }
+  ]
+}

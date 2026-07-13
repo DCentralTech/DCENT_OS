@@ -85,7 +85,6 @@
 <div class="row">
   <button onclick="restartDaemon()">Restart dcentrald</button>
   <button class="ghost" onclick="reportIp()">Report IP (broadcast)</button>
-  <button class="ghost" onclick="runDspicProbe()">Run dspic-flash proto-probe</button>
   <button class="ghost" onclick="refresh()">Refresh now</button>
   <span class="key" style="margin-left:auto">Auto-refresh: every 5s</span>
 </div>
@@ -115,13 +114,6 @@
   </div>
 
   <div class="panel">
-    <h2>dsPIC probe (single-byte read at I2C bus 0)</h2>
-    <table id="dspic-tbl">
-      <tr><th>Address</th><th>Present</th><th>Raw byte</th><th>Notes</th></tr>
-    </table>
-  </div>
-
-  <div class="panel">
     <h2>FPGA UART relay (read-only mirrors per Wave 1-4)</h2>
     <table id="fpga-tbl">
       <tr><th>Register</th><th>Value</th></tr>
@@ -136,11 +128,6 @@
   <div class="panel full">
     <h2>dcentrald log tail</h2>
     <pre id="log-tail">—</pre>
-  </div>
-
-  <div class="panel full">
-    <h2>dspic-flash proto-probe (run on demand)</h2>
-    <pre id="dspic-probe">Click "Run dspic-flash proto-probe" to query the dsPIC at 0x21.</pre>
   </div>
 
 </div>
@@ -170,16 +157,6 @@ function fmtUptime(s) {
   if (s < 3600) return Math.floor(s/60) + "m " + (s%60) + "s";
   return Math.floor(s/3600) + "h " + Math.floor((s%3600)/60) + "m";
 }
-function fwHint(raw) {
-  if (!raw) return "";
-  const v = parseInt(raw, 16);
-  if (v === 0x82) return "fw=0x82 (production)";
-  if (v === 0x86) return "fw=0x86 (LOCKED — downgraded)";
-  if (v === 0x89) return "fw=0x89 (production)";
-  if (v === 0x8A) return "fw=0x8A (production)";
-  if (v === 0xff) return "0xFF (silent)";
-  return "unknown";
-}
 async function refresh() {
   try {
     const r = await fetch("/api/dashboard/health", { cache: "no-store" });
@@ -200,18 +177,6 @@ async function refresh() {
     if (d.slot) {
       $("slot").textContent = d.slot.firmware || "—";
       $("upgrade-stage").textContent = d.slot.upgrade_stage || "—";
-    }
-    const dspicTbl = $("dspic-tbl");
-    dspicTbl.innerHTML = "<tr><th>Address</th><th>Present</th><th>Raw byte</th><th>Notes</th></tr>";
-    if (d.dspic_probe) {
-      for (const [addr, info] of Object.entries(d.dspic_probe)) {
-        const tr = document.createElement("tr");
-        const presentTd = `<td class="${info.present ? "ok" : "bad"}">${info.present ? "yes" : "no"}</td>`;
-        const rawTd = `<td>${info.raw_byte || info.error || "—"}</td>`;
-        const noteTd = `<td>${info.present ? fwHint(info.raw_byte) : ""}</td>`;
-        tr.innerHTML = `<td>${addr}</td>${presentTd}${rawTd}${noteTd}`;
-        dspicTbl.appendChild(tr);
-      }
     }
     const fpgaTbl = $("fpga-tbl");
     fpgaTbl.innerHTML = "<tr><th>Register</th><th>Value</th></tr>";
@@ -247,14 +212,6 @@ async function reportIp() {
     const d = await r.json();
     notify("IP report broadcast (" + (d.method || d.status) + ")");
   } catch (e) { notify("Error: " + e.message); }
-}
-async function runDspicProbe() {
-  $("dspic-probe").textContent = "Probing 0x21...";
-  try {
-    const r = await fetch("/api/dashboard/dspic-flash-probe");
-    const d = await r.json();
-    $("dspic-probe").textContent = JSON.stringify(d, null, 2);
-  } catch (e) { $("dspic-probe").textContent = "Error: " + e.message; }
 }
 refresh();
 setInterval(refresh, 5000);

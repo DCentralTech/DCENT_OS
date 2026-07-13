@@ -80,8 +80,12 @@ file_md5() {
         md5sum "$1" | awk '{print $1}'
     elif command -v md5 >/dev/null 2>&1; then
         md5 -q "$1"
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -md5 "$1" | awk '{print $NF}'
     else
-        echo ""
+        # Fail closed: empty MD5 would skip the stock-XIL denylist.
+        echo "ERROR: no md5sum/md5/openssl available to hash BOOT.bin" >&2
+        return 2
     fi
 }
 
@@ -126,8 +130,12 @@ else
         echo "ERROR: BOOT.bin size $BOOT_SZ outside 20KiB..5MiB valid Zynq range" >&2
         errors=1
     fi
-    BOOT_MD5=$(file_md5 "$BOOT_SRC")
-    if [ -n "$BOOT_MD5" ]; then
+    if ! BOOT_MD5=$(file_md5 "$BOOT_SRC"); then
+        errors=1
+    elif [ -z "$BOOT_MD5" ]; then
+        echo "ERROR: could not compute BOOT.bin md5 (fail-closed stock denylist)" >&2
+        errors=1
+    else
         case "$STOCK_XIL_BOOT_MD5S" in
             *"$BOOT_MD5"*)
                 echo "ERROR: BOOT.bin md5 $BOOT_MD5 matches known stock XIL signed image" >&2

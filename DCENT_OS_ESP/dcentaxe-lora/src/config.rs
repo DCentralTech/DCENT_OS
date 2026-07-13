@@ -43,13 +43,45 @@ pub struct MeshConfig {
     /// 32-byte owner HMAC key as lowercase hex; empty ⇒ **unprovisioned** ⇒ the
     /// command gate refuses ALL over-the-air control (fail-closed).
     pub owner_key_hex: String,
-    /// 32-byte AES channel PSK as hex for Phase-2 Meshtastic interop; empty ⇒
-    /// none. Reserved — not consumed until the interop pass.
+    /// Meshtastic channel PSK as hex (Phase-2 interop). Variable length per
+    /// Meshtastic: empty ⇒ the default public channel (well-known key); 1 byte ⇒
+    /// a default-key selector; 16 bytes ⇒ AES-128; 32 bytes ⇒ AES-256. Consumed
+    /// by [`meshtastic_channel`](Self::meshtastic_channel).
     pub channel_psk_hex: String,
     /// Telemetry beacon cadence (seconds); see [`effective_telemetry_interval_s`](Self::effective_telemetry_interval_s).
     pub telemetry_interval_s: u16,
-    /// Phase-4: allow the offline solo tip-relay mining path (see the fork plan).
+    /// Phase-4: master enable for offline solo tip-relay mining (default OFF).
+    /// Also requires a non-empty [`solo_payout_address`] and
+    /// `mining_source == "solo_mesh_empty"`.
     pub solo_relay_enabled: bool,
+    /// Work source for mesh solo: `"off"` (default) | `"solo_mesh_empty"`.
+    /// Pool mining is the normal stratum path; this only gates mesh tip work.
+    pub mining_source: String,
+    /// Payout address for solo coinbase (bc1/bcrt1/…). Empty ⇒ solo path
+    /// stays disabled even if solo_relay_enabled (fail-closed).
+    pub solo_payout_address: String,
+    /// Solo chain policy: `"regtest"` (default) | `"testnet"` | `"mainnet"`.
+    pub solo_chain: String,
+
+    // ── Phase-2 Meshtastic interop ────────────────────────────────────────────
+    /// Run the radio as a **Meshtastic Router** instead of a native `$DCM` node.
+    /// A single SX1262 is on ONE sync word/modulation at a time, so this selects
+    /// the radio's operating mode. OFF by default (a plain `$DCM` mesh node).
+    /// Only honoured when the binary is built with the `meshtastic` feature.
+    pub meshtastic_mode: bool,
+    /// Meshtastic channel name; empty ⇒ the modem-preset name (e.g. `"LongFast"`),
+    /// matching Meshtastic's unnamed-channel behaviour. Feeds the channel hash.
+    pub meshtastic_channel_name: String,
+    /// Meshtastic modem preset token (`"LongFast"` default | `"ShortFast"` | …);
+    /// see [`ModemPreset`](crate::meshtastic::ModemPreset).
+    pub meshtastic_preset: String,
+    /// Explicit channel centre frequency (Hz); `0` ⇒ use the region LongFast
+    /// default. Read it from your Meshtastic app (Radio Config → LoRa) for a
+    /// non-LongFast channel — the exact slot is not re-derived here (see `phy`).
+    pub meshtastic_freq_hz: u32,
+    /// Our Meshtastic short name (≤ 4 chars on the wire); empty ⇒ derived from the
+    /// board model by the binary.
+    pub meshtastic_short_name: String,
 }
 
 impl Default for MeshConfig {
@@ -63,6 +95,14 @@ impl Default for MeshConfig {
             channel_psk_hex: String::new(),
             telemetry_interval_s: DEFAULT_TELEMETRY_INTERVAL_S,
             solo_relay_enabled: false,
+            mining_source: "off".into(),
+            solo_payout_address: String::new(),
+            solo_chain: "regtest".into(),
+            meshtastic_mode: false,
+            meshtastic_channel_name: String::new(),
+            meshtastic_preset: "LongFast".into(),
+            meshtastic_freq_hz: 0,
+            meshtastic_short_name: String::new(),
         }
     }
 }
@@ -90,10 +130,73 @@ impl MeshConfig {
         self.telemetry_interval_s.max(MIN_TELEMETRY_INTERVAL_S)
     }
 
+    /// `true` when operator opted into solo mesh empty-block work.
+    /// Fail-closed: requires solo_relay_enabled + mining_source token + payout.
+    pub fn solo_mesh_empty_active(&self) -> bool {
+        self.solo_relay_enabled
+            && self.mining_source.eq_ignore_ascii_case("solo_mesh_empty")
+            && !self.solo_payout_address.trim().is_empty()
+    }
+
     /// `true` once an owner key is provisioned (air control is possible).
     pub fn is_provisioned(&self) -> bool {
         self.owner_key().is_some()
     }
+
+    /// The Meshtastic channel PSK as raw bytes: empty hex ⇒ `[1]` (the default
+    /// public-channel key selector); otherwise the parsed hex bytes (any length —
+    /// [`meshtastic_channel`](Self::meshtastic_channel) validates 1/16/32). Malformed
+    /// hex also falls back to the default public key rather than an empty PSK, so a
+    /// typo can never silently drop a private channel to *plaintext*.
+    pub fn meshtastic_psk_bytes(&self) -> Vec<u8> {
+        let h = self.channel_psk_hex.trim();
+        if h.is_empty() {
+            return vec![1];
+        }
+        parse_hex_bytes(h).unwrap_or_else(|| vec![1])
+    }
+
+    /// The resolved [`ModemPreset`](crate::meshtastic::ModemPreset) — defaults to
+    /// `LongFast` if the token is unrecognized.
+    #[cfg(feature = "meshtastic-interop")]
+    pub fn meshtastic_modem_preset(&self) -> crate::meshtastic::ModemPreset {
+        crate::meshtastic::ModemPreset::from_name(&self.meshtastic_preset).unwrap_or_default()
+    }
+
+    /// The resolved Meshtastic [`Channel`](crate::meshtastic::Channel), or `None`
+    /// when the PSK length is invalid (⇒ the caller should not enter Meshtastic
+    /// mode). An empty channel name uses the preset name for the channel hash.
+    #[cfg(feature = "meshtastic-interop")]
+    pub fn meshtastic_channel(&self) -> Option<crate::meshtastic::Channel> {
+        crate::meshtastic::Channel::new(&self.meshtastic_channel_name, &self.meshtastic_psk_bytes())
+    }
+
+    /// The resolved [`MeshtasticPhyConfig`](crate::meshtastic::MeshtasticPhyConfig)
+    /// to program the radio. Uses the configured frequency, or `default_freq_hz`
+    /// (the caller-supplied region LongFast default) when `meshtastic_freq_hz == 0`.
+    #[cfg(feature = "meshtastic-interop")]
+    pub fn meshtastic_phy(&self, default_freq_hz: u32) -> crate::meshtastic::MeshtasticPhyConfig {
+        let freq = if self.meshtastic_freq_hz != 0 {
+            self.meshtastic_freq_hz
+        } else {
+            default_freq_hz
+        };
+        crate::meshtastic::MeshtasticPhyConfig::new(self.meshtastic_modem_preset(), freq)
+    }
+}
+
+/// Parse an even-length hex string into bytes, or `None` on odd length / non-hex.
+fn parse_hex_bytes(hex: &str) -> Option<Vec<u8>> {
+    let h = hex.trim();
+    if h.len() % 2 != 0 {
+        return None;
+    }
+    let b = h.as_bytes();
+    let mut out = Vec::with_capacity(h.len() / 2);
+    for i in 0..h.len() / 2 {
+        out.push((hexval(b[2 * i])? << 4) | hexval(b[2 * i + 1])?);
+    }
+    Some(out)
 }
 
 /// Parse exactly 32 bytes of lowercase/uppercase hex, or `None`.
@@ -129,11 +232,25 @@ mod tests {
         assert!(!c.enabled);
         assert_eq!(c.role(), RelayRole::Router);
         assert!(!c.is_provisioned());
+        assert!(!c.solo_mesh_empty_active(), "solo mesh fail-closed by default");
+        assert_eq!(c.mining_source, "off");
+        assert_eq!(c.solo_chain, "regtest");
         assert_eq!(c.owner_key(), None);
         assert_eq!(
             c.effective_telemetry_interval_s(),
             DEFAULT_TELEMETRY_INTERVAL_S
         );
+    }
+
+    #[test]
+    fn solo_mesh_empty_requires_all_three_gates() {
+        let mut c = MeshConfig::default();
+        c.solo_relay_enabled = true;
+        assert!(!c.solo_mesh_empty_active());
+        c.mining_source = "solo_mesh_empty".into();
+        assert!(!c.solo_mesh_empty_active());
+        c.solo_payout_address = "bcrt1qtest".into();
+        assert!(c.solo_mesh_empty_active());
     }
 
     #[test]
@@ -198,5 +315,93 @@ mod tests {
             ..MeshConfig::default()
         };
         assert_eq!(c.effective_telemetry_interval_s(), MIN_TELEMETRY_INTERVAL_S);
+    }
+
+    #[test]
+    fn meshtastic_defaults_off_and_longfast() {
+        let c = MeshConfig::default();
+        assert!(!c.meshtastic_mode);
+        assert_eq!(c.meshtastic_preset, "LongFast");
+        assert_eq!(c.meshtastic_freq_hz, 0);
+    }
+
+    #[test]
+    fn meshtastic_psk_bytes_defaults_to_public_key_selector() {
+        let mut c = MeshConfig::default();
+        // Empty ⇒ the [1] default public-channel selector.
+        assert_eq!(c.meshtastic_psk_bytes(), vec![1]);
+        // Explicit 1-byte selector.
+        c.channel_psk_hex = "01".into();
+        assert_eq!(c.meshtastic_psk_bytes(), vec![1]);
+        // A 32-byte private key parses to its 32 bytes.
+        c.channel_psk_hex = "ab".repeat(32);
+        assert_eq!(c.meshtastic_psk_bytes(), vec![0xab; 32]);
+        // Malformed hex falls back to the public selector (never plaintext).
+        c.channel_psk_hex = "zz".into();
+        assert_eq!(c.meshtastic_psk_bytes(), vec![1]);
+        c.channel_psk_hex = "abc".into(); // odd length
+        assert_eq!(c.meshtastic_psk_bytes(), vec![1]);
+    }
+
+    #[test]
+    fn meshtastic_fields_round_trip_and_legacy_blob_defaults_them() {
+        let c = MeshConfig {
+            meshtastic_mode: true,
+            meshtastic_channel_name: "MyMesh".into(),
+            meshtastic_preset: "ShortFast".into(),
+            meshtastic_freq_hz: 906_875_000,
+            meshtastic_short_name: "DCAX".into(),
+            ..MeshConfig::default()
+        };
+        let back: MeshConfig = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(c, back);
+        // A legacy blob without the meshtastic keys defaults them (no error).
+        let legacy: MeshConfig = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert!(!legacy.meshtastic_mode);
+        assert_eq!(legacy.meshtastic_preset, "LongFast");
+    }
+
+    #[cfg(feature = "meshtastic-interop")]
+    #[test]
+    fn meshtastic_resolvers_produce_typed_values() {
+        use crate::meshtastic::ModemPreset;
+
+        // Default: unnamed LongFast channel on the default public key → hash 0x08.
+        let c = MeshConfig::default();
+        assert_eq!(c.meshtastic_modem_preset(), ModemPreset::LongFast);
+        let ch = c.meshtastic_channel().expect("default channel resolves");
+        assert_eq!(ch.name, "LongFast");
+        assert_eq!(ch.hash(), 0x08);
+
+        // freq default is used when meshtastic_freq_hz == 0.
+        let phy = c.meshtastic_phy(906_875_000);
+        assert_eq!(phy.freq_hz, 906_875_000);
+        assert_eq!(phy.sf, 11);
+
+        // An explicit frequency overrides the default; preset token honoured.
+        let c2 = MeshConfig {
+            meshtastic_preset: "ShortFast".into(),
+            meshtastic_freq_hz: 869_525_000,
+            ..MeshConfig::default()
+        };
+        assert_eq!(c2.meshtastic_modem_preset(), ModemPreset::ShortFast);
+        assert_eq!(c2.meshtastic_phy(906_875_000).freq_hz, 869_525_000);
+
+        // A custom named + 32-byte-PSK channel resolves to AES-256.
+        let c3 = MeshConfig {
+            meshtastic_channel_name: "Private".into(),
+            channel_psk_hex: "5a".repeat(32),
+            ..MeshConfig::default()
+        };
+        let ch3 = c3.meshtastic_channel().unwrap();
+        assert_eq!(ch3.name, "Private");
+        assert!(ch3.key.is_encrypted());
+
+        // An invalid PSK length ⇒ no channel (caller must not enter mesh mode).
+        let bad = MeshConfig {
+            channel_psk_hex: "abcd".into(), // 2 bytes → invalid Meshtastic PSK len
+            ..MeshConfig::default()
+        };
+        assert!(bad.meshtastic_channel().is_none());
     }
 }

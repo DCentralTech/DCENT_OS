@@ -23,6 +23,13 @@ members = [
     "pic-recovery",
     "dcentos-init",
 ]
+
+# Normal workspace builds intentionally omit the standalone controller tools.
+# `pic-recovery` remains a member so it shares the lockfile and can be tested
+# explicitly with `-p pic-recovery`. Unqualified workspace builds omit it;
+# `--workspace` and `--all` override `default-members`, so release drivers must
+# not use those flags (the offline boundary test enforces this). Keep this list
+# equal to `members` except for `pic-recovery`.
 default-members = [
     "dcentrald",
     "dcentrald-hal",
@@ -41,7 +48,6 @@ default-members = [
     "dcentrald-bridge",
     "dcentos-init",
 ]
-
 
 # Single source of truth for the DCENT_OS daemon stack version.
 # Propagated to all member crates via `version.workspace = true` in their

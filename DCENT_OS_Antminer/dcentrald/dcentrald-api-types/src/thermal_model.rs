@@ -271,12 +271,27 @@ pub enum FanSafetyTrigger {
 /// safety trigger. Returns the mode-cap PWM in every safety case (always at
 /// or below the fan_ctrl IP ceiling of 100 — never 127, even for
 /// HashrateMax).
+///
+/// # Policy chokepoint (cycle-3)
+///
+/// Delegates clamping to [`dcentrald_common::FanCommand`] so emergency/home
+/// paths share one effective-PWM formula with HAL `PWM_SAFETY_MAX` (30) and
+/// cannot reintroduce industrial “fans 100%” on QuietHome/Home modes.
 pub fn safe_fan_pwm(mode: FanMode, trigger: Option<FanSafetyTrigger>, requested: u8) -> u8 {
+    use dcentrald_common::FanCommand;
+
     let cap = mode.safety_cap_pwm();
-    if trigger.is_some() {
-        return cap;
+    // Residential modes always intersect HOME_FAN_PWM_SAFETY_MAX.
+    // Balanced/Advanced/HashrateMax are explicit industrial opt-ins and use
+    // the mode cap only (matches historical safe_fan_pwm behavior).
+    let apply_home_safety_cap = matches!(mode, FanMode::QuietHome | FanMode::Home);
+    let requested = if trigger.is_some() { cap } else { requested };
+    FanCommand {
+        profile_max_pwm: cap,
+        requested_pwm: requested,
+        apply_home_safety_cap,
     }
-    requested.min(cap)
+    .effective_pwm()
 }
 
 // ---------------------------------------------------------------------------

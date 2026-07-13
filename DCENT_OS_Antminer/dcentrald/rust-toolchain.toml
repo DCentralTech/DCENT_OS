@@ -1,0 +1,15 @@
+# Pins the DCENT_OS daemon toolchain so every clone builds with the exact
+# version CI and `make release` already enforce (1.90.0 — see DCENT_OS_Antminer/
+#  and the Makefile `rustup run 1.90.0` gate). The sibling crates
+# dcentos-esp/, dcentaxe-avalon/, and dcentos-avalon/ already pin their
+# toolchain; the PRIMARY daemon workspace did not, so a fresh `cargo build` used
+# whatever toolchain the contributor happened to have. This makes the pinned
+# toolchain the source of truth at clone time, not just in CI.
+[toolchain]
+channel = "1.90.0"
+components = ["rustfmt", "clippy"]
+targets = [
+    "armv7-unknown-linux-musleabihf",
+    "aarch64-unknown-linux-musl",
+]
+profile = "minimal"

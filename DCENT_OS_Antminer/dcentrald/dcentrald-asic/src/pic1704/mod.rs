@@ -45,31 +45,27 @@
 //! - **No raw I2C.** The service routes all I/O through `I2cServiceHandle`,
 //!   honoring the AM2 SINGLE-I2C-OWNER rule (one process owns
 //!   `/dev/i2c-N`).
-//! - **RESET is compile-gated.** `Pic1704Service::reset` only exists when
-//!   the `recovery-tool` Cargo feature is enabled. The production
-//!   `dcentrald` binary does not enable that feature, so calling
-//!   `reset()` from the daemon is a compile error. See
+//! - **RESET is research/test-only.** `Pic1704Service::reset` only exists
+//!   behind the `recovery-tool` Cargo feature. No shipped package enables
+//!   that feature, so neither `dcentrald` nor the diagnostic-only
+//!   `pic-recovery` package can link the method. See
 //!   .
-//! - **Programmer ops are recovery-tool ONLY.** The bootloader
+//! - **Programmer ops are protocol research only.** The bootloader
 //!   programmer surface (`pic_seek_1704`, `pic_erase_1704`,
 //!   `pic_write_1704`, `pic_start_app_common`) lives in
 //!   [`programmer`] and only exists when `recovery-tool` is enabled.
-//!   Production `dcentrald` cannot link them — calling any programmer
-//!   op from the daemon is a compile error. Each op also requires a
-//!   [`programmer::ConfirmedBrickedToken`] (mintable only via the
-//!   recovery binary's `--confirm-bricked` flow) and a runtime
-//!   `version == VER_BOOTLOADER` check. See `programmer.rs` for the
-//!   full safety contract.
+//!   No shipped consumer enables it. The token and bootloader-state checks
+//!   preserve research invariants; they are not sufficient deployment
+//!   authority. Any future mutating executor requires a separate, typed
+//!   controller-recovery authority architecture.
 
 pub mod protocol;
 pub mod service;
 
-/// Bootloader programmer ops — **recovery-tool ONLY**. Linked in only
-/// when the `recovery-tool` Cargo feature is enabled. Production
-/// `dcentrald` cannot reach these symbols. See module-level docs for
-/// the layered safety contract (compile-time gate + sealed-trait
-/// platform whitelist + `ConfirmedBrickedToken` runtime gate +
-/// version-must-be-bootloader precondition).
+/// Bootloader programmer protocol research — available only when the
+/// `recovery-tool` Cargo feature is enabled for host tests or explicit
+/// research builds. No shipped package enables the feature. The internal
+/// guards are research invariants, not authority for a runtime executor.
 #[cfg(feature = "recovery-tool")]
 pub mod programmer;
 
@@ -77,13 +73,13 @@ pub mod programmer;
 /// from `programmer` (W11.7 BraiinsOS-shared register-style 0x01/0x05/0x09)
 /// — uses framed REG_CMD ordinals 0x10-0x15 from the W4 handoff
 /// `pic1704_v2.{c,h}`. Host-side wire-format helpers + collision-guard
-/// against REG_VOLTAGE_L=0x10 in app mode. Recovery-tool feature gated;
-/// production `dcentrald` cannot link.
+/// against REG_VOLTAGE_L=0x10 in app mode. Research/test-only behind
+/// `recovery-tool`; no shipped package enables the feature.
 ///
 /// Honest confidence label: framed protocol bytes are inferred from RE C
 /// source; known-good CRC test vectors in handoff are still 0x????
-/// placeholders. CLI uses `--i-acknowledge-pic1704-framed-inferred`,
-/// NOT `--i-acknowledge-90-percent`.
+/// placeholders. A future executor must carry this uncertainty through the
+/// separate controller-recovery authority contract.
 #[cfg(feature = "recovery-tool")]
 pub mod programmer_v2;
 
@@ -93,21 +89,21 @@ pub mod programmer_v2;
 /// `_update_pic_app_program_1704.c`. Wire format:
 /// `0x55` magic + additive-sum checksum + 2-phase write + 300 ms wait.
 /// Distinct from W14.C V2 which uses REG_CMD 0x10-0x15 + CRC-ITU-T V.41
-/// + single-phase write. Recovery-tool feature gated; production
-/// `dcentrald` cannot link. Coexists with `programmer_v2`; routing
-/// decision lives in [`reflash`].
+/// + single-phase write. Research/test-only behind `recovery-tool`; no
+/// shipped package enables the feature. Coexists with `programmer_v2`;
+/// routing research lives in [`reflash`].
 #[cfg(feature = "recovery-tool")]
 pub mod programmer_stock;
 
 /// PIC1704 reflash auto-detection wrapper (W15.B3). Routes to either
 /// [`programmer_stock`] (PRIMARY) or [`programmer_v2`] (fallback) based
-/// on a stock-SEEK probe ACK pattern. Recovery-tool feature gated.
+/// on a stock-SEEK probe ACK pattern. Research/test-only behind
+/// `recovery-tool`; it has no shipped transport consumer.
 #[cfg(feature = "recovery-tool")]
 pub mod reflash;
 
 // W14.C re-exports: keep the framed-protocol surface available at the
-// `pic1704::` prefix so CLI / pic-recovery callers don't need to
-// reach into the submodule.
+// `pic1704::` prefix for host tests and explicit protocol research.
 #[cfg(feature = "recovery-tool")]
 pub use programmer_v2::{
     collision_guard, compute_crc_host, decode_verify_response, erase_steps_v2,

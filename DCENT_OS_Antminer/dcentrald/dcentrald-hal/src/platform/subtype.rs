@@ -58,10 +58,244 @@
 //! `None` and the I²C probe returns `false`, so unit tests run without
 //! touching `/dev/`.
 
+use crate::i2c::{I2cPicFirmware, I2cServiceHandle};
 use crate::platform::config::VoltageControllerKind;
+
+/// Opaque authority to construct a voltage-controller service at one
+/// discovery-bound I2C endpoint.
+///
+/// The family, bus and address are readable for diagnostics, but the fields
+/// and constructor are private. A caller therefore cannot turn a config file,
+/// model guess, or arbitrary address into permission to issue energizing wire
+/// commands. Obtain this value only through
+/// [`discover_system_voltage_controller_endpoint`], which reads the system
+/// subtype and performs the required non-payload presence probe itself.
+///
+/// ```compile_fail
+/// use dcentrald_hal::platform::{VoltageControllerEndpoint, VoltageControllerKind};
+///
+/// // Private fields prevent caller-asserted protocol/address capabilities.
+/// let _forged = VoltageControllerEndpoint {
+///     kind: VoltageControllerKind::Dspic33Ep,
+///     bus: 0,
+///     address: 0x20,
+/// };
+/// ```
+#[derive(Debug, PartialEq, Eq)]
+pub struct VoltageControllerEndpoint {
+    kind: VoltageControllerKind,
+    bus: u8,
+    address: u8,
+    observed_firmware: Option<u8>,
+}
+
+impl VoltageControllerEndpoint {
+    /// Confirmed protocol family. This is observational metadata, not a
+    /// constructor input.
+    pub fn kind(&self) -> VoltageControllerKind {
+        self.kind
+    }
+
+    /// I2C bus on which the family-presence observation was made.
+    pub fn bus(&self) -> u8 {
+        self.bus
+    }
+
+    /// Topology-validated controller address bound to this capability.
+    pub fn address(&self) -> u8 {
+        self.address
+    }
+
+    /// Firmware byte observed while issuing this endpoint, when the discovery
+    /// route performed a protocol-specific version transaction. `None` means
+    /// family/address presence was proven without firmware-revision evidence.
+    pub fn observed_firmware(&self) -> Option<u8> {
+        self.observed_firmware
+    }
+
+    pub(super) fn from_observed_am2(address: u8, firmware: u8) -> Self {
+        Self {
+            kind: VoltageControllerKind::Dspic33Ep,
+            bus: 0,
+            address,
+            observed_firmware: Some(firmware),
+        }
+    }
+}
+
+/// Why system discovery could not issue an endpoint capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoltageControllerEndpointError {
+    /// Discovery was unknown, contradictory, or positively found no
+    /// controller. These states can never be projected into authority.
+    DiscoveryNotConfirmed(VoltageControllerDiscoveryStatus),
+    /// The exact family is known, but this discovery route does not yet have a
+    /// presence-validated topology from which an endpoint can be issued.
+    TopologyNotPresenceValidated(VoltageControllerKind),
+    /// The caller-selected bus is not the bus pinned by the exact carrier +
+    /// hashboard identity table.
+    BusOutsideTopology {
+        kind: VoltageControllerKind,
+        bus: u8,
+        expected_bus: u8,
+    },
+    /// The requested address is outside the documented topology for the
+    /// confirmed family.
+    AddressOutsideTopology {
+        kind: VoltageControllerKind,
+        address: u8,
+    },
+    /// The exact requested endpoint did not ACK the non-payload probe. A
+    /// family anchor elsewhere on the bus is not enough.
+    EndpointPresenceNotObserved { bus: u8, address: u8 },
+}
+
+impl std::fmt::Display for VoltageControllerEndpointError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DiscoveryNotConfirmed(status) => {
+                write!(
+                    f,
+                    "voltage-controller discovery is not confirmed: {status:?}"
+                )
+            }
+            Self::TopologyNotPresenceValidated(kind) => write!(
+                f,
+                "voltage-controller topology is not presence-validated for {}",
+                kind.as_str()
+            ),
+            Self::BusOutsideTopology {
+                kind,
+                bus,
+                expected_bus,
+            } => write!(
+                f,
+                "I2C bus {bus} is outside the confirmed {} topology (expected bus {expected_bus})",
+                kind.as_str()
+            ),
+            Self::AddressOutsideTopology { kind, address } => write!(
+                f,
+                "I2C address 0x{address:02X} is outside the confirmed {} topology",
+                kind.as_str()
+            ),
+            Self::EndpointPresenceNotObserved { bus, address } => write!(
+                f,
+                "no voltage-controller presence observed on I2C bus {bus} address 0x{address:02X}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VoltageControllerEndpointError {}
+
+/// Evidence-level outcome of voltage-controller discovery.
+///
+/// This is intentionally not a capability: callers cannot construct a bound
+/// I2C endpoint from it. The follow-up endpoint API will consume the private
+/// evidence held by [`VoltageControllerDiscovery`] inside the HAL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoltageControllerDiscoveryStatus {
+    /// Exact platform evidence and any required presence probe agree.
+    Confirmed(VoltageControllerKind),
+    /// Exact, documented hardware identity positively specifies no controller.
+    NoController,
+    /// Evidence is missing or not in the versioned identity table.
+    Unknown,
+    /// Two observations disagree; no controller protocol may be selected.
+    Contradictory,
+}
+
+/// Read-only discovery result. Fields and construction remain private so this
+/// cannot become a caller-asserted family capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoltageControllerDiscovery {
+    status: VoltageControllerDiscoveryStatus,
+    detail: &'static str,
+}
+
+impl VoltageControllerDiscovery {
+    pub fn status(&self) -> VoltageControllerDiscoveryStatus {
+        self.status
+    }
+
+    /// True only when the HAL has enough agreeing evidence to bind a concrete
+    /// controller protocol. Unknown, contradictory and known-NoController
+    /// outcomes are always non-energizing.
+    pub fn energization_eligible(&self) -> bool {
+        matches!(
+            self.status,
+            VoltageControllerDiscoveryStatus::Confirmed(
+                VoltageControllerKind::Pic1704
+                    | VoltageControllerKind::Dspic33Ep
+                    | VoltageControllerKind::Pic16f1704
+            )
+        )
+    }
+
+    pub fn detail(&self) -> &'static str {
+        self.detail
+    }
+
+    /// Non-breaking projection for existing platform configuration. All
+    /// unresolved outcomes map to `NoPic`, which is the only compatibility
+    /// value that cannot select PIC/dsPIC wire bytes.
+    pub fn compatibility_kind(&self) -> VoltageControllerKind {
+        match self.status {
+            VoltageControllerDiscoveryStatus::Confirmed(kind) => kind,
+            VoltageControllerDiscoveryStatus::NoController
+            | VoltageControllerDiscoveryStatus::Unknown
+            | VoltageControllerDiscoveryStatus::Contradictory => VoltageControllerKind::NoPic,
+        }
+    }
+
+    fn confirmed(kind: VoltageControllerKind, detail: &'static str) -> Self {
+        Self {
+            status: VoltageControllerDiscoveryStatus::Confirmed(kind),
+            detail,
+        }
+    }
+
+    fn no_controller(detail: &'static str) -> Self {
+        Self {
+            status: VoltageControllerDiscoveryStatus::NoController,
+            detail,
+        }
+    }
+
+    fn unknown(detail: &'static str) -> Self {
+        Self {
+            status: VoltageControllerDiscoveryStatus::Unknown,
+            detail,
+        }
+    }
+
+    fn contradictory(detail: &'static str) -> Self {
+        Self {
+            status: VoltageControllerDiscoveryStatus::Contradictory,
+            detail,
+        }
+    }
+}
 
 /// Canonical `/etc/subtype` path on Linux. Static for ground-truthing.
 pub const SUBTYPE_PATH: &str = "/etc/subtype";
+
+/// Canonical runtime board identity written by DCENT_OS images.
+const BOARD_TARGET_PATH: &str = "/etc/dcentos/board_target";
+
+fn read_board_target() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(BOARD_TARGET_PATH)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
 
 /// Read `/etc/subtype` and return its trimmed contents.
 ///
@@ -105,7 +339,88 @@ pub fn read_subtype() -> Option<String> {
     }
 }
 
-/// Classify a `/etc/subtype` string into a `VoltageControllerKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubtypeExpectation {
+    ControllerAt0x20(VoltageControllerKind),
+    ControllerElsewhere(VoltageControllerKind),
+    NoController,
+    Unknown,
+}
+
+fn subtype_expectation(subtype: Option<&str>) -> SubtypeExpectation {
+    let Some(subtype) = subtype.map(str::trim).filter(|value| !value.is_empty()) else {
+        return SubtypeExpectation::Unknown;
+    };
+    let upper = subtype.to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "CVCTRL_BHB42XXX" | "BBCTRL_BHB42XXX" | "AMLCTRL_BHB42XXX"
+    ) {
+        return SubtypeExpectation::ControllerAt0x20(VoltageControllerKind::Pic1704);
+    }
+    if upper.starts_with("AMLCTRL_BHB56") {
+        return SubtypeExpectation::ControllerAt0x20(VoltageControllerKind::Dspic33Ep);
+    }
+    if upper.starts_with("AMLCTRL_BHB68") {
+        return SubtypeExpectation::NoController;
+    }
+    if matches!(upper.as_str(), "S9" | "S9J" | "S9K" | "S9_BHB09001") {
+        return SubtypeExpectation::ControllerElsewhere(VoltageControllerKind::Pic16f1704);
+    }
+    SubtypeExpectation::Unknown
+}
+
+fn presence_validated_topology_bus(subtype: Option<&str>) -> Option<u8> {
+    // Every identity currently represented by ControllerAt0x20 is documented
+    // on hashboard bus 0 across CV1835, AM335x BB, and Amlogic carriers. Keep
+    // this next to the identity table so a future carrier must add its bus
+    // explicitly instead of inheriting a caller-selected value.
+    matches!(
+        subtype_expectation(subtype),
+        SubtypeExpectation::ControllerAt0x20(_)
+    )
+    .then_some(0)
+}
+
+fn discover_from_observations(
+    subtype: Option<&str>,
+    address_0x20_acked: bool,
+) -> VoltageControllerDiscovery {
+    match subtype_expectation(subtype) {
+        SubtypeExpectation::ControllerAt0x20(kind) if address_0x20_acked => {
+            VoltageControllerDiscovery::confirmed(
+                kind,
+                "exact subtype and address-0x20 presence evidence agree",
+            )
+        }
+        SubtypeExpectation::ControllerAt0x20(_) => VoltageControllerDiscovery::contradictory(
+            "exact subtype requires a controller at address 0x20 but the presence probe failed",
+        ),
+        SubtypeExpectation::ControllerElsewhere(kind) => VoltageControllerDiscovery::confirmed(
+            kind,
+            "exact subtype identifies a controller family outside the 0x20 topology",
+        ),
+        SubtypeExpectation::NoController if address_0x20_acked => {
+            VoltageControllerDiscovery::contradictory(
+                "exact NoController subtype conflicts with a device ACK at address 0x20",
+            )
+        }
+        SubtypeExpectation::NoController => VoltageControllerDiscovery::no_controller(
+            "exact subtype identifies a documented NoController hashboard family",
+        ),
+        SubtypeExpectation::Unknown if address_0x20_acked => VoltageControllerDiscovery::unknown(
+            "a device ACKed at address 0x20 but no evidence identifies its protocol family",
+        ),
+        SubtypeExpectation::Unknown => {
+            VoltageControllerDiscovery::unknown("subtype evidence is missing or unrecognized")
+        }
+    }
+}
+
+/// Classify a `/etc/subtype` string into an informational compatibility kind.
+///
+/// This pure helper performs no presence validation and grants no energization
+/// authority. New platform code should use [`discover_voltage_controller`].
 ///
 /// Pure function: no I/O. Logging side-effects only — `tracing::debug!` for a
 /// matched arm (and for an absent `/etc/subtype`, which is normal on some
@@ -118,14 +433,15 @@ pub fn read_subtype() -> Option<String> {
 /// - `AMLCtrl_BHB56xxx` (S19k Pro / S21 with framed dsPIC) → `Dspic33Ep`
 /// - other `AML*` strings (catch-all for S21 NoPic variants) → `NoPic`
 /// - `S9` / Bitmain stock S9 → `Pic16f1704`
-/// - missing → `Dspic33Ep` (legacy safe path for units without `/etc/subtype`)
+/// - missing → `NoPic` compatibility result (identity unknown; non-energizing)
 /// - present but unknown → `NoPic` (fail closed: issue no PIC/dsPIC voltage commands)
-pub fn classify_voltage_controller(subtype: Option<&str>) -> VoltageControllerKind {
+#[cfg(test)]
+pub(crate) fn classify_voltage_controller(subtype: Option<&str>) -> VoltageControllerKind {
     let s = match subtype {
         Some(s) => s,
         None => {
-            tracing::debug!("subtype: absent → defaulting to Dspic33Ep");
-            return VoltageControllerKind::Dspic33Ep;
+            tracing::warn!("subtype: absent → NoPic compatibility result (identity unknown)");
+            return VoltageControllerKind::NoPic;
         }
     };
 
@@ -167,9 +483,8 @@ pub fn classify_voltage_controller(subtype: Option<&str>) -> VoltageControllerKi
     }
 
     // A subtype string was present but matched no known family. Fail closed to
-    // NoPic so a fresh or mistyped controller marker never silently opts into a
-    // PIC/dsPIC voltage command family. Missing subtype still keeps the legacy
-    // Dspic33Ep fallback above for older images that never shipped the file.
+    // NoPic so a fresh, missing, or mistyped controller marker never silently
+    // opts into a PIC/dsPIC voltage command family.
     tracing::warn!(
         subtype = %s,
         "subtype: UNKNOWN string → NoPic fail-closed \
@@ -249,6 +564,48 @@ pub fn probe_pic1704_at_0x20(bus: u8) -> bool {
     }
 }
 
+/// Non-payload ACK probe for an already identity-validated controller
+/// address. This is private so callers cannot use an ACK alone to select a
+/// protocol family.
+fn probe_voltage_controller_address(bus: u8, address: u8) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let mut i2c = match crate::i2c::I2cBus::open(bus) {
+            Ok(i2c) => i2c,
+            Err(error) => {
+                tracing::warn!(bus, %error, "controller endpoint probe could not open I2C bus");
+                return false;
+            }
+        };
+        if let Err(error) = i2c.set_slave(address) {
+            tracing::warn!(
+                bus,
+                address = format_args!("0x{address:02X}"),
+                %error,
+                "controller endpoint probe could not select address"
+            );
+            return false;
+        }
+        match i2c.write(&[]) {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::info!(
+                    bus,
+                    address = format_args!("0x{address:02X}"),
+                    %error,
+                    "controller endpoint did not ACK non-payload probe"
+                );
+                false
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (bus, address);
+        false
+    }
+}
+
 /// Classify from a DCENT_OS *board-target* name / PSU-kind string when
 /// there is no `/etc/subtype` to read (Phase B, am3-bb on
 /// `S19J_IO_BOARD_V2_0`).
@@ -271,7 +628,7 @@ pub fn probe_pic1704_at_0x20(bus: u8) -> bool {
 /// hashboard voltage-controller identity. The reusable controller identity is
 /// still `Dspic33Ep`; the AM3 BB mining path owns the LuxOS-trace fw=0x89
 /// sequence and heartbeat timing.
-pub fn classify_from_board_target(s: &str) -> Option<VoltageControllerKind> {
+pub(crate) fn discover_from_board_target(s: &str) -> VoltageControllerDiscovery {
     let lower = s.trim().to_ascii_lowercase();
     match lower.as_str() {
         "dspic33ep" | "dspic33ep-fw89" | "dspic33ep16gs202" | "dspic-fw89" => {
@@ -279,7 +636,10 @@ pub fn classify_from_board_target(s: &str) -> Option<VoltageControllerKind> {
                 board_target_voltage_controller = %s,
                 "board-target classification: explicit dsPIC33EP voltage controller",
             );
-            Some(VoltageControllerKind::Dspic33Ep)
+            VoltageControllerDiscovery::confirmed(
+                VoltageControllerKind::Dspic33Ep,
+                "exact board-target voltage-controller identity",
+            )
         }
         // Legacy AM3 BB board-targets used the PSU transport string as the
         // voltage-controller hint. Preserve compatibility, but route to the
@@ -290,54 +650,293 @@ pub fn classify_from_board_target(s: &str) -> Option<VoltageControllerKind> {
                 "board-target classification: apw12-uart-tunnel → Dspic33Ep \
                  (am3-bb S19J_IO_BOARD_V2_0; APW12 upstream PSU plus hashboard fw=0x89 dsPICs)"
             );
-            Some(VoltageControllerKind::Dspic33Ep)
+            VoltageControllerDiscovery::confirmed(
+                VoltageControllerKind::Dspic33Ep,
+                "exact legacy board-target plus retained hardware-trace identity",
+            )
         }
         _ => {
             tracing::debug!(
                 board_target_psu_kind = %s,
                 "board-target classification: unrecognized PSU-kind string → no override"
             );
-            None
+            VoltageControllerDiscovery::unknown("board-target evidence is unrecognized")
         }
     }
 }
 
-/// Combined classification + runtime probe. Call this once at platform
-/// init: the result becomes `PlatformConfig::voltage_controller`.
-///
-/// If the subtype string says PIC1704 but the runtime probe FAILS, this
-/// returns `Dspic33Ep` (the existing safe path) instead of `Pic1704`.
-/// This guarantees no regression on s19jpro (sustained-mining unit
-/// running existing dsPIC path) or any other unit whose `/etc/subtype`
-/// might disagree with reality.
-pub fn classify_with_probe(subtype: Option<&str>, i2c_bus: u8) -> VoltageControllerKind {
-    let classified = classify_voltage_controller(subtype);
-    if classified == VoltageControllerKind::Pic1704 {
-        if probe_pic1704_at_0x20(i2c_bus) {
-            tracing::info!(
-                subtype = %subtype.unwrap_or("<missing>"),
-                bus = i2c_bus,
-                kind = classified.as_str(),
-                "voltage controller classification: PIC1704 confirmed by subtype + probe"
-            );
-            VoltageControllerKind::Pic1704
-        } else {
-            tracing::warn!(
-                subtype = %subtype.unwrap_or("<missing>"),
-                bus = i2c_bus,
-                "voltage controller classification: subtype says PIC1704 but 0x20 probe \
-                 NACK — falling back to Dspic33Ep (existing safe path)"
-            );
-            VoltageControllerKind::Dspic33Ep
-        }
-    } else {
-        tracing::info!(
-            subtype = %subtype.unwrap_or("<missing>"),
-            kind = classified.as_str(),
-            "voltage controller classification: subtype-only (no PIC1704 probe needed)"
-        );
-        classified
+/// Compatibility projection for existing BeagleBone configuration code.
+pub(crate) fn classify_from_board_target(s: &str) -> Option<VoltageControllerKind> {
+    let discovery = discover_from_board_target(s);
+    match discovery.status() {
+        VoltageControllerDiscoveryStatus::Confirmed(kind) => Some(kind),
+        VoltageControllerDiscoveryStatus::NoController
+        | VoltageControllerDiscoveryStatus::Unknown
+        | VoltageControllerDiscoveryStatus::Contradictory => None,
     }
+}
+
+/// Discover a voltage controller from exact subtype evidence plus a
+/// non-payload presence observation. ACK is corroboration only: without an
+/// exact identity-table match it never selects a protocol family.
+pub(crate) fn discover_voltage_controller(
+    subtype: Option<&str>,
+    i2c_bus: u8,
+) -> VoltageControllerDiscovery {
+    discover_voltage_controller_with_probe(subtype, || probe_pic1704_at_0x20(i2c_bus))
+}
+
+fn bind_presence_validated_endpoint<F>(
+    subtype: Option<&str>,
+    discovery: VoltageControllerDiscovery,
+    i2c_bus: u8,
+    address: u8,
+    probe_exact_address: F,
+) -> Result<VoltageControllerEndpoint, VoltageControllerEndpointError>
+where
+    F: FnOnce() -> bool,
+{
+    let kind = match discovery.status() {
+        VoltageControllerDiscoveryStatus::Confirmed(kind) => kind,
+        status @ (VoltageControllerDiscoveryStatus::NoController
+        | VoltageControllerDiscoveryStatus::Unknown
+        | VoltageControllerDiscoveryStatus::Contradictory) => {
+            return Err(VoltageControllerEndpointError::DiscoveryNotConfirmed(
+                status,
+            ));
+        }
+    };
+
+    // Only ControllerAt0x20 identities ran a presence probe. S9's exact text
+    // identity remains useful discovery evidence, but cannot yet issue an
+    // endpoint because its 0x55-0x57 topology was not probed by this route.
+    if !matches!(
+        subtype_expectation(subtype),
+        SubtypeExpectation::ControllerAt0x20(expected) if expected == kind
+    ) {
+        return Err(VoltageControllerEndpointError::TopologyNotPresenceValidated(kind));
+    }
+    let expected_bus = presence_validated_topology_bus(subtype)
+        .ok_or(VoltageControllerEndpointError::TopologyNotPresenceValidated(kind))?;
+    if i2c_bus != expected_bus {
+        return Err(VoltageControllerEndpointError::BusOutsideTopology {
+            kind,
+            bus: i2c_bus,
+            expected_bus,
+        });
+    }
+
+    let address_is_valid = match kind {
+        // BHB42 controllers are selected per hashboard bus at the common 0x20
+        // endpoint. Do not generalize the dsPIC multi-address topology to PIC.
+        VoltageControllerKind::Pic1704 => address == 0x20,
+        // Live S19-family evidence pins dsPIC board endpoints to 0x20-0x22;
+        // the 0x20 anchor probe establishes family presence on this bus.
+        VoltageControllerKind::Dspic33Ep => (0x20..=0x22).contains(&address),
+        VoltageControllerKind::Pic16f1704 | VoltageControllerKind::NoPic => false,
+    };
+    if !address_is_valid {
+        return Err(VoltageControllerEndpointError::AddressOutsideTopology { kind, address });
+    }
+    if !probe_exact_address() {
+        return Err(
+            VoltageControllerEndpointError::EndpointPresenceNotObserved {
+                bus: i2c_bus,
+                address,
+            },
+        );
+    }
+
+    Ok(VoltageControllerEndpoint {
+        kind,
+        bus: i2c_bus,
+        address,
+        observed_firmware: None,
+    })
+}
+
+/// Discover and bind one controller endpoint from system-owned evidence.
+///
+/// This is deliberately the only public endpoint issuer. It reads
+/// `/etc/subtype` internally and performs the safe address-0x20 presence
+/// probe, so callers cannot inject identity text or an ACK result. The
+/// requested address is accepted only when it belongs to the exact confirmed
+/// family topology. Unknown, contradictory and NoController outcomes fail.
+pub fn discover_system_voltage_controller_endpoint(
+    i2c_bus: u8,
+    address: u8,
+) -> Result<VoltageControllerEndpoint, VoltageControllerEndpointError> {
+    let subtype = read_subtype();
+    if let SubtypeExpectation::ControllerAt0x20(kind) = subtype_expectation(subtype.as_deref()) {
+        let expected_bus = presence_validated_topology_bus(subtype.as_deref())
+            .ok_or(VoltageControllerEndpointError::TopologyNotPresenceValidated(kind))?;
+        if i2c_bus != expected_bus {
+            return Err(VoltageControllerEndpointError::BusOutsideTopology {
+                kind,
+                bus: i2c_bus,
+                expected_bus,
+            });
+        }
+    }
+    let discovery = discover_voltage_controller(subtype.as_deref(), i2c_bus);
+    bind_presence_validated_endpoint(subtype.as_deref(), discovery, i2c_bus, address, || {
+        // Confirmation already includes the 0x20 ACK. Other documented dsPIC
+        // addresses must independently ACK before their capability is issued.
+        address == 0x20 || probe_voltage_controller_address(i2c_bus, address)
+    })
+}
+
+fn standard_pic16_discovery(
+    board_target: Option<&str>,
+    subtype: Option<&str>,
+) -> VoltageControllerDiscovery {
+    let exact_board_target = board_target
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("am1-s9"));
+    if !exact_board_target {
+        return VoltageControllerDiscovery::unknown(
+            "exact DCENT_OS am1-s9 board target is missing",
+        );
+    }
+
+    match subtype.map(str::trim).filter(|value| !value.is_empty()) {
+        None => VoltageControllerDiscovery::confirmed(
+            VoltageControllerKind::Pic16f1704,
+            "exact am1-s9 board target identifies the standard PIC16 topology",
+        ),
+        Some(value)
+            if matches!(
+                subtype_expectation(Some(value)),
+                SubtypeExpectation::ControllerElsewhere(VoltageControllerKind::Pic16f1704)
+            ) =>
+        {
+            VoltageControllerDiscovery::confirmed(
+                VoltageControllerKind::Pic16f1704,
+                "exact am1-s9 board target and S9 subtype agree",
+            )
+        }
+        Some(_) => VoltageControllerDiscovery::contradictory(
+            "exact am1-s9 board target conflicts with the observed subtype",
+        ),
+    }
+}
+
+fn bind_standard_pic16_endpoint_after_heartbeat(
+    board_target: Option<&str>,
+    subtype: Option<&str>,
+    bus: u8,
+    address: u8,
+    heartbeat_succeeded: bool,
+) -> Result<VoltageControllerEndpoint, VoltageControllerEndpointError> {
+    let discovery = standard_pic16_discovery(board_target, subtype);
+    let kind = match discovery.status() {
+        VoltageControllerDiscoveryStatus::Confirmed(VoltageControllerKind::Pic16f1704) => {
+            VoltageControllerKind::Pic16f1704
+        }
+        status => {
+            return Err(VoltageControllerEndpointError::DiscoveryNotConfirmed(
+                status,
+            ));
+        }
+    };
+    if bus != 0 {
+        return Err(VoltageControllerEndpointError::BusOutsideTopology {
+            kind,
+            bus,
+            expected_bus: 0,
+        });
+    }
+    if !(0x55..=0x57).contains(&address) {
+        return Err(VoltageControllerEndpointError::AddressOutsideTopology { kind, address });
+    }
+    if !heartbeat_succeeded {
+        return Err(VoltageControllerEndpointError::EndpointPresenceNotObserved { bus, address });
+    }
+    Ok(VoltageControllerEndpoint {
+        kind,
+        bus,
+        address,
+        observed_firmware: None,
+    })
+}
+
+/// Bind one standard-daemon S9 PIC16 endpoint by consuming its existing first
+/// post-presence heartbeat.
+///
+/// This issuer is deliberately narrower than the subtype/ACK issuer above.
+/// It independently reads the exact DCENT_OS `am1-s9` board target, rejects a
+/// contradictory `/etc/subtype`, pins bus 0 and addresses 0x55..=0x57, and only
+/// returns authority when the canonical `[55 AA 16]` heartbeat succeeds. The
+/// standard daemon calls it after cooling and slot-presence admission, in place
+/// of the legacy heartbeat, so endpoint migration adds no wire transaction.
+pub fn discover_system_pic16_endpoint_with_heartbeat(
+    service: &I2cServiceHandle,
+    address: u8,
+) -> Result<VoltageControllerEndpoint, VoltageControllerEndpointError> {
+    let board_target = read_board_target();
+    let subtype = read_subtype();
+    let discovery = standard_pic16_discovery(board_target.as_deref(), subtype.as_deref());
+    if !matches!(
+        discovery.status(),
+        VoltageControllerDiscoveryStatus::Confirmed(VoltageControllerKind::Pic16f1704)
+    ) {
+        return Err(VoltageControllerEndpointError::DiscoveryNotConfirmed(
+            discovery.status(),
+        ));
+    }
+    if service.bus() != 0 {
+        return Err(VoltageControllerEndpointError::BusOutsideTopology {
+            kind: VoltageControllerKind::Pic16f1704,
+            bus: service.bus(),
+            expected_bus: 0,
+        });
+    }
+    if !(0x55..=0x57).contains(&address) {
+        return Err(VoltageControllerEndpointError::AddressOutsideTopology {
+            kind: VoltageControllerKind::Pic16f1704,
+            address,
+        });
+    }
+
+    let heartbeat_succeeded = service.heartbeat(address, I2cPicFirmware::Unknown).is_ok();
+    bind_standard_pic16_endpoint_after_heartbeat(
+        board_target.as_deref(),
+        subtype.as_deref(),
+        service.bus(),
+        address,
+        heartbeat_succeeded,
+    )
+}
+
+fn discover_voltage_controller_with_probe<F>(
+    subtype: Option<&str>,
+    probe_address_0x20: F,
+) -> VoltageControllerDiscovery
+where
+    F: FnOnce() -> bool,
+{
+    let address_0x20_acked = match subtype_expectation(subtype) {
+        SubtypeExpectation::ControllerAt0x20(_) => probe_address_0x20(),
+        SubtypeExpectation::ControllerElsewhere(_)
+        | SubtypeExpectation::NoController
+        | SubtypeExpectation::Unknown => false,
+    };
+    let discovery = discover_from_observations(subtype, address_0x20_acked);
+    tracing::info!(
+        subtype = %subtype.unwrap_or("<missing>"),
+        status = ?discovery.status(),
+        energization_eligible = discovery.energization_eligible(),
+        detail = discovery.detail(),
+        "voltage-controller evidence evaluated"
+    );
+    discovery
+}
+
+/// Non-breaking compatibility projection for existing platform configuration.
+/// Unknown, contradictory and positively NoController outcomes all map to
+/// `NoPic`; this wrapper never guesses another controller family.
+pub(crate) fn classify_with_probe(subtype: Option<&str>, i2c_bus: u8) -> VoltageControllerKind {
+    discover_voltage_controller(subtype, i2c_bus).compatibility_kind()
 }
 
 #[cfg(test)]
@@ -394,11 +993,10 @@ mod tests {
             VoltageControllerKind::Pic16f1704,
         );
 
-        // Missing subtype keeps the legacy Dspic33Ep default; present unknown
-        // strings fail closed to NoPic.
+        // Missing and present-unknown subtype evidence both fail closed.
         assert_eq!(
             classify_voltage_controller(None),
-            VoltageControllerKind::Dspic33Ep,
+            VoltageControllerKind::NoPic,
         );
         assert_eq!(
             classify_voltage_controller(Some("")),
@@ -423,6 +1021,341 @@ mod tests {
                 "unknown subtype {unknown:?} must fail closed to NoPic",
             );
         }
+    }
+
+    #[test]
+    fn evidence_table_is_fail_closed_and_ack_never_selects_a_family_alone() {
+        let cases = [
+            (
+                Some("CVCtrl_BHB42XXX"),
+                true,
+                VoltageControllerDiscoveryStatus::Confirmed(VoltageControllerKind::Pic1704),
+                true,
+            ),
+            (
+                Some("CVCtrl_BHB42XXX"),
+                false,
+                VoltageControllerDiscoveryStatus::Contradictory,
+                false,
+            ),
+            (
+                Some("AMLCtrl_BHB56902"),
+                true,
+                VoltageControllerDiscoveryStatus::Confirmed(VoltageControllerKind::Dspic33Ep),
+                true,
+            ),
+            (
+                Some("AMLCtrl_BHB56902"),
+                false,
+                VoltageControllerDiscoveryStatus::Contradictory,
+                false,
+            ),
+            (
+                Some("AMLCtrl_BHB68900"),
+                false,
+                VoltageControllerDiscoveryStatus::NoController,
+                false,
+            ),
+            (
+                Some("AMLCtrl_BHB68900"),
+                true,
+                VoltageControllerDiscoveryStatus::Contradictory,
+                false,
+            ),
+            (
+                None,
+                false,
+                VoltageControllerDiscoveryStatus::Unknown,
+                false,
+            ),
+            (None, true, VoltageControllerDiscoveryStatus::Unknown, false),
+            (
+                Some("FutureCtrl_0x20"),
+                true,
+                VoltageControllerDiscoveryStatus::Unknown,
+                false,
+            ),
+        ];
+
+        for (subtype, acked, expected_status, eligible) in cases {
+            let discovery = discover_from_observations(subtype, acked);
+            assert_eq!(discovery.status(), expected_status, "subtype={subtype:?}");
+            assert_eq!(
+                discovery.energization_eligible(),
+                eligible,
+                "subtype={subtype:?}"
+            );
+            if !eligible {
+                assert_eq!(discovery.compatibility_kind(), VoltageControllerKind::NoPic);
+            }
+        }
+    }
+
+    #[test]
+    fn arbitrary_unknown_strings_never_become_energization_eligible() {
+        for index in 0..512u16 {
+            let subtype = format!("FUTURE_UNKNOWN_CONTROLLER_{index:04X}");
+            for acked in [false, true] {
+                let discovery = discover_from_observations(Some(&subtype), acked);
+                assert_eq!(
+                    discovery.status(),
+                    VoltageControllerDiscoveryStatus::Unknown
+                );
+                assert!(!discovery.energization_eligible());
+                assert_eq!(discovery.compatibility_kind(), VoltageControllerKind::NoPic);
+            }
+        }
+    }
+
+    #[test]
+    fn only_exact_address_0x20_identities_invoke_the_presence_probe() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for subtype in [
+            None,
+            Some(""),
+            Some("unknown"),
+            Some("S9"),
+            Some("AMLCtrl_BHB68900"),
+            Some("AMLCtrl_S21Pro"),
+        ] {
+            let calls = AtomicUsize::new(0);
+            let _ = discover_voltage_controller_with_probe(subtype, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                true
+            });
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "subtype={subtype:?}");
+        }
+
+        for subtype in ["CVCtrl_BHB42XXX", "AMLCtrl_BHB56902"] {
+            let calls = AtomicUsize::new(0);
+            let _ = discover_voltage_controller_with_probe(Some(subtype), || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                true
+            });
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "subtype={subtype:?}");
+        }
+    }
+
+    #[test]
+    fn text_evidence_entry_points_are_not_public_authority_surfaces() {
+        let source = include_str!("subtype.rs");
+        for signature in [
+            "pub(crate) fn classify_voltage_controller(",
+            "pub(crate) fn discover_voltage_controller(",
+            "pub(crate) fn classify_with_probe(",
+            "pub(crate) fn discover_from_board_target(",
+            "pub(crate) fn classify_from_board_target(",
+        ] {
+            assert!(
+                source
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(signature)),
+                "crate-private discovery signature disappeared: {signature}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_binding_requires_confirmed_presence_validated_topology() {
+        let confirmed_pic =
+            discover_voltage_controller_with_probe(Some("CVCtrl_BHB42XXX"), || true);
+        let pic = bind_presence_validated_endpoint(
+            Some("CVCtrl_BHB42XXX"),
+            confirmed_pic,
+            0,
+            0x20,
+            || true,
+        )
+        .expect("exact PIC identity plus ACK should bind 0x20");
+        assert_eq!(pic.kind(), VoltageControllerKind::Pic1704);
+        assert_eq!(pic.bus(), 0);
+        assert_eq!(pic.address(), 0x20);
+
+        let confirmed_dspic =
+            discover_voltage_controller_with_probe(Some("AMLCtrl_BHB56902"), || true);
+        let dspic = bind_presence_validated_endpoint(
+            Some("AMLCtrl_BHB56902"),
+            confirmed_dspic,
+            0,
+            0x22,
+            || true,
+        )
+        .expect("confirmed dsPIC identity plus exact-address ACK should bind");
+        assert_eq!(dspic.kind(), VoltageControllerKind::Dspic33Ep);
+        assert_eq!(dspic.address(), 0x22);
+    }
+
+    #[test]
+    fn standard_pic16_endpoint_consumes_exact_identity_and_successful_heartbeat() {
+        for subtype in [None, Some("S9"), Some("S9J"), Some("S9_BHB09001")] {
+            let endpoint = bind_standard_pic16_endpoint_after_heartbeat(
+                Some("am1-s9"),
+                subtype,
+                0,
+                0x56,
+                true,
+            )
+            .expect("exact S9 evidence and the existing heartbeat should issue authority");
+            assert_eq!(endpoint.kind(), VoltageControllerKind::Pic16f1704);
+            assert_eq!(endpoint.bus(), 0);
+            assert_eq!(endpoint.address(), 0x56);
+        }
+    }
+
+    #[test]
+    fn standard_pic16_endpoint_refuses_guesses_contradictions_and_failed_heartbeats() {
+        for (board_target, subtype, bus, address, heartbeat) in [
+            (None, None, 0, 0x55, true),
+            (Some(""), None, 0, 0x55, true),
+            (Some("am1-s9-extra"), None, 0, 0x55, true),
+            (Some("am2-s19j"), Some("S9"), 0, 0x55, true),
+            (Some("am1-s9"), Some("AMLCtrl_BHB56902"), 0, 0x55, true),
+            (Some("am1-s9"), None, 1, 0x55, true),
+            (Some("am1-s9"), None, 0, 0x20, true),
+            (Some("am1-s9"), None, 0, 0x58, true),
+            (Some("am1-s9"), None, 0, 0x55, false),
+        ] {
+            assert!(
+                bind_standard_pic16_endpoint_after_heartbeat(
+                    board_target,
+                    subtype,
+                    bus,
+                    address,
+                    heartbeat,
+                )
+                .is_err(),
+                "board_target={board_target:?} subtype={subtype:?} bus={bus} address={address:#04x} heartbeat={heartbeat}"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_pic16_issuer_reuses_one_heartbeat_without_an_extra_probe() {
+        let source = include_str!("subtype.rs");
+        let start = source
+            .find("pub fn discover_system_pic16_endpoint_with_heartbeat(")
+            .expect("PIC16 system issuer");
+        let body = &source[start..];
+        let body = body
+            .split("fn discover_voltage_controller_with_probe")
+            .next()
+            .expect("bounded PIC16 issuer body");
+        assert_eq!(body.matches("service.heartbeat(").count(), 1);
+        assert!(!body.contains("probe_voltage_controller_address("));
+        assert!(!body.contains("service.write_bytes("));
+        assert!(!body.contains("service.read_bytes("));
+    }
+
+    #[test]
+    fn endpoint_binding_rejects_unknown_contradictory_and_unprobed_topologies() {
+        for (subtype, acked) in [
+            (None, false),
+            (Some("FutureCtrl"), false),
+            (Some("FutureCtrl"), true),
+            (Some("CVCtrl_BHB42XXX"), false),
+            (Some("AMLCtrl_BHB68900"), false),
+        ] {
+            let discovery = discover_voltage_controller_with_probe(subtype, || acked);
+            assert!(
+                bind_presence_validated_endpoint(subtype, discovery, 0, 0x20, || true).is_err(),
+                "subtype={subtype:?}, acked={acked}"
+            );
+        }
+
+        let s9 = discover_voltage_controller_with_probe(Some("S9"), || {
+            panic!("S9 must not use the 0x20 probe")
+        });
+        assert_eq!(
+            bind_presence_validated_endpoint(Some("S9"), s9, 0, 0x55, || true),
+            Err(
+                VoltageControllerEndpointError::TopologyNotPresenceValidated(
+                    VoltageControllerKind::Pic16f1704
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn endpoint_binding_rejects_addresses_outside_exact_family_topology() {
+        for (subtype, address) in [
+            ("CVCtrl_BHB42XXX", 0x21),
+            ("AMLCtrl_BHB56902", 0x1F),
+            ("AMLCtrl_BHB56902", 0x23),
+        ] {
+            let discovery = discover_voltage_controller_with_probe(Some(subtype), || true);
+            assert!(matches!(
+                bind_presence_validated_endpoint(Some(subtype), discovery, 0, address, || true),
+                Err(VoltageControllerEndpointError::AddressOutsideTopology { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn endpoint_binding_requires_the_requested_address_to_ack() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let exact_probe_calls = AtomicUsize::new(0);
+        let discovery = discover_voltage_controller_with_probe(Some("AMLCtrl_BHB56902"), || true);
+        let result =
+            bind_presence_validated_endpoint(Some("AMLCtrl_BHB56902"), discovery, 0, 0x22, || {
+                exact_probe_calls.fetch_add(1, Ordering::SeqCst);
+                false
+            });
+        assert_eq!(exact_probe_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            result,
+            Err(
+                VoltageControllerEndpointError::EndpointPresenceNotObserved {
+                    bus: 0,
+                    address: 0x22,
+                }
+            )
+        );
+
+        let invalid_probe_calls = AtomicUsize::new(0);
+        let discovery = discover_voltage_controller_with_probe(Some("AMLCtrl_BHB56902"), || true);
+        let _ =
+            bind_presence_validated_endpoint(Some("AMLCtrl_BHB56902"), discovery, 0, 0x23, || {
+                invalid_probe_calls.fetch_add(1, Ordering::SeqCst);
+                true
+            });
+        assert_eq!(
+            invalid_probe_calls.load(Ordering::SeqCst),
+            0,
+            "out-of-topology addresses must be rejected before any bus probe"
+        );
+
+        let wrong_bus_probe_calls = AtomicUsize::new(0);
+        let discovery = discover_voltage_controller_with_probe(Some("CVCtrl_BHB42XXX"), || true);
+        let wrong_bus =
+            bind_presence_validated_endpoint(Some("CVCtrl_BHB42XXX"), discovery, 1, 0x20, || {
+                wrong_bus_probe_calls.fetch_add(1, Ordering::SeqCst);
+                true
+            });
+        assert!(matches!(
+            wrong_bus,
+            Err(VoltageControllerEndpointError::BusOutsideTopology { .. })
+        ));
+        assert_eq!(
+            wrong_bus_probe_calls.load(Ordering::SeqCst),
+            0,
+            "out-of-topology buses must be rejected before any endpoint probe"
+        );
+    }
+
+    #[test]
+    fn board_target_discovery_preserves_exact_evidence_and_unknown_state() {
+        let known = discover_from_board_target("dspic33ep-fw89");
+        assert_eq!(
+            known.status(),
+            VoltageControllerDiscoveryStatus::Confirmed(VoltageControllerKind::Dspic33Ep)
+        );
+        assert!(known.energization_eligible());
+
+        let unknown = discover_from_board_target("future-controller");
+        assert_eq!(unknown.status(), VoltageControllerDiscoveryStatus::Unknown);
+        assert!(!unknown.energization_eligible());
     }
 
     #[test]
@@ -457,23 +1390,22 @@ mod tests {
     }
 
     #[test]
-    fn classify_with_probe_falls_back_to_dspic_when_probe_misses() {
-        // On non-Linux hosts the probe always returns false, so any
-        // PIC1704-classified subtype must fall back to Dspic33Ep —
-        // proving the no-regression guarantee end-to-end on host CI.
+    fn classify_with_probe_fails_closed_when_probe_misses() {
+        // A BHB42 identity contradicted by a failed presence probe must never
+        // guess dsPIC merely because that was the historical fallback.
         #[cfg(not(target_os = "linux"))]
         {
             assert_eq!(
                 classify_with_probe(Some("BBCtrl_BHB42XXX"), 0),
-                VoltageControllerKind::Dspic33Ep,
+                VoltageControllerKind::NoPic,
             );
             assert_eq!(
                 classify_with_probe(Some("CVCtrl_BHB42XXX"), 0),
-                VoltageControllerKind::Dspic33Ep,
+                VoltageControllerKind::NoPic,
             );
             assert_eq!(
                 classify_with_probe(Some("AMLCtrl_BHB42XXX"), 0),
-                VoltageControllerKind::Dspic33Ep,
+                VoltageControllerKind::NoPic,
             );
         }
     }
@@ -570,18 +1502,18 @@ mod tests {
         // RE3 §2.5: Antminer T19 ships on Cvitek CV183x only with the
         // BM1362-family BHB42XXX hashboard pattern → PIC1704 gate.
         // The subtype-only classification is Pic1704; on host the
-        // probe falls back to Dspic33Ep (no /dev/i2c-0).
+        // probe fails closed to NoPic (no /dev/i2c-0).
         assert_eq!(
             classify_voltage_controller(Some("CVCtrl_BHB42XXX")),
             VoltageControllerKind::Pic1704,
         );
         // On non-Linux hosts the probe always returns false, proving
         // the no-regression contract: subtype says Pic1704 but probe
-        // misses → Dspic33Ep fallback.
+        // misses → non-energizing NoPic compatibility result.
         #[cfg(not(target_os = "linux"))]
         assert_eq!(
             classify_with_probe(Some("CVCtrl_BHB42XXX"), 0),
-            VoltageControllerKind::Dspic33Ep,
+            VoltageControllerKind::NoPic,
         );
     }
 
@@ -634,11 +1566,12 @@ mod tests {
     }
 
     #[test]
-    fn classify_with_probe_passes_through_non_pic1704_kinds() {
-        // Non-PIC1704 classifications skip the probe entirely.
+    fn classify_with_probe_requires_presence_for_address_0x20_families() {
+        // BHB56 is exact dsPIC identity evidence, but still requires presence
+        // at its documented 0x20 endpoint before compatibility can energize.
         assert_eq!(
             classify_with_probe(Some("AMLCtrl_BHB56902"), 0),
-            VoltageControllerKind::Dspic33Ep,
+            VoltageControllerKind::NoPic,
         );
         assert_eq!(
             classify_with_probe(Some("AMLCtrl_S21NoPic"), 0),
@@ -648,10 +1581,7 @@ mod tests {
             classify_with_probe(Some("S9"), 0),
             VoltageControllerKind::Pic16f1704,
         );
-        assert_eq!(
-            classify_with_probe(None, 0),
-            VoltageControllerKind::Dspic33Ep,
-        );
+        assert_eq!(classify_with_probe(None, 0), VoltageControllerKind::NoPic,);
     }
 
     // -----------------------------------------------------------------
@@ -725,7 +1655,7 @@ mod tests {
         );
         assert_eq!(
             classify_voltage_controller(None),
-            VoltageControllerKind::Dspic33Ep,
+            VoltageControllerKind::NoPic,
         );
         // And the board-target helper recognizes ONLY the apw12-uart-tunnel
         // family — it must not also start accepting a subtype string.

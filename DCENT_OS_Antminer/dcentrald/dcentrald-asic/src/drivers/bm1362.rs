@@ -1021,16 +1021,18 @@ impl ChipDriver for Bm1362Driver {
         // commands based on `MinerProfile.pic_type`; this function is only
         // reached if the caller mistakenly treats BM1362 as a PIC16F1704 part.
         //
-        // Do NOT write to a PIC16F1704 here — the S19j Pro dsPIC uses a
-        // completely different I2C address space and a SET_VOLTAGE opcode
-        // that is NOT 0x10.,
-        // . No-op with a warn
-        // so callers catch the routing bug in logs.
+        // ADR-0010 / VoltageRail: MUST NOT return Ok(()) (silent success) —
+        // that pattern made callers believe voltage was applied. Fail closed
+        // with InvalidParameter so the routing bug is loud.
         tracing::warn!(
             "BM1362::set_voltage called — S19j Pro uses DspicController, not \
              PicController. Route voltage through MinerProfile.pic_type."
         );
-        Ok(())
+        Err(crate::AsicError::InvalidParameter(
+            "BM1362 voltage is DspicController (not PicController); \
+             route via MinerProfile.pic_type / VoltageRail"
+                .into(),
+        ))
     }
 
     fn send_work(&self, chain: &mut FpgaChain, work: &MiningWork) -> Result<u16> {

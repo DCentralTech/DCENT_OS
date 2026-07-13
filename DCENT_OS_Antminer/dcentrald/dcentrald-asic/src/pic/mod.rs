@@ -1466,7 +1466,66 @@ pub fn parse_pic_firmware(path: &str) -> Option<Vec<u8>> {
 }
 
 // v0.13.0: PicServiceController -- PIC operations via I2C service thread
-use dcentrald_hal::i2c::I2cServiceHandle;
+use dcentrald_hal::i2c::{I2cMutationLabel, I2cPicFirmware, I2cServiceHandle};
+use dcentrald_hal::platform::{VoltageControllerEndpoint, VoltageControllerKind};
+
+/// Durable construction authority for one discovery-bound PIC16 service.
+///
+/// The standard daemon creates short-lived service views throughout cold-boot
+/// initialization. This session consumes the opaque endpoint once and prevents
+/// those call sites from reasserting a family, bus, or raw address.
+///
+/// ```compile_fail
+/// use dcentrald_asic::pic::Pic16EndpointSession;
+/// use dcentrald_hal::i2c::I2cServiceHandle;
+///
+/// fn caller_asserted(handle: I2cServiceHandle) {
+///     // A raw address is not a discovery capability.
+///     let _ = Pic16EndpointSession::new(handle, 0x55);
+/// }
+/// ```
+pub struct Pic16EndpointSession {
+    i2c: I2cServiceHandle,
+    address: u8,
+}
+
+impl Pic16EndpointSession {
+    pub fn new(i2c: I2cServiceHandle, endpoint: VoltageControllerEndpoint) -> Result<Self> {
+        if endpoint.kind() != VoltageControllerKind::Pic16f1704 {
+            return Err(crate::AsicError::InvalidParameter(format!(
+                "{} endpoint cannot construct a PIC16 session",
+                endpoint.kind().as_str()
+            )));
+        }
+        if endpoint.bus() != i2c.bus() {
+            return Err(crate::AsicError::InvalidParameter(format!(
+                "PIC16 endpoint is bound to I2C bus {}, but service owns bus {}",
+                endpoint.bus(),
+                i2c.bus()
+            )));
+        }
+        Ok(Self {
+            i2c,
+            address: endpoint.address(),
+        })
+    }
+
+    pub fn address(&self) -> u8 {
+        self.address
+    }
+
+    pub fn service(&self) -> PicServiceController {
+        PicServiceController::new_legacy_parts(self.i2c.clone(), self.address)
+    }
+
+    pub fn service_with_firmware(&self, firmware: PicFirmware) -> PicServiceController {
+        PicServiceController::new_legacy_parts_with_firmware(
+            self.i2c.clone(),
+            self.address,
+            firmware,
+        )
+    }
+}
 
 pub struct PicServiceController {
     i2c: I2cServiceHandle,
@@ -1476,7 +1535,14 @@ pub struct PicServiceController {
 }
 
 impl PicServiceController {
+    /// Legacy caller-asserted construction seam. New production routes must
+    /// consume a discovery endpoint through [`Pic16EndpointSession`].
+    #[doc(hidden)]
     pub fn new(i2c: I2cServiceHandle, address: u8) -> Self {
+        Self::new_legacy_parts(i2c, address)
+    }
+
+    fn new_legacy_parts(i2c: I2cServiceHandle, address: u8) -> Self {
         Self {
             i2c,
             address,
@@ -1485,7 +1551,18 @@ impl PicServiceController {
         }
     }
 
+    /// Legacy caller-asserted construction seam with an observed firmware
+    /// hint. Prefer [`Pic16EndpointSession::service_with_firmware`].
+    #[doc(hidden)]
     pub fn new_with_firmware(i2c: I2cServiceHandle, address: u8, firmware: PicFirmware) -> Self {
+        Self::new_legacy_parts_with_firmware(i2c, address, firmware)
+    }
+
+    fn new_legacy_parts_with_firmware(
+        i2c: I2cServiceHandle,
+        address: u8,
+        firmware: PicFirmware,
+    ) -> Self {
         Self {
             i2c,
             address,
@@ -1518,8 +1595,12 @@ impl PicServiceController {
     }
 
     fn send_command(&self, data: &[u8]) -> Result<()> {
+        self.send_mutating_command(I2cMutationLabel::Unclassified, data)
+    }
+
+    fn send_mutating_command(&self, label: I2cMutationLabel, data: &[u8]) -> Result<()> {
         self.i2c
-            .write_byte_by_byte(self.address, data)
+            .write_byte_by_byte_mutating(label, self.address, data)
             .map_err(|e| crate::AsicError::Pic {
                 addr: self.address,
                 detail: format!("svc write: {}", e),
@@ -1543,37 +1624,51 @@ impl PicServiceController {
     /// for the per-`(Platform, PicFw)` interval table. Callers must
     /// tick this at `cfg.interval_ms`, never slower.
     pub fn send_heartbeat(&self) -> Result<()> {
-        self.send_command(&[PIC_PREAMBLE[0], PIC_PREAMBLE[1], BRAIINS_CMD_SEND_HEARTBEAT])
+        self.send_mutating_command(
+            I2cMutationLabel::KeepAlive,
+            &[PIC_PREAMBLE[0], PIC_PREAMBLE[1], BRAIINS_CMD_SEND_HEARTBEAT],
+        )
     }
 
     pub fn set_voltage(&mut self, pic_value: u8) -> Result<()> {
         let clamped = pic_value.max(PicController::MIN_SAFE_PIC_VALUE);
-        self.send_command(&[
-            PIC_PREAMBLE[0],
-            PIC_PREAMBLE[1],
-            BRAIINS_CMD_SET_VOLTAGE,
-            clamped,
-        ])?;
+        self.send_mutating_command(
+            I2cMutationLabel::Energize,
+            &[
+                PIC_PREAMBLE[0],
+                PIC_PREAMBLE[1],
+                BRAIINS_CMD_SET_VOLTAGE,
+                clamped,
+            ],
+        )?;
         self.current_voltage_pic = clamped;
         Ok(())
     }
 
     pub fn enable_voltage(&self) -> Result<()> {
-        self.send_command(&[
-            PIC_PREAMBLE[0],
-            PIC_PREAMBLE[1],
-            BRAIINS_CMD_ENABLE_VOLTAGE,
-            0x01,
-        ])
+        self.send_mutating_command(
+            I2cMutationLabel::Energize,
+            &[
+                PIC_PREAMBLE[0],
+                PIC_PREAMBLE[1],
+                BRAIINS_CMD_ENABLE_VOLTAGE,
+                0x01,
+            ],
+        )
     }
 
     pub fn disable_voltage(&self) -> Result<()> {
-        self.send_command(&[
-            PIC_PREAMBLE[0],
-            PIC_PREAMBLE[1],
-            BRAIINS_CMD_ENABLE_VOLTAGE,
-            0x00,
-        ])
+        let firmware = match self.firmware {
+            PicFirmware::Stock(_) => I2cPicFirmware::Stock,
+            PicFirmware::BraiinsOs => I2cPicFirmware::BraiinsOs,
+            PicFirmware::Unknown => I2cPicFirmware::Unknown,
+        };
+        self.i2c
+            .disable_voltage(self.address, firmware)
+            .map_err(|e| crate::AsicError::Pic {
+                addr: self.address,
+                detail: format!("svc disable: {}", e),
+            })
     }
 
     pub fn read_voltage(&self) -> Result<u8> {

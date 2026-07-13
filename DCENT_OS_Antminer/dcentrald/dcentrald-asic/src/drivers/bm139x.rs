@@ -7,7 +7,7 @@
 
 use crate::protocol::{pack_lsb_first, unpack_lsb_first};
 use crate::Result;
-use dcentrald_hal::fpga_chain::{self, FpgaChain};
+use dcentrald_hal::fpga_chain::FpgaChain;
 
 const HDR_WRITE_ALL: u8 = 0x51;
 const HDR_READ_ALL: u8 = 0x52;
@@ -66,8 +66,29 @@ pub fn read_pll_register(
         return Ok(None);
     }
 
-    let r0 = chain.cmd.read_reg(fpga_chain::REG_CMD_RX_FIFO);
-    let _ = chain.cmd.read_reg(fpga_chain::REG_CMD_RX_FIFO);
+    let Some(r0) = chain.read_cmd_response() else {
+        return Ok(None);
+    };
+    let _ = chain.read_cmd_response();
     let bytes = unpack_lsb_first(r0);
     Ok(Some(u32::from_be_bytes(bytes)))
+}
+
+#[cfg(all(test, feature = "sim-hal"))]
+mod tests {
+    use super::*;
+    use dcentrald_hal::platform::sim::SimModel;
+
+    #[test]
+    fn concrete_fpga_accessor_reads_virtual_broadcast_register_state() {
+        let mut chain = FpgaChain::open_sim_for_model(0, SimModel::S19Pro).unwrap();
+        let expected = 0x4068_0221;
+        let (w0, w1) = fifo_write_reg_bcast(0x08, expected);
+        chain.write_cmd(w0);
+        chain.write_cmd(w1);
+        assert_eq!(
+            read_pll_register(&mut chain, 0, 0x08).unwrap(),
+            Some(expected)
+        );
+    }
 }

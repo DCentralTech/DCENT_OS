@@ -13,6 +13,8 @@ import argparse
 import hashlib
 import re
 import sys
+import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -79,11 +81,25 @@ def classify(path: str, context: str) -> str | None:
     return None
 
 
+def iter_rust_sources(dcentrald_root: Path) -> Iterator[Path]:
+    """Yield immediate Cargo packages' production Rust sources deterministically.
+
+    The workspace keeps packages one directory below ``dcentrald_root``. Using
+    each package manifest as the source boundary avoids Cargo output, examples,
+    integration tests, fuzz targets, and scratch trees without reserving names
+    that remain valid below ``src/`` (for example ``src/target/mod.rs``).
+    """
+    for manifest in sorted(dcentrald_root.glob("*/Cargo.toml")):
+        source_root = manifest.parent / "src"
+        if source_root.is_dir():
+            yield from sorted(source_root.rglob("*.rs"))
+
+
 def collect_sites(project_root: Path) -> list[ClampSite]:
     dcentrald_root = project_root / "dcentrald"
     sites: list[ClampSite] = []
 
-    for source in sorted(dcentrald_root.rglob("*.rs")):
+    for source in iter_rust_sources(dcentrald_root):
         rel = source.relative_to(project_root).as_posix()
         lines = source.read_text(encoding="utf-8").splitlines()
         for index, line in enumerate(lines):
@@ -137,8 +153,44 @@ def verify(sites: list[ClampSite], *, quiet: bool = False) -> bool:
     return False
 
 
-def self_test(project_root: Path) -> bool:
-    sites = collect_sites(project_root)
+def source_discovery_self_test() -> bool:
+    with tempfile.TemporaryDirectory(prefix="dcentos-safety-clamp-") as temp_dir:
+        root = Path(temp_dir) / "dcentrald"
+        manifest = root / "crate" / "Cargo.toml"
+        source = root / "crate" / "src" / "kept.rs"
+        legitimate_target_module = root / "crate" / "src" / "target" / "legitimate.rs"
+        generated = root / "crate" / "target" / "debug" / "generated.rs"
+        root_generated = root / "target" / "release" / "generated.rs"
+        integration_test = root / "crate" / "tests" / "integration.rs"
+        scratch_source = root / "scratch" / "src" / "unowned.rs"
+        for path in (
+            source,
+            legitimate_target_module,
+            generated,
+            root_generated,
+            integration_test,
+            scratch_source,
+        ):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("let pwm = value.clamp(0, 100);\n", encoding="utf-8")
+        manifest.write_text("[package]\nname = 'fixture'\n", encoding="utf-8")
+
+        discovered = [
+            path.relative_to(root).as_posix() for path in iter_rust_sources(root)
+        ]
+        if discovered != ["crate/src/kept.rs", "crate/src/target/legitimate.rs"]:
+            print(
+                "SAFETY_CLAMP_SELFTEST_FAILED source discovery included build output: "
+                f"{discovered}",
+                file=sys.stderr,
+            )
+            return False
+    return True
+
+
+def self_test(sites: list[ClampSite]) -> bool:
+    if not source_discovery_self_test():
+        return False
     if verify(sites, quiet=True):
         synthetic = sites + [
             ClampSite(
@@ -173,7 +225,7 @@ def main() -> int:
         print_sites(sites)
         return 0
     if args.self_test:
-        return 0 if self_test(project_root) else 1
+        return 0 if self_test(sites) else 1
     return 0 if verify(sites) else 1
 
 

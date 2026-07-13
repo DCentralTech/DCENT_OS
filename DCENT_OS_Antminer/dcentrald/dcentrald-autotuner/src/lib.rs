@@ -46,6 +46,7 @@ pub mod dps;
 // `[thermal].dps_enabled`. See
 //  §RE-002.
 pub mod dps_governor;
+mod durable_json;
 pub mod dvfs;
 pub mod efficiency;
 pub mod error_model;

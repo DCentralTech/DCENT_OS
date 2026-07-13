@@ -62,9 +62,6 @@ pub fn bridge_guard_asic_options(
 /// CE-052: narrow `Identify` bridge guard. `pub` (re-exported from `crate::rest`)
 /// so the daemon crate can gate `locate_device` without a `dcent_schema`
 /// capability dependency.
-pub fn bridge_guard_identify(
-    state: &AppState,
-    surface: &str,
-) -> std::result::Result<(), String> {
+pub fn bridge_guard_identify(state: &AppState, surface: &str) -> std::result::Result<(), String> {
     bridge_runtime_capability_guard(state, RuntimeCapability::Identify, surface)
 }

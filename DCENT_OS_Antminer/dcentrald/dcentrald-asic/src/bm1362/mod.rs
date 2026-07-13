@@ -61,6 +61,11 @@
 use crate::drivers::bm1362 as driver;
 use crate::protocol::crc5;
 
+/// CRC-verified parsing and explicit partial/exact-set assessment for BM1362
+/// ChipAddress responses after address assignment. Observation-only: this
+/// module does not mint daemon hardware identity or topology authority.
+pub mod assigned_address;
+
 /// W13.B1 (2026-05-10): BM1362 UART_RELAY ASIC register `0x2C`
 /// candidate/control evidence for the per-chain UART relay.
 ///

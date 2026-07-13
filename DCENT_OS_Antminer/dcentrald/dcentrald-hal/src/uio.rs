@@ -41,13 +41,17 @@ pub fn offset_in_bounds(offset: u32, size: usize) -> bool {
 /// A single UIO device with an mmap'd register region.
 pub struct UioDevice {
     /// File descriptor for /dev/uioN (owned).
-    file: std::fs::File,
+    file: Option<std::fs::File>,
     /// mmap'd register base pointer (4 KB region of 32-bit registers).
     regs: *mut u32,
     /// Mapped region size (always 4096 bytes for FPGA register blocks).
     size: usize,
     /// UIO device name from sysfs (e.g., "chain6-common").
     name: String,
+    /// Vec-backed register window for host-only simulation. The field and its
+    /// constructor do not exist in default/firmware builds.
+    #[cfg(feature = "sim-hal")]
+    sim_regs: Option<std::sync::Arc<std::sync::Mutex<Vec<u32>>>>,
 }
 
 // SAFETY: UioDevice is safe to send between threads because the mmap'd
@@ -105,11 +109,29 @@ impl UioDevice {
         );
 
         Ok(Self {
-            file,
+            file: Some(file),
             regs: regs.as_ptr() as *mut u32,
             size,
             name,
+            #[cfg(feature = "sim-hal")]
+            sim_regs: None,
         })
+    }
+
+    /// Construct a Vec-backed UIO register window for `FpgaChain::open_sim`.
+    #[cfg(feature = "sim-hal")]
+    pub(crate) fn open_sim(name: impl Into<String>) -> Self {
+        Self {
+            file: None,
+            regs: std::ptr::null_mut(),
+            size: UIO_MAP_SIZE,
+            name: name.into(),
+            sim_regs: Some(std::sync::Arc::new(std::sync::Mutex::new(vec![
+                0;
+                UIO_MAP_SIZE
+                    / 4
+            ]))),
+        }
     }
 
     /// Read a 32-bit register at the given byte offset.
@@ -131,6 +153,15 @@ impl UioDevice {
                 "UIO read_reg refused: offset out of bounds or not 4-byte aligned (returning 0)"
             );
             return 0;
+        }
+
+        #[cfg(feature = "sim-hal")]
+        if let Some(registers) = &self.sim_regs {
+            return registers
+                .lock()
+                .ok()
+                .and_then(|values| values.get((offset / 4) as usize).copied())
+                .unwrap_or_default();
         }
 
         unsafe {
@@ -159,6 +190,16 @@ impl UioDevice {
             return;
         }
 
+        #[cfg(feature = "sim-hal")]
+        if let Some(registers) = &self.sim_regs {
+            if let Ok(mut values) = registers.lock() {
+                if let Some(register) = values.get_mut((offset / 4) as usize) {
+                    *register = value;
+                }
+            }
+            return;
+        }
+
         unsafe {
             let ptr = self.regs.add((offset / 4) as usize);
             std::ptr::write_volatile(ptr, value);
@@ -170,10 +211,17 @@ impl UioDevice {
     /// Returns the IRQ count (number of interrupts since device open).
     /// Blocking read of 4 bytes from the UIO fd returns the IRQ count.
     pub fn wait_irq(&self) -> Result<u32> {
+        #[cfg(feature = "sim-hal")]
+        if self.sim_regs.is_some() {
+            return Ok(1);
+        }
         let mut buf = [0u8; 4];
 
         // Use nix::unistd::read for blocking read on UIO fd (read takes RawFd)
-        let n = nix::unistd::read(self.file.as_raw_fd(), &mut buf).map_err(|e| {
+        let file = self.file.as_ref().ok_or_else(|| {
+            HalError::Other("UIO device has neither hardware fd nor simulator window".to_string())
+        })?;
+        let n = nix::unistd::read(file.as_raw_fd(), &mut buf).map_err(|e| {
             HalError::Io(std::io::Error::other(format!("UIO IRQ wait failed: {}", e)))
         })?;
 
@@ -192,9 +240,16 @@ impl UioDevice {
     /// Must be called after each wait_irq() to re-enable the interrupt.
     /// Write 1u32 to the UIO fd to re-enable interrupts.
     pub fn enable_irq(&self) -> Result<()> {
+        #[cfg(feature = "sim-hal")]
+        if self.sim_regs.is_some() {
+            return Ok(());
+        }
         let val: u32 = 1;
 
-        nix::unistd::write(&self.file, &val.to_ne_bytes()).map_err(|e| {
+        let file = self.file.as_ref().ok_or_else(|| {
+            HalError::Other("UIO device has neither hardware fd nor simulator window".to_string())
+        })?;
+        nix::unistd::write(file, &val.to_ne_bytes()).map_err(|e| {
             HalError::Io(std::io::Error::other(format!(
                 "UIO IRQ enable failed: {}",
                 e
@@ -211,7 +266,7 @@ impl UioDevice {
 
     /// Get the raw file descriptor (for select/poll).
     pub fn raw_fd(&self) -> i32 {
-        self.file.as_raw_fd()
+        self.file.as_ref().map(AsRawFd::as_raw_fd).unwrap_or(-1)
     }
 }
 
@@ -263,5 +318,15 @@ mod tests {
         // The extreme value that would wrap a naive `offset + 4` — saturating
         // add keeps it rejected rather than overflowing to a small number.
         assert!(!offset_in_bounds(u32::MAX, UIO_MAP_SIZE));
+    }
+
+    #[cfg(feature = "sim-hal")]
+    #[test]
+    fn simulated_uio_window_round_trips_without_device_node() {
+        let device = UioDevice::open_sim("sim-chain-common");
+        device.write_reg(0x10, 0x1234_5678);
+        assert_eq!(device.read_reg(0x10), 0x1234_5678);
+        assert_eq!(device.raw_fd(), -1);
+        assert_eq!(device.wait_irq().expect("sim IRQ"), 1);
     }
 }

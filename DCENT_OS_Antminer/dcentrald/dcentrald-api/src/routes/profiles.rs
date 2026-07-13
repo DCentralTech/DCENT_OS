@@ -757,7 +757,8 @@ pub async fn delete_profile(
         return resp;
     }
     let mode = *state.mode_rx.borrow();
-    if let Err(resp) = crate::mode_middleware::check_mode_access("/api/profiles/silicon/:id", mode) {
+    if let Err(resp) = crate::mode_middleware::check_mode_access("/api/profiles/silicon/:id", mode)
+    {
         return resp.into_response();
     }
 

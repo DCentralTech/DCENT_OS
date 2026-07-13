@@ -1,0 +1,11 @@
+{"schema":"dcent-init-trace-v1","model":"s19kpro","strictness":"structural","provenance":["","",""]}
+{"event":"baud_changed","chain_id":0,"baud":114678}
+{"event":"command","chain_id":0,"bytes":[88,9,0,8]}
+{"event":"command","chain_id":0,"bytes":[64,161,2,32]}
+{"event":"command","chain_id":0,"bytes":[88,9,0,16]}
+{"event":"command","chain_id":0,"bytes":[0,0,17,90]}
+{"event":"command","chain_id":0,"bytes":[88,9,0,164]}
+{"event":"command","chain_id":0,"bytes":[144,0,255,255]}
+{"event":"command","chain_id":0,"bytes":[88,9,0,40]}
+{"event":"command","chain_id":0,"bytes":[17,48,2,0]}
+{"event":"baud_changed","chain_id":0,"baud":1041666}

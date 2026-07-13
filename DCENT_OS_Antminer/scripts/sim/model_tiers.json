@@ -1,0 +1,24 @@
+{
+  "schema": "dcent-sim-tier-matrix-v1",
+  "models": {
+    "s9": {"tier": 3, "strictness": "exact"},
+    "s11": {"tier": 1, "strictness": "structural"},
+    "s15": {"tier": 1, "strictness": "scaffold"},
+    "t15": {"tier": 1, "strictness": "scaffold"},
+    "s17": {"tier": 3, "strictness": "exact"},
+    "s17pro": {"tier": 3, "strictness": "exact"},
+    "t17": {"tier": 3, "strictness": "exact"},
+    "s17plus": {"tier": 1, "strictness": "structural"},
+    "t17plus": {"tier": 1, "strictness": "structural"},
+    "s17e": {"tier": 1, "strictness": "structural"},
+    "s19": {"tier": 1, "strictness": "structural"},
+    "s19pro": {"tier": 3, "strictness": "exact"},
+    "s19jpro": {"tier": 3, "strictness": "structural"},
+    "s19xp": {"tier": 3, "strictness": "structural"},
+    "s19kpro": {"tier": 3, "strictness": "structural"},
+    "s21": {"tier": 3, "strictness": "structural"},
+    "s21pro": {"tier": 3, "strictness": "structural"},
+    "s21xp": {"tier": 1, "strictness": "structural"},
+    "s23": {"tier": 1, "strictness": "scaffold"}
+  }
+}

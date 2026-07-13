@@ -36,19 +36,6 @@ pub mod bm1393;
 pub mod chain;
 pub mod drivers;
 pub mod dspic;
-/// dsPIC firmware reflash tooling — destructive (NAND erase + write).
-///
-/// Gated behind the `recovery-tool` Cargo feature so the production
-/// `dcentrald` binary cannot link these symbols. Only `pic-recovery`
-/// (separate binary, requires `--confirm-bricked` flag) enables the
-/// feature. A future bug in the daemon that tries to call
-/// `dspic_flash::reflash` / `reset_pic` / `erase_app_region` is now a
-/// **compile error**, not just a runtime gate.
-///
-/// and the 2026-04-29
-/// corruption-prevention plan for context.
-#[cfg(feature = "recovery-tool")]
-pub mod dspic_flash;
 pub mod hw_err_tracker;
 pub mod pic;
 pub mod pic1704;
@@ -87,6 +74,14 @@ pub enum AsicError {
     /// FIFO timeout (no response within expected time).
     #[error("FIFO timeout on chain {chain_id}: {detail}")]
     FifoTimeout { chain_id: u8, detail: String },
+
+    /// GetAddress returned bytes, but the complete FPGA enumeration window did
+    /// not satisfy the integrity contract required to select one ASIC driver.
+    #[error("enumeration integrity failure on chain {chain_id}: {reason:?}")]
+    EnumerationIntegrity {
+        chain_id: u8,
+        reason: crate::chain::EnumerationIdentityIneligibility,
+    },
 
     /// Chip initialization failed.
     #[error("chip init failed on chain {chain_id}: {detail}")]

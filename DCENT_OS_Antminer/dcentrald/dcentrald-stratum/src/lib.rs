@@ -37,6 +37,8 @@ pub mod pool_quality;
 pub mod pool_failover;
 pub mod router;
 pub mod scrypt;
+/// Pure share-pipeline façade (ADR-0009). Prefer this module name in new code.
+pub mod share_pipeline;
 pub mod types;
 pub mod url_validator;
 pub mod v1;

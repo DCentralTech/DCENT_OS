@@ -1,0 +1,70 @@
+# cargo-deny config for the DCENT_OS daemon workspace. Closes the supply-chain
+# gap the build/CI audit (2026-07-11, G4.2 / G2.3) flagged: the PRIMARY firmware
+# had zero dependency vulnerability / license / source scanning, while the ESP
+# sibling already runs cargo-audit in CI. This gives the daemon a CVE gate, a
+# copyleft/unknown-license tripwire, and a no-unknown-source guarantee.
+# Run: `cargo deny check` (wire into CI as a job — see the ESP gate for the shape).
+#
+# NOTE: to add a permissive SPDX id, run `cargo deny check licenses` and append
+# it here with justification rather than loosening the whole check.
+
+[advisories]
+version = 2
+# Fail on any RustSec advisory or yanked crate. Add specific RUSTSEC-*-* ids to
+# `ignore` ONLY with a written justification comment when a fix is unavailable.
+yanked = "deny"
+ignore = [
+    # anyhow 1.0.x Error::downcast_mut() unsoundness. The daemon does not call
+    # downcast_mut on anyhow::Error anywhere (anyhow is used for context/bail
+    # only). Same rationale + ignore as the ESP sibling gate. Unsoundness, not a
+    # reachable vulnerability; no fixed 1.x release at pin time.
+    "RUSTSEC-2026-0190",
+    # rand 0.8/0.9 unsoundness that requires a custom logger calling rand::rng()
+    # during log formatting — the daemon uses the `tracing` crate (not a rand-in-
+    # logger setup), so the unsound path is unreachable. Unsoundness, not a
+    # reachable vulnerability.
+    "RUSTSEC-2026-0097",
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# Firmware is GPL-3.0; these permissive licenses are GPL-compatible. An explicit
+# allow-list keeps a surprising copyleft / unknown-license dependency from
+# entering the tree unnoticed.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    # Community Data License Agreement — Permissive 2.0. A permissive DATA
+    # license (not a code copyleft); used by webpki-roots for the Mozilla CA
+    # certificate bundle pulled in via the Stratum TLS stack.
+    "CDLA-Permissive-2.0",
+    "GPL-3.0",
+    "GPL-3.0-or-later",
+]
+
+[bans]
+multiple-versions = "warn"   # duplicate dep versions bloat the static binary — flag them
+# `warn` (not `deny`): the daemon's ~15 intra-workspace crates use bare path deps
+# (`dcentrald-common = { path = "../dcentrald-common" }`, implicit `*`), which
+# cargo-deny counts as wildcards and — because these crates carry a [package]
+# version — will not exempt under allow-wildcard-paths (it reserves that for
+# unpublished crates). Adding explicit versions to every internal path dep is
+# invasive for a lint that only matters for crates.io publication (these are not
+# published). `warn` still surfaces any real EXTERNAL `foo = "*"` dependency.
+wildcards = "warn"
+deny = []                    # hard-ban specific crates here (e.g. duplicate TLS stacks)
+
+[sources]
+unknown-registry = "deny"    # crates.io only unless explicitly allowed
+unknown-git = "deny"
+allow-git = []               # add first-party git deps here if any are introduced

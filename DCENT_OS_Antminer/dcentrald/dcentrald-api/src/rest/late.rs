@@ -19,10 +19,7 @@ pub(crate) struct HomeNightModeView {
     pub schema_source: &'static str,
 }
 
-fn home_night_mode_from_value(
-    nm: &toml::Table,
-    schema_source: &'static str,
-) -> HomeNightModeView {
+fn home_night_mode_from_value(nm: &toml::Table, schema_source: &'static str) -> HomeNightModeView {
     HomeNightModeView {
         enabled: nm.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false),
         start_hour: nm
@@ -891,9 +888,10 @@ end_hour = 5
     // `grpc_bridge_reboot`) reuse from the REST handlers. They exercise the
     // pure (no-HAL, no-filesystem) pieces — the load-bearing PWM-30 fan clamp
     // and the pool-validation pipeline — so the bridges can never diverge from
-    // the REST handlers' caps. (The actual `set_fan_pwm_via_hal` UIO write and
-    // the `/data/dcentrald.toml` atomic write are hardware/path-bound and
-    // covered on-target, not here.)
+    // the REST handlers' caps. The physical fan command is deliberately
+    // unavailable until the mining runtime owns a serialized broker; the
+    // `/data/dcentrald.toml` atomic write remains path-bound and is covered
+    // separately.)
 
     // ── WAVE 0 STABILIZE (2026-06-05) ──────────────────────────────────────
 
@@ -1893,16 +1891,15 @@ end_hour = 5
         let hw = crate::HardwareInfo {
             control_board: "Zynq am2-s17".to_string(),
             chip_type: "BM1362".to_string(),
-            identification: crate::HardwareIdentification {
-                confidence: "high".to_string(),
-                sources: vec![
-                    "config_model:s19jpro->BM1362".to_string(),
-                    "board_target:am2-s19jpro-zynq->BM1362".to_string(),
+            identification: crate::HardwareIdentification::from_evidence(
+                vec![
+                    crate::HardwareIdentityEvidence::declared_asic_config("s19jpro", "BM1362"),
+                    crate::HardwareIdentityEvidence::declared_asic_board_target(
+                        "am2-s19j", "BM1362",
+                    ),
                 ],
-                note: Some(
-                    "configured model and baked board target agree on ASIC family".to_string(),
-                ),
-            },
+                Some("configured model and baked board target agree on ASIC family".to_string()),
+            ),
             ..crate::HardwareInfo::default()
         };
 
@@ -1913,11 +1910,12 @@ end_hour = 5
             "192.0.2.44".to_string(),
         );
 
-        assert_eq!(body["identification_confidence"], "high");
-        assert_eq!(body["identification"]["confidence"], "high");
+        assert_eq!(body["identification_confidence"], "low");
+        assert_eq!(body["identification"]["confidence"], "low");
+        assert_eq!(body["identification"]["evidence"][0]["level"], "declared");
         assert_eq!(
             body["identification"]["sources"][1],
-            "board_target:am2-s19jpro-zynq->BM1362"
+            "board_target:am2-s19j->BM1362"
         );
     }
 
@@ -2309,11 +2307,19 @@ end_hour = 5
         let host =
             diagnostic_pool_dns_host("stratum+tcp://api09_user:api09_secret@pool.example.com:3333");
 
-        assert_eq!(host, "pool.example.com");
+        assert_eq!(host.as_deref(), Some("pool.example.com"));
         assert!(
-            !host.contains("api09_user") && !host.contains("api09_secret"),
-            "diagnostic DNS host must not expose inline pool credentials: {host}"
+            !host.as_deref().unwrap_or_default().contains("api09_user")
+                && !host.as_deref().unwrap_or_default().contains("api09_secret"),
+            "diagnostic DNS host must not expose inline pool credentials: {host:?}"
         );
+    }
+
+    #[test]
+    fn diagnostic_pool_dns_host_has_no_unsolicited_external_fallback() {
+        assert_eq!(diagnostic_pool_dns_host(""), None);
+        assert_eq!(diagnostic_pool_dns_host("not-a-pool-url"), None);
+        assert_eq!(diagnostic_pool_dns_host("stratum+tcp://:3333"), None);
     }
 
     #[test]
@@ -2384,8 +2390,8 @@ end_hour = 5
             "diagnostic context should preserve the usable pool endpoint without credentials"
         );
         assert_eq!(
-            diagnostic_pool_dns_host(&raw_pool_url),
-            "pool.example.com",
+            diagnostic_pool_dns_host(&raw_pool_url).as_deref(),
+            Some("pool.example.com"),
             "network diagnostics should resolve the sanitized pool host, not the URL userinfo"
         );
     }
@@ -4614,8 +4620,17 @@ end_hour = 5
         });
         {
             let mut hw = state.hardware_info.lock().expect("hardware lock");
-            hw.identification.confidence = "high".to_string();
-            hw.identification.sources = vec!["test:am1-s9".to_string()];
+            hw.identification = crate::HardwareIdentification::from_evidence(
+                vec![
+                    crate::HardwareIdentityEvidence::declared_asic_board_target("am1-s9", "BM1387"),
+                    crate::HardwareIdentityEvidence::measured_asic_enumeration(
+                        0x1387,
+                        "BM1387",
+                        crate::HardwareCompositionToken::new(1, "test:am1-s9"),
+                    ),
+                ],
+                Some("test S9 identity".to_string()),
+            );
         }
 
         let response =
@@ -6874,11 +6889,9 @@ pub(super) async fn post_mqtt_config(
     // CE-111: dedicated config writer — gate on runtime ConfigRw (fail-closed
     // for Unknown/Experimental/Unsupported identities, same as the generic
     // /api/config writer).
-    if let Err(response) = require_antminer_runtime_capability(
-        &state,
-        RuntimeCapability::ConfigRw,
-        "/api/config/mqtt",
-    ) {
+    if let Err(response) =
+        require_antminer_runtime_capability(&state, RuntimeCapability::ConfigRw, "/api/config/mqtt")
+    {
         return response;
     }
 
@@ -10893,61 +10906,41 @@ pub(crate) fn compute_commanded_fan_pwm(
 }
 
 pub(super) fn set_fan_pwm_via_hal(
-    pwm: u8,
+    _hardware_mutation_lease: &dcentrald_hal::platform::HardwareMutationLease,
+    _pwm: u8,
 ) -> std::result::Result<(u8, dcentrald_hal::fan::FanVariant, u8, u8, u8, u32), String> {
-    let (discovery, fan) = dcentrald_hal::fan::FanController::open_discovered()
-        .map_err(|e| format!("open fan-control UIO failed: {}", e))?;
-    let uio = discovery.uio_number;
-    let variant = discovery.variant;
-    fan.set_speed(pwm);
-    let (commanded_pwm0, commanded_pwm1) = fan.get_speed_pwm_channels();
-    let commanded_pwm = commanded_pwm0.max(commanded_pwm1);
-    let max_rpm = fan
-        .get_per_fan_rpm()
-        .iter()
-        .map(|(_, rpm)| *rpm)
-        .max()
-        .unwrap_or(0);
-    Ok((
-        uio,
-        variant,
-        commanded_pwm,
-        commanded_pwm0,
-        commanded_pwm1,
-        max_rpm,
-    ))
+    Err(
+        "fan mutation unavailable until the mining runtime exposes a serialized command broker"
+            .to_string(),
+    )
+}
+
+/// Acquire shared teardown admission for a future brokered hardware write.
+///
+/// The returned RAII lease must stay live through the final broker response.
+/// Requiring a reference to it in [`set_fan_pwm_via_hal`] prevents future fan
+/// call sites from silently bypassing the mutation barrier.
+pub(super) fn acquire_hardware_mutation_lease(
+    state: &AppState,
+    operation: &str,
+) -> std::result::Result<dcentrald_hal::platform::HardwareMutationLease, String> {
+    state
+        .hardware_mutation_gate
+        .try_acquire()
+        .map_err(|error| format!("{operation}: {error}"))
 }
 
 pub(super) fn read_fan_via_hal(
 ) -> std::result::Result<(u8, dcentrald_hal::fan::FanVariant, u8, u8, u8, u32), String> {
-    let (discovery, fan) = dcentrald_hal::fan::FanController::open_discovered()
-        .map_err(|e| format!("open fan-control UIO failed: {}", e))?;
-    let uio = discovery.uio_number;
-    let variant = discovery.variant;
-    let (commanded_pwm0, commanded_pwm1) = fan.get_speed_pwm_channels();
-    let commanded_pwm = commanded_pwm0.max(commanded_pwm1);
-    let max_rpm = fan
-        .get_per_fan_rpm()
-        .iter()
-        .map(|(_, rpm)| *rpm)
-        .max()
-        .unwrap_or(0);
-    Ok((
-        uio,
-        variant,
-        commanded_pwm,
-        commanded_pwm0,
-        commanded_pwm1,
-        max_rpm,
-    ))
+    Err("fan reads must consume the runtime telemetry snapshot".to_string())
 }
 
 /// POST /api/fan -- Set fan speed mode.
 ///
 /// Accepts JSON: { "mode": "quiet|balanced|performance|custom", "target_pwm": 50 }
 /// Maps mode presets to PWM values, or uses target_pwm for custom mode.
-/// Writes through the HAL/UIO fan controller. AM2 must not use devmem here:
-/// the devmem path can hit a stale shadow and falsely report success.
+/// Physical application is unavailable until the mining runtime exposes a
+/// serialized command broker. This request never opens UIO or devmem.
 /// Normal dashboard/API requests are home-capped at PWM 30. Higher requests
 /// require explicit `allow_loud: true`.
 pub(crate) async fn post_fan(
@@ -11026,7 +11019,22 @@ pub(crate) async fn post_fan(
         }
     };
 
-    match set_fan_pwm_via_hal(pwm) {
+    let hardware_mutation_lease = match acquire_hardware_mutation_lease(&state, "POST /api/fan") {
+        Ok(lease) => lease,
+        Err(detail) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "message": "hardware mutation admission rejected",
+                    "detail": detail,
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match set_fan_pwm_via_hal(&hardware_mutation_lease, pwm) {
         Ok((uio, variant, commanded_pwm, commanded_pwm0, commanded_pwm1, max_rpm)) => {
             let physical_floor_warning = pwm <= 10 && max_rpm >= 2000;
             tracing::info!(
@@ -11074,10 +11082,11 @@ pub(crate) async fn post_fan(
                 .into_response()
         }
         Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::NOT_IMPLEMENTED,
             Json(serde_json::json!({
-                "status": "error",
-                "message": format!("Failed to write fan PWM via HAL/UIO: {}", e),
+                "status": "unavailable",
+                "hardware_access_attempted": false,
+                "message": format!("Fan command broker unavailable: {}", e),
             })),
         )
             .into_response(),
@@ -11085,6 +11094,89 @@ pub(crate) async fn post_fan(
 }
 
 // ─── PSU Override Handlers ──────────────────────────────────────────
+
+#[cfg(test)]
+mod fan_mutation_admission_tests {
+    use super::*;
+
+    fn granted_state_with_gate(
+        gate: dcentrald_hal::platform::HardwareMutationGate,
+    ) -> Arc<AppState> {
+        let state = crate::build_minimal_app_state_with_hardware_mutation_gate(
+            crate::MinimalAppStateInputs {
+                api_config: crate::ApiConfig::default(),
+                pool_url: String::new(),
+                pool_protocol: "sv1".to_string(),
+                mode: crate::OperatingMode::Standard,
+                firmware_version: "fan-mutation-admission-test".to_string(),
+                fan_pwm: 20,
+                network_block: crate::NetworkBlockConfig::default(),
+                profile_path: "/tmp/fan-mutation-admission-test".to_string(),
+                control_board_label: "test".to_string(),
+                chip_type_label: "BM1387".to_string(),
+                external_state_rx: None,
+            },
+            gate,
+        );
+        {
+            let mut hardware = state.hardware_info.lock().unwrap();
+            hardware.identification = crate::HardwareIdentification::from_evidence(
+                vec![
+                    crate::HardwareIdentityEvidence::declared_asic_board_target("am1-s9", "BM1387"),
+                    crate::HardwareIdentityEvidence::measured_asic_enumeration(
+                        0x1387,
+                        "BM1387",
+                        crate::HardwareCompositionToken::new(1, "test:am1-s9"),
+                    ),
+                ],
+                Some("test S9 enumeration evidence".to_string()),
+            );
+        }
+        state
+    }
+
+    async fn assert_rest_fan_admission_denied(state: Arc<AppState>, expected_detail: &str) {
+        let response = post_fan(
+            State(state),
+            Json(serde_json::json!({
+                "mode": "custom",
+                "target_pwm": 30,
+            })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["message"].as_str(),
+            Some("hardware mutation admission rejected")
+        );
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains(expected_detail),
+            "expected `{expected_detail}` in admission detail, got: {detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_fan_rejects_pending_mutation_admission_before_hal() {
+        let gate_owner = dcentrald_hal::platform::HardwareMutationGateOwner::new_pending();
+        let state = granted_state_with_gate(gate_owner.gate());
+
+        assert_rest_fan_admission_denied(state, "pending mining readiness").await;
+    }
+
+    #[tokio::test]
+    async fn rest_fan_rejects_closed_mutation_admission_before_hal() {
+        let state =
+            granted_state_with_gate(dcentrald_hal::platform::HardwareMutationGate::new_closed());
+
+        assert_rest_fan_admission_denied(state, "closed for teardown").await;
+    }
+}
 
 /// GET /api/config/power-calibration -- Current wall-meter calibration state.
 pub(super) async fn get_power_calibration(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -11993,6 +12085,56 @@ pub(super) async fn post_offgrid_config(
 
 /// POST /api/offgrid/test -- Probe the configured ADC backend without restarting the daemon.
 pub(super) async fn post_offgrid_test(Json(body): Json<OffGridConfigPayload>) -> impl IntoResponse {
+    match body.adc.as_ref() {
+        Some(dcentrald_hal::adc::AdcBackendConfig::Simulated {
+            voltage_v,
+            current_a,
+        }) => {
+            let power_w = *voltage_v * *current_a;
+            let plausible = voltage_v.is_finite()
+                && *voltage_v > 0.0
+                && *voltage_v < 500.0
+                && current_a.is_finite()
+                && power_w.is_finite();
+            Json(serde_json::json!({
+                "ok": true,
+                "backend": "simulated",
+                "sensorSource": "Simulated",
+                "hasCurrent": *current_a > 0.0,
+                "plausible": plausible,
+                "voltageV": voltage_v,
+                "currentA": current_a,
+                "powerW": power_w,
+                "hardware_access_attempted": false,
+                "message": "Simulated ADC path responded. This confirms lab wiring and UI flow only; do not treat it as field protection.",
+            }))
+            .into_response()
+        }
+        Some(_) => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "ok": false,
+                "status": "unavailable",
+                "hardware_access_attempted": false,
+                "message": "Live ADC tests are unavailable until the runtime owner exposes a serialized telemetry snapshot or command broker.",
+            })),
+        )
+            .into_response(),
+        None => Json(serde_json::json!({
+            "ok": false,
+            "backend": "unconfigured",
+            "sensorSource": "Unconfigured",
+            "hasCurrent": false,
+            "plausible": false,
+            "hardware_access_attempted": false,
+            "message": "Select an ADC backend before testing the Off-Grid sensor path.",
+        }))
+        .into_response(),
+    }
+}
+
+#[cfg(feature = "recovery-tool")]
+async fn post_offgrid_test_recovery(Json(body): Json<OffGridConfigPayload>) -> impl IntoResponse {
     let Some(adc) = body.adc.as_ref() else {
         return Json(serde_json::json!({
             "ok": false,
@@ -14426,11 +14568,9 @@ pub(super) async fn post_home_target(
 ) -> Response {
     // CE-111: dedicated power-policy writer — gate on ConfigRw AND PowerControl
     // (writes [home].target_watts, live power ceiling for the heater path).
-    if let Err(response) = require_antminer_runtime_capability(
-        &state,
-        RuntimeCapability::ConfigRw,
-        "/api/home/target",
-    ) {
+    if let Err(response) =
+        require_antminer_runtime_capability(&state, RuntimeCapability::ConfigRw, "/api/home/target")
+    {
         return response;
     }
     if let Err(response) = require_antminer_runtime_capability(
@@ -14911,10 +15051,34 @@ pub(super) async fn post_home_night_mode(
 
 // ─── Debug Handlers (Hacker Mode Only) ─────────────────────────────────
 
-/// GET /api/debug/registers -- Raw FPGA register dump.
+/// GET /api/debug/registers -- Retired raw FPGA register compatibility route.
 ///
-/// Hacker mode only. Reads FPGA registers via devmem.
+/// Hacker mode remains required, but the normal runtime never reads devmem.
 pub(super) async fn get_debug_registers(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<RegisterQuery>,
+) -> impl IntoResponse {
+    let mode = *state.mode_rx.borrow();
+    if let Err(resp) = crate::mode_middleware::check_mode_access("/api/debug/registers", mode) {
+        return resp.into_response();
+    }
+
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "status": "unavailable",
+            "chain": query.chain,
+            "offset": query.offset,
+            "count": query.count,
+            "hardware_access_attempted": false,
+            "message": "Raw FPGA reads are unavailable until the runtime owner publishes a register snapshot.",
+        })),
+    )
+        .into_response()
+}
+
+#[cfg(feature = "recovery-tool")]
+async fn get_debug_registers_recovery(
     State(state): State<Arc<AppState>>,
     Query(query): Query<RegisterQuery>,
 ) -> impl IntoResponse {
@@ -15038,7 +15202,7 @@ pub(super) async fn post_debug_registers(
         .into_response()
 }
 
-/// GET /api/debug/i2c -- Raw I2C register read.
+/// GET /api/debug/i2c -- Retired raw I2C register read compatibility surface.
 pub(super) async fn get_debug_i2c(
     State(state): State<Arc<AppState>>,
     Query(query): Query<I2cQuery>,
@@ -15048,85 +15212,19 @@ pub(super) async fn get_debug_i2c(
         return resp.into_response();
     }
 
-    // Read I2C register via i2ctransfer
-    let addr_val = u8::from_str_radix(
-        query.addr.trim_start_matches("0x").trim_start_matches("0X"),
-        16,
-    )
-    .unwrap_or(0);
-
-    // Run the blocking i2ctransfer on a blocking thread under a timeout so a stuck
-    // bus can't park a tokio worker indefinitely (AXI IIC stuck-state is a real
-    // hardware condition; this is the diagnostic used to assess it).
-    let bus = query.bus;
-    let reg_opt = query.reg.clone();
-    let i2c_fut = tokio::task::spawn_blocking(move || {
-        if let Some(ref reg) = reg_opt {
-            let reg_val =
-                u8::from_str_radix(reg.trim_start_matches("0x").trim_start_matches("0X"), 16)
-                    .unwrap_or(0);
-            // Write register address, then read 1 byte
-            std::process::Command::new("i2ctransfer")
-                .args([
-                    "-y",
-                    &bus.to_string(),
-                    &format!("w1@0x{:02x}", addr_val),
-                    &format!("0x{:02x}", reg_val),
-                    &format!("r1@0x{:02x}", addr_val),
-                ])
-                .output()
-        } else {
-            // Just read 1 byte
-            std::process::Command::new("i2ctransfer")
-                .args(["-y", &bus.to_string(), &format!("r1@0x{:02x}", addr_val)])
-                .output()
-        }
-    });
-    let result = match tokio::time::timeout(std::time::Duration::from_secs(3), i2c_fut).await {
-        Ok(Ok(r)) => r,
-        _ => {
-            return Json(serde_json::json!({
-                "bus": query.bus,
-                "addr": format!("0x{:02X}", addr_val),
-                "reg": query.reg,
-                "error": "bus did not respond within timeout",
-                "status": "timeout",
-            }))
-            .into_response();
-        }
-    };
-
-    match result {
-        Ok(output) if output.status.success() => {
-            let data_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            Json(serde_json::json!({
-                "bus": query.bus,
-                "addr": format!("0x{:02X}", addr_val),
-                "reg": query.reg,
-                "data": data_str,
-                "status": "ok",
-            }))
-            .into_response()
-        }
-        Ok(output) => {
-            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            Json(serde_json::json!({
-                "bus": query.bus,
-                "addr": format!("0x{:02X}", addr_val),
-                "reg": query.reg,
-                "error": err,
-                "status": "NACK/EIO — device not responding",
-            }))
-            .into_response()
-        }
-        Err(e) => Json(serde_json::json!({
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "status": "unavailable",
+            "operation": "raw_i2c_read",
             "bus": query.bus,
-            "addr": format!("0x{:02X}", addr_val),
-            "error": e.to_string(),
-            "status": "command_failed",
-        }))
-        .into_response(),
-    }
+            "addr": query.addr,
+            "reg": query.reg,
+            "hardware_access_attempted": false,
+            "message": "Direct REST bus access is retired. dcentrald must publish a service-owned snapshot or provide a serialized typed command broker before this operation can be restored.",
+        })),
+    )
+        .into_response()
 }
 
 /// POST /api/debug/i2c -- Raw I2C write.
@@ -15778,6 +15876,46 @@ pub(super) async fn post_debug_psu_control(
         return resp.into_response();
     }
 
+    push_rest_audit_free(
+        &state,
+        "psu",
+        format!("Unavailable PSU control requested: action={}", body.action),
+    );
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "status": "unavailable",
+            "action": body.action,
+            "hardware_access_attempted": false,
+            "message": "Direct PSU control is unavailable until the runtime owner exposes a serialized command broker.",
+        })),
+    )
+        .into_response()
+}
+
+#[cfg(feature = "recovery-tool")]
+async fn post_debug_psu_control_recovery(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PsuControlRequest>,
+) -> impl IntoResponse {
+    if let Err(response) = require_antminer_runtime_capability(
+        &state,
+        RuntimeCapability::PowerControl,
+        "/api/debug/psu/control",
+    ) {
+        return response;
+    }
+
+    let mode = *state.mode_rx.borrow();
+    if let Err(resp) = crate::mode_middleware::check_mode_access("/api/debug/psu/control", mode) {
+        return resp.into_response();
+    }
+
+    let body_json = serde_json::to_value(&body).unwrap_or_default();
+    if let Err(resp) = crate::mode_middleware::check_hacker_confirmation(&body_json) {
+        return resp.into_response();
+    }
+
     let hw = state
         .hardware_info
         .lock()
@@ -15791,6 +15929,26 @@ pub(super) async fn post_debug_psu_control(
         "psu",
         format!("PSU control requested: action={}", body.action),
     );
+
+    // Hold admission across the complete blocking hardware call. Teardown
+    // closes this gate and drains every admitted lease before it observes
+    // safe-off, so an in-flight Hacker request cannot re-enable a rail after
+    // the engine has minted its GPIO-low evidence.
+    let _hardware_mutation_lease = match state.hardware_mutation_gate.try_acquire() {
+        Ok(lease) => lease,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "action": body.action,
+                    "message": "hardware mutation admission is closed for teardown",
+                    "detail": error.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
 
     match body.action.as_str() {
         "enable_output" | "disable_output" if hw.control_board.starts_with("AML") => {
@@ -15832,32 +15990,22 @@ pub(super) async fn post_debug_psu_control(
             };
 
             return match result {
-                Ok(()) => {
-                    let _guard = state.psu_lock.lock().ok();
-                    let (reported_output, measured_voltage) =
-                        match dcentrald_hal::psu::PsuController::open_kernel_only() {
-                            Ok(mut psu) => {
-                                std::thread::sleep(std::time::Duration::from_millis(500));
-                                (psu.read_state().ok(), psu.measure_voltage().ok())
-                            }
-                            Err(_) => (None, None),
-                        };
-
-                    Json(serde_json::json!({
-                        "status": "ok",
-                        "action": body.action,
-                        "control_mode": "gpio_enable + bitmain_apw_i2c",
-                        "output_gate_enabled": dcentrald_hal::platform::zynq::is_psu_output_enabled(),
-                        "output_enabled": reported_output,
-                        "voltage_out": measured_voltage,
-                        "message": if body.action == "enable_output" {
-                            "Zynq PSU output gate enabled"
-                        } else {
-                            "Zynq PSU output gate disabled"
-                        },
-                    }))
-                    .into_response()
-                }
+                Ok(()) => Json(serde_json::json!({
+                    "status": "ok",
+                    "action": body.action,
+                    "control_mode": "gpio_enable",
+                    "output_gate_enabled": dcentrald_hal::platform::zynq::is_psu_output_enabled(),
+                    "output_enabled": null,
+                    "voltage_out": null,
+                    "telemetry_source": "unavailable_until_daemon_owned_psu_snapshot",
+                    "hardware_bus_access_attempted": false,
+                    "message": if body.action == "enable_output" {
+                        "Zynq PSU output gate enabled"
+                    } else {
+                        "Zynq PSU output gate disabled"
+                    },
+                }))
+                .into_response(),
                 Err(e) => (
                     StatusCode::BAD_GATEWAY,
                     Json(serde_json::json!({
@@ -15883,147 +16031,16 @@ pub(super) async fn post_debug_psu_control(
         _ => {}
     }
 
-    let _guard = match state.psu_lock.lock() {
-        Ok(guard) => guard,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "status": "error",
-                    "message": "PSU control lock is poisoned",
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    let mut psu = match dcentrald_hal::psu::PsuController::open_kernel_only() {
-        Ok(psu) => psu,
-        Err(e) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "status": "error",
-                    "message": format!("Smart PSU kernel I2C path unavailable: {}", e),
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    let fw_version = psu.get_version().ok();
-    let model = fw_version
-        .as_deref()
-        .map(dcentrald_hal::psu::PsuController::model_name_from_version);
-
-    let response = match body.action.as_str() {
-        "enable_watchdog" => psu.enable_watchdog().map(|_| {
-            serde_json::json!({
-                "status": "ok",
-                "action": body.action,
-                "model": model,
-                "fw_version": fw_version,
-                "output_enabled": psu.read_state().ok(),
-                "voltage_out": psu.measure_voltage().ok(),
-                "message": "Smart PSU watchdog enabled",
-            })
-        }),
-        "disable_watchdog" => psu.disable_watchdog().map(|_| {
-            serde_json::json!({
-                "status": "ok",
-                "action": body.action,
-                "model": model,
-                "fw_version": fw_version,
-                "output_enabled": psu.read_state().ok(),
-                "voltage_out": psu.measure_voltage().ok(),
-                "message": "Smart PSU watchdog disabled",
-            })
-        }),
-        "feed_watchdog" => psu.feed_watchdog().map(|_| {
-            serde_json::json!({
-                "status": "ok",
-                "action": body.action,
-                "model": model,
-                "fw_version": fw_version,
-                "output_enabled": psu.read_state().ok(),
-                "voltage_out": psu.measure_voltage().ok(),
-                "message": "Smart PSU watchdog fed",
-            })
-        }),
-        "set_voltage" => {
-            let target_v = body.voltage_v.unwrap_or(0.0);
-            if !target_v.is_finite() {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "status": "error",
-                        "message": "voltage_v must be a finite number",
-                    })),
-                )
-                    .into_response();
-            }
-
-            if let Some(ref version) = fw_version {
-                if let Some((min_v, max_v)) =
-                    dcentrald_hal::psu::PsuController::voltage_range_for_version(version)
-                {
-                    if target_v < min_v || target_v > max_v {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(serde_json::json!({
-                                "status": "error",
-                                "message": format!("Target voltage {:.2}V is outside this PSU's supported range ({:.2}V - {:.2}V)", target_v, min_v, max_v),
-                                "model": model,
-                                "fw_version": fw_version,
-                            })),
-                        )
-                            .into_response();
-                    }
-                }
-            }
-
-            psu.disable_watchdog().ok();
-            psu.set_voltage_v(target_v).map(|_| {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                let measured = psu.measure_voltage().ok();
-                let output_enabled = psu.read_state().ok();
-                let _ = psu.enable_watchdog();
-                serde_json::json!({
-                    "status": "ok",
-                    "action": body.action,
-                    "model": model,
-                    "fw_version": fw_version,
-                    "target_voltage_v": target_v,
-                    "measured_voltage_v": measured,
-                    "output_enabled": output_enabled,
-                    "message": "Smart PSU voltage updated and watchdog re-armed",
-                })
-            })
-        }
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "status": "error",
-                    "message": "Unsupported PSU action. Use enable_watchdog, disable_watchdog, feed_watchdog, set_voltage, enable_output, or disable_output.",
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    match response {
-        Ok(payload) => Json(payload).into_response(),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "status": "error",
-                "action": body.action,
-                "message": e.to_string(),
-            })),
-        )
-            .into_response(),
-    }
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "status": "unavailable",
+            "action": body.action,
+            "hardware_bus_access_attempted": false,
+            "message": "Smart PSU mutation is unavailable until the mining runtime exposes a typed, serialized control broker. REST must not open a second bus owner.",
+        })),
+    )
+        .into_response()
 }
 
 // ─── Diagnostic Handlers ───────────────────────────────────────────────
@@ -16041,7 +16058,10 @@ pub(super) async fn post_diag_hashreport_start(
     let state_for_finalize = Arc::clone(&state);
     let chain = body.chain;
     let finalize = std::sync::Arc::new(move |test_id: Uuid, elapsed_s: u64| {
-        build_timed_hashreport_result(&state_for_finalize, test_id, chain, elapsed_s)
+        let state_for_finalize = Arc::clone(&state_for_finalize);
+        Box::pin(async move {
+            build_timed_hashreport_result(&state_for_finalize, test_id, chain, elapsed_s).await
+        }) as dcentrald_diagnostics::FinalizeTestFuture
     });
 
     let test_id = match state.diagnostic_service.lock().await.start_test(
@@ -16149,6 +16169,10 @@ pub(super) async fn get_diag_hashreport_status(
         Some(job) => job,
         None => return report_not_found_response(&query.test_id),
     };
+    let report_available = match snapshot_html_available(test_id).await {
+        Ok(available) => available,
+        Err(response) => return response,
+    };
     Json(serde_json::json!({
         "test_id": query.test_id,
         "status": test_status_as_str(job.status),
@@ -16161,7 +16185,7 @@ pub(super) async fn get_diag_hashreport_status(
         "started_at_epoch_s": job.started_at_epoch_s,
         "completed_at_epoch_s": job.completed_at_epoch_s,
         "duration_seconds": job.result.as_ref().map(|result| result.duration_s).unwrap_or(job.elapsed_s),
-        "report_available": ReportGenerator::new().report_dir().join(format!("{}.html", test_id)).exists(),
+        "report_available": report_available,
         "message": match job.status {
             TestStatus::Running => "Timed HashReport job is still running.",
             TestStatus::Completed => "Timed HashReport job completed and report is available.",
@@ -16192,7 +16216,7 @@ pub(super) async fn get_diag_hashreport_result(
     };
 
     match job.status {
-        TestStatus::Completed => match load_snapshot_artifact(&test_id) {
+        TestStatus::Completed => match load_snapshot_artifact(test_id).await {
             Ok(report) => Json(report).into_response(),
             Err(response) => response,
         },
@@ -16240,12 +16264,12 @@ pub(super) async fn get_diag_hashreport_report(
     };
     let format = query.format.unwrap_or_else(|| "html".to_string());
     if format.eq_ignore_ascii_case("json") {
-        return match load_snapshot_artifact(&test_id) {
+        return match load_snapshot_artifact(test_id).await {
             Ok(report) => Json(report).into_response(),
             Err(response) => response,
         };
     }
-    match load_snapshot_html(&test_id) {
+    match load_snapshot_html(test_id).await {
         Ok(html) => Html(html).into_response(),
         Err(response) => response,
     }
@@ -16258,13 +16282,15 @@ pub(super) async fn post_diag_chiphealth_start(
 ) -> impl IntoResponse {
     let context = snapshot_context(&state);
     let report = build_chip_health_snapshot(&context, body.chain);
-    let html = match ReportGenerator::new().render_chip_health(&report) {
-        Ok(html) => html,
-        Err(error) => return report_storage_error_response(&error),
+    let report_id = report.report_id;
+    let (report, _) = match persist_snapshot_artifact(report_id, report, |generator, report| {
+        generator.render_chip_health(report).map(Some)
+    })
+    .await
+    {
+        Ok(persisted) => persisted,
+        Err(response) => return response,
     };
-    if let Err(response) = persist_snapshot_artifact(report.report_id, &report, Some(&html)) {
-        return response;
-    }
     Json(serde_json::json!({
         "status": "completed",
         "measurement_type": "snapshot",
@@ -16286,7 +16312,7 @@ pub(super) async fn get_diag_chiphealth_status(
         Ok(test_id) => test_id,
         Err(response) => return response,
     };
-    let report = match load_snapshot_artifact(&test_id) {
+    let (report, report_available) = match load_snapshot_artifact_with_html_status(test_id).await {
         Ok(report) => report,
         Err(response) => return response,
     };
@@ -16299,7 +16325,7 @@ pub(super) async fn get_diag_chiphealth_status(
         "source": report.get("source").and_then(|value| value.as_str()).unwrap_or("stored_snapshot"),
         "generated_at": report.get("generated_at").and_then(|value| value.as_str()).unwrap_or_default(),
         "chains": report.get("chains").and_then(|value| value.as_array()).map(|chains| chains.len()).unwrap_or(0),
-        "report_available": ReportGenerator::new().report_dir().join(format!("{}.html", test_id)).exists(),
+        "report_available": report_available,
         "report_url": format!("/api/diagnostics/chip-health/report?test_id={}", test_id),
         "message": "Stored chip-health snapshot is available for this completed test_id.",
     }))
@@ -16314,16 +16340,13 @@ pub(super) async fn get_diag_chiphealth_result(
         Ok(test_id) => test_id,
         Err(response) => return response,
     };
-    match load_snapshot_artifact(&test_id) {
-        Ok(mut report) => {
+    match load_snapshot_artifact_with_html_status(test_id).await {
+        Ok((mut report, report_available)) => {
             if let Some(object) = report.as_object_mut() {
                 object.insert("test_id".to_string(), serde_json::json!(query.test_id));
                 object.insert(
                     "report_available".to_string(),
-                    serde_json::json!(ReportGenerator::new()
-                        .report_dir()
-                        .join(format!("{}.html", test_id))
-                        .exists()),
+                    serde_json::json!(report_available),
                 );
                 object.insert(
                     "report_url".to_string(),
@@ -16349,12 +16372,12 @@ pub(super) async fn get_diag_chiphealth_report(
     };
     let format = query.format.unwrap_or_else(|| "html".to_string());
     if format.eq_ignore_ascii_case("json") {
-        return match load_snapshot_artifact(&test_id) {
+        return match load_snapshot_artifact(test_id).await {
             Ok(report) => Json(report).into_response(),
             Err(response) => response,
         };
     }
-    match load_snapshot_html(&test_id) {
+    match load_snapshot_html(test_id).await {
         Ok(html) => Html(html).into_response(),
         Err(response) => response,
     }
@@ -16367,13 +16390,15 @@ pub(super) async fn post_diag_boardhealth_start(
 ) -> impl IntoResponse {
     let context = snapshot_context(&state);
     let report = build_board_health_snapshot(&context, body.chain);
-    let html = match ReportGenerator::new().render_board_health(&report) {
-        Ok(html) => html,
-        Err(error) => return report_storage_error_response(&error),
+    let report_id = context.report_id;
+    let (report, _) = match persist_snapshot_artifact(report_id, report, |generator, report| {
+        generator.render_board_health(report).map(Some)
+    })
+    .await
+    {
+        Ok(persisted) => persisted,
+        Err(response) => return response,
     };
-    if let Err(response) = persist_snapshot_artifact(context.report_id, &report, Some(&html)) {
-        return response;
-    }
     Json(serde_json::json!({
         "status": "completed",
         "measurement_type": "snapshot",
@@ -16395,7 +16420,7 @@ pub(super) async fn get_diag_boardhealth_status(
         Ok(test_id) => test_id,
         Err(response) => return response,
     };
-    let report = match load_snapshot_artifact(&test_id) {
+    let (report, report_available) = match load_snapshot_artifact_with_html_status(test_id).await {
         Ok(report) => report,
         Err(response) => return response,
     };
@@ -16406,7 +16431,7 @@ pub(super) async fn get_diag_boardhealth_status(
         "phase": "snapshot_ready",
         "measurement_type": "snapshot",
         "boards": report.as_array().map(|boards| boards.len()).unwrap_or(0),
-        "report_available": ReportGenerator::new().report_dir().join(format!("{}.html", test_id)).exists(),
+        "report_available": report_available,
         "report_url": format!("/api/diagnostics/board-health/report?test_id={}", test_id),
         "message": "Stored board-health snapshot is available for this completed test_id.",
     }))
@@ -16421,13 +16446,13 @@ pub(super) async fn get_diag_boardhealth_result(
         Ok(test_id) => test_id,
         Err(response) => return response,
     };
-    match load_snapshot_artifact(&test_id) {
-        Ok(report) => {
+    match load_snapshot_artifact_with_html_status(test_id).await {
+        Ok((report, report_available)) => {
             let response = serde_json::json!({
                 "test_id": query.test_id,
                 "status": "completed",
                 "message": "Stored board-health snapshot loaded.",
-                "report_available": ReportGenerator::new().report_dir().join(format!("{}.html", test_id)).exists(),
+                "report_available": report_available,
                 "report_url": format!("/api/diagnostics/board-health/report?test_id={}", test_id),
                 "boards": report,
             });
@@ -16447,12 +16472,12 @@ pub(super) async fn get_diag_boardhealth_report(
     };
     let format = query.format.unwrap_or_else(|| "html".to_string());
     if format.eq_ignore_ascii_case("json") {
-        return match load_snapshot_artifact(&test_id) {
+        return match load_snapshot_artifact(test_id).await {
             Ok(report) => Json(report).into_response(),
             Err(response) => response,
         };
     }
-    match load_snapshot_html(&test_id) {
+    match load_snapshot_html(test_id).await {
         Ok(html) => Html(html).into_response(),
         Err(response) => response,
     }
@@ -16467,7 +16492,7 @@ pub(super) async fn get_diag_recent_reports(
         .unwrap_or(10)
         .clamp(1, dcentrald_diagnostics::report::MAX_STORED_REPORTS);
 
-    match ReportGenerator::new().list_reports() {
+    match list_snapshot_reports().await {
         Ok(mut reports) => {
             reports.truncate(limit);
             Json(serde_json::json!({
@@ -16476,146 +16501,179 @@ pub(super) async fn get_diag_recent_reports(
             }))
             .into_response()
         }
-        Err(error) => report_storage_error_response(&error),
+        Err(response) => response,
     }
 }
 
 /// GET /api/diagnostics/troubleshoot/network -- Network connectivity test.
 ///
-/// Tests DNS resolution, gateway ping, pool connectivity, NTP sync.
+/// Tests interface address discovery, gateway reachability, and DNS through a
+/// zero-queue bounded subprocess owner. Pool connectivity remains an explicitly
+/// labeled cached runtime observation; this endpoint does not claim an NTP or
+/// live pool-connect probe.
 pub(super) async fn get_diag_network(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let mac = std::fs::read_to_string("/sys/class/net/eth0/address")
-        .unwrap_or_else(|_| "unknown".to_string())
-        .trim()
-        .to_string();
-
-    let carrier = std::fs::read_to_string("/sys/class/net/eth0/carrier")
-        .map(|s| s.trim() == "1")
-        .unwrap_or(false);
-
-    // Get IP address from ip command
-    let ip_output = std::process::Command::new("ip")
-        .args(["-4", "addr", "show", "eth0"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
-    let ip_addr = ip_output
-        .lines()
-        .find(|l| l.contains("inet "))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .unwrap_or("unknown")
-        .to_string();
-
-    // Get default gateway
-    let gw_output = std::process::Command::new("ip")
-        .args(["route", "show", "default"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
-    let gateway = gw_output
-        .split_whitespace()
-        .nth(2)
-        .unwrap_or("unknown")
-        .to_string();
-
-    // Ping gateway (1 packet, 2s timeout)
-    let gw_reachable = std::process::Command::new("ping")
-        .args(["-c", "1", "-W", "2", &gateway])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    // DNS test (resolve pool hostname)
     let miner = state.state_rx.borrow().clone();
     let pool_host = diagnostic_pool_dns_host(&miner.pool.url);
-    let dns_ok = std::process::Command::new("nslookup")
-        .arg(&pool_host)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let probe = match run_network_diagnostic(NetworkProbeInput {
+        dns_host: pool_host.clone(),
+    })
+    .await
+    {
+        Ok(probe) => probe,
+        Err(NetworkProbeError::Busy) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": ProbeStatus::Busy,
+                    "message": "network diagnostic probe is busy; retry after the active bounded probe completes",
+                })),
+            )
+                .into_response();
+        }
+        Err(NetworkProbeError::Cancelled) => {
+            return (
+                StatusCode::REQUEST_TIMEOUT,
+                Json(serde_json::json!({
+                    "status": ProbeStatus::Cancelled,
+                    "message": "network diagnostic probe was cancelled after its active child was terminated",
+                })),
+            )
+                .into_response();
+        }
+        Err(NetworkProbeError::Worker(error)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": ProbeStatus::WorkerError,
+                    "message": error,
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Link metadata is intentionally after bounded-owner admission. A Busy
+    // request therefore starts no Tokio filesystem work. The interface came
+    // from the strictly validated default-route parser, not caller input.
+    let (mac, carrier) = if let Some(interface) = probe.interface.as_deref() {
+        const SYSFS_READ_DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
+        let address_path = format!("/sys/class/net/{interface}/address");
+        let carrier_path = format!("/sys/class/net/{interface}/carrier");
+        let (mac, carrier) = tokio::join!(
+            tokio::time::timeout(SYSFS_READ_DEADLINE, tokio::fs::read_to_string(address_path)),
+            tokio::time::timeout(SYSFS_READ_DEADLINE, tokio::fs::read_to_string(carrier_path))
+        );
+        let mac = mac
+            .ok()
+            .and_then(|result| result.ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
+        let carrier = carrier
+            .ok()
+            .and_then(|result| result.ok())
+            .map(|value| value.trim() == "1")
+            .unwrap_or(false);
+        (mac, carrier)
+    } else {
+        ("unknown".to_string(), false)
+    };
+    let cached_pool_connected = is_pool_connected(&miner.pool.status);
 
     Json(serde_json::json!({
+        "status": "ok",
         "ethernet": {
             "mac": mac,
-            "ip": ip_addr,
+            "ip": probe.ip_cidr.clone().unwrap_or_else(|| "unknown".to_string()),
+            "ip_address": probe.ip_address.clone().unwrap_or_else(|| "unknown".to_string()),
+            "interface": probe.interface.clone().unwrap_or_else(|| "unknown".to_string()),
             "link_up": carrier,
-            "gateway": gateway,
+            "gateway": probe.gateway.clone().unwrap_or_else(|| "unknown".to_string()),
         },
-        "gateway_reachable": gw_reachable,
-        "dns_ok": dns_ok,
+        "gateway_reachable": probe.gateway_reachable.unwrap_or(false),
+        "dns_ok": probe.dns_ok.unwrap_or(false),
         "dns_test_host": pool_host,
+        "probe": probe,
         // SEC (W20 / parity #66): strip inline stratum credentials.
         "pool_url": dcentrald_stratum::pool_api::sanitize_pool_url(&miner.pool.url),
-        "pool_connected": is_pool_connected(&miner.pool.status),
+        "pool_connected": cached_pool_connected,
+        "pool_connectivity": {
+            "connected": cached_pool_connected,
+            "source": "cached_runtime_state",
+            "live_probe_performed": false,
+        },
+        "ntp_probe": {
+            "performed": false,
+            "reason": "NTP probing is not implemented by this endpoint",
+        },
     }))
+    .into_response()
 }
 
-/// GET /api/diagnostics/troubleshoot/psu -- PSU control/telemetry snapshot.
-///
-/// Reports the active PSU control mode for the current platform:
-/// - Bitmain APW smart-PSU kernel-I2C path on supported boards
-/// - GPIO output gating on Amlogic boards
-/// - fixed-voltage override mode for non-smart PSUs
+/// GET /api/diagnostics/troubleshoot/psu -- Daemon-owned PSU telemetry snapshot.
 pub(super) async fn get_diag_psu(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let hw = state
         .hardware_info
         .lock()
         .map(|g| g.clone())
         .unwrap_or_default();
+    let miner = state.state_rx.borrow().clone();
+    let live_power = state.power_rx.borrow().clone();
+    let projection = project_power_telemetry(&live_power, &miner, &hw);
 
-    if hw.psu_override_active {
-        return Json(serde_json::json!({
-            "detected": false,
-            "model": hw.psu_model,
-            "transport": "override",
-            "control_mode": "fixed_voltage_override",
-            "voltage_in": null,
-            "voltage_out": null,
-            "current_a": null,
-            "power_w": null,
-            "temp_c": null,
-            "supports_output_gate": false,
-            "supports_voltage_set": false,
-            "supports_watchdog": false,
-            "message": "PSU override is active. DCENT_OS is treating this as a fixed-voltage PSU with no smart telemetry path.",
-        }));
-    }
-
-    if hw.control_board.starts_with("AML") {
-        return Json(psu_diag_gpio_payload(&hw));
-    }
-
-    let _guard = match state.psu_lock.lock() {
-        Ok(guard) => guard,
-        Err(_) => {
-            return Json(serde_json::json!({
-                "detected": false,
-                "message": "PSU control lock is poisoned",
-            }));
-        }
-    };
-
-    match dcentrald_hal::psu::PsuController::open_kernel_only() {
-        Ok(mut psu) => Json(psu_diag_kernel_payload(&hw, &mut psu)),
-        Err(e) => Json(serde_json::json!({
-            "detected": false,
-            "transport": "kernel_i2c",
-            "voltage_in": null,
-            "voltage_out": null,
-            "current_a": null,
-            "power_w": null,
-            "temp_c": null,
-            "message": format!("Smart PSU kernel I2C path unavailable: {}", e),
-        })),
-    }
+    Json(serde_json::json!({
+        "detected": hw
+            .psu_model
+            .as_deref()
+            .is_some_and(|model| !model.trim().is_empty()),
+        "model": hw.psu_model,
+        "fw_version": hw.psu_fw_version,
+        "transport": "daemon_snapshot",
+        "control_mode": if hw.psu_override_active {
+            "fixed_voltage_override"
+        } else {
+            "runtime_owned"
+        },
+        "voltage_range": hw.psu_voltage_range,
+        "voltage_in": null,
+        "voltage_out": null,
+        "current_a": null,
+        "power_w": projection.live_power_available.then_some(projection.wall_watts),
+        "power_source": projection.source,
+        "power_source_detail": projection.source_detail,
+        "power_modeled": projection.modeled,
+        "temp_c": null,
+        "supports_output_gate": false,
+        "supports_voltage_set": false,
+        "supports_watchdog": false,
+        "hardware_bus_access_attempted": false,
+        "message": "This diagnostic consumes the mining runtime's published power snapshot and never opens a parallel PSU transport. Voltage/current/controller state remain unavailable until the runtime publishes them.",
+    }))
 }
 
-/// GET /api/diagnostics/troubleshoot/fpga -- Per-chain FPGA status.
+/// GET /api/diagnostics/troubleshoot/fpga -- Daemon-owned chain snapshot.
 ///
-/// Reads FPGA version, build ID, and chain status registers via devmem.
-pub(super) async fn get_diag_fpga(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+/// Raw FPGA register fields remain unavailable in the normal runtime.
+pub(super) async fn get_diag_fpga(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let miner = state.state_rx.borrow().clone();
+    Json(serde_json::json!({
+        "status": "snapshot_only",
+        "source": "daemon_runtime_snapshot",
+        "chains": miner.chains,
+        "fans": miner.fans,
+        "hardware_access_attempted": false,
+        "unsupported_fields": [
+            "raw_fpga_version",
+            "raw_fpga_build_id",
+            "raw_fpga_control_register",
+            "raw_gpio_registers"
+        ],
+        "message": "Raw FPGA diagnostics are unavailable until the engine publishes a typed register snapshot.",
+    }))
+}
+
+#[cfg(feature = "recovery-tool")]
+async fn get_diag_fpga_recovery(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
     // Read FPGA registers via devmem for each chain
     // Chain bases: 6=0x43C00000, 7=0x43C10000, 8=0x43C20000
     let chain_bases = [(6u8, 0x43C00000u64), (7, 0x43C10000), (8, 0x43C20000)];
@@ -16760,50 +16818,19 @@ pub(super) async fn get_diag_asic_comm(State(state): State<Arc<AppState>>) -> im
     }))
 }
 
-/// GET /api/diagnostics/troubleshoot/i2c-scan -- I2C bus scan.
-///
-/// Scans I2C bus for all responding devices (PICs, temp sensors, EEPROM).
+/// GET /api/diagnostics/troubleshoot/i2c-scan -- Retired scan compatibility surface.
 pub(super) async fn get_diag_i2c_scan(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
-    // Scan I2C bus 0 by attempting reads at known addresses
-    let mut devices = Vec::new();
-    let known_addrs: Vec<(u8, &str)> = vec![
-        (0x48, "TMP75 temp sensor (if present)"),
-        (0x50, "EEPROM / PIC alternate"),
-        (0x51, "EEPROM / PIC alternate"),
-        (0x52, "EEPROM / PIC alternate"),
-        (0x55, "PIC16F1704 chain 6 (J6)"),
-        (0x56, "PIC16F1704 chain 7 (J7)"),
-        (0x57, "PIC16F1704 chain 8 (J8)"),
-        (0x58, "APW PSU (PMBus)"),
-    ];
-
-    for (addr, description) in &known_addrs {
-        let result = std::process::Command::new("i2ctransfer")
-            .args(["-y", "0", &format!("r1@0x{:02x}", addr)])
-            .output();
-        let status = match result {
-            Ok(o) if o.status.success() => "ACK",
-            _ => "NACK",
-        };
-        devices.push(serde_json::json!({
-            "addr": format!("0x{:02X}", addr),
-            "status": status,
-            "description": description,
-        }));
-    }
-
-    let found_count = devices.iter().filter(|d| d["status"] == "ACK").count();
-
-    Json(serde_json::json!({
-        "bus": "/dev/i2c-0",
-        "devices": devices,
-        "found_count": found_count,
-        "message": if found_count == 0 {
-            "No I2C devices responding — hash boards may lack PSU power (12V via 6-pin connectors)"
-        } else {
-            "I2C scan complete"
-        },
-    }))
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "status": "unavailable",
+            "operation": "i2c_topology_scan",
+            "devices": [],
+            "found_count": 0,
+            "hardware_access_attempted": false,
+            "message": "Live scans are retired because they bypass the daemon's serialized bus owner. Consume a daemon-owned topology snapshot when available.",
+        })),
+    )
 }
 
 // ───  W1: Failure-mode catalog (api-types) ──────────────────────
@@ -18488,7 +18515,11 @@ impl crate::mqtt::MqttCommandSink for AppStateMqttCommandSink {
 
     async fn set_target_watts(&self, requested_watts: u32) -> Result<u32, String> {
         // CE-052: fail-closed `AsicOptions` gate FIRST — before persist/dispatch.
-        bridge_runtime_capability_guard(&self.state, RuntimeCapability::AsicOptions, "mqtt:target_watts")?;
+        bridge_runtime_capability_guard(
+            &self.state,
+            RuntimeCapability::AsicOptions,
+            "mqtt:target_watts",
+        )?;
         let clamped = requested_watts.clamp(
             crate::mqtt::CMD_TARGET_WATTS_MIN,
             crate::mqtt::CMD_TARGET_WATTS_MAX,
@@ -18506,7 +18537,11 @@ impl crate::mqtt::MqttCommandSink for AppStateMqttCommandSink {
 
     async fn set_target_temp_c(&self, requested_temp_c: f64) -> Result<u8, String> {
         // CE-052: fail-closed `ConfigRw` gate FIRST — before the TOML write.
-        bridge_runtime_capability_guard(&self.state, RuntimeCapability::ConfigRw, "mqtt:target_temp_c")?;
+        bridge_runtime_capability_guard(
+            &self.state,
+            RuntimeCapability::ConfigRw,
+            "mqtt:target_temp_c",
+        )?;
         if !requested_temp_c.is_finite() {
             return Err("target temperature must be a finite number".to_string());
         }
@@ -21152,9 +21187,7 @@ fn validate_setup_circuit(
 
     // (1) A declared source must be a known install source. Empty source is the
     // "skip"/not-yet-declared path and stays allowed.
-    if !source.is_empty()
-        && !matches!(source, "grid" | "direct_dc" | "solar_battery" | "hybrid")
-    {
+    if !source.is_empty() && !matches!(source, "grid" | "direct_dc" | "solar_battery" | "hybrid") {
         return Err("source must be one of: grid, direct_dc, solar_battery, hybrid");
     }
 
@@ -21806,11 +21839,9 @@ pub(super) async fn post_led_pattern(
     Json(body): Json<PatternSetRequest>,
 ) -> impl IntoResponse {
     // CE-111: dedicated config writer — gate on runtime ConfigRw.
-    if let Err(response) = require_antminer_runtime_capability(
-        &state,
-        RuntimeCapability::ConfigRw,
-        "/api/led/pattern",
-    ) {
+    if let Err(response) =
+        require_antminer_runtime_capability(&state, RuntimeCapability::ConfigRw, "/api/led/pattern")
+    {
         return response;
     }
 
@@ -22047,11 +22078,9 @@ pub(super) async fn post_led_config(
     Json(body): Json<LedConfigUpdateRequest>,
 ) -> impl IntoResponse {
     // CE-111: dedicated config writer — gate on runtime ConfigRw.
-    if let Err(response) = require_antminer_runtime_capability(
-        &state,
-        RuntimeCapability::ConfigRw,
-        "/api/led/config",
-    ) {
+    if let Err(response) =
+        require_antminer_runtime_capability(&state, RuntimeCapability::ConfigRw, "/api/led/config")
+    {
         return response;
     }
 
@@ -23200,20 +23229,56 @@ mod capability_contract_tests {
         crate::MinerState::empty(crate::OperatingMode::Standard)
     }
 
-    fn hardware(
+    fn unproven_hardware(chip_type: &str, control_board: &str) -> crate::HardwareInfo {
+        crate::HardwareInfo {
+            chip_type: chip_type.to_string(),
+            control_board: control_board.to_string(),
+            ..crate::HardwareInfo::default()
+        }
+    }
+
+    fn measured_hardware(
         chip_type: &str,
+        chip_id: u16,
         control_board: &str,
-        confidence: &str,
-        sources: &[&str],
+        board_target: &str,
     ) -> crate::HardwareInfo {
         crate::HardwareInfo {
             chip_type: chip_type.to_string(),
             control_board: control_board.to_string(),
-            identification: crate::HardwareIdentification {
-                confidence: confidence.to_string(),
-                sources: sources.iter().map(|source| source.to_string()).collect(),
-                note: Some("test identity".to_string()),
-            },
+            identification: crate::HardwareIdentification::from_evidence(
+                vec![
+                    crate::HardwareIdentityEvidence::declared_asic_board_target(
+                        board_target,
+                        chip_type,
+                    ),
+                    crate::HardwareIdentityEvidence::measured_asic_enumeration(
+                        chip_id,
+                        chip_type,
+                        crate::HardwareCompositionToken::new(1, format!("test:{board_target}")),
+                    ),
+                ],
+                Some("test identity with enumeration evidence".to_string()),
+            ),
+            ..crate::HardwareInfo::default()
+        }
+    }
+
+    fn declared_hardware(
+        chip_type: &str,
+        control_board: &str,
+        board_target: &str,
+    ) -> crate::HardwareInfo {
+        crate::HardwareInfo {
+            chip_type: chip_type.to_string(),
+            control_board: control_board.to_string(),
+            identification: crate::HardwareIdentification::from_evidence(
+                vec![crate::HardwareIdentityEvidence::declared_asic_board_target(
+                    board_target,
+                    chip_type,
+                )],
+                Some("test declared identity".to_string()),
+            ),
             ..crate::HardwareInfo::default()
         }
     }
@@ -23243,10 +23308,10 @@ mod capability_contract_tests {
     }
 
     #[test]
-    fn bm1362_chip_type_alone_does_not_promote_to_beta() {
+    fn hardware_identity_bm1362_chip_type_alone_does_not_promote_to_beta() {
         let descriptor = build_antminer_capability_descriptor(
             &empty_miner(),
-            &hardware("BM1362", "am2", "unknown", &[]),
+            &unproven_hardware("BM1362", "am2"),
         );
 
         assert_eq!(descriptor.support, CapabilitySupportTier::Experimental);
@@ -23262,15 +23327,53 @@ mod capability_contract_tests {
     }
 
     #[test]
-    fn exact_s19jpro_am2_source_is_the_bm1362_beta_anchor() {
+    fn hardware_identity_bm1387_chip_id_alone_does_not_promote_unknown_composition() {
         let descriptor = build_antminer_capability_descriptor(
             &empty_miner(),
-            &hardware(
-                "BM1362",
-                "am2-s19jpro-zynq",
-                "high",
-                &["board_target:am2-s19jpro-zynq->BM1362"],
-            ),
+            &unproven_hardware("BM1387", "unknown-zynq"),
+        );
+
+        assert_eq!(descriptor.support, CapabilitySupportTier::Unknown);
+        assert_eq!(descriptor.identity.confidence, IdentityConfidence::Low);
+        assert!(descriptor.fail_safe.read_only);
+        assert!(!descriptor
+            .runtime_caps
+            .contains(&RuntimeCapability::ConfigRw));
+    }
+
+    #[test]
+    fn hardware_identity_bm1387_t9_declaration_is_not_the_s9_beta_anchor() {
+        let descriptor = build_antminer_capability_descriptor(
+            &empty_miner(),
+            &declared_hardware("BM1387", "zynq-t9", "am1-t9"),
+        );
+
+        assert_eq!(descriptor.support, CapabilitySupportTier::Unknown);
+        assert_eq!(descriptor.identity.confidence, IdentityConfidence::Low);
+        assert!(descriptor.fail_safe.read_only);
+    }
+
+    #[test]
+    fn hardware_identity_exact_s9_declaration_is_beta_but_read_only() {
+        let descriptor = build_antminer_capability_descriptor(
+            &empty_miner(),
+            &declared_hardware("BM1387", "am1-s9", "am1-s9"),
+        );
+
+        assert_eq!(descriptor.support, CapabilitySupportTier::Beta);
+        assert_eq!(descriptor.identity.confidence, IdentityConfidence::Low);
+        assert!(descriptor.fail_safe.read_only);
+        assert!(!descriptor
+            .runtime_caps
+            .contains(&RuntimeCapability::ConfigRw));
+        assert!(!descriptor.power.writes_enabled);
+    }
+
+    #[test]
+    fn hardware_identity_measured_s19jpro_is_authorized_beta_anchor() {
+        let descriptor = build_antminer_capability_descriptor(
+            &empty_miner(),
+            &measured_hardware("BM1362", 0x1362, "am2-s19j", "am2-s19j"),
         );
 
         assert_eq!(descriptor.support, CapabilitySupportTier::Beta);
@@ -23301,11 +23404,34 @@ mod capability_contract_tests {
     }
 
     #[test]
+    fn hardware_identity_legacy_exact_without_typed_evidence_is_not_authority() {
+        let legacy: crate::HardwareIdentification = serde_json::from_value(serde_json::json!({
+            "confidence": "exact",
+            "sources": ["board_target:am1-s9->BM1387"]
+        }))
+        .unwrap();
+        let hardware = crate::HardwareInfo {
+            chip_type: "BM1387".to_string(),
+            control_board: "am1-s9".to_string(),
+            identification: legacy,
+            ..crate::HardwareInfo::default()
+        };
+        let descriptor = build_antminer_capability_descriptor(&empty_miner(), &hardware);
+
+        assert_eq!(descriptor.support, CapabilitySupportTier::Unknown);
+        assert_eq!(descriptor.identity.confidence, IdentityConfidence::Low);
+        assert!(descriptor.fail_safe.read_only);
+        assert!(!descriptor
+            .runtime_caps
+            .contains(&RuntimeCapability::ConfigRw));
+    }
+
+    #[test]
     fn bm1366_bm1368_bm1370_baud_reports_antminer_runtime_value() {
         for chip in ["BM1366", "BM1368", "BM1370"] {
             let descriptor = build_antminer_capability_descriptor(
                 &empty_miner(),
-                &hardware(chip, "am3-aml", "high", &["board_target:test"]),
+                &unproven_hardware(chip, "am3-aml"),
             );
 
             assert_eq!(
@@ -23339,7 +23465,7 @@ mod capability_contract_tests {
     fn runtime_guard_blocks_experimental_identity_as_conflict() {
         let descriptor = build_antminer_capability_descriptor(
             &empty_miner(),
-            &hardware("BM1362", "am2", "unknown", &[]),
+            &unproven_hardware("BM1362", "am2"),
         );
         let error = runtime_capability_guard_error(
             &descriptor,
@@ -23357,12 +23483,7 @@ mod capability_contract_tests {
     fn runtime_guard_allows_exact_beta_reboot_and_power_control() {
         let descriptor = build_antminer_capability_descriptor(
             &empty_miner(),
-            &hardware(
-                "BM1362",
-                "am2-s19jpro-zynq",
-                "high",
-                &["board_target:am2-s19jpro-zynq->BM1362"],
-            ),
+            &measured_hardware("BM1362", 0x1362, "am2-s19j", "am2-s19j"),
         );
 
         assert_eq!(
@@ -23417,16 +23538,11 @@ mod capability_contract_tests {
             build_antminer_capability_descriptor(&empty_miner(), &crate::HardwareInfo::default());
         let experimental = build_antminer_capability_descriptor(
             &empty_miner(),
-            &hardware("BM1362", "am2", "unknown", &[]),
+            &unproven_hardware("BM1362", "am2"),
         );
         let beta = build_antminer_capability_descriptor(
             &empty_miner(),
-            &hardware(
-                "BM1362",
-                "am2-s19jpro-zynq",
-                "high",
-                &["board_target:am2-s19jpro-zynq->BM1362"],
-            ),
+            &measured_hardware("BM1362", 0x1362, "am2-s19j", "am2-s19j"),
         );
 
         let config_rw_routes = [
@@ -23447,7 +23563,11 @@ mod capability_contract_tests {
                 runtime_capability_guard_error(&unknown, RuntimeCapability::ConfigRw, route)
                     .unwrap_or_else(|| panic!("{route}: unknown must not grant ConfigRw"));
             assert_eq!(unknown_err.http_status, 409, "{route}");
-            assert_eq!(unknown_err.kind, CapabilityErrorKind::UnknownHardware, "{route}");
+            assert_eq!(
+                unknown_err.kind,
+                CapabilityErrorKind::UnknownHardware,
+                "{route}"
+            );
 
             let exp_err =
                 runtime_capability_guard_error(&experimental, RuntimeCapability::ConfigRw, route)
@@ -23506,16 +23626,11 @@ mod capability_contract_tests {
         // POSITIVE: both beta-tier boards grant Restore.
         let am2 = build_antminer_capability_descriptor(
             &empty_miner(),
-            &hardware(
-                "BM1362",
-                "am2-s19jpro-zynq",
-                "high",
-                &["board_target:am2-s19jpro-zynq->BM1362"],
-            ),
+            &measured_hardware("BM1362", 0x1362, "am2-s19j", "am2-s19j"),
         );
         let am1_s9 = build_antminer_capability_descriptor(
             &empty_miner(),
-            &hardware("BM1387", "am1-s9", "high", &["board_target:am1-s9"]),
+            &measured_hardware("BM1387", 0x1387, "am1-s9", "am1-s9"),
         );
         for descriptor in [&am2, &am1_s9] {
             assert_eq!(
@@ -23539,7 +23654,7 @@ mod capability_contract_tests {
         // NEGATIVE: experimental BM1362 (not the exact anchor) → 409 Conflict.
         let experimental = build_antminer_capability_descriptor(
             &empty_miner(),
-            &hardware("BM1362", "am2", "unknown", &[]),
+            &unproven_hardware("BM1362", "am2"),
         );
         let exp_err = runtime_capability_guard_error(&experimental, restore, restore_route)
             .expect("experimental identity must not grant Restore");
@@ -23549,7 +23664,7 @@ mod capability_contract_tests {
         // NEGATIVE: Amlogic never grants Restore.
         let amlogic = build_antminer_capability_descriptor(
             &empty_miner(),
-            &hardware("BM1368", "am3-aml", "high", &["board_target:am3-aml->BM1368"]),
+            &unproven_hardware("BM1368", "am3-aml"),
         );
         assert!(
             runtime_capability_guard_error(&amlogic, restore, restore_route).is_some(),

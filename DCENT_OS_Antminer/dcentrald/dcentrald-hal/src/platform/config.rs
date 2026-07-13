@@ -213,19 +213,18 @@ pub struct PlatformConfig {
     /// Architecture (for cross-compilation and binary compatibility).
     pub arch: Architecture,
 
-    /// Voltage controller kind, classified at runtime by
-    /// `crate::platform::subtype`. Defaults to `Dspic33Ep` so existing
-    /// platforms keep behaving as before until a subtype probe upgrades
-    /// them. See [`VoltageControllerKind`] for rationale.
+    /// Informational voltage-controller classification. This is not an
+    /// energization capability; mutating services should consume a
+    /// `crate::platform::VoltageControllerEndpoint` issued from discovery.
+    /// Missing serialized data defaults to `NoPic` so schema drift cannot
+    /// silently select dsPIC wire bytes.
     #[serde(default = "default_voltage_controller")]
     pub voltage_controller: VoltageControllerKind,
 }
 
-/// Default for `PlatformConfig::voltage_controller`. Existing platforms
-/// (S9, S19 Pro, S21, S19k Pro) all use the dsPIC family path, so default
-/// to `Dspic33Ep`. PIC1704 detection is opt-in via subtype + probe.
+/// Fail-closed serde default for legacy configs without controller identity.
 fn default_voltage_controller() -> VoltageControllerKind {
-    VoltageControllerKind::Dspic33Ep
+    VoltageControllerKind::NoPic
 }
 
 /// PIC microcontroller type.
@@ -241,16 +240,15 @@ pub enum PicType {
 
 /// Voltage-controller kind selected for the runtime hashboard.
 ///
-/// W2A.2 / W10 PIC1704 wire-up (2026-05-09): platforms now declare which
-/// voltage-controller protocol is in use so the daemon-side orchestrator
-/// can construct the right service (`Pic1704Service` vs. `Pic0x89Service`
-/// vs. NoPic frequency-only) without hardcoding board names.
+/// W2A.2 / W10 PIC1704 wire-up (2026-05-09): platforms expose the observed
+/// controller family for compatibility and telemetry without hardcoding board
+/// names. This enum is not authority to construct a mutating service.
 ///
 /// This is **runtime-classified** by `crate::platform::subtype` from a
 /// combination of `/etc/subtype` and an `i2cdetect 0x20` ACK probe — the
-/// stored value is the result of that classification, not a static
-/// platform default. Falling back to `Dspic33Ep` when the probe is
-/// inconclusive preserves the existing am2 / am3 paths.
+/// stored value is the result of that classification, not a static platform
+/// default. Missing or contradictory evidence projects to `NoPic`; new
+/// service construction consumes an opaque discovery-bound endpoint.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum VoltageControllerKind {
     /// PIC1704-class voltage controller at I²C 0x20. Used by the
@@ -981,6 +979,11 @@ impl PlatformConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_serialized_controller_identity_defaults_to_nopic() {
+        assert_eq!(default_voltage_controller(), VoltageControllerKind::NoPic);
+    }
 
     #[test]
     fn s19k_amlogic_is_nopic_with_kernel_managed_voltage() {

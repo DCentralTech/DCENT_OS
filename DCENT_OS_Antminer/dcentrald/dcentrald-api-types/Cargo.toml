@@ -9,6 +9,8 @@ license = "GPL-3.0"
 serde.workspace = true
 #  tel-B audit_log encoder needs serde_json at runtime, not just tests.
 serde_json.workspace = true
+# FanCommand / HOME_FAN_PWM_SAFETY_MAX — single home-first safety policy (ADR / cycle-3).
+dcentrald-common = { path = "../dcentrald-common" }
 
 [dev-dependencies]
 serde_json.workspace = true

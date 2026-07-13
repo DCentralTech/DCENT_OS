@@ -294,6 +294,31 @@ verify_sha() {
 verify_sha "$NEW_KERNEL" "${NEW_KERNEL}.sha256" || exit 10
 verify_sha "$NEW_ROOTFS" "${NEW_ROOTFS}.sha256" || exit 11
 
+# The SHA sidecars are not a trust anchor because they travel beside the image
+# bytes. The signed CV manifest also carries both digests; bind the payloads to
+# those authenticated values before any write.
+verify_manifest_payload_sha() {
+    payload=$1
+    manifest_key=$2
+    expected=$(grep -E "\"${manifest_key}\"[[:space:]]*:" MANIFEST.json | head -1 \
+        | sed -E 's/.*:[[:space:]]*"([0-9a-fA-F]{64})".*/\1/' \
+        | tr 'A-F' 'a-f')
+    case "$expected" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+        *) err "MANIFEST.json missing valid signed SHA256 for $manifest_key"; return 1 ;;
+    esac
+    [ "${#expected}" -eq 64 ] || {
+        err "MANIFEST.json SHA256 for $manifest_key has invalid length"
+        return 1
+    }
+    actual=$(sha256sum "$payload" | awk '{print $1}')
+    if [ "$expected" != "$actual" ]; then
+        err "signed MANIFEST.json SHA mismatch on $payload: expected=$expected actual=$actual"
+        return 1
+    fi
+    log "OK signed MANIFEST.json SHA256 $payload"
+}
+
 # === Stage 2.5: MANDATORY Ed25519 release-signature verify (CE-091/CE-287) ===
 # The SHA sidecars above are ADDITIONAL integrity checks, NOT a trust anchor:
 # they travel inside the same attacker-controlled tar. Require + verify a real
@@ -339,6 +364,9 @@ else
     fi
     log "OK MANIFEST.sig verified against pinned $RELEASE_PUBKEY"
 fi
+
+verify_manifest_payload_sha "$NEW_KERNEL" "uImage" || exit 22
+verify_manifest_payload_sha "$NEW_ROOTFS" "rootfs.gz" || exit 23
 
 # === Stage 3: backup running kernel + rootfs ========================
 mkdir -p "$BACKUP_DIR"

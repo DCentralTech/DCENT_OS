@@ -50,6 +50,10 @@ DISCOVERY_BIN="${BR2_EXTERNAL_DCENTOS_PATH}/../dcentrald/target/armv7-unknown-li
 if [ -f "$DISCOVERY_BIN" ]; then
     cp "$DISCOVERY_BIN" "${TARGET_DIR}/usr/local/bin/dcentos-discovery"
     chmod 755 "${TARGET_DIR}/usr/local/bin/dcentos-discovery"
+else
+    echo "DCENTos post-build (cv1835-s19jpro): ERROR: dcentos-discovery not found at $DISCOVERY_BIN" >&2
+    echo "  Refusing to ship CV1835 discovery from an undeclared or stale volume artifact." >&2
+    exit 1
 fi
 
 # Board identity files (also pre-staged via rootfs-overlay/etc/dcentos/, but

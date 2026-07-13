@@ -25,12 +25,15 @@
 // crate's `esp-idf`-feature split).
 
 pub mod auth;
+pub mod bitcoin;
 pub mod config;
 pub mod duty;
 pub mod flood;
 pub mod gate;
+pub mod gateway;
 pub mod mcp;
 pub mod mesh;
+pub mod reassembly;
 pub mod relay;
 pub mod sx1262;
 
@@ -48,11 +51,23 @@ pub mod meshtastic;
 pub mod esp_hal;
 
 pub use auth::{MeshAuthenticator, ReplayGuard};
+pub use bitcoin::{
+    build_netinfo, difficulty_from_nbits, netinfo_from_stratum_nbits, BitcoinTickerView,
+    BitcoinTracker,
+};
 pub use config::MeshConfig;
 pub use duty::{DutyCycle, ModulationParams};
 pub use flood::{RebroadcastPlanner, RelayRole, RxAction, SuppressReason};
 pub use gate::{AutotunerMode, CommandGate, ControlLimits, GateOutcome, GateReject, MeshControl};
-pub use mesh::{MeshFrame, MeshHealth, MeshKind, NodeId, Peer, PeerTable, DEFAULT_TTL, MAX_TTL};
+pub use gateway::{GatewayFragmentCollector, GatewayIngest};
+pub use mesh::{
+    BlockFragment, MeshFrame, MeshHealth, MeshKind, NetInfo, NodeId, Peer, PeerTable, Tip,
+    DEFAULT_TTL, MAX_TTL,
+};
+pub use reassembly::{
+    fragment_block, BlockReassembler, ReassemblyOutcome, RejectReason, MAX_BLOCK_BYTES,
+    MAX_BLOCK_FRAGMENTS, MAX_FRAGMENT_BYTES,
+};
 pub use relay::{Enqueued, RelayCache, TxPriority, TxQueue};
 pub use sx1262::{CadExitMode, IrqStatus, LoRaPacketConfig, RampTime, Region, Sx1262, TcxoVoltage};
 

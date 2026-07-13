@@ -1,15 +1,16 @@
 //! PIC1704 reflash auto-detection wrapper (W15.B3).
 //!
-//! Routes PIC1704 reflash invocations to either:
+//! Models how a future authorized PIC1704 reflash executor could route to:
 //!
 //! - [`super::programmer_stock`] (Ghidra-extracted stock bmminer
 //!   protocol — PRIMARY since W15.B), or
 //! - [`super::programmer_v2`] (W4 V2 theoretical/inferred REG_CMD
-//!   0x10-0x15 framed protocol — alternative when stock fails or
-//!   operator explicitly requests).
+//!   0x10-0x15 framed protocol — alternative research model).
 //!
-//! Both backends require the `recovery-tool` Cargo feature; production
-//! `dcentrald` cannot link this module.
+//! Both backends require the `recovery-tool` Cargo feature. No shipped package
+//! enables it, and the diagnostic-only `pic-recovery` package does not execute
+//! this decision. A future transport requires separate controller-recovery
+//! authority.
 //!
 //! ## Routing decision
 //!
@@ -23,11 +24,10 @@
 //! 5. Else (NACK, timeout, or unexpected ACK) → choose
 //!    [`Pic1704Protocol::V2Custom`].
 //!
-//! This module ships the DECISION LOGIC only. The actual I²C transport
-//! (probe write + delay + read) lives in the `pic-recovery` binary's
-//! CLI layer (`pic1704_v2_cli` / future `pic1704_stock_cli`). Keeping
-//! the routing decision host-safe lets the unit tests pin the policy
-//! without requiring a bus.
+//! This module retains DECISION LOGIC only; no shipped I²C probe or mutation
+//! transport consumes it. Keeping the routing decision host-safe lets unit
+//! tests pin the historical policy without requiring a bus. Any future use
+//! must be mediated by the controller-recovery authority architecture.
 
 #![cfg(feature = "recovery-tool")]
 
@@ -59,10 +59,9 @@ pub enum Pic1704Protocol {
     /// - CRC-ITU-T V.41 checksum (poly 0x1021)
     /// - Single-phase write (`0x12 + count + data`)
     ///
-    /// Use when the stock probe fails — i.e. the chip's bootloader has
-    /// been replaced with a different firmware that speaks the dsPIC33EP
-    /// bootloader spec. Also the explicit fallback when the operator
-    /// requests `--pic1704-protocol=w4v2`.
+    /// Research model selected when a stock-protocol fixture does not match —
+    /// for example, a bootloader image that speaks the dsPIC33EP-derived
+    /// protocol. No shipped CLI exposes this selection.
     V2Custom,
 }
 

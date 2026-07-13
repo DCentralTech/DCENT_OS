@@ -26,6 +26,9 @@
 # Prerequisites:
 #   - BraiinsOS boot components in extractions/s9/ (kernel)
 #   - DCENTos rootfs.squashfs from Buildroot
+#   - Release invocations must supply source-bound SOURCE_DATE_EPOCH,
+#     DCENT_SOURCE_COMMIT[_EPOCH], clean tree state, build arch and toolchain id.
+#     scripts/build_in_docker.sh derives and validates these centrally.
 #
 # Usage:
 #   ./package_sysupgrade.sh                           # Default paths
@@ -44,6 +47,7 @@ FIRMWARE_DIR="$(dirname "$SCRIPT_DIR")"
 PROJECT_ROOT="$(dirname "$FIRMWARE_DIR")"
 IMAGES_DIR="$FIRMWARE_DIR/buildroot/output/images"
 . "$SCRIPT_DIR/lib/dcentrald_version_gate.sh"
+. "$SCRIPT_DIR/lib/release_envelope.sh"
 
 OUTPUT_FILE=""
 UPLOAD_IP=""
@@ -402,6 +406,11 @@ if is_release_status "$PACKAGE_STATUS" && ! is_truthy "${DCENT_RELEASE_IMAGE:-0}
     error "release-status package requires DCENT_RELEASE_IMAGE=1 (release-image hardening); set DCENT_PACKAGE_STATUS to a non-release lab value (e.g. lab_signed) for dev/lab packages (CE-183)."
 fi
 
+DCENT_BUILD_TARGET="${DCENT_BUILD_TARGET:-$BOARD_NAME}"
+DCENT_PACKAGE_STATUS="$PACKAGE_STATUS"
+dcent_release_provenance_init || error "Invalid or missing release provenance."
+CANONICAL_BUILD_TIME=$(printf '%s' "$DCENT_CREATED_AT_UTC" | sed 's/T/ /; s/Z/ UTC/')
+
 # =============================================================================
 # Validate Prerequisites
 # =============================================================================
@@ -546,7 +555,7 @@ info "    root    ($((ROOTFS_SIZE / 1024)) KB)"
 cat > "$SYSUPGRADE_DIR/METADATA" << EOF
 DCENT_OS
 D-Central Technologies
-Build: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+Build: $CANONICAL_BUILD_TIME
 Board: $BOARD_NAME
 Kernel: BraiinsOS 4.4.x (preserved)
 Rootfs: DCENTos (Buildroot)
@@ -571,8 +580,17 @@ cat > "$SYSUPGRADE_DIR/MANIFEST.json" << EOF
   "board": "$BOARD_NAME",
   "board_target": "$BOARD_NAME",
   "version": "$PACKAGE_VERSION",
-  "created_at_utc": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "created_at_utc": "$DCENT_CREATED_AT_UTC",
   "status": "$PACKAGE_STATUS",
+  "provenance": {
+    "source_commit": "$DCENT_SOURCE_COMMIT",
+    "source_tree_state": "$DCENT_SOURCE_TREE_STATE",
+    "source_date_epoch": $SOURCE_DATE_EPOCH,
+    "source_commit_epoch": $DCENT_SOURCE_COMMIT_EPOCH,
+    "build_target": "$DCENT_BUILD_TARGET",
+    "build_arch": "$DCENT_BUILD_ARCH",
+    "toolchain_id": "$DCENT_TOOLCHAIN_ID"
+  },
   "payloads": {
     "kernel": {
       "path": "$SYSUPGRADE_SUBDIR/kernel",
@@ -635,8 +653,17 @@ if [ -n "$SIGNING_KEY" ]; then
   "board": "$BOARD_NAME",
   "board_target": "$BOARD_NAME",
   "version": "$PACKAGE_VERSION",
-  "created_at_utc": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "created_at_utc": "$DCENT_CREATED_AT_UTC",
   "status": "$PACKAGE_STATUS",
+  "provenance": {
+    "source_commit": "$DCENT_SOURCE_COMMIT",
+    "source_tree_state": "$DCENT_SOURCE_TREE_STATE",
+    "source_date_epoch": $SOURCE_DATE_EPOCH,
+    "source_commit_epoch": $DCENT_SOURCE_COMMIT_EPOCH,
+    "build_target": "$DCENT_BUILD_TARGET",
+    "build_arch": "$DCENT_BUILD_ARCH",
+    "toolchain_id": "$DCENT_TOOLCHAIN_ID"
+  },
   "payloads": {
     "kernel": {
       "path": "$SYSUPGRADE_SUBDIR/kernel",
@@ -688,7 +715,7 @@ fi
 # OpenWrt sysupgrade expects a plain tar (no compression) with the
 # sysupgrade-<board>/ directory at the top level.
 info "Creating sysupgrade tar..."
-(cd "$STAGING" && tar cf "$OUTPUT_FILE" "$SYSUPGRADE_SUBDIR/")
+dcent_create_deterministic_tar "$OUTPUT_FILE" "$STAGING" "$SYSUPGRADE_SUBDIR"
 
 # Cleanup staging
 rm -rf "$STAGING"

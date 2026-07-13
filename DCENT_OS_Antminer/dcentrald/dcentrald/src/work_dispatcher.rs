@@ -41,11 +41,91 @@ use dcentrald_autotuner::power_budget::RuntimeWattCapState;
 use dcentrald_autotuner::power_budget::{efficiency_jth_from, EfficiencyHashrateEma};
 use dcentrald_autotuner::{FreqCommand, FrequencyLimitSource, LivePowerEstimate, PowerCalibration};
 use dcentrald_hal::led::LedCommand;
+use dcentrald_stratum::share_pipeline::WorkBuilder;
 use dcentrald_stratum::types::{JobTemplate, ValidShare};
-use dcentrald_stratum::WorkBuilder;
+
+use crate::asic_identity_publication::{ActiveCompositionSession, AsicIdentityPublicationPort};
+use crate::runtime::task_guard::RuntimeTaskGuard;
+use crate::voltage_mailbox::{VoltageCommandSender, VoltageTrySendError};
 
 const MIN_RUNTIME_FREQ_MHZ: u16 = 200;
 const RECENT_WORK_ID_SLOT_GUARD: Duration = Duration::from_secs(5);
+const VOLTAGE_REPLY_TASK_STOP_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Production chip identities allowed to cross the dispatcher's hardware-write
+/// boundary. Keeping this closed and typed prevents an unknown or missing ID
+/// from inheriting BM1387 work timing, PLL floors, version policy, or packet
+/// selection through a wildcard/default branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchWriteChip {
+    Bm1362,
+    Bm1366,
+    Bm1368,
+    Bm1370,
+    Bm1387,
+    Bm1397,
+    Bm1398,
+}
+
+impl DispatchWriteChip {
+    fn chip_id(self) -> u16 {
+        match self {
+            Self::Bm1362 => 0x1362,
+            Self::Bm1366 => 0x1366,
+            Self::Bm1368 => 0x1368,
+            Self::Bm1370 => 0x1370,
+            Self::Bm1387 => 0x1387,
+            Self::Bm1397 => 0x1397,
+            Self::Bm1398 => 0x1398,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchWriteIdentityError {
+    Missing,
+    Unsupported(u16),
+    Mixed {
+        dispatcher_chip_id: u16,
+        chain_chip_id: u16,
+    },
+}
+
+impl std::fmt::Display for DispatchWriteIdentityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => write!(f, "ASIC chip identity is missing"),
+            Self::Unsupported(chip_id) => {
+                write!(f, "ASIC chip identity 0x{chip_id:04X} is not production-dispatchable")
+            }
+            Self::Mixed {
+                dispatcher_chip_id,
+                chain_chip_id,
+            } => write!(
+                f,
+                "dispatcher chip 0x{dispatcher_chip_id:04X} disagrees with chain chip 0x{chain_chip_id:04X}"
+            ),
+        }
+    }
+}
+
+impl TryFrom<u16> for DispatchWriteChip {
+    type Error = DispatchWriteIdentityError;
+
+    fn try_from(chip_id: u16) -> std::result::Result<Self, Self::Error> {
+        match chip_id {
+            0 => Err(DispatchWriteIdentityError::Missing),
+            0x1362 => Ok(Self::Bm1362),
+            0x1366 => Ok(Self::Bm1366),
+            0x1368 => Ok(Self::Bm1368),
+            0x1370 => Ok(Self::Bm1370),
+            0x1387 => Ok(Self::Bm1387),
+            0x1397 => Ok(Self::Bm1397),
+            0x1398 => Ok(Self::Bm1398),
+            other => Err(DispatchWriteIdentityError::Unsupported(other)),
+        }
+    }
+}
 
 /// Work tracking entry for matching nonces back to jobs.
 #[derive(Clone)]
@@ -87,7 +167,7 @@ struct WorkEntry {
     dispatched_at: Instant,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum VoltageCommandReply {
     Applied(u16),
     Verified(Option<u16>),
@@ -401,9 +481,8 @@ pub struct WorkDispatcher {
     freq_cmd_rx: Option<mpsc::Receiver<FreqCommand>>,
     /// Autotuner measurement window interval (seconds).
     autotune_window_s: u64,
-    /// Channel to route platform-aware voltage commands to the runtime I2C thread.
-    /// SAFETY (wave 8, 2026-04-28): bounded SyncSender — see daemon.rs field doc.
-    voltage_cmd_tx: Option<std::sync::mpsc::SyncSender<VoltageCommand>>,
+    /// Safety-prioritized mailbox for platform-aware runtime voltage commands.
+    voltage_cmd_tx: Option<VoltageCommandSender>,
     /// Gap 2: Shared XADC die temperature from thermal loop (f32 bits).
     xadc_temp: Option<Arc<AtomicU32>>,
     /// Per-chain board temperatures (f32 bits) via BM1387 I2C passthrough.
@@ -461,9 +540,39 @@ pub struct WorkDispatcher {
     /// stale up-front, fewer wasted hash recomputes against aliased
     /// midstates). Set to 1 to revert to legacy behavior.
     stale_age_divisor: u32,
+    /// One-shot, generation-bound authority to publish measured ASIC identity
+    /// after dispatcher/all-chain consensus is proven.
+    asic_identity_publication: Option<AsicIdentityPublicationPort>,
 }
 
 impl WorkDispatcher {
+    fn normalize_dispatch_write_identity<I>(
+        dispatcher_chip_id: u16,
+        mining_chain_chip_ids: I,
+    ) -> std::result::Result<DispatchWriteChip, DispatchWriteIdentityError>
+    where
+        I: IntoIterator<Item = u16>,
+    {
+        let chip = DispatchWriteChip::try_from(dispatcher_chip_id)?;
+        for chain_chip_id in mining_chain_chip_ids {
+            let chain_chip = DispatchWriteChip::try_from(chain_chip_id)?;
+            if chain_chip != chip {
+                return Err(DispatchWriteIdentityError::Mixed {
+                    dispatcher_chip_id,
+                    chain_chip_id,
+                });
+            }
+        }
+        Ok(chip)
+    }
+
+    fn normalize_chain_write_identity(
+        dispatcher_chip_id: u16,
+        chain_chip_id: u16,
+    ) -> std::result::Result<DispatchWriteChip, DispatchWriteIdentityError> {
+        Self::normalize_dispatch_write_identity(dispatcher_chip_id, [chain_chip_id])
+    }
+
     /// Create a new work dispatcher with chains and chip info.
     ///
     /// `hw_difficulty` must match the TicketMask written during init.
@@ -481,7 +590,7 @@ impl WorkDispatcher {
         autotune_stats_tx: Option<mpsc::Sender<ChipStatsSnapshot>>,
         freq_cmd_rx: Option<mpsc::Receiver<FreqCommand>>,
         autotune_window_s: u64,
-        voltage_cmd_tx: Option<std::sync::mpsc::SyncSender<VoltageCommand>>,
+        voltage_cmd_tx: Option<VoltageCommandSender>,
         xadc_temp: Arc<AtomicU32>,
         i2c_active: Arc<AtomicBool>,
         board_temps: Vec<Arc<AtomicU32>>,
@@ -545,7 +654,15 @@ impl WorkDispatcher {
             // from `MiningConfig::stale_age_divisor` (default 4 from
             // `default_stale_age_divisor()`).
             stale_age_divisor: 1,
+            asic_identity_publication: None,
         }
+    }
+
+    pub(crate) fn set_asic_identity_publication_port(
+        &mut self,
+        port: Option<AsicIdentityPublicationPort>,
+    ) {
+        self.asic_identity_publication = port;
     }
 
     ///  W1 — install the stale-age divisor (from `MiningConfig`).
@@ -724,7 +841,10 @@ impl WorkDispatcher {
     }
 
     fn accepts_job_version_mask(chip_id: u16, version_mask: u32) -> bool {
-        !Self::requires_negotiated_version_mask(chip_id) || version_mask != 0
+        let Ok(chip) = DispatchWriteChip::try_from(chip_id) else {
+            return false;
+        };
+        chip != DispatchWriteChip::Bm1387 || version_mask != 0
     }
 
     fn uses_8bit_fpga_work_id(chip_id: u16) -> bool {
@@ -824,8 +944,8 @@ impl WorkDispatcher {
         }
     }
 
-    fn min_supported_freq(chip_id: u16) -> u16 {
-        MinerProfile::pll_frequencies_for_chip(chip_id)
+    fn min_supported_freq(chip: DispatchWriteChip) -> u16 {
+        MinerProfile::pll_frequencies_for_chip(chip.chip_id())
             .iter()
             .copied()
             .filter(|freq| *freq >= MIN_RUNTIME_FREQ_MHZ)
@@ -833,8 +953,12 @@ impl WorkDispatcher {
             .unwrap_or(MIN_RUNTIME_FREQ_MHZ)
     }
 
-    fn clamp_requested_freq(chip_id: u16, requested_mhz: u16, ceiling_mhz: Option<u16>) -> u16 {
-        let floor = Self::min_supported_freq(chip_id);
+    fn clamp_requested_freq(
+        chip: DispatchWriteChip,
+        requested_mhz: u16,
+        ceiling_mhz: Option<u16>,
+    ) -> u16 {
+        let floor = Self::min_supported_freq(chip);
         let requested = requested_mhz.max(floor);
         ceiling_mhz.map_or(requested, |ceiling| requested.min(ceiling.max(floor)))
     }
@@ -845,7 +969,11 @@ impl WorkDispatcher {
     ) -> Option<Option<u16>> {
         match max_freq_mhz {
             None => Some(None),
-            Some(freq) => chip_id.map(|id| Some(Self::clamp_requested_freq(id, freq, None))),
+            Some(freq) => chip_id.and_then(|id| {
+                DispatchWriteChip::try_from(id)
+                    .ok()
+                    .map(|chip| Some(Self::clamp_requested_freq(chip, freq, None)))
+            }),
         }
     }
 
@@ -939,24 +1067,56 @@ impl WorkDispatcher {
         self.chains
             .get(chain_idx)
             .map(|chain| {
-                chain
-                    .frequency_mhz
-                    .max(Self::min_supported_freq(chain.chip_id))
+                DispatchWriteChip::try_from(chain.chip_id)
+                    .map(|chip| chain.frequency_mhz.max(Self::min_supported_freq(chip)))
+                    .unwrap_or(0)
             })
             .unwrap_or(200)
     }
 
-    fn recalc_work_time_for_chain(chain: &mut Chain, min_freq_mhz: u16) {
-        let midstate_cnt = 1u32 << chain.fpga_midstate_cnt;
-        let work_time = match chain.chip_id {
-            0x1362 => Bm1362Driver::calculate_work_time_for(chain.chip_count, min_freq_mhz),
-            0x1366 => Bm1366Driver::calculate_work_time(min_freq_mhz, midstate_cnt),
-            0x1368 => Bm1368Driver::calculate_work_time(min_freq_mhz, chain.chip_count),
-            0x1370 => Bm1370Driver::calculate_work_time(min_freq_mhz, chain.chip_count),
-            0x1397 => Bm1397Driver::calculate_work_time(min_freq_mhz, midstate_cnt),
-            0x1398 => Bm1398Driver::calculate_work_time(min_freq_mhz, midstate_cnt),
-            _ => Bm1387Driver::calculate_work_time(min_freq_mhz, midstate_cnt),
-        };
+    fn calculate_work_time_for_chip(
+        chip: DispatchWriteChip,
+        chip_count: u8,
+        min_freq_mhz: u16,
+        fpga_midstate_cnt: u8,
+    ) -> u32 {
+        let midstate_cnt = 1u32 << fpga_midstate_cnt;
+        match chip {
+            DispatchWriteChip::Bm1362 => {
+                Bm1362Driver::calculate_work_time_for(chip_count, min_freq_mhz)
+            }
+            DispatchWriteChip::Bm1366 => {
+                Bm1366Driver::calculate_work_time(min_freq_mhz, midstate_cnt)
+            }
+            DispatchWriteChip::Bm1368 => {
+                Bm1368Driver::calculate_work_time(min_freq_mhz, chip_count)
+            }
+            DispatchWriteChip::Bm1370 => {
+                Bm1370Driver::calculate_work_time(min_freq_mhz, chip_count)
+            }
+            DispatchWriteChip::Bm1387 => {
+                Bm1387Driver::calculate_work_time(min_freq_mhz, midstate_cnt)
+            }
+            DispatchWriteChip::Bm1397 => {
+                Bm1397Driver::calculate_work_time(min_freq_mhz, midstate_cnt)
+            }
+            DispatchWriteChip::Bm1398 => {
+                Bm1398Driver::calculate_work_time(min_freq_mhz, midstate_cnt)
+            }
+        }
+    }
+
+    fn recalc_work_time_for_chain(
+        chain: &mut Chain,
+        min_freq_mhz: u16,
+    ) -> std::result::Result<(), DispatchWriteIdentityError> {
+        let chip = DispatchWriteChip::try_from(chain.chip_id)?;
+        let work_time = Self::calculate_work_time_for_chip(
+            chip,
+            chain.chip_count,
+            min_freq_mhz,
+            chain.fpga_midstate_cnt,
+        );
         chain
             .fpga
             .common
@@ -972,6 +1132,7 @@ impl WorkDispatcher {
             min_freq_mhz,
             work_time,
         );
+        Ok(())
     }
 
     async fn reapply_chain_frequencies(
@@ -989,6 +1150,8 @@ impl WorkDispatcher {
         if !chain.mining {
             return Ok(());
         }
+        let write_chip = Self::normalize_chain_write_identity(self.chip_id, chain.chip_id)
+            .map_err(|error| format!("refusing {}: {}", reason, error))?;
         let chain_id = chain.chain_id;
         let chain_chip_id = chain.chip_id;
         let chain_chip_count = chain.chip_count;
@@ -1014,7 +1177,7 @@ impl WorkDispatcher {
         let mut target_freqs = desired;
         for (chip_idx, freq) in target_freqs.iter_mut().enumerate() {
             *freq = Self::clamp_requested_freq(
-                chain_chip_id,
+                write_chip,
                 *freq,
                 self.effective_chip_ceiling(chain_idx, chip_idx),
             );
@@ -1115,7 +1278,8 @@ impl WorkDispatcher {
             .unwrap_or(current_chain_freq);
         let chain = &mut self.chains[chain_idx];
         chain.frequency_mhz = new_chain_freq;
-        Self::recalc_work_time_for_chain(chain, min_freq);
+        Self::recalc_work_time_for_chain(chain, min_freq)
+            .map_err(|error| format!("refusing {} work-time update: {}", reason, error))?;
         if partial_failure {
             warn!(
                 chain_id,
@@ -1271,9 +1435,51 @@ impl WorkDispatcher {
             "Work dispatcher online — the mining engine that converts pool jobs into bitcoin shares"
         );
 
-        // Look up the chip driver from the registry
+        // Normalize the global + per-mining-chain identity before ANY policy
+        // that can feed a hardware write. A single registry hit is not enough:
+        // the dispatcher owns one driver, so a mixed or unknown chain would
+        // otherwise inherit that driver's packet/PLL/version behavior.
+        let dispatch_chip = match Self::normalize_dispatch_write_identity(
+            self.chip_id,
+            self.chains
+                .iter()
+                .filter(|chain| chain.mining)
+                .map(|chain| chain.chip_id),
+        ) {
+            Ok(chip) => Some(chip),
+            Err(error) => {
+                error!(
+                    chip_id = format_args!("0x{:04X}", self.chip_id),
+                    error = %error,
+                    "ASIC dispatch identity is not authoritative; work and frequency writes remain disabled"
+                );
+                None
+            }
+        };
+
+        // Look up the chip driver only after the typed write boundary accepts
+        // the identity. Unknown/missing/mixed identities stay monitoring-only.
         let registry = ChipRegistry::new();
-        let driver = registry.detect(self.chip_id);
+        let driver = dispatch_chip.and_then(|chip| registry.detect(chip.chip_id()));
+
+        let mut identity_composition_session: Option<ActiveCompositionSession> = None;
+        if let Some(publication) = self.asic_identity_publication.take() {
+            if dispatch_chip.is_some() && driver.is_some() {
+                match publication.publish(self.chip_id) {
+                    Ok(session) => identity_composition_session = Some(session),
+                    Err(error) => {
+                        error!(
+                            error = %error,
+                            "Dispatcher ASIC consensus did not publish measured hardware identity"
+                        );
+                    }
+                }
+            } else {
+                warn!(
+                    "Dispatcher identity is missing, mixed, or unsupported; measured hardware identity remains unpublished"
+                );
+            }
+        }
 
         if driver.is_none() {
             if self.chip_id != 0 {
@@ -1314,7 +1520,11 @@ impl WorkDispatcher {
             .map(|c| c.fpga_midstate_cnt.min(3) as u32)
             .max()
             .unwrap_or(0);
-        let work_id_space = Self::work_id_space_for(self.chip_id, max_midstate_shift);
+        let work_id_space = dispatch_chip
+            .map(|chip| Self::work_id_space_for(chip.chip_id(), max_midstate_shift))
+            // Monitoring-only mode never dispatches. Keep a one-slot inert
+            // table without selecting any ASIC family's work-id policy.
+            .unwrap_or(1);
         let work_id_mask = (work_id_space - 1) as u16;
         let mut work_id_counter: u16 = 0;
         let mut work_table: Vec<Option<Arc<WorkEntry>>> = vec![None; work_id_space];
@@ -1416,6 +1626,8 @@ impl WorkDispatcher {
         let mut bm1387_missing_version_mask_logged = false;
         let dispatch_start = std::time::Instant::now();
         let (voltage_result_tx, mut voltage_result_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut voltage_reply_tasks = RuntimeTaskGuard::new(self.shutdown.child_token());
+        let mut voltage_reply_task_sequence: u64 = 0;
         let mut power_cap_under_ticks = vec![0u8; self.chains.len()];
 
         // Work dispatch interval: 5ms poll for TX FIFO space.
@@ -2417,7 +2629,7 @@ impl WorkDispatcher {
                             if chain_chip_id == 0x1398 {
                                 let header =
                                     dispatcher_build_header(&work_entry, full_version, nonce_result.nonce);
-                                if !dcentrald_stratum::work::validate_full_header(
+                                if !dcentrald_stratum::share_pipeline::validate_full_header(
                                     &header,
                                     &work_entry.share_target,
                                 ) {
@@ -2458,7 +2670,7 @@ impl WorkDispatcher {
                                 // midstate end-to-end. This is the historically proven
                                 // accepted-share path for BM1387/BM1397.
                                 let midstate = &work_entry.midstates[ms_idx];
-                                let mut legacy_valid = dcentrald_stratum::work::validate_share(
+                                let mut legacy_valid = dcentrald_stratum::share_pipeline::validate_share(
                                     midstate,
                                     &work_entry.header_tail,
                                     nonce_result.nonce,
@@ -2885,6 +3097,10 @@ impl WorkDispatcher {
                     }
                 } => {
                     if let Some(cmd) = cmd {
+                        let completed_reply_tasks = voltage_reply_tasks.reap_finished().await;
+                        if completed_reply_tasks.any_panicked() {
+                            warn!("A voltage reply task panicked; command acknowledgement may have been lost");
+                        }
                         // Gate FPGA-touching freq commands on i2c_active to prevent
                         // AXI bus contention with PIC heartbeat thread. Same pattern
                         // as work dispatch (line 1372) and nonce polling (line 1661).
@@ -2935,6 +3151,23 @@ impl WorkDispatcher {
                                     let ci = chip_index as usize;
                                     let chain_chip_id = self.chains[idx].chip_id;
                                     let chain_chip_count = self.chains[idx].chip_count;
+                                    let chain_write_chip = match
+                                        Self::normalize_chain_write_identity(
+                                            self.chip_id,
+                                            chain_chip_id,
+                                        ) {
+                                        Ok(chip) => chip,
+                                        Err(identity_error) => {
+                                            apply_result = Err(format!(
+                                                "refusing SetChipFreq for chain {}: {}",
+                                                chain_id, identity_error
+                                            ));
+                                            if let Some(ack_tx) = ack_tx {
+                                                let _ = ack_tx.send(apply_result);
+                                            }
+                                            continue;
+                                        }
+                                    };
                                     if ci >= chain_chip_count as usize {
                                         warn!(chain_id, chip_index, freq_mhz, "Autotuner: chip index out of range for SetChipFreq");
                                         apply_result = Err(format!(
@@ -2947,7 +3180,8 @@ impl WorkDispatcher {
                                         continue;
                                     }
 
-                                    let desired_freq = Self::clamp_requested_freq(chain_chip_id, freq_mhz, None);
+                                    let desired_freq =
+                                        Self::clamp_requested_freq(chain_write_chip, freq_mhz, None);
                                     if let Some(freqs) = self.desired_chip_frequencies.get_mut(idx) {
                                         if ci < freqs.len() {
                                             freqs[ci] = desired_freq;
@@ -2955,7 +3189,7 @@ impl WorkDispatcher {
                                     }
 
                                     let applied_freq = Self::clamp_requested_freq(
-                                        chain_chip_id,
+                                        chain_write_chip,
                                         desired_freq,
                                         self.effective_chip_ceiling(idx, ci),
                                     );
@@ -3038,7 +3272,22 @@ impl WorkDispatcher {
 
                                 for idx in target_indices {
                                     let chain_chip_id = self.chains[idx].chip_id;
-                                    let desired_freq = Self::clamp_requested_freq(chain_chip_id, freq_mhz, None);
+                                    let chain_write_chip = match Self::normalize_chain_write_identity(
+                                        self.chip_id,
+                                        chain_chip_id,
+                                    ) {
+                                        Ok(chip) => chip,
+                                        Err(identity_error) => {
+                                            apply_result = Err(format!(
+                                                "refusing SetChainFreq for chain {}: {}",
+                                                self.chains[idx].chain_id,
+                                                identity_error
+                                            ));
+                                            break;
+                                        }
+                                    };
+                                    let desired_freq =
+                                        Self::clamp_requested_freq(chain_write_chip, freq_mhz, None);
                                     if let Some(freqs) = self.desired_chip_frequencies.get_mut(idx) {
                                         freqs.fill(desired_freq);
                                     }
@@ -3130,7 +3379,26 @@ impl WorkDispatcher {
                                     let actual_min = self.current_chain_min_freq(idx);
                                     let effective_min = actual_min.min(min_freq_mhz);
                                     let chain = &mut self.chains[idx];
-                                    Self::recalc_work_time_for_chain(chain, effective_min);
+                                    if let Err(identity_error) = Self::normalize_chain_write_identity(
+                                        self.chip_id,
+                                        chain.chip_id,
+                                    ) {
+                                        warn!(
+                                            chain_id,
+                                            error = %identity_error,
+                                            "Refusing WORK_TIME update for non-authoritative chip identity"
+                                        );
+                                        continue;
+                                    }
+                                    if let Err(identity_error) =
+                                        Self::recalc_work_time_for_chain(chain, effective_min)
+                                    {
+                                        warn!(
+                                            chain_id,
+                                            error = %identity_error,
+                                            "Refusing WORK_TIME update for unsupported chip identity"
+                                        );
+                                    }
                                 }
                             }
                             FreqCommand::SetVoltage { chain_id, voltage_mv, ack_tx } => {
@@ -3156,8 +3424,10 @@ impl WorkDispatcher {
 
                                                 if let Err(e) = tx.try_send(cmd) {
                                                     match &e {
-                                                        std::sync::mpsc::TrySendError::Full(_) => warn!(chain_id, "voltage queue full, dropping SetVoltage from autotuner"),
-                                                        std::sync::mpsc::TrySendError::Disconnected(_) => error!(chain_id, "voltage worker thread dead — daemon shutdown imminent (autotuner SetVoltage)"),
+                                                        VoltageTrySendError::Full(_) => warn!(chain_id, "voltage mailbox full, rejecting SetVoltage from autotuner"),
+                                                        VoltageTrySendError::Disconnected => error!(chain_id, "voltage worker thread dead — daemon shutdown imminent (autotuner SetVoltage)"),
+                                                        VoltageTrySendError::TerminalLatched => warn!(chain_id, "terminal safe-off latched, rejecting autotuner SetVoltage"),
+                                                        VoltageTrySendError::Superseded { generation } => warn!(chain_id, generation = %generation, "endpoint disable pending, superseding autotuner SetVoltage"),
                                                     }
                                                     if let Some(ack_tx) = ack_tx {
                                                         let _ = ack_tx.send(Err(format!("failed to send voltage command to runtime thread: {}", e)));
@@ -3165,8 +3435,15 @@ impl WorkDispatcher {
                                                 } else {
                                                     let voltage_result_tx = voltage_result_tx.clone();
                                                     let timeout = Self::VOLTAGE_COMMAND_TIMEOUT;
-                                                    tokio::spawn(async move {
-                                                        let (timed_out, result) = match tokio::time::timeout(timeout, reply_rx).await {
+                                                    let task_shutdown = voltage_reply_tasks.cancellation_token();
+                                                    voltage_reply_task_sequence = voltage_reply_task_sequence.wrapping_add(1);
+                                                    let task_name = format!("voltage-apply-reply-{chain_id}-{voltage_reply_task_sequence}");
+                                                    if !voltage_reply_tasks.spawn(task_name, async move {
+                                                        let reply = tokio::select! {
+                                                            _ = task_shutdown.cancelled() => return,
+                                                            reply = tokio::time::timeout(timeout, reply_rx) => reply,
+                                                        };
+                                                        let (timed_out, result) = match reply {
                                                             Ok(Ok(Ok(VoltageCommandReply::Applied(applied_mv)))) => (false, Ok(applied_mv)),
                                                             Ok(Ok(Ok(other))) => (false, Err(format!("unexpected reply to SetVoltage command: {:?}", other))),
                                                             Ok(Ok(Err(detail))) => (false, Err(detail)),
@@ -3185,7 +3462,9 @@ impl WorkDispatcher {
                                                             ack_tx,
                                                             result,
                                                         });
-                                                    });
+                                                    }) {
+                                                        error!(chain_id, "Could not register owned voltage-apply reply task");
+                                                    }
                                                 }
                                             }
                                         } else if let Some(ack_tx) = ack_tx {
@@ -3219,8 +3498,10 @@ impl WorkDispatcher {
 
                                             if let Err(e) = tx.try_send(cmd) {
                                                 match &e {
-                                                    std::sync::mpsc::TrySendError::Full(_) => warn!(chain_id, "voltage queue full, dropping VerifyVoltage from autotuner"),
-                                                    std::sync::mpsc::TrySendError::Disconnected(_) => error!(chain_id, "voltage worker thread dead — daemon shutdown imminent (autotuner VerifyVoltage)"),
+                                                    VoltageTrySendError::Full(_) => warn!(chain_id, "voltage mailbox full, rejecting VerifyVoltage from autotuner"),
+                                                    VoltageTrySendError::Disconnected => error!(chain_id, "voltage worker thread dead — daemon shutdown imminent (autotuner VerifyVoltage)"),
+                                                    VoltageTrySendError::TerminalLatched => warn!(chain_id, "terminal safe-off latched, rejecting autotuner VerifyVoltage"),
+                                                    VoltageTrySendError::Superseded { generation } => warn!(chain_id, generation = %generation, "endpoint disable pending, superseding autotuner VerifyVoltage"),
                                                 }
                                                 if let Some(ack_tx) = ack_tx {
                                                     let _ = ack_tx.send(Err(format!("failed to send voltage verification command to runtime thread: {}", e)));
@@ -3228,8 +3509,15 @@ impl WorkDispatcher {
                                             } else {
                                                 let voltage_result_tx = voltage_result_tx.clone();
                                                 let timeout = Self::VOLTAGE_COMMAND_TIMEOUT;
-                                                tokio::spawn(async move {
-                                                    let (timed_out, result) = match tokio::time::timeout(timeout, reply_rx).await {
+                                                let task_shutdown = voltage_reply_tasks.cancellation_token();
+                                                voltage_reply_task_sequence = voltage_reply_task_sequence.wrapping_add(1);
+                                                let task_name = format!("voltage-verify-reply-{chain_id}-{voltage_reply_task_sequence}");
+                                                if !voltage_reply_tasks.spawn(task_name, async move {
+                                                    let reply = tokio::select! {
+                                                        _ = task_shutdown.cancelled() => return,
+                                                        reply = tokio::time::timeout(timeout, reply_rx) => reply,
+                                                    };
+                                                    let (timed_out, result) = match reply {
                                                         Ok(Ok(Ok(VoltageCommandReply::Verified(actual_mv)))) => (false, Ok(actual_mv)),
                                                         Ok(Ok(Ok(other))) => (false, Err(format!("unexpected reply to VerifyVoltage command: {:?}", other))),
                                                         Ok(Ok(Err(detail))) => (false, Err(detail)),
@@ -3248,7 +3536,9 @@ impl WorkDispatcher {
                                                         ack_tx,
                                                         result,
                                                     });
-                                                });
+                                                }) {
+                                                    error!(chain_id, "Could not register owned voltage-verify reply task");
+                                                }
                                             }
                                         } else if let Some(ack_tx) = ack_tx {
                                             let _ = ack_tx.send(Err("runtime voltage thread is unavailable".to_string()));
@@ -3420,7 +3710,20 @@ impl WorkDispatcher {
                                     let new_freq = (current_avg as u16).saturating_sub(clamped_reduction);
 
                                     // Enforce minimum frequency floor (don't kill mining entirely)
-                                    let min_freq = Self::min_supported_freq(chain_chip_id);
+                                    let min_freq = match Self::normalize_chain_write_identity(
+                                        self.chip_id,
+                                        chain_chip_id,
+                                    ) {
+                                        Ok(chip) => Self::min_supported_freq(chip),
+                                        Err(identity_error) => {
+                                            error!(
+                                                chain_id,
+                                                error = %identity_error,
+                                                "Refusing power-cap frequency write for non-authoritative chip identity"
+                                            );
+                                            continue;
+                                        }
+                                    };
                                     let new_freq = new_freq.max(min_freq);
 
                                     if new_freq < current_avg as u16 {
@@ -3851,6 +4154,18 @@ impl WorkDispatcher {
         }
 
         // Log final stats — this is the mining session summary
+        let voltage_reply_stop = voltage_reply_tasks
+            .stop_and_join(VOLTAGE_REPLY_TASK_STOP_TIMEOUT)
+            .await;
+        if voltage_reply_stop.any_timed_out() {
+            error!(
+                timeout_ms = VOLTAGE_REPLY_TASK_STOP_TIMEOUT.as_millis(),
+                "Voltage reply task did not terminate after dispatcher cancellation and abort"
+            );
+        } else if voltage_reply_stop.any_panicked() {
+            warn!("Voltage reply task panicked before dispatcher shutdown");
+        }
+
         info!("=== MINING SESSION SUMMARY ===");
         info!(
             total_nonces = hashrate.total_nonces,
@@ -3878,6 +4193,14 @@ impl WorkDispatcher {
                     hw_error_pct = format_args!("{:.1}%", hw_pct),
                     "Hardware error rate {:.1}% is above 1% — this may indicate: overclocking too high, voltage too low, bad ASIC chip, or signal integrity issues on the UART chain",
                     hw_pct,
+                );
+            }
+        }
+        if let Some(session) = identity_composition_session {
+            if let Err(error) = session.revoke() {
+                warn!(
+                    error = %error,
+                    "Dispatcher composition session could not revoke measured hardware identity during shutdown"
                 );
             }
         }
@@ -4041,16 +4364,22 @@ mod tests {
     #[test]
     fn clamp_requested_freq_respects_chip_specific_floor_and_ceiling() {
         // BM1362 minimum supported PLL entry is 400 MHz, not the S9's 200 MHz.
-        assert_eq!(WorkDispatcher::clamp_requested_freq(0x1362, 200, None), 400);
         assert_eq!(
-            WorkDispatcher::clamp_requested_freq(0x1362, 375, Some(450)),
+            WorkDispatcher::clamp_requested_freq(DispatchWriteChip::Bm1362, 200, None),
+            400
+        );
+        assert_eq!(
+            WorkDispatcher::clamp_requested_freq(DispatchWriteChip::Bm1362, 375, Some(450)),
             400
         );
 
         // S9/BM1387 still respects a 200 MHz floor and ceiling overlays.
-        assert_eq!(WorkDispatcher::clamp_requested_freq(0x1387, 150, None), 200);
         assert_eq!(
-            WorkDispatcher::clamp_requested_freq(0x1387, 650, Some(600)),
+            WorkDispatcher::clamp_requested_freq(DispatchWriteChip::Bm1387, 150, None),
+            200
+        );
+        assert_eq!(
+            WorkDispatcher::clamp_requested_freq(DispatchWriteChip::Bm1387, 650, Some(600)),
             600
         );
     }
@@ -4073,9 +4402,125 @@ mod tests {
             "missing chain identity must not silently assume BM1387/S9"
         );
         assert_eq!(
+            WorkDispatcher::normalize_frequency_limit_for_chip(Some(0xFFFF), Some(150)),
+            None,
+            "unknown chain identity must not inherit the BM1387 PLL table"
+        );
+        assert_eq!(
             WorkDispatcher::normalize_frequency_limit_for_chip(None, None),
             Some(None),
             "clearing an absent limit remains a no-op, not a chip-family guess"
+        );
+    }
+
+    #[test]
+    fn dispatch_write_identity_accepts_every_production_chip_route() {
+        for chip_id in [0x1362, 0x1366, 0x1368, 0x1370, 0x1387, 0x1397, 0x1398] {
+            let normalized =
+                WorkDispatcher::normalize_dispatch_write_identity(chip_id, [chip_id, chip_id])
+                    .expect("production chip identity should cross the write boundary");
+            assert_eq!(normalized.chip_id(), chip_id);
+        }
+    }
+
+    #[test]
+    fn dispatch_write_identity_rejects_missing_unknown_and_mixed_chains() {
+        assert_eq!(
+            WorkDispatcher::normalize_dispatch_write_identity(0, [0]),
+            Err(DispatchWriteIdentityError::Missing)
+        );
+        assert_eq!(
+            WorkDispatcher::normalize_dispatch_write_identity(0xFFFF, [0xFFFF]),
+            Err(DispatchWriteIdentityError::Unsupported(0xFFFF))
+        );
+        assert_eq!(
+            WorkDispatcher::normalize_dispatch_write_identity(0x1387, [0x1387, 0x1397]),
+            Err(DispatchWriteIdentityError::Mixed {
+                dispatcher_chip_id: 0x1387,
+                chain_chip_id: 0x1397,
+            })
+        );
+        assert_eq!(
+            WorkDispatcher::normalize_dispatch_write_identity(0x1387, [0]),
+            Err(DispatchWriteIdentityError::Missing),
+            "a missing mining-chain identity disables the whole write policy"
+        );
+    }
+
+    #[test]
+    fn typed_work_time_keeps_known_routes_without_a_bm1387_fallback() {
+        let freq = 500;
+        let chip_count = 63;
+        let midstate_shift = 2;
+        let midstate_count = 1 << midstate_shift;
+
+        assert_eq!(
+            WorkDispatcher::calculate_work_time_for_chip(
+                DispatchWriteChip::Bm1387,
+                chip_count,
+                freq,
+                midstate_shift,
+            ),
+            Bm1387Driver::calculate_work_time(freq, midstate_count)
+        );
+        assert_eq!(
+            WorkDispatcher::calculate_work_time_for_chip(
+                DispatchWriteChip::Bm1362,
+                chip_count,
+                freq,
+                midstate_shift,
+            ),
+            Bm1362Driver::calculate_work_time_for(chip_count, freq)
+        );
+        assert_eq!(
+            WorkDispatcher::calculate_work_time_for_chip(
+                DispatchWriteChip::Bm1366,
+                chip_count,
+                freq,
+                midstate_shift,
+            ),
+            Bm1366Driver::calculate_work_time(freq, midstate_count)
+        );
+        assert_eq!(
+            WorkDispatcher::calculate_work_time_for_chip(
+                DispatchWriteChip::Bm1368,
+                chip_count,
+                freq,
+                midstate_shift,
+            ),
+            Bm1368Driver::calculate_work_time(freq, chip_count)
+        );
+        assert_eq!(
+            WorkDispatcher::calculate_work_time_for_chip(
+                DispatchWriteChip::Bm1370,
+                chip_count,
+                freq,
+                midstate_shift,
+            ),
+            Bm1370Driver::calculate_work_time(freq, chip_count)
+        );
+        assert_eq!(
+            WorkDispatcher::calculate_work_time_for_chip(
+                DispatchWriteChip::Bm1397,
+                chip_count,
+                freq,
+                midstate_shift,
+            ),
+            Bm1397Driver::calculate_work_time(freq, midstate_count)
+        );
+        assert_eq!(
+            WorkDispatcher::calculate_work_time_for_chip(
+                DispatchWriteChip::Bm1398,
+                chip_count,
+                freq,
+                midstate_shift,
+            ),
+            Bm1398Driver::calculate_work_time(freq, midstate_count)
+        );
+        assert_eq!(
+            DispatchWriteChip::try_from(0x1396),
+            Err(DispatchWriteIdentityError::Unsupported(0x1396)),
+            "BM1396 has no production dispatcher driver and must not borrow BM1387 timing"
         );
     }
 
@@ -4440,6 +4885,14 @@ mod tests {
                 "non-BM1387 chip 0x{chip_id:04X} must not inherit the S9-only refusal"
             );
         }
+        assert!(
+            !WorkDispatcher::accepts_job_version_mask(0xFFFF, 0x1fff_e000),
+            "an unknown chip must not accept a job under a guessed version policy"
+        );
+        assert!(
+            !WorkDispatcher::accepts_job_version_mask(0, 0x1fff_e000),
+            "a missing chip identity must not accept a job under a guessed version policy"
+        );
     }
 
     #[test]

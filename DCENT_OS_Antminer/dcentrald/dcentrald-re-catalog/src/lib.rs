@@ -1,66 +1,48 @@
-//! `dcentrald-re-catalog` — INTENDED typed Rust mirror of the +6
-//! master research catalogs.
+//! Pure, no-HAL mirror of the reverse-engineering facts consumed by offline
+//! Antminer bring-up proofs.
 //!
-//! ## ⚠️ STATUS (as of 2026-05-29): STUB — not populated, no consumers, no drift tests yet.
+//! Every hardware value carries a repository-relative provenance path. The
+//! catalog deliberately distinguishes exact evidence, structural evidence,
+//! and scaffolds so an emulator result cannot silently become a live-hardware
+//! claim.
 //!
-//! This crate is the *intended* home of the KB-Wires-To-Code mirror (per
-//! ), but **the catalog content has
-//! NOT been ported.** All three modules below are empty `pub mod` stubs, the
-//! `pub use` re-exports are commented out, and the crate currently exports
-//! **zero** types / statics / functions. **There are NO consumers today** — in
-//! particular `dcentrald-api`'s re-catalog route sources its data from
-//! `dcentrald-api-types`, NOT from this crate, and no `dcentrald-thermal` /
-//! `dcentrald-asic` path imports from here. Do not `use dcentrald_re_catalog::*`
-//! expecting populated data — it will not compile.
+//! # Adding a new ASIC model / chip (contributor guide)
 //!
-//! | KB document (PLANNED source — not yet ported)      | Module (stub)      | Rows when ported   |
-//! |----------------------------------------------------|--------------------|--------------------|
-//! |                              | [`fan_curves`]     | ~118 / 20+ curves  |
-//! |                      | [`pll_bible`]      | 13 chip families   |
-//! |                           | [`model_catalog`]  | ~94 model rows     |
+//! Support for a new Antminer is **data first**: add rows here, not a new code
+//! path. Two sibling tables must stay consistent — [`model_catalog`] (per-board
+//! rows: chip_id, geometry, baud, voltage envelope, evidence strength) and
+//! [`pll_bible`] (per-chip PLL register facts). The `#[test]`s in each module
+//! ENFORCE the following rules, so a row that breaks them fails CI, not a miner:
 //!
-//! ## When the catalog content IS ported (TODO — not done yet)
+//! 1. **Honest provenance.** Every row carries a repo-relative source path, and
+//!    its `EvidenceStrength` (or the pll_bible `SCAFFOLD_NO_GROUND_TRUTH`
+//!    marker) reflects what you actually have. **Never fabricate or project** a
+//!    frequency/voltage/geometry you have not measured or RE'd — leave it `None`
+//!    (see the S23/`0x1372` scaffold row, which is deliberately field-free).
+//! 2. **chip_id agreement.** Use the id the silicon SELF-REPORTS on enumeration
+//!    (e.g. BM1373/S23 enumerates as `0x1372` even though its canonical id is
+//!    `0x1373` — the driver dual-keys, but the catalog uses the enumerated id).
+//!    A `pll_bible` chip_id with a representative frequency must equal the
+//!    `default_frequency_mhz` of at least one `model_catalog` board with that
+//!    chip_id (`representative_freq_matches_a_catalogued_board`).
+//! 3. **Ordered voltage bounds.** If you set both, `voltage_min_mv <
+//!    voltage_max_mv` (`voltage_bounds_are_ordered_when_present`).
+//! 4. **PLL coverage for proven chips.** An `Exact` model row that carries a
+//!    proven `default_frequency_mhz` must also have a `pll_bible` entry for its
+//!    chip_id (`exact_models_with_a_frequency_have_pll_facts`) — a proven
+//!    operating point implies you have the PLL register facts to program it.
 //!
-//! Keep this crate pure no-HAL (so Windows host tests run without an ARM
-//! cross-compile and a catalog typo can't reach `mmap(/dev/mem)`). **At that
-//! time**, add a `tests/` suite that pins row counts + representative rows so a
-//! one-sided edit of a KB master doc vs the Rust mirror fails CI (the
-//! KB-Wires-To-Code drift guard). **Until the content lands that drift guard
-//! does NOT exist** — there is currently no `tests/` dir and no paired Rust
-//! mirror to update when a KB master doc changes. (gap-swarm no-HAL hunt
-//! findings #4+#5: the prior header asserted populated catalogs, working host
-//! tests, live consumers, and a mechanical drift guard — none of which exist.)
+//! For the runtime chip-driver side of a new chip (init sequence, PLL encode,
+//! nonce decode), see `dcentrald-asic::drivers` and its `ChipDriver` trait.
 
 #![forbid(unsafe_code)]
 
-// W10.11 dx-stability: the three +6 catalog modules were declared
-// in W7.1+W7.2+W7.4 but their per-module `.rs` files were never landed.
-// This left the crate broken on master HEAD (`cargo build --workspace`
-// fails with E0583 "file not found for module"). To unblock workspace
-// builds without making up catalog content, the modules are stubbed
-// inline as empty `pub mod`s. The `pub use` re-exports stay commented
-// out until the catalog content lands. See
-//  for the KB-Wires-To-Code
-// expectation.
-
 pub mod fan_curves {
-    //! Stub.  catalog content (118 rows, 20+ curves) to be ported
-    //! from . See parent crate doc for the wiring
-    //! pattern.
+    //! Fan-curve port remains deferred; simulator fan behavior is model-state
+    //! based and does not claim a golden curve yet.
 }
+pub mod model_catalog;
+pub mod pll_bible;
 
-pub mod model_catalog {
-    //! Stub.  catalog content (94 model rows) to be ported from
-    //! .
-}
-
-pub mod pll_bible {
-    //! Stub.  catalog content (13 chip families) to be ported
-    //! from .
-}
-
-// pub use fan_curves::{
-//     for_platform_sku, CurveSource, FanCurve, MASTER_FAN_CURVES,
-// };
-// pub use model_catalog::{ModelEntry, MASTER_MODELS};
-// pub use pll_bible::{pll_table_for_chip, PllRegister};
+pub use model_catalog::{model_evidence, EvidenceStrength, ModelEvidence, ANTMINER_MODELS};
+pub use pll_bible::{pll_expectation, PllExpectation, PLL_EXPECTATIONS};

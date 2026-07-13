@@ -328,15 +328,38 @@ mark_firstboot_pending() {
     # Record intent to write firstboot=0 BEFORE we commit the recovery flag.
     # If the system reboots between recovery-flag commit and env-clear, this
     # file remains; replay_pending_env_clear() picks it up on next boot.
-    if [ ! -d /data ]; then
-        echo "  *** WARN: /data not mounted; cannot persist firstboot WAL ***"
+    WAL_DIR=${FIRSTBOOT_PENDING_FILE%/*}
+    [ "$WAL_DIR" != "$FIRSTBOOT_PENDING_FILE" ] || WAL_DIR=.
+    if [ ! -d "$WAL_DIR" ]; then
+        echo "  *** WARN: WAL directory $WAL_DIR is not mounted; cannot persist firstboot WAL ***"
         return 1
     fi
-    if ! : > "$FIRSTBOOT_PENDING_FILE" 2>/dev/null; then
-        echo "  *** WARN: failed to write WAL marker $FIRSTBOOT_PENDING_FILE ***"
+    # Publish through a same-directory temp + rename. A direct `: > marker`
+    # can leave a newly-created directory entry non-durable at the exact crash
+    # point this WAL exists to cover. The first sync makes the staged inode
+    # durable; the second makes the rename durable. Do not proceed to the raw
+    # recovery-flag commit unless both boundaries complete.
+    WAL_TMP="${FIRSTBOOT_PENDING_FILE}.tmp.$$"
+    rm -f "$WAL_TMP" 2>/dev/null || true
+    if ! (umask 077; : > "$WAL_TMP") 2>/dev/null; then
+        echo "  *** WARN: failed to stage WAL marker $WAL_TMP ***"
+        rm -f "$WAL_TMP" 2>/dev/null || true
         return 1
     fi
-    sync
+    if ! sync; then
+        echo "  *** WARN: failed to sync staged WAL marker $WAL_TMP ***"
+        rm -f "$WAL_TMP" 2>/dev/null || true
+        return 1
+    fi
+    if ! mv -f "$WAL_TMP" "$FIRSTBOOT_PENDING_FILE" 2>/dev/null; then
+        echo "  *** WARN: failed to publish WAL marker $FIRSTBOOT_PENDING_FILE ***"
+        rm -f "$WAL_TMP" 2>/dev/null || true
+        return 1
+    fi
+    if ! sync; then
+        echo "  *** WARN: WAL marker is visible but directory durability is unproven: $FIRSTBOOT_PENDING_FILE ***"
+        return 1
+    fi
     return 0
 }
 
@@ -395,8 +418,11 @@ case "$1" in
                 # a crash during the mtd5 write or anywhere between here and
                 # successful clear_uboot_env leaves a replay marker. The
                 # marker is cleared only after fw_printenv confirms firstboot=0.
-                mark_firstboot_pending || \
-                    echo "  *** WARN: WAL marker write failed; continuing (split-state risk if env write also fails) ***"
+                if ! mark_firstboot_pending; then
+                    echo "  *** ERROR: durable WAL intent was not proven - refusing recovery-flag commit ***"
+                    echo "  *** Slot remains uncommitted at recovery flag 0x02; retry on next boot ***"
+                    exit 1
+                fi
 
                 if ! commit_recovery_flag; then
                     echo "  *** ERROR: recovery flag commit failed - U-Boot will revert on next reboot ***"

@@ -57,6 +57,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=lib/sd_common.sh
 . "$SCRIPT_DIR/lib/sd_common.sh"
+# shellcheck source=lib/am3_bb_dtb_contract.sh
+. "$SCRIPT_DIR/lib/am3_bb_dtb_contract.sh"
 # shellcheck source=lib/buildroot_rootfs_arch_guard.sh
 . "$SCRIPT_DIR/lib/buildroot_rootfs_arch_guard.sh"
 BUILDROOT_OUTPUT="${BUILDROOT_OUTPUT:-$PROJECT_DIR/buildroot/output/images}"
@@ -551,8 +553,11 @@ if printf "%s\n" "$UIMAGE_INFO" | grep -q 'Linux-3\.8\.13'; then
     echo "[WARN] uImage reports Linux-3.8.13+; live LuxOS .79 ran Linux 5.4.242 bone66." >&2
 fi
 
+# The shared admission helper is authoritative. The legacy classification below
+# remains only to preserve existing diagnostic wording and manifest fields.
+dcent_am3_bb_admit_carrier_dtb "$DTB_SRC" vnish-btm "$ALLOW_STALE_KERNEL"
 DTB_STALE=0
-if grep -a -q 'am335x-boneblack-btm' "$DTB_SRC" || grep -a -q 'S19J_IO_BOARD' "$DTB_SRC"; then
+if dcent_am3_bb_dtb_matches_policy "$DTB_SRC" vnish-btm; then
     echo "[INFO] DTB provenance: Bitmain/BTM BeagleBone-compatible DTB detected"
 elif grep -a -q 'am335x-bone' "$DTB_SRC"; then
     DTB_STALE=1

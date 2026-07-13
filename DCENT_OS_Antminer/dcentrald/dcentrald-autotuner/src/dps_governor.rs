@@ -52,6 +52,7 @@ use crate::dps::DpsWalkerConfig;
 
 /// Persisted-record schema version. Bump on any incompatible field change.
 pub const DPS_GOVERNOR_STATE_VERSION: u32 = 1;
+const MAX_DPS_GOVERNOR_STATE_BYTES: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // State
@@ -94,8 +95,8 @@ pub enum DpsState {
 /// Persistence is best-effort and fail-open to in-memory: a missing, corrupt,
 /// or unreadable record means the governor behaves EXACTLY as before D5
 /// (starts at Normal). Persistence never panics and a write error never aborts
-/// a tick. The same `serde + atomic-temp-then-rename` pattern as
-/// [`crate::state_persistence::AutotunerResumeState`] is reused.
+/// a tick. The shared crash-durable state-file replacement/deletion framework
+/// is reused for publication and thermal-recovery clearing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DpsGovernorPersistedState {
     /// Schema version (see [`DPS_GOVERNOR_STATE_VERSION`]).
@@ -139,17 +140,21 @@ impl DpsGovernorPersistedState {
     pub fn save_atomic(&self, path: impl AsRef<Path>) -> crate::Result<()> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
+            // Parent/ancestor creation durability is outside atomic_write's
+            // single-file contract; production images should pre-create it.
             std::fs::create_dir_all(parent)?;
         }
-        let tmp_path = path.with_extension("toml.tmp");
         let toml = toml::to_string_pretty(self).map_err(|err| {
             crate::AutoTunerError::Config(format!("dps governor state serialize error: {err}"))
         })?;
-        std::fs::write(&tmp_path, toml)?;
-        if let Ok(file) = std::fs::File::open(&tmp_path) {
-            let _ = file.sync_all();
-        }
-        std::fs::rename(&tmp_path, path)?;
+        dcentrald_common::atomic_file::atomic_write(
+            path,
+            toml.as_bytes(),
+            dcentrald_common::atomic_file::AtomicWriteOptions::state_file(
+                MAX_DPS_GOVERNOR_STATE_BYTES,
+            ),
+        )
+        .map_err(dcentrald_common::atomic_file::AtomicWriteError::into_io_error)?;
         Ok(())
     }
 }
@@ -315,8 +320,15 @@ impl DpsGovernor {
             scaled_power_target_watts: self.last_scaled_power_target_watts,
             shutdown_elapsed_secs: self.shutdown_elapsed_secs,
         };
-        // Swallow errors: a throttle-resume hint is never worth a tick abort.
-        let _ = record.save_atomic(path);
+        // A throttle-resume hint is never worth aborting a control tick, but a
+        // durability failure must remain observable to operators.
+        if let Err(error) = record.save_atomic(path) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "Failed to persist DPS throttle-resume state"
+            );
+        }
     }
 
     /// D5: clear any persisted throttle record (called on thermal recovery /
@@ -326,10 +338,26 @@ impl DpsGovernor {
         let Some(path) = self.persist_path.as_ref() else {
             return;
         };
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => { /* swallow: clearing is best-effort */ }
+        match dcentrald_common::atomic_file::remove_file(path) {
+            Ok(
+                dcentrald_common::atomic_file::AtomicRemoveOutcome::Removed
+                | dcentrald_common::atomic_file::AtomicRemoveOutcome::AlreadyAbsent,
+            ) => {}
+            Err(error) => {
+                // Clearing remains best-effort and never aborts a control tick,
+                // but an unlink followed by parent-fsync failure is materially
+                // different from a pre-unlink refusal: after a crash the stale
+                // throttle record may reappear and must not be reported durable.
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    persistence_stage = %error.stage(),
+                    target_unlinked = error.target_unlinked(),
+                    target_absent_observed = error.target_absent_observed(),
+                    deletion_durability_uncertain = error.deletion_durability_uncertain(),
+                    "Failed to durably clear DPS throttle-resume state"
+                );
+            }
         }
     }
 
@@ -906,6 +934,46 @@ mod tests {
         assert_eq!(g2.state(), DpsState::Normal);
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d5_clear_refuses_symlink_without_aborting_thermal_recovery() {
+        use std::os::unix::fs::symlink;
+
+        let path = temp_state_path("clear_symlink_refusal");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let outside = path.parent().unwrap().join("outside.toml");
+        std::fs::write(&outside, b"must remain").unwrap();
+        symlink(&outside, &path).unwrap();
+
+        let mut g = governor().with_persistence(&path);
+        g.force_state(DpsState::ScalingUp);
+        let action = g.tick(&sample_recovered(3068, 3068), 1);
+        assert_eq!(action, DpsAction::NoOp);
+        assert_eq!(g.state(), DpsState::Normal);
+        assert_eq!(std::fs::read(&outside).unwrap(), b"must remain");
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn d5_clear_path_uses_shared_durable_remove_and_logs_uncertainty() {
+        let source = include_str!("dps_governor.rs");
+        let start = source.find("fn clear_persisted(&self)").unwrap();
+        let end = source[start..]
+            .find("pub fn is_enabled")
+            .map(|offset| start + offset)
+            .unwrap();
+        let body = &source[start..end];
+        assert!(body.contains("dcentrald_common::atomic_file::remove_file(path)"));
+        assert!(!body.contains("std::fs::remove_file"));
+        assert!(body.contains("target_unlinked = error.target_unlinked()"));
+        assert!(body.contains("deletion_durability_uncertain"));
     }
 
     #[test]

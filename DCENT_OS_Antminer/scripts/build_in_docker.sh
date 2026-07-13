@@ -7,10 +7,15 @@
 # a case-sensitive ext4 filesystem — bind-mounting from NTFS breaks the
 # build the same way it broke on /mnt/c under WSL.
 #
-# Usage (from a bash shell on Windows with Docker Desktop running):
+# Release usage (from a bash shell with Docker running):
 #
 #   cd DCENT_OS_Antminer
-#   bash scripts/build_in_docker.sh 2>&1 | tee output/docker_build.log
+#   bash scripts/build_s9_release_capsule.sh
+#
+# This file is the inner packaging driver. Release admission requires the
+# source-snapshot, invocation, sealed Cargo-result, and private release-set
+# authorities prepared by build_s9_release_capsule.sh; direct release use is
+# rejected.
 #
 # RELEASE BUILDS (BUG-2, 2026-07-09): export DCENT_MANIFEST_PUBLIC_KEY_HEX
 # (64-hex ed25519 verifying key) for BOTH build steps —
@@ -30,19 +35,18 @@
 # then network (original URL, then a hash-verified mirror). Every source is
 # verified against the recorded SHA256 pin (fail-closed on release builds).
 #
-# What it does (in order):
-#   1. Build the `dcentos-build:latest` image from Dockerfile.build (cached).
-#   2. Create/reuse the `dcentos-build-work` Docker volume (persists Buildroot
-#      clone + downloads + output across runs — second build is fast).
-#   3. Stage the project tree into the volume via rsync (mirrors the WSL
-#      exclude list + strips CRLF from shell scripts).
+# Capsule path (in order):
+#   1. Build an invocation-tagged image from the authenticated Dockerfile.
+#   2. Create a fresh, exactly labelled invocation Buildroot volume.
+#   3. Stage Git-object source bytes without CRLF/mode/version rewrites.
 #   4. Stage  into the volume at the path
 #      package_sysupgrade.sh probes ($FIRMWARE_DIR/extractions/s9).
-#   5. Stage the pre-built ARM binary from dcentrald/target/... into the
+#   5. Stage receipt-bound ARM binaries from the sealed result stage into the
 #      same layout so the Buildroot overlay picks it up.
 #   6. Run `make setup` + `make -j$(nproc)` inside a container.
 #   7. Run `package_sysupgrade.sh --board am1-s9 --output /build/out.tar`.
-#   8. Copy the tarball back out to DCENT_OS_Antminer/output/.
+#   8. Copy the complete evidence set only to the private release-set stage;
+#      the outer driver seals and atomically promotes that directory.
 #
 
 set -euo pipefail
@@ -85,9 +89,8 @@ while [ $# -gt 0 ]; do
             echo "Usage: $(basename "$0") [--target s9|am2-s19jpro|am2-s19pro|am2-s17pro|am3-s19kpro|am3-s21|am3-s19jpro-aml|am3-t21|am3-bb|am3-bb-s19jpro|am3-bb-s19jpro-vnish] [--output-dir DIR] [--lab-unsigned]"
             echo ""
             echo "Options:"
-            echo "  --lab-unsigned  Explicitly allow unsigned/generated-key lab packages; sets"
-            echo "                  DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 and defaults"
-            echo "                  DCENT_PACKAGE_STATUS=lab_unsigned."
+            echo "  --lab-unsigned  Reserved for a future explicit lab capsule; direct"
+            echo "                  packaging currently fails closed before build work."
             echo ""
             echo "Targets:"
             echo "  s9               (default) Antminer S9 am1-s9 (armv7) — tarball: dcentos-sysupgrade-118.tar"
@@ -337,6 +340,11 @@ case "$TARGET" in
         ;;
 esac
 
+# Immutable Buildroot source identity shared by cold- and warm-volume paths.
+# A warm checkout is never trusted merely because its Makefile exists.
+BUILDROOT_REPOSITORY="https://github.com/buildroot/buildroot.git"
+BUILDROOT_COMMIT="7c8edc1b402efcd7bba2dabfe0b3be877adaed7a"
+
 dcent_target_requires_dcentos_init() {
     case "$1" in
         s9|am2-s19jpro|am2-s19jpro-sd|am2-s19pro|am2-s17pro|am3-s19kpro|am3-s21|am3-s19jpro-aml|am3-t21)
@@ -348,11 +356,37 @@ dcent_target_requires_dcentos_init() {
 
 dcent_target_requires_dcentos_discovery() {
     case "$1" in
-        am3-bb|am3-bb-s19jpro|am3-bb-s19jpro-vnish)
+        am3-bb|am3-bb-s19jpro|am3-bb-s19jpro-vnish|cv1835-s19jpro)
             return 0
             ;;
     esac
     return 1
+}
+
+dcent_validate_docker_transport_path() {
+    python3 - "$1" <<'PY'
+import sys
+
+value = sys.argv[1]
+if not value or any(character in value for character in ("\0", "\r", "\n")):
+    raise SystemExit("unsafe empty/control-character Docker transport path")
+windows_drive = (
+    len(value) >= 3
+    and value[0].isalpha()
+    and value[1] == ":"
+    and value[2] in ("/", "\\")
+)
+remainder = value[2:] if windows_drive else value
+if ":" in remainder:
+    raise SystemExit(f"unsafe colon in Docker transport path: {value!r}")
+PY
+}
+
+dcent_require_absolute_host_path() {
+    case "$1" in
+        /*|[A-Za-z]:[\\/]*|\\\\*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 dcent_required_prebuilt_binaries() {
@@ -363,6 +397,19 @@ dcent_required_prebuilt_binaries() {
     if dcent_target_requires_dcentos_discovery "$TARGET"; then
         printf '%s\n' dcentos-discovery
     fi
+}
+
+dcent_expected_build_variant() {
+    case "$1" in
+        s9|am2-s19jpro|am2-s19jpro-sd|am2-s19pro|am2-s17pro) printf '%s\n' zynq ;;
+        am3-s19kpro|am3-s21|am3-s19jpro-aml|am3-t21) printf '%s\n' amlogic ;;
+        # BB packaging currently stages the static musl ARMv7 artifact emitted
+        # by the zynq build lane (the standalone `beaglebone` builder targets
+        # glibc armv7-unknown-linux-gnueabihf and cannot satisfy BUILD_ARCH).
+        am3-bb|am3-bb-s19jpro|am3-bb-s19jpro-vnish) printf '%s\n' zynq ;;
+        cv1835-s19jpro) printf '%s\n' cvitek ;;
+        *) return 1 ;;
+    esac
 }
 
 dcent_stale_sources_for_binary() {
@@ -391,7 +438,55 @@ dcent_stale_sources_for_binary() {
 
 dcent_phase0_stale_binary_guard() {
     failed=0
-    release_dir="$PROJECT_DIR/dcentrald/target/$BUILD_ARCH/release"
+    if [ "$CAPSULE_MODE" = "1" ]; then
+        release_dir="$CAPSULE_RESULT_ROOT/target/$BUILD_ARCH/release"
+        metadata_file="$CAPSULE_RESULT_ROOT/target/release-inventory/${BUILD_ARCH}.metadata.json"
+        toolchain_context="$CAPSULE_RESULT_ROOT/target/release-inventory/${BUILD_ARCH}.toolchain.txt"
+        compile_environment="$CAPSULE_RESULT_ROOT/target/release-inventory/${BUILD_ARCH}.compile-env.txt"
+    else
+        release_dir="$PROJECT_DIR/dcentrald/target/$BUILD_ARCH/release"
+        metadata_file="$PROJECT_DIR/dcentrald/target/release-inventory/${BUILD_ARCH}.metadata.json"
+        toolchain_context="$PROJECT_DIR/dcentrald/target/release-inventory/${BUILD_ARCH}.toolchain.txt"
+        compile_environment="$PROJECT_DIR/dcentrald/target/release-inventory/${BUILD_ARCH}.compile-env.txt"
+    fi
+    expected_variant=$(dcent_expected_build_variant "$TARGET") || {
+        echo "ERROR: no Rust build variant mapping exists for package target $TARGET" >&2
+        return 1
+    }
+
+    if ! python3 "$SCRIPT_DIR/binary_build_receipt.py" check-override-policy \
+        --allow-stale "${DCENT_ALLOW_STALE_DCENTRALD:-0}" \
+        --release-provenance "${DCENT_REQUIRE_RELEASE_PROVENANCE:-0}" \
+        --release-image "${DCENT_RELEASE_IMAGE:-0}" \
+        --package-status "${DCENT_PACKAGE_STATUS:-}"; then
+        return 1
+    fi
+
+    if [ "$CAPSULE_MODE" != "1" ]; then
+        echo "ERROR: packaging prebuilt Rust binaries now requires an invocation capsule" >&2
+        echo "       use scripts/build_s9_release_capsule.sh for the migrated S9 release lane" >&2
+        return 1
+    fi
+    export_args=(
+        export-snapshot-set
+        --git-object-repo "$GIT_OBJECT_REPO"
+        --source-snapshot "$CAPSULE_SOURCE_SNAPSHOT"
+        --source-commit "$DCENT_SOURCE_COMMIT"
+        --source-workspace DCENT_OS_Antminer/dcentrald
+        --release-invocation "$CAPSULE_INVOCATION_STAGE"
+        --result-root "$CAPSULE_RESULT_ROOT"
+        --build-input-snapshot "$CAPSULE_CARGO_BUILD_INPUT_SNAPSHOT"
+        --target "$BUILD_ARCH"
+        --profile release
+        --build-variant "$expected_variant"
+        --metadata "$metadata_file"
+        --toolchain-context "$toolchain_context"
+        --compile-environment "$compile_environment"
+        --stage-parent "$BINARY_EXPORT_PARENT"
+    )
+    if dcent_release_provenance_required; then
+        export_args+=(--require-immutable-builder)
+    fi
 
     for binary_name in $(dcent_required_prebuilt_binaries); do
         binary_path="$release_dir/$binary_name"
@@ -403,80 +498,42 @@ dcent_phase0_stale_binary_guard() {
             continue
         fi
 
-        stale_src=$(dcent_stale_sources_for_binary "$binary_path" "$binary_name")
-        if [ -n "$stale_src" ]; then
-            case "$BUILD_ARCH" in
-                aarch64-unknown-linux-musl) recompile_target=amlogic ;;
-                *) recompile_target=zynq ;;
-            esac
-            echo "ERROR: $binary_name binary is STALE - source is newer than the built binary." >&2
-            echo "  binary: $binary_path" >&2
-            echo "  newer source (sample):" >&2
-            echo "$stale_src" | sed 's/^/    /' >&2
-            echo "  Recompile first:  bash DCENT_OS_Antminer/scripts/build-dcentrald.sh ${recompile_target}" >&2
-            echo "  (override only for an intentional binary pin: DCENT_ALLOW_STALE_DCENTRALD=1)" >&2
-            if [ "${DCENT_ALLOW_STALE_DCENTRALD:-0}" != "1" ]; then
-                failed=1
-            else
-                echo "  WARNING: proceeding with a STALE $binary_name binary (DCENT_ALLOW_STALE_DCENTRALD=1)" >&2
-            fi
-        fi
+        export_args+=(--pair "$binary_path" "${binary_path}.build-receipt.json")
+
+        # Capsule source is immutable and Git-authenticated; mtimes belong to
+        # materialization, not source freshness, so the legacy advisory is not
+        # meaningful in this lane.
     done
 
-    return "$failed"
+
+    if [ "$failed" -ne 0 ]; then
+        return "$failed"
+    fi
+
+    if ! BINARY_EXPORT_STAGE="$(
+        python3 "$SCRIPT_DIR/binary_build_receipt.py" "${export_args[@]}"
+    )"; then
+        echo "ERROR: immutable prebuilt Rust binary export failed." >&2
+        echo "  Recompile first with: bash DCENT_OS_Antminer/scripts/build-dcentrald.sh $expected_variant" >&2
+        if is_truthy "${DCENT_ALLOW_STALE_DCENTRALD:-0}"; then
+            echo "  DCENT_ALLOW_STALE_DCENTRALD is deprecated and does not bypass receipt/export validation." >&2
+        fi
+        return 1
+    fi
+    if ! BINARY_EXPORT_CAPABILITY="$(
+        python3 "$SCRIPT_DIR/binary_build_receipt.py" \
+            export-snapshot-capability-path --stage "$BINARY_EXPORT_STAGE"
+    )"; then
+        echo "ERROR: cannot locate the binary export destruction capability." >&2
+        return 1
+    fi
+
+    return 0
 }
 
 dcent_phase0_stale_binary_guard_selftest() {
-    tmpdir=$(mktemp -d 2>/dev/null || echo "/tmp/dcentos-stale-binary-selftest.$$")
-    rm -rf "$tmpdir"
-    mkdir -p \
-        "$tmpdir/project/dcentrald/dcentos-init/src" \
-        "$tmpdir/project/dcentrald/src" \
-        "$tmpdir/project/dcentrald/target/armv7-unknown-linux-musleabihf/release" || return 1
-
-    printf '[workspace]\n' > "$tmpdir/project/dcentrald/Cargo.toml" || return 1
-    printf 'fn main() {}\n' > "$tmpdir/project/dcentrald/src/main.rs" || return 1
-    printf 'fn main() {}\n' > "$tmpdir/project/dcentrald/dcentos-init/src/main.rs" || return 1
-    printf 'dcentrald fixture\n' > "$tmpdir/project/dcentrald/target/armv7-unknown-linux-musleabihf/release/dcentrald" || return 1
-    printf 'dcentos-init fixture\n' > "$tmpdir/project/dcentrald/target/armv7-unknown-linux-musleabihf/release/dcentos-init" || return 1
-
-    touch -t 202601010000 \
-        "$tmpdir/project/dcentrald/Cargo.toml" \
-        "$tmpdir/project/dcentrald/src/main.rs" \
-        "$tmpdir/project/dcentrald/target/armv7-unknown-linux-musleabihf/release/dcentrald" \
-        "$tmpdir/project/dcentrald/target/armv7-unknown-linux-musleabihf/release/dcentos-init" || return 1
-    touch -t 202601020000 "$tmpdir/project/dcentrald/dcentos-init/src/main.rs" || return 1
-
-    out="$tmpdir/out.txt"
-    if (
-        PROJECT_DIR="$tmpdir/project"
-        BUILD_ARCH="armv7-unknown-linux-musleabihf"
-        TARGET="s9"
-        DCENT_ALLOW_STALE_DCENTRALD=0
-        dcent_phase0_stale_binary_guard
-    ) > "$out" 2>&1; then
-        rm -rf "$tmpdir"
-        return 1
-    fi
-    if ! grep -F 'dcentos-init binary is STALE' "$out" >/dev/null 2>&1; then
-        cat "$out" >&2
-        rm -rf "$tmpdir"
-        return 1
-    fi
-
-    if ! (
-        PROJECT_DIR="$tmpdir/project"
-        BUILD_ARCH="armv7-unknown-linux-musleabihf"
-        TARGET="s9"
-        DCENT_ALLOW_STALE_DCENTRALD=1
-        dcent_phase0_stale_binary_guard
-    ) >/dev/null 2>&1; then
-        rm -rf "$tmpdir"
-        return 1
-    fi
-
-    rm -rf "$tmpdir"
-    return 0
+    selftest_script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+    sh "$selftest_script_dir/test_binary_build_receipt.sh"
 }
 
 if [ "${DCENT_STALE_BINARY_GUARD_SELFTEST:-0}" = "1" ]; then
@@ -562,20 +619,481 @@ VOLUME_NAME="dcentos-build-work"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"                    # DCENT_OS_Antminer
 REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"             # DCENT Projects repo root
+GIT_OBJECT_REPO="$REPO_ROOT"
+CAPSULE_MODE=0
+CAPSULE_SOURCE_SNAPSHOT=""
+CAPSULE_SOURCE_TREE=""
+CAPSULE_SOURCE_ID=""
+CAPSULE_SOURCE_DESCRIPTOR_SHA256=""
+CAPSULE_INVOCATION_STAGE=""
+CAPSULE_INVOCATION_ID=""
+CAPSULE_RESULT_STAGE=""
+CAPSULE_RESULT_ROOT=""
+CAPSULE_EXTERNAL_INPUT_ROOT=""
+CAPSULE_CARGO_BUILD_INPUT_SNAPSHOT=""
+CAPSULE_RELEASE_SET_CAPABILITY_FILE=""
+CAPSULE_RELEASE_SET_STAGE=""
+if [ "${DCENT_RELEASE_CAPSULE_MODE:-0}" = "1" ]; then
+    CAPSULE_MODE=1
+    for capsule_variable in \
+        DCENT_CAPSULE_GIT_OBJECT_REPO \
+        DCENT_CAPSULE_SOURCE_SNAPSHOT \
+        DCENT_CAPSULE_SOURCE_COMMIT \
+        DCENT_CAPSULE_INVOCATION_STAGE \
+        DCENT_CAPSULE_RESULT_STAGE \
+        DCENT_CAPSULE_RESULT_ROOT \
+        DCENT_CAPSULE_EXTERNAL_INPUT_ROOT \
+        DCENT_CAPSULE_CARGO_BUILD_INPUT_SNAPSHOT \
+        DCENT_CAPSULE_RELEASE_SET_CAPABILITY_FILE; do
+        if [ -z "${!capsule_variable:-}" ]; then
+            echo "ERROR: capsule packaging requires $capsule_variable" >&2
+            exit 1
+        fi
+    done
+    GIT_OBJECT_REPO="$DCENT_CAPSULE_GIT_OBJECT_REPO"
+    CAPSULE_SOURCE_SNAPSHOT="$DCENT_CAPSULE_SOURCE_SNAPSHOT"
+    CAPSULE_INVOCATION_STAGE="$DCENT_CAPSULE_INVOCATION_STAGE"
+    CAPSULE_RESULT_STAGE="$DCENT_CAPSULE_RESULT_STAGE"
+    CAPSULE_RESULT_ROOT="$DCENT_CAPSULE_RESULT_ROOT"
+    CAPSULE_EXTERNAL_INPUT_ROOT="$DCENT_CAPSULE_EXTERNAL_INPUT_ROOT"
+    CAPSULE_CARGO_BUILD_INPUT_SNAPSHOT="$DCENT_CAPSULE_CARGO_BUILD_INPUT_SNAPSHOT"
+    CAPSULE_RELEASE_SET_CAPABILITY_FILE="$DCENT_CAPSULE_RELEASE_SET_CAPABILITY_FILE"
+    CAPSULE_VERIFY_RESULT="$(python3 "$SCRIPT_DIR/source_snapshot.py" \
+        verify-against-git \
+        --repo-root "$GIT_OBJECT_REPO" \
+        --commit "$DCENT_CAPSULE_SOURCE_COMMIT" \
+        "$CAPSULE_SOURCE_SNAPSHOT")"
+    capsule_verified_field() {
+        printf '%s\n' "$CAPSULE_VERIFY_RESULT" \
+            | python3 "$SCRIPT_DIR/source_snapshot.py" query-verified --field "$1"
+    }
+    dcent_capsule_shell_path() {
+        if command -v cygpath >/dev/null 2>&1; then
+            cygpath -u "$1"
+        else
+            printf '%s\n' "$1"
+        fi
+    }
+    CAPSULE_SOURCE_TREE="$(dcent_capsule_shell_path "$(capsule_verified_field tree)")"
+    CAPSULE_SOURCE_ID="$(capsule_verified_field snapshot_id)"
+    CAPSULE_SOURCE_DESCRIPTOR_SHA256="$(capsule_verified_field descriptor_sha256)"
+    CAPSULE_INVOCATION_ID="$(python3 "$SCRIPT_DIR/release_invocation.py" query \
+        --field invocation_id "$CAPSULE_INVOCATION_STAGE")"
+    VOLUME_NAME="$(python3 "$SCRIPT_DIR/release_invocation.py" query \
+        --field buildroot_volume "$CAPSULE_INVOCATION_STAGE")"
+    IMAGE_NAME="$(python3 "$SCRIPT_DIR/release_docker_resources.py" \
+        query-builder-tag "$CAPSULE_INVOCATION_STAGE")"
+    EXPECTED_CAPSULE_PROJECT="$(cd "$CAPSULE_SOURCE_TREE/DCENT_OS_Antminer" && pwd)"
+    if [ "$PROJECT_DIR" != "$EXPECTED_CAPSULE_PROJECT" ]; then
+        echo "ERROR: capsule packaging driver is not executing from the authenticated source snapshot" >&2
+        exit 1
+    fi
+    python3 "$SCRIPT_DIR/release_result_stage.py" verify \
+        --invocation-stage "$CAPSULE_INVOCATION_STAGE" \
+        "$CAPSULE_RESULT_STAGE" >/dev/null
+    VERIFIED_CAPSULE_RESULT_ROOT="$(python3 "$SCRIPT_DIR/release_result_stage.py" query \
+        --field result_root \
+        --invocation-stage "$CAPSULE_INVOCATION_STAGE" \
+        "$CAPSULE_RESULT_STAGE")"
+    CAPSULE_RESULT_ROOT="$(dcent_capsule_shell_path "$CAPSULE_RESULT_ROOT")"
+    VERIFIED_CAPSULE_RESULT_ROOT="$(dcent_capsule_shell_path "$VERIFIED_CAPSULE_RESULT_ROOT")"
+    if [ "$CAPSULE_RESULT_ROOT" != "$VERIFIED_CAPSULE_RESULT_ROOT" ]; then
+        echo "ERROR: capsule result root does not match the invocation-bound result stage" >&2
+        exit 1
+    fi
+    CAPSULE_RELEASE_SET_STAGE="$(python3 "$SCRIPT_DIR/release_set_publication.py" query \
+        --field stage-path < "$CAPSULE_RELEASE_SET_CAPABILITY_FILE")"
+    CAPSULE_RELEASE_SET_STAGE="$(dcent_capsule_shell_path "$CAPSULE_RELEASE_SET_STAGE")"
+    python3 "$SCRIPT_DIR/build_input_snapshot.py" verify \
+        --target cargo-workspace "$CAPSULE_CARGO_BUILD_INPUT_SNAPSHOT" >/dev/null
+    DCENT_SOURCE_COMMIT="$DCENT_CAPSULE_SOURCE_COMMIT"
+    DCENT_SOURCE_TREE_STATE="exact_git_object_snapshot"
+    SOURCE_DATE_EPOCH="$(git -C "$GIT_OBJECT_REPO" show -s --format=%ct "$DCENT_SOURCE_COMMIT")"
+    DCENT_CREATED_AT_UTC="$(python3 - "$SOURCE_DATE_EPOCH" <<'PY'
+import datetime
+import sys
+print(datetime.datetime.fromtimestamp(int(sys.argv[1]), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+PY
+)"
+    DCENT_BUILD_ARCH="$BUILD_ARCH"
+    DCENT_TOOLCHAIN_ID="linaro-7.2.1:${TOOLCHAIN_FILE}"
+    DCENT_REQUIRE_RELEASE_PROVENANCE=1
+    export DCENT_SOURCE_COMMIT DCENT_SOURCE_TREE_STATE SOURCE_DATE_EPOCH
+    export DCENT_CREATED_AT_UTC DCENT_BUILD_ARCH DCENT_TOOLCHAIN_ID
+fi
+
+# Direct packaging used mutable checkout, Cargo, and Buildroot authorities that
+# cannot satisfy receipt-v4 lineage. Reject it before provenance scans,
+# snapshots, locks, or Docker access; a future lab lane needs its own explicit
+# non-release capsule instead of inheriting this production driver.
+if [ "$CAPSULE_MODE" != "1" ]; then
+    echo "ERROR: direct Buildroot packaging is disabled until a separate lab capsule exists" >&2
+    echo "       use scripts/build_s9_release_capsule.sh for the admitted S9 release lane" >&2
+    exit 2
+fi
 # shellcheck source=lib/sd_image_signing_gate.sh
 . "$SCRIPT_DIR/lib/sd_image_signing_gate.sh"
+. "$SCRIPT_DIR/lib/release_envelope.sh"
+dcent_run_docker_resource_spec() {
+    local spec_json=$1
+    local -a spec_argv=()
+    mapfile -d '' -t spec_argv < <(
+        printf '%s\n' "$spec_json" \
+            | python3 "$SCRIPT_DIR/release_docker_resources.py" \
+                emit-argv0 "$CAPSULE_INVOCATION_STAGE"
+    )
+    if [ "${#spec_argv[@]}" -eq 0 ] || [ "${spec_argv[0]}" != "docker" ]; then
+        echo "ERROR: Docker resource helper emitted no executable exact argv" >&2
+        return 1
+    fi
+    "${spec_argv[@]}"
+}
 KB_DIR="${DCENT_SOC_BOOT_DIR:-$PROJECT_DIR/vendor/soc-boot}"
-WIN_BIN="$PROJECT_DIR/dcentrald/target/$BUILD_ARCH/release/dcentrald"
+if [ "$CAPSULE_MODE" = "1" ]; then
+    WIN_BIN="$CAPSULE_RESULT_ROOT/target/$BUILD_ARCH/release/dcentrald"
+    RUST_METADATA_FILE="$CAPSULE_RESULT_ROOT/target/release-inventory/${BUILD_ARCH}.metadata.json"
+else
+    WIN_BIN="$PROJECT_DIR/dcentrald/target/$BUILD_ARCH/release/dcentrald"
+    RUST_METADATA_FILE="$PROJECT_DIR/dcentrald/target/release-inventory/${BUILD_ARCH}.metadata.json"
+fi
+
+# Snapshot every target-scoped gitignored payload before Docker can consume it.
+# cv1835-s19jpro intentionally fails here: its defconfig has no kernel producer
+# while its post-image consumer requires uImage, so a warm-volume uImage must
+# never silently become a newly signed package input.
+command -v python3 >/dev/null 2>&1 || {
+    echo "ERROR: python3 is required for out-of-band build-input snapshotting" >&2
+    exit 1
+}
+DCENT_REQUIRE_RELEASE_PROVENANCE="${DCENT_REQUIRE_RELEASE_PROVENANCE:-0}"
+if [ "$CAPSULE_MODE" != "1" ]; then
+    dcent_prepare_git_release_provenance \
+        "$REPO_ROOT" \
+        "$DCENT_PACKAGE_STATUS" \
+        "$TARGET" \
+        "$BUILD_ARCH" \
+        "linaro-7.2.1:${TOOLCHAIN_FILE}"
+fi
+export DCENT_REQUIRE_RELEASE_PROVENANCE
+if dcent_release_provenance_required; then
+    [ -n "${DCENT_RELEASE_SIGNING_KEY:-}" ] || {
+        echo "ERROR: release build requires DCENT_RELEASE_SIGNING_KEY" >&2
+        exit 1
+    }
+    [ -n "${DCENT_RELEASE_PUBKEY_FILE:-}" ] || {
+        echo "ERROR: release build requires DCENT_RELEASE_PUBKEY_FILE" >&2
+        exit 1
+    }
+    bash "$SCRIPT_DIR/verify_release_keypair.sh" \
+        "$DCENT_RELEASE_SIGNING_KEY" \
+        "$DCENT_RELEASE_PUBKEY_FILE" \
+        "$DCENT_MANIFEST_PUBLIC_KEY_HEX" >/dev/null
+fi
 if [ -n "$OUTPUT_DIR_OVERRIDE" ]; then
     case "$OUTPUT_DIR_OVERRIDE" in
         /*|[A-Za-z]:*) OUTPUT_DIR="$OUTPUT_DIR_OVERRIDE" ;;
         *) OUTPUT_DIR="$PROJECT_DIR/$OUTPUT_DIR_OVERRIDE" ;;
     esac
 else
+    if [ "$CAPSULE_MODE" = "1" ]; then
+        echo "ERROR: capsule packaging requires --output-dir for its private release-set stage" >&2
+        exit 1
+    fi
     OUTPUT_DIR="$PROJECT_DIR/output"
 fi
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
+if [ "$CAPSULE_MODE" = "1" ] && [ "$OUTPUT_DIR" != "$CAPSULE_RELEASE_SET_STAGE" ]; then
+    echo "ERROR: capsule output is not the capability-owned release-set stage" >&2
+    exit 1
+fi
+
+# Legacy packaging still shares one volume/output namespace. Capsule packaging
+# owns a fresh volume and private publication stage, so it neither needs nor may
+# mutate a lock below the sealed source snapshot.
+BUILD_LOCK_DIR="$PROJECT_DIR/output/.dcentos-build.lock"
+BUILD_LOCK_HELD=0
+if [ "$CAPSULE_MODE" != "1" ]; then
+    mkdir -p "$PROJECT_DIR/output"
+    dcent_release_build_lock_acquire "$BUILD_LOCK_DIR"
+    BUILD_LOCK_HELD=1
+fi
+dcent_release_early_unlock() {
+    status=$?
+    trap - EXIT
+    if [ "$BUILD_LOCK_HELD" = "1" ]; then
+        dcent_release_build_lock_release "$BUILD_LOCK_DIR" >/dev/null 2>&1 || true
+    fi
+    exit "$status"
+}
+trap dcent_release_early_unlock EXIT
+
+# Resolve and pre-clean the exact release publication names before any build
+# work. These are tracked independently from the legacy artifact sidecars so
+# the EXIT trap can retract every release-looking alias and metadata file if a
+# later signer or private-stage cleanup fails.
+RELEASE_NAME=""
+RELEASE_EXT="tar"
+case "$TARBALL_NAME" in *.img) RELEASE_EXT="img" ;; esac
+RELEASE_GRADE_PATH=""
+RELEASE_LAB_PATH=""
+RELEASE_METADATA_PATH=""
+RELEASE_COPY=""
+RELEASE_DATE_STAMP="$(
+    printf '%s\n' "$DCENT_CREATED_AT_UTC" \
+        | awk -F'T' '{ gsub(/-/, "", $1); print $1 }'
+)"
+if release_name_candidate="$(
+    sh "$SCRIPT_DIR/firmware_release_name.sh" \
+        "$TARGET" "${DCENT_RELEASE_CHANNEL:-beta}" "$RELEASE_DATE_STAMP" 2>/dev/null
+)"; then
+    case "$release_name_candidate" in
+        ""|.|..|*/*|*\\*)
+            echo "ERROR: firmware release name is not a canonical flat basename" >&2
+            exit 1
+            ;;
+    esac
+    RELEASE_NAME="$release_name_candidate"
+    RELEASE_GRADE_PATH="$OUTPUT_DIR/${RELEASE_NAME}.${RELEASE_EXT}"
+    RELEASE_LAB_PATH="$OUTPUT_DIR/${RELEASE_NAME}-LAB-UNSIGNED-NOT-FOR-RELEASE.${RELEASE_EXT}"
+    RELEASE_METADATA_PATH="$OUTPUT_DIR/${RELEASE_NAME}.release.txt"
+    dcent_release_require_publication_absent \
+        "$OUTPUT_DIR" "$RELEASE_NAME" "$RELEASE_EXT"
+else
+    if dcent_release_provenance_required; then
+        echo "ERROR: release build has no canonical publication name for target '$TARGET'" >&2
+        exit 1
+    fi
+fi
+
+dcent_remove_prebuilt_rust_sidecars() {
+    sidecar_prefix="$1"
+    for sidecar_binary in dcentrald dcentos-init dcentos-discovery; do
+        rm -f -- \
+            "$OUTPUT_DIR/${sidecar_prefix}.prebuilt-rust.${sidecar_binary}.bin" \
+            "$OUTPUT_DIR/${sidecar_prefix}.prebuilt-rust.${sidecar_binary}.build-receipt.json"
+    done
+}
+
+# Evidence sidecars authenticate one exact artifact generation. Clear the
+# previous generation before any build or packaging mutation so a failed run
+# cannot leave stale legal/Rust/closure evidence next to newly written (or
+# partially written) firmware bytes. Failure to remove a non-regular collision
+# is fatal under set -e; it must not be silently overwritten as evidence.
+rm -f -- \
+    "$OUTPUT_DIR/${TARBALL_NAME}.buildroot-legal.json" \
+    "$OUTPUT_DIR/${TARBALL_NAME}.rust-dependencies.json" \
+    "$OUTPUT_DIR/${TARBALL_NAME}.source-closure.json" \
+    "$OUTPUT_DIR/${TARBALL_NAME}.source-closure.json.sig" \
+    "$OUTPUT_DIR/release-packaging-input.json" \
+    "$OUTPUT_DIR/${TARBALL_NAME}.sig"
+dcent_remove_prebuilt_rust_sidecars "$TARBALL_NAME"
+
+BUILD_INPUT_STAGE=""
+BUILD_INPUT_SNAPSHOT=""
+BUILD_INPUT_DESTROY_TOKEN=""
+BUILD_INPUT_MOUNT_ARGS=()
+BINARY_EXPORT_PARENT=""
+BINARY_EXPORT_STAGE=""
+BINARY_EXPORT_CAPABILITY=""
+BINARY_EXPORT_MOUNT_ARGS=()
+BINARY_EXPORT_REQUIRED=""
+BINARY_EXPORT_DCENTRALD_PATH=""
+BINARY_EXPORT_DCENTRALD_SHA256=""
+BINARY_EXPORT_INIT_PATH=""
+BINARY_EXPORT_INIT_SHA256=""
+BINARY_EXPORT_DISCOVERY_PATH=""
+BINARY_EXPORT_DISCOVERY_SHA256=""
+PREBUILT_RUST_INPUT_ARGS=()
+PREBUILT_RUST_INPUT_COUNT=0
+CAPSULE_BUILDROOT_VOLUME_CREATED=0
+CAPSULE_BUILDROOT_VOLUME_INSPECT=""
+CAPSULE_IMAGE_TAG_CREATED=0
+CAPSULE_RETAINED_IMAGE_TAG=""
+
+dcent_cleanup_failed_release_evidence() {
+    status=$?
+    trap - EXIT
+    # EXIT cleanup is best-effort across every independent artifact/stage. A
+    # single non-removable collision must never let inherited `set -e` abort
+    # before canonical publication retraction or private-stage destruction.
+    set +e
+    if [ "$CAPSULE_BUILDROOT_VOLUME_CREATED" = "1" ]; then
+        current_volume_inspect="$(docker volume inspect -- "$VOLUME_NAME" 2>/dev/null)"
+        if [ -z "$current_volume_inspect" ] || ! printf '%s\n' "$current_volume_inspect" \
+            | python3 "$SCRIPT_DIR/release_docker_resources.py" verify-inspect \
+                --role buildroot "$CAPSULE_INVOCATION_STAGE" >/dev/null; then
+            echo "ERROR: invocation Buildroot volume identity changed before cleanup" >&2
+            [ "$status" -ne 0 ] || status=1
+        else
+            invocation_cleanup_capability="$(python3 "$SCRIPT_DIR/release_invocation.py" query \
+                --field capability "$CAPSULE_INVOCATION_STAGE")"
+            destroy_volume_spec="$(printf '%s\n' "$current_volume_inspect" \
+                | python3 "$SCRIPT_DIR/release_docker_resources.py" destroy-spec \
+                    --role buildroot \
+                    --capability "$invocation_cleanup_capability" \
+                    --empty-or-disposable disposable \
+                    "$CAPSULE_INVOCATION_STAGE")"
+            if [ -z "$destroy_volume_spec" ] || ! dcent_run_docker_resource_spec \
+                "$destroy_volume_spec" >/dev/null; then
+                echo "ERROR: failed to remove exact invocation Buildroot volume" >&2
+                [ "$status" -ne 0 ] || status=1
+            else
+                CAPSULE_BUILDROOT_VOLUME_CREATED=0
+            fi
+        fi
+    fi
+    if [ "$CAPSULE_IMAGE_TAG_CREATED" = "1" ]; then
+        retained_image_id="$(docker image inspect --format '{{.Id}}' \
+            "$CAPSULE_RETAINED_IMAGE_TAG" 2>/dev/null)"
+        unique_image_id="$(docker image inspect --format '{{.Id}}' \
+            "$IMAGE_NAME" 2>/dev/null)"
+        if [ -z "$retained_image_id" ] || [ "$retained_image_id" != "$unique_image_id" ]; then
+            echo "ERROR: refusing to remove unique builder tag without its retained content-addressed reference" >&2
+            [ "$status" -ne 0 ] || status=1
+        elif ! docker image rm "$IMAGE_NAME" >/dev/null 2>&1; then
+            echo "ERROR: failed to remove exact invocation builder tag" >&2
+            [ "$status" -ne 0 ] || status=1
+        else
+            CAPSULE_IMAGE_TAG_CREATED=0
+        fi
+    fi
+    if [ "$status" -ne 0 ]; then
+        if [ -n "$RELEASE_NAME" ] && ! dcent_release_remove_publication \
+            "$OUTPUT_DIR" "$RELEASE_NAME" "$RELEASE_EXT"; then
+            echo "ERROR: failed to retract release publication set" >&2
+        fi
+        rm -f -- \
+            "$OUTPUT_DIR/${TARBALL_NAME}.buildroot-legal.json" \
+            "$OUTPUT_DIR/${TARBALL_NAME}.rust-dependencies.json" \
+            "$OUTPUT_DIR/${TARBALL_NAME}.source-closure.json" \
+            "$OUTPUT_DIR/${TARBALL_NAME}.source-closure.json.sig" \
+            "$OUTPUT_DIR/release-packaging-input.json" \
+            "$OUTPUT_DIR/${TARBALL_NAME}.sig"
+        dcent_remove_prebuilt_rust_sidecars "$TARBALL_NAME"
+    fi
+    if [ -n "$BINARY_EXPORT_STAGE" ]; then
+        if [ -z "$BINARY_EXPORT_CAPABILITY" ]; then
+            BINARY_EXPORT_CAPABILITY="$(
+                python3 "$SCRIPT_DIR/binary_build_receipt.py" \
+                    export-snapshot-capability-path --stage "$BINARY_EXPORT_STAGE" \
+                    2>/dev/null
+            )" || true
+        fi
+        if [ -z "$BINARY_EXPORT_CAPABILITY" ] || ! \
+            python3 "$SCRIPT_DIR/binary_build_receipt.py" \
+                destroy-export-snapshot-set \
+                --stage "$BINARY_EXPORT_STAGE" \
+                --capability "$BINARY_EXPORT_CAPABILITY" >/dev/null 2>&1; then
+            echo "ERROR: failed to remove private binary export set: $BINARY_EXPORT_STAGE" >&2
+            [ "$status" -ne 0 ] || status=1
+        fi
+    fi
+    if [ -n "$BINARY_EXPORT_PARENT" ]; then
+        capability_directory="$BINARY_EXPORT_PARENT/.dcent-export-capabilities"
+        if { [ -e "$capability_directory" ] || [ -L "$capability_directory" ]; } && \
+            ! rmdir -- "$capability_directory" 2>/dev/null; then
+            echo "ERROR: failed to remove binary export capability directory: $capability_directory" >&2
+            [ "$status" -ne 0 ] || status=1
+        fi
+        if ! rmdir -- "$BINARY_EXPORT_PARENT" 2>/dev/null; then
+            echo "ERROR: failed to remove private binary export parent: $BINARY_EXPORT_PARENT" >&2
+            [ "$status" -ne 0 ] || status=1
+        fi
+    fi
+    if [ -n "$BUILD_INPUT_SNAPSHOT" ]; then
+        python3 "$SCRIPT_DIR/build_input_snapshot.py" destroy \
+            --token "$BUILD_INPUT_DESTROY_TOKEN" "$BUILD_INPUT_SNAPSHOT" \
+            >/dev/null 2>&1 || {
+            echo "ERROR: failed to remove private build-input snapshot: $BUILD_INPUT_STAGE" >&2
+            [ "$status" -ne 0 ] || status=1
+        }
+    fi
+    # Cleanup itself is part of release success. If private-stage destruction
+    # changed a previously successful status to failure, remove every evidence
+    # sidecar now so a failed invocation cannot leave publishable-looking proof.
+    if [ "$status" -ne 0 ]; then
+        if [ -n "$RELEASE_NAME" ] && ! dcent_release_remove_publication \
+            "$OUTPUT_DIR" "$RELEASE_NAME" "$RELEASE_EXT"; then
+            echo "ERROR: failed to retract release publication set" >&2
+        fi
+        rm -f -- \
+            "$OUTPUT_DIR/${TARBALL_NAME}.buildroot-legal.json" \
+            "$OUTPUT_DIR/${TARBALL_NAME}.rust-dependencies.json" \
+            "$OUTPUT_DIR/${TARBALL_NAME}.source-closure.json" \
+            "$OUTPUT_DIR/${TARBALL_NAME}.source-closure.json.sig" \
+            "$OUTPUT_DIR/release-packaging-input.json" \
+            "$OUTPUT_DIR/${TARBALL_NAME}.sig"
+        dcent_remove_prebuilt_rust_sidecars "$TARBALL_NAME"
+    fi
+    # Lock release is the last shared-state mutation. A subsequent invocation
+    # must not enter while this trap can still retract aliases or sidecars.
+    if [ "$BUILD_LOCK_HELD" = "1" ]; then
+        if dcent_release_build_lock_release "$BUILD_LOCK_DIR"; then
+            BUILD_LOCK_HELD=0
+        else
+            echo "ERROR: failed to release shared build/output lock: $BUILD_LOCK_DIR" >&2
+            [ "$status" -ne 0 ] || status=1
+        fi
+    fi
+    exit "$status"
+}
+trap dcent_cleanup_failed_release_evidence EXIT
+
+# Materialize target-selected external bytes once. All supported S9/AM2
+# consumers below read this private, read-only stage instead of reopening the
+# live repository paths declared by the manifest. This does not snapshot or
+# claim closure over the project source tree.
+BUILD_INPUT_REPO_ROOT="$REPO_ROOT"
+if [ "$CAPSULE_MODE" = "1" ]; then
+    BUILD_INPUT_REPO_ROOT="$CAPSULE_EXTERNAL_INPUT_ROOT"
+fi
+BUILD_INPUT_SELECTION_ARGS=()
+if [ "$CAPSULE_MODE" = "1" ]; then
+    BUILD_INPUT_SELECTION_ARGS=(--selection-root "$REPO_ROOT")
+fi
+BUILD_INPUT_CREATE_RESULT="$(python3 "$SCRIPT_DIR/build_input_snapshot.py" create \
+    --repo-root "$BUILD_INPUT_REPO_ROOT" \
+    --build-input-manifest "$SCRIPT_DIR/build_inputs.manifest" \
+    "${BUILD_INPUT_SELECTION_ARGS[@]}" \
+    --target "$TARGET")"
+snapshot_result_field() {
+    printf '%s\n' "$BUILD_INPUT_CREATE_RESULT" \
+        | python3 "$SCRIPT_DIR/build_input_snapshot.py" query-result "$@"
+}
+BUILD_INPUT_STAGE="$(snapshot_result_field --field stage)"
+BUILD_INPUT_SNAPSHOT="$(snapshot_result_field --field snapshot)"
+BUILD_INPUT_DESTROY_TOKEN="$(snapshot_result_field --field destroy_token)"
+if command -v cygpath >/dev/null 2>&1; then
+    DOCKER_BUILD_INPUT_STAGE="$(cygpath -w "$BUILD_INPUT_STAGE")"
+else
+    DOCKER_BUILD_INPUT_STAGE="$BUILD_INPUT_STAGE"
+fi
+BUILD_INPUT_MOUNT_ARGS=(
+    -v "${DOCKER_BUILD_INPUT_STAGE}:/dcent-inputs:ro"
+)
+
+# Place the binary export beside the already Docker-shareable out-of-band
+# snapshot, but in its own private parent. The export helper owns every entry
+# below this directory and cleanup uses its out-of-stage capability.
+BINARY_EXPORT_PARENT="$(python3 - "$BUILD_INPUT_STAGE" <<'PY'
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+shareable_parent = Path(sys.argv[1]).parent
+private_parent = Path(
+    tempfile.mkdtemp(prefix="dcent-binary-export-parent-", dir=shareable_parent)
+)
+os.chmod(private_parent, 0o700)
+print(private_parent)
+PY
+)"
+dcent_validate_docker_transport_path "$BINARY_EXPORT_PARENT" || {
+    echo "ERROR: private binary export parent is unsafe for Docker transport" >&2
+    exit 1
+}
 
 # Release signing keys are host files. Docker build stages must see them via
 # stable container paths; passing a Windows/WSL host path through the env is not
@@ -585,6 +1103,10 @@ PUBKEY_MOUNT_ARGS=()
 CONTAINER_RELEASE_SIGNING_KEY="${DCENT_RELEASE_SIGNING_KEY:-}"
 CONTAINER_RELEASE_PUBKEY_FILE="${DCENT_RELEASE_PUBKEY_FILE:-}"
 if [ -n "${DCENT_RELEASE_SIGNING_KEY:-}" ]; then
+    dcent_require_absolute_host_path "$DCENT_RELEASE_SIGNING_KEY" || {
+        echo "ERROR: DCENT_RELEASE_SIGNING_KEY must be an absolute host path" >&2
+        exit 1
+    }
     if [ ! -f "$DCENT_RELEASE_SIGNING_KEY" ]; then
         echo "ERROR: DCENT_RELEASE_SIGNING_KEY points to missing file: $DCENT_RELEASE_SIGNING_KEY" >&2
         exit 1
@@ -594,10 +1116,18 @@ if [ -n "${DCENT_RELEASE_SIGNING_KEY:-}" ]; then
     else
         SIGN_KEY_MOUNT="$DCENT_RELEASE_SIGNING_KEY"
     fi
+    dcent_validate_docker_transport_path "$SIGN_KEY_MOUNT" || {
+        echo "ERROR: release signing-key path is unsafe for Docker transport" >&2
+        exit 1
+    }
     SIGNING_MOUNT_ARGS+=(-v "${SIGN_KEY_MOUNT}:/dcent-release-signing-key.pem:ro")
     CONTAINER_RELEASE_SIGNING_KEY="/dcent-release-signing-key.pem"
 fi
 if [ -n "${DCENT_RELEASE_PUBKEY_FILE:-}" ]; then
+    dcent_require_absolute_host_path "$DCENT_RELEASE_PUBKEY_FILE" || {
+        echo "ERROR: DCENT_RELEASE_PUBKEY_FILE must be an absolute host path" >&2
+        exit 1
+    }
     if [ ! -f "$DCENT_RELEASE_PUBKEY_FILE" ]; then
         echo "ERROR: DCENT_RELEASE_PUBKEY_FILE points to missing file: $DCENT_RELEASE_PUBKEY_FILE" >&2
         exit 1
@@ -607,6 +1137,10 @@ if [ -n "${DCENT_RELEASE_PUBKEY_FILE:-}" ]; then
     else
         RELEASE_PUBKEY_MOUNT="$DCENT_RELEASE_PUBKEY_FILE"
     fi
+    dcent_validate_docker_transport_path "$RELEASE_PUBKEY_MOUNT" || {
+        echo "ERROR: release public-key path is unsafe for Docker transport" >&2
+        exit 1
+    }
     SIGNING_MOUNT_ARGS+=(-v "${RELEASE_PUBKEY_MOUNT}:/dcent-release-ed25519.pub:ro")
     PUBKEY_MOUNT_ARGS+=(-v "${RELEASE_PUBKEY_MOUNT}:/dcent-release-ed25519.pub:ro")
     CONTAINER_RELEASE_PUBKEY_FILE="/dcent-release-ed25519.pub"
@@ -617,60 +1151,84 @@ fi
 
 # -------- Phase 0: staged binary freshness guard (build-hygiene) --------
 # This pipeline stages pre-built Rust binaries (Phase 5) and does not
-# recompile them. Fail early if dcentrald, dcentos-init, or BB discovery would
+# recompile them. Fail early if dcentrald, dcentos-init, or BB/CV discovery would
 # ship stale or missing.
 if ! dcent_phase0_stale_binary_guard; then
     exit 1
 fi
-
-# -------- Phase 0: dcentrald binary freshness guard (build-hygiene) --------
-# This pipeline STAGES the pre-built host binary (Phase 5) — it does NOT
-# recompile dcentrald. So if a source edit is committed but build-dcentrald.sh
-# is never re-run, the image silently ships a STALE binary. This actually
-# happened: the .25 dashboard-freq fix (b1e9e8ca, 2026-06-14) was committed but
-# never compiled, so every image built for hours carried the pre-fix binary and
-# the dashboard kept reporting the wrong frequency. Refuse to ship a binary
-# older than its source. Override (intentional binary pin only):
-# DCENT_ALLOW_STALE_DCENTRALD=1.
-if false && [ -f "$WIN_BIN" ]; then
-    STALE_SRC=$(find "$PROJECT_DIR/dcentrald" -path '*/target' -prune -o \
-        \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
-        -newer "$WIN_BIN" -print 2>/dev/null | head -3)
-    # A2e-2: the binary also embeds out-of-tree inputs the find above misses —
-    # the dcent-schema path-dep (config/MCP/swarm contracts) and the baked
-    # stock-bitmain manifest + signature (include_str!/include_bytes!). Editing
-    # either without a recompile is the same silent-stale class, so check them
-    # too. (Each root is quoted — the repo path contains a space.)
-    if [ -d "$PROJECT_DIR/dcent-schema" ]; then
-        _schema_stale=$(find "$PROJECT_DIR/dcent-schema" -path '*/target' -prune -o \
-            \( -name '*.rs' -o -name 'Cargo.toml' \) \
-            -newer "$WIN_BIN" -print 2>/dev/null | head -3)
-        [ -n "$_schema_stale" ] && STALE_SRC=$(printf '%s\n%s' "$STALE_SRC" "$_schema_stale")
-    fi
-    for _baked in \
-        "${DCENT_STOCK_MANIFEST_DIR:-$PROJECT_DIR/vendor/stock-manifest}/stock-bitmain-manifest.json" \
-        "${DCENT_STOCK_MANIFEST_DIR:-$PROJECT_DIR/vendor/stock-manifest}/stock-bitmain-manifest.json.sig"; do
-        if [ -f "$_baked" ] && [ "$_baked" -nt "$WIN_BIN" ]; then
-            STALE_SRC=$(printf '%s\n%s' "$STALE_SRC" "$_baked")
-        fi
-    done
-    if [ -n "$STALE_SRC" ]; then
-        case "$BUILD_ARCH" in
-            aarch64-unknown-linux-musl) _recompile_target=amlogic ;;
-            *) _recompile_target=zynq ;;
-        esac
-        echo "ERROR: dcentrald binary is STALE — source is newer than the built binary." >&2
-        echo "  binary: $WIN_BIN" >&2
-        echo "  newer source (sample):" >&2
-        echo "$STALE_SRC" | sed 's/^/    /' >&2
-        echo "  Recompile first:  bash DCENT_OS_Antminer/scripts/build-dcentrald.sh ${_recompile_target}" >&2
-        echo "  (override only for an intentional binary pin: DCENT_ALLOW_STALE_DCENTRALD=1)" >&2
-        if [ "${DCENT_ALLOW_STALE_DCENTRALD:-0}" != "1" ]; then
-            exit 1
-        fi
-        echo "  WARNING: proceeding with a STALE binary (DCENT_ALLOW_STALE_DCENTRALD=1)" >&2
-    fi
+dcent_validate_docker_transport_path "$BINARY_EXPORT_STAGE" || {
+    echo "ERROR: private binary export stage is unsafe for Docker transport" >&2
+    exit 1
+}
+if command -v cygpath >/dev/null 2>&1; then
+    DOCKER_BINARY_EXPORT_STAGE="$(cygpath -w "$BINARY_EXPORT_STAGE")"
+else
+    DOCKER_BINARY_EXPORT_STAGE="$BINARY_EXPORT_STAGE"
 fi
+dcent_validate_docker_transport_path "$DOCKER_BINARY_EXPORT_STAGE" || {
+    echo "ERROR: converted binary export stage is unsafe for Docker transport" >&2
+    exit 1
+}
+BINARY_EXPORT_MOUNT_ARGS=(
+    -v "${DOCKER_BINARY_EXPORT_STAGE}:/dcent-binaries:ro"
+)
+for binary_name in $(dcent_required_prebuilt_binaries); do
+    binary_export_record="$(
+        python3 "$SCRIPT_DIR/binary_build_receipt.py" \
+            query-export-snapshot-path \
+            --stage "$BINARY_EXPORT_STAGE" \
+            --binary-name "$binary_name" \
+            --artifact binary \
+            --field path-sha256
+    )"
+    IFS=' ' read -r binary_relative_path binary_sha256 binary_record_extra \
+        <<<"$binary_export_record"
+    if [ -n "$binary_record_extra" ] || \
+        [ "$binary_export_record" != "$binary_relative_path $binary_sha256" ]; then
+        echo "ERROR: helper returned a malformed export path/digest record for $binary_name" >&2
+        exit 1
+    fi
+    case "$binary_relative_path" in
+        artifacts/[0-9][0-9][0-9][0-9]/"$binary_name") ;;
+        *)
+            echo "ERROR: helper returned unsafe export path for $binary_name: $binary_relative_path" >&2
+            exit 1
+            ;;
+    esac
+    case "$binary_sha256" in
+        *[!0-9a-f]*|'')
+            echo "ERROR: helper returned malformed SHA256 for $binary_name" >&2
+            exit 1
+            ;;
+    esac
+    if [ "${#binary_sha256}" -ne 64 ]; then
+        echo "ERROR: helper returned non-64-byte SHA256 for $binary_name" >&2
+        exit 1
+    fi
+    case "$binary_name" in
+        dcentrald)
+            BINARY_EXPORT_DCENTRALD_PATH="$binary_relative_path"
+            BINARY_EXPORT_DCENTRALD_SHA256="$binary_sha256"
+            ;;
+        dcentos-init)
+            BINARY_EXPORT_INIT_PATH="$binary_relative_path"
+            BINARY_EXPORT_INIT_SHA256="$binary_sha256"
+            ;;
+        dcentos-discovery)
+            BINARY_EXPORT_DISCOVERY_PATH="$binary_relative_path"
+            BINARY_EXPORT_DISCOVERY_SHA256="$binary_sha256"
+            ;;
+        *)
+            echo "ERROR: unsupported required prebuilt binary name: $binary_name" >&2
+            exit 1
+            ;;
+    esac
+    if [ -n "$BINARY_EXPORT_REQUIRED" ]; then
+        BINARY_EXPORT_REQUIRED="$BINARY_EXPORT_REQUIRED $binary_name"
+    else
+        BINARY_EXPORT_REQUIRED="$binary_name"
+    fi
+done
 
 echo "==================================================================="
 echo "DCENT_OS Docker build pipeline — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -703,12 +1261,14 @@ echo ""
 command -v docker >/dev/null 2>&1 || { echo "ERROR: docker not in PATH"; exit 1; }
 docker info >/dev/null 2>&1 || { echo "ERROR: Docker daemon not responding"; exit 1; }
 [ -f "$WIN_BIN" ] || { echo "ERROR: prebuilt $BUILD_ARCH binary missing: $WIN_BIN"; exit 1; }
-[ -d "$KB_DIR" ] || { echo "ERROR: SoC boot inputs missing: $KB_DIR"; echo "       A full flashable image needs non-redistributable boot components"; echo "       (kernel / FPGA / U-Boot). See DEVELOPMENT.md, or flash a prebuilt signed release image."; exit 1; }
-# kernel.bin probe is S9-only. am2-s19jpro and am3-s19kpro use a board
-# post-image.sh that probes its own kernel paths (env override, sibling
-# fallback). Don't fail the host-side sanity gate for them.
-if [ "$BOARD_POST_IMAGE" != "board-script" ]; then
-    [ -f "$KB_DIR/kernel.bin" ] || { echo "ERROR: kernel.bin missing in $KB_DIR"; exit 1; }
+if [ "$CAPSULE_MODE" != "1" ]; then
+    [ -d "$KB_DIR" ] || { echo "ERROR: SoC boot inputs missing: $KB_DIR"; echo "       A full flashable image needs non-redistributable boot components"; echo "       (kernel / FPGA / U-Boot). See DEVELOPMENT.md, or flash a prebuilt signed release image."; exit 1; }
+    # kernel.bin probe is S9-only. am2-s19jpro and am3-s19kpro use a board
+    # post-image.sh that probes its own kernel paths (env override, sibling
+    # fallback). Don't fail the host-side sanity gate for them.
+    if [ "$BOARD_POST_IMAGE" != "board-script" ]; then
+        [ -f "$KB_DIR/kernel.bin" ] || { echo "ERROR: kernel.bin missing in $KB_DIR"; exit 1; }
+    fi
 fi
 
 # -------- Phase 1: build image --------
@@ -724,11 +1284,48 @@ else
     DOCKER_BUILD_DOCKERFILE="$PROJECT_DIR/Dockerfile.build"
 fi
 docker build -f "$DOCKER_BUILD_DOCKERFILE" -t "$IMAGE_NAME" "$DOCKER_BUILD_CTX"
+if [ "$CAPSULE_MODE" = "1" ]; then
+    CAPSULE_IMAGE_TAG_CREATED=1
+fi
+BUILD_CONTAINER_ID="$(docker image inspect --format '{{.Id}}' "$IMAGE_NAME")"
+case "$BUILD_CONTAINER_ID" in
+    sha256:[0-9a-f][0-9a-f]*) ;;
+    *)
+        echo "ERROR: Docker returned a non-immutable build image identity: $BUILD_CONTAINER_ID" >&2
+        exit 1
+        ;;
+esac
+if [ "$CAPSULE_MODE" = "1" ]; then
+    CAPSULE_RETAINED_IMAGE_TAG="dcentos-build-cache:${BUILD_CONTAINER_ID#sha256:}"
+    docker image tag "$BUILD_CONTAINER_ID" "$CAPSULE_RETAINED_IMAGE_TAG"
+    [ "$(docker image inspect --format '{{.Id}}' "$CAPSULE_RETAINED_IMAGE_TAG")" = "$BUILD_CONTAINER_ID" ] || {
+        echo "ERROR: retained content-addressed builder tag does not name the inspected image" >&2
+        exit 1
+    }
+fi
 echo ""
 
 # -------- Phase 2: volume --------
 echo "--- Phase 2: volume ---"
-if docker volume inspect "$VOLUME_NAME" >/dev/null 2>&1; then
+if [ "$CAPSULE_MODE" = "1" ]; then
+    if docker volume inspect -- "$VOLUME_NAME" >/dev/null 2>&1; then
+        echo "ERROR: invocation-scoped Buildroot volume already exists: $VOLUME_NAME" >&2
+        exit 1
+    fi
+    CAPSULE_VOLUME_CREATE_SPEC="$(python3 "$SCRIPT_DIR/release_docker_resources.py" \
+        create-spec --role buildroot "$CAPSULE_INVOCATION_STAGE")"
+    dcent_run_docker_resource_spec "$CAPSULE_VOLUME_CREATE_SPEC" >/dev/null
+    CAPSULE_BUILDROOT_VOLUME_CREATED=1
+    CAPSULE_VOLUME_INSPECT_SPEC="$(python3 "$SCRIPT_DIR/release_docker_resources.py" \
+        inspect-spec --role buildroot "$CAPSULE_INVOCATION_STAGE")"
+    CAPSULE_BUILDROOT_VOLUME_INSPECT="$(
+        dcent_run_docker_resource_spec "$CAPSULE_VOLUME_INSPECT_SPEC"
+    )"
+    printf '%s\n' "$CAPSULE_BUILDROOT_VOLUME_INSPECT" \
+        | python3 "$SCRIPT_DIR/release_docker_resources.py" verify-inspect \
+            --role buildroot "$CAPSULE_INVOCATION_STAGE" >/dev/null
+    echo "Created fresh invocation-scoped volume: $VOLUME_NAME"
+elif docker volume inspect "$VOLUME_NAME" >/dev/null 2>&1; then
     echo "Reusing existing volume: $VOLUME_NAME"
 else
     docker volume create "$VOLUME_NAME"
@@ -736,16 +1333,52 @@ else
 fi
 echo ""
 
-# -------- Phase 2b: invalidate cached dcentrald in volume --------
-# Bug #7 (2026-05-05): the persistent volume can hold a stale dcentrald from
-# a prior run. Phase 5 always re-stages from the host, but if Phase 5 is
-# skipped or fails midway the docker volume's old binary leaks into the
-# rootfs (post-build.sh `cp` from the volume path). Pre-purging guarantees
-# post-build.sh either sees a fresh Phase-5 stage or fails loudly.
-echo "--- Phase 2b: invalidate cached dcentrald in volume ---"
-docker run --rm -v "${VOLUME_NAME}:/build" "$IMAGE_NAME" bash -c \
-    "rm -f /build/dcentos/dcentrald/target/${BUILD_ARCH}/release/dcentrald && \
-     echo '  dcentrald cache invalidated (or was already absent)'"
+# -------- Phase 2b: invalidate cached prebuilt binaries in volume --------
+# A persistent volume can hold an older generation from a prior run. Purge the
+# Purge every known prebuilt name and receipt before Phase 5 so target switching or a
+# partial staging failure cannot expose an undeclared warm-volume generation.
+echo "--- Phase 2b: invalidate cached prebuilt binaries in volume ---"
+if [ "$CAPSULE_MODE" = "1" ]; then
+    echo "Fresh capsule volume has no warm prebuilt state to invalidate"
+else
+docker run --rm \
+    -e BUILD_ARCH="$BUILD_ARCH" \
+    -e ALL_PREBUILT_BINARIES="dcentrald dcentos-init dcentos-discovery pic-recovery dspic-flash" \
+    -v "${VOLUME_NAME}:/build" \
+    "$BUILD_CONTAINER_ID" bash -c '
+        set -eu
+        case "$BUILD_ARCH" in
+            armv7-unknown-linux-musleabihf|aarch64-unknown-linux-musl) ;;
+            *) echo "ERROR: unsafe BUILD_ARCH for binary staging: $BUILD_ARCH" >&2; exit 1 ;;
+        esac
+        release_dir=/build
+        [ -d "$release_dir" ] && [ ! -L "$release_dir" ] || {
+            echo "ERROR: Docker volume root is not a real directory" >&2
+            exit 1
+        }
+        for component in dcentos dcentrald target "$BUILD_ARCH" release; do
+            next="$release_dir/$component"
+            if [ -L "$next" ] || { [ -e "$next" ] && [ ! -d "$next" ]; }; then
+                echo "ERROR: unsafe persistent binary staging component: $next" >&2
+                exit 1
+            fi
+            if [ ! -d "$next" ]; then
+                mkdir -- "$next"
+            fi
+            [ -d "$next" ] && [ ! -L "$next" ] || {
+                echo "ERROR: binary staging component changed during creation: $next" >&2
+                exit 1
+            }
+            release_dir="$next"
+        done
+        for binary_name in $ALL_PREBUILT_BINARIES; do
+            rm -f -- \
+                "$release_dir/$binary_name" \
+                "$release_dir/${binary_name}.build-receipt.json"
+            echo "  $binary_name cache invalidated (or was already absent)"
+        done
+    '
+fi
 echo ""
 
 # Docker Desktop on Windows accepts POSIX-style mounts for bash. Convert the
@@ -753,8 +1386,13 @@ echo ""
 # In practice bash on Windows passes "/c/Users/..." which Docker Desktop rewrites
 # to the host path, so we use the paths as-is.
 POSIX_PROJECT_DIR="$PROJECT_DIR"
-POSIX_KB_PARENT="$(dirname "${DCENT_SOC_BOOT_DIR:-$PROJECT_DIR/vendor/soc-boot}")"
 POSIX_OUTPUT_DIR="$OUTPUT_DIR"
+for docker_transport_path in "$POSIX_PROJECT_DIR" "$POSIX_OUTPUT_DIR"; do
+    dcent_validate_docker_transport_path "$docker_transport_path" || {
+        echo "ERROR: project/output path is unsafe for Docker transport" >&2
+        exit 1
+    }
+done
 
 # -------- Phase 3: stage project tree into volume --------
 echo "--- Phase 3: stage project tree into volume ---"
@@ -763,9 +1401,10 @@ echo "--- Phase 3: stage project tree into volume ---"
 # buildroot external config (Windows editors may save with CRLF and bash
 # chokes on \r in shebang lines and inside heredocs).
 docker run --rm \
+    -e CAPSULE_MODE="$CAPSULE_MODE" \
     -v "${VOLUME_NAME}:/build" \
     -v "${POSIX_PROJECT_DIR}:/src:ro" \
-    "$IMAGE_NAME" bash -c '
+    "$BUILD_CONTAINER_ID" bash -c '
         set -e
         mkdir -p /build/dcentos
         rsync -a --delete \
@@ -777,107 +1416,73 @@ docker run --rm \
             --exclude=*.log \
             --exclude=.git/ \
             /src/ /build/dcentos/
-        # Strip CRLF from shell scripts and Buildroot config files. Some may
-        # have been touched by Windows tools.
-        find /build/dcentos/scripts -type f -name "*.sh" \
-            -exec sed -i "s/\r$//" {} + 2>/dev/null || true
-        find /build/dcentos/br2_external_dcentos -type f \
-            \( -name "*.sh" -o -name "S[0-9][0-9]*" -o -name "Config.in" -o -name "*.mk" -o -name "*defconfig*" -o -name "*.fragment" \) \
-            -exec sed -i "s/\r$//" {} + 2>/dev/null || true
-        chmod +x /build/dcentos/scripts/*.sh 2>/dev/null || true
-        find /build/dcentos/br2_external_dcentos -type f -name "*.sh" \
-            -exec chmod +x {} + 2>/dev/null || true
+        if [ "$CAPSULE_MODE" != "1" ]; then
+            # Compatibility-only normalization for the legacy live-tree lane.
+            # Capsule releases consume Git-object bytes and modes unchanged.
+            find /build/dcentos/scripts -type f -name "*.sh" \
+                -exec sed -i "s/\r$//" {} + 2>/dev/null || true
+            find /build/dcentos/br2_external_dcentos -type f \
+                \( -name "*.sh" -o -name "S[0-9][0-9]*" -o -name "Config.in" -o -name "*.mk" -o -name "*defconfig*" -o -name "*.fragment" \) \
+                -exec sed -i "s/\r$//" {} + 2>/dev/null || true
+            chmod +x /build/dcentos/scripts/*.sh 2>/dev/null || true
+            find /build/dcentos/br2_external_dcentos -type f -name "*.sh" \
+                -exec chmod +x {} + 2>/dev/null || true
+        fi
         DCENTOS_VERSION_FILE="/build/dcentos/br2_external_dcentos/board/zynq/rootfs-overlay/etc/dcentos-version"
         DCENTOS_VERSION="$(sed -n "s/^[[:space:]]*//;s/[[:space:]]*$//;/^$/!{p;q;}" "$DCENTOS_VERSION_FILE")"
         [ -n "$DCENTOS_VERSION" ] || { echo "ERROR: empty DCENTOS_VERSION from $DCENTOS_VERSION_FILE" >&2; exit 1; }
-        for version_path in \
-            /build/dcentos/br2_external_dcentos/board/zynq/rootfs-overlay/etc/dcentos-version \
-            /build/dcentos/br2_external_dcentos/board/zynq/am2-s19jpro/rootfs-overlay/etc/dcentos-version \
-            /build/dcentos/br2_external_dcentos/board/amlogic/rootfs-overlay/etc/dcentos-version \
-            /build/dcentos/br2_external_dcentos/board/amlogic/am3-s19kpro/rootfs-overlay/etc/dcentos-version \
-            /build/dcentos/br2_external_dcentos/board/amlogic/am3-s21/rootfs-overlay/etc/dcentos-version \
-            /build/dcentos/br2_external_dcentos/board/amlogic/am3-s19jpro-aml/rootfs-overlay/etc/dcentos-version \
-            /build/dcentos/br2_external_dcentos/board/amlogic/am3-t21/rootfs-overlay/etc/dcentos-version \
-            /build/dcentos/br2_external_dcentos/board/beaglebone/am3-bb/rootfs-overlay/etc/dcentos-version
-        do
-            mkdir -p "$(dirname "$version_path")"
-            printf "%s\n" "$DCENTOS_VERSION" > "$version_path"
-        done
-        echo "Stamped dcentos-version=$DCENTOS_VERSION into staged rootfs overlays"
+        if [ "$CAPSULE_MODE" != "1" ]; then
+            for version_path in \
+                /build/dcentos/br2_external_dcentos/board/zynq/rootfs-overlay/etc/dcentos-version \
+                /build/dcentos/br2_external_dcentos/board/zynq/am2-s19jpro/rootfs-overlay/etc/dcentos-version \
+                /build/dcentos/br2_external_dcentos/board/amlogic/rootfs-overlay/etc/dcentos-version \
+                /build/dcentos/br2_external_dcentos/board/amlogic/am3-s19kpro/rootfs-overlay/etc/dcentos-version \
+                /build/dcentos/br2_external_dcentos/board/amlogic/am3-s21/rootfs-overlay/etc/dcentos-version \
+                /build/dcentos/br2_external_dcentos/board/amlogic/am3-s19jpro-aml/rootfs-overlay/etc/dcentos-version \
+                /build/dcentos/br2_external_dcentos/board/amlogic/am3-t21/rootfs-overlay/etc/dcentos-version \
+                /build/dcentos/br2_external_dcentos/board/beaglebone/am3-bb/rootfs-overlay/etc/dcentos-version
+            do
+                mkdir -p "$(dirname "$version_path")"
+                printf "%s\n" "$DCENTOS_VERSION" > "$version_path"
+            done
+            echo "Stamped dcentos-version=$DCENTOS_VERSION into staged rootfs overlays"
+        else
+            echo "Capsule source staged without CRLF, mode, or version rewrites (version=$DCENTOS_VERSION)"
+        fi
         echo "Staged $(du -sh /build/dcentos | cut -f1) into volume"
     '
 echo ""
 
 # -------- Phase 4: stage knowledge-base extractions --------
 echo "--- Phase 4: stage knowledge-base/extractions ---"
-# Each target needs different extractions staged to /build/dcentos/extractions/:
-#   s9                   -> needs extractions/s9 (kernel.bin + boot chain)
-#   am2-s19jpro          -> needs extractions/s19j (and post-image probes there)
-#   am3-s21              -> needs extractions/s21 (verified-working AXG kernel).
-#   am3-bb               -> no kernel extraction; SD boot artifacts are added
-#                           later by the operator from a verified restore bundle.
-#   am3-s19kpro / am3-*  -> needs extractions/s21 fallback + extractions/s19k.
+# Only source-closure-supported targets reach this phase. Every byte comes from
+# the exact target snapshot; unpinned fallback directories are intentionally
+# unavailable even for lab packaging.
 docker run --rm \
     -v "${VOLUME_NAME}:/build" \
-    -v "${POSIX_KB_PARENT}:/kb:ro" \
+    "${BUILD_INPUT_MOUNT_ARGS[@]}" \
     -e TARGET="$TARGET" \
-    "$IMAGE_NAME" bash -c '
+    "$BUILD_CONTAINER_ID" bash -c '
         set -e
         case "$TARGET" in
             s9)
                 mkdir -p /build/dcentos/extractions/s9
-                rsync -a /kb/extractions/s9/ /build/dcentos/extractions/s9/
+                rsync -a --delete \
+                    /dcent-inputs/files/knowledge-base/extractions/s9/ \
+                    /build/dcentos/extractions/s9/
                 echo "Staged s9: $(du -sh /build/dcentos/extractions/s9 | cut -f1)"
                 ls -la /build/dcentos/extractions/s9/kernel.bin
                 ;;
-            am2-s19jpro|am2-s19pro)
-                # am2-s19pro (Phase 2K) shares the s19j extraction probe
-                # with am2-s19jpro — both am2-Zynq, same Braiins kernel/
-                # bitstream knowledge base. post-image.sh probes s19j.
+            am2-s19jpro|am2-s19jpro-sd|am2-s19pro)
                 mkdir -p /build/dcentos/extractions/s19j
-                if [ -d /kb/extractions/s19j ]; then
-                    rsync -a /kb/extractions/s19j/ /build/dcentos/extractions/s19j/
-                    echo "Staged s19j: $(du -sh /build/dcentos/extractions/s19j | cut -f1)"
-                else
-                    echo "(no s19j extractions yet — post-image may use defaults)"
-                fi
+                rsync -a --delete \
+                    /dcent-inputs/files/knowledge-base/extractions/s19j/ \
+                    /build/dcentos/extractions/s19j/
+                echo "Staged s19j: $(du -sh /build/dcentos/extractions/s19j | cut -f1)"
                 ;;
-            am2-s17pro)
-                # Phase 2K: RUNTIME-ONLY — there is no extracted S17 kernel
-                # in the knowledge base (no live S17 unit ever probed). Stage
-                # extractions/s17 only if it exists; the board post-image.sh
-                # emits a rootfs-only WARN build when no kernel is found.
-                mkdir -p /build/dcentos/extractions/s17
-                if [ -d /kb/extractions/s17 ]; then
-                    rsync -a /kb/extractions/s17/ /build/dcentos/extractions/s17/
-                    echo "Staged s17: $(du -sh /build/dcentos/extractions/s17 | cut -f1)"
-                else
-                    echo "(no s17 extractions — am2-s17pro is RUNTIME-ONLY, rootfs-only build expected)"
-                fi
-                ;;
-            # Added by Phase 4B: am3-s19jpro-aml + am3-t21 reuse the
-            # am3-aml kernel probe (S21 fallback) like am3-s21 / am3-s19kpro.
-            am3-s19kpro|am3-s21|am3-s19jpro-aml|am3-t21)
-                # End Phase 4B
-                # am3-aml post-image kernel probe: $DCENT_AM3_AML_KERNEL ->
-                # extractions/s19k/kernel_uimage.bin -> extractions/s21/kernel_uimage.bin
-                mkdir -p /build/dcentos/extractions/s21 /build/dcentos/extractions/s19k
-                if [ -d /kb/extractions/s21 ]; then
-                    rsync -a --include="kernel_uimage.bin" --include="*.bin" --exclude="*" \
-                        /kb/extractions/s21/ /build/dcentos/extractions/s21/ 2>/dev/null || true
-                    rsync -a /kb/extractions/s21/kernel_uimage.bin /build/dcentos/extractions/s21/ 2>/dev/null || true
-                fi
-                if [ -d /kb/extractions/s19k ]; then
-                    # Only stage kernel artifacts (not the multi-GB live-probe captures).
-                    find /kb/extractions/s19k -maxdepth 3 -name "kernel*.bin" -o -name "kernel*.uimage" 2>/dev/null \
-                        | xargs -I{} cp {} /build/dcentos/extractions/s19k/ 2>/dev/null || true
-                fi
-                echo "Staged am3 kernels:"
-                ls -la /build/dcentos/extractions/s21/kernel_uimage.bin 2>/dev/null || echo "  (no s21 kernel)"
-                ls -la /build/dcentos/extractions/s19k/*kernel*.bin 2>/dev/null || echo "  (no s19k kernel)"
-                ;;
-            am3-bb)
-                echo "am3-bb: no kernel/rootfs extraction staged; SD boot artifacts remain operator-supplied"
+            *)
+                echo "ERROR: target $TARGET reached Phase 4 without an exact build-input staging policy" >&2
+                exit 1
                 ;;
         esac
     '
@@ -885,33 +1490,92 @@ echo ""
 
 # -------- Phase 5: stage pre-built ARM binary --------
 echo "--- Phase 5: stage pre-built dcentrald binary ($BUILD_ARCH) ---"
-# Mount the parent target/ directory (may contain spaces). Copy only the
-# release binary into the volume at the layout the Buildroot overlay expects.
+# Consume only the exact target-required binaries captured by Phase 0. The
+# mutable host target tree is deliberately absent from this packaging phase.
 docker run --rm \
     -e BUILD_ARCH="$BUILD_ARCH" \
     -e TARGET="$TARGET" \
+    -e REQUIRED_BINARIES="$BINARY_EXPORT_REQUIRED" \
+    -e DCENTRALD_EXPORT_PATH="$BINARY_EXPORT_DCENTRALD_PATH" \
+    -e DCENTRALD_EXPORT_SHA256="$BINARY_EXPORT_DCENTRALD_SHA256" \
+    -e INIT_EXPORT_PATH="$BINARY_EXPORT_INIT_PATH" \
+    -e INIT_EXPORT_SHA256="$BINARY_EXPORT_INIT_SHA256" \
+    -e DISCOVERY_EXPORT_PATH="$BINARY_EXPORT_DISCOVERY_PATH" \
+    -e DISCOVERY_EXPORT_SHA256="$BINARY_EXPORT_DISCOVERY_SHA256" \
     -e DCENT_MANIFEST_PUBLIC_KEY_HEX="${DCENT_MANIFEST_PUBLIC_KEY_HEX:-}" \
     -e DCENT_ALLOW_UNSIGNED_SYSUPGRADE="$DCENT_ALLOW_UNSIGNED_SYSUPGRADE" \
+    "${BINARY_EXPORT_MOUNT_ARGS[@]}" \
     -v "${VOLUME_NAME}:/build" \
-    -v "${POSIX_PROJECT_DIR}/dcentrald/target:/target:ro" \
-    "$IMAGE_NAME" bash -c '
-        set -e
-        mkdir -p "/build/dcentos/dcentrald/target/$BUILD_ARCH/release"
-        cp "/target/$BUILD_ARCH/release/dcentrald" \
-           "/build/dcentos/dcentrald/target/$BUILD_ARCH/release/dcentrald"
-        file "/build/dcentos/dcentrald/target/$BUILD_ARCH/release/dcentrald"
-        ls -lh "/build/dcentos/dcentrald/target/$BUILD_ARCH/release/dcentrald"
-        if [ -f "/target/$BUILD_ARCH/release/dcentos-init" ]; then
-            cp "/target/$BUILD_ARCH/release/dcentos-init" \
-               "/build/dcentos/dcentrald/target/$BUILD_ARCH/release/dcentos-init"
-            file "/build/dcentos/dcentrald/target/$BUILD_ARCH/release/dcentos-init"
-            ls -lh "/build/dcentos/dcentrald/target/$BUILD_ARCH/release/dcentos-init"
-        elif case "$TARGET" in s9|am2-s19jpro|am2-s19jpro-sd|am2-s19pro|am2-s17pro|am3-s19kpro|am3-s21|am3-s19jpro-aml|am3-t21) true ;; *) false ;; esac; then
-            echo "ERROR: dcentos-init is required for $TARGET but absent on host at /target/$BUILD_ARCH/release/dcentos-init" >&2
+    "$BUILD_CONTAINER_ID" bash -c '
+        set -eu
+        case "$BUILD_ARCH" in
+            armv7-unknown-linux-musleabihf|aarch64-unknown-linux-musl) ;;
+            *) echo "ERROR: unsafe BUILD_ARCH for binary staging: $BUILD_ARCH" >&2; exit 1 ;;
+        esac
+        release_dir=/build
+        [ -d "$release_dir" ] && [ ! -L "$release_dir" ] || {
+            echo "ERROR: Docker volume root is not a real directory" >&2
             exit 1
-        else
-            echo "  dcentos-init not staged for $BUILD_ARCH (binary absent on host)"
-        fi
+        }
+        for component in dcentos dcentrald target "$BUILD_ARCH" release; do
+            next="$release_dir/$component"
+            [ -d "$next" ] && [ ! -L "$next" ] || {
+                echo "ERROR: unsafe persistent binary staging component: $next" >&2
+                exit 1
+            }
+            release_dir="$next"
+        done
+        for binary_name in $REQUIRED_BINARIES; do
+            case "$binary_name" in
+                dcentrald)
+                    relative_path="$DCENTRALD_EXPORT_PATH"
+                    expected_sha256="$DCENTRALD_EXPORT_SHA256"
+                    ;;
+                dcentos-init)
+                    relative_path="$INIT_EXPORT_PATH"
+                    expected_sha256="$INIT_EXPORT_SHA256"
+                    ;;
+                dcentos-discovery)
+                    relative_path="$DISCOVERY_EXPORT_PATH"
+                    expected_sha256="$DISCOVERY_EXPORT_SHA256"
+                    ;;
+                *) echo "ERROR: unsafe required binary name: $binary_name" >&2; exit 1 ;;
+            esac
+            case "$relative_path" in
+                artifacts/[0-9][0-9][0-9][0-9]/"$binary_name") ;;
+                *) echo "ERROR: unsafe exported path for $binary_name" >&2; exit 1 ;;
+            esac
+            case "$expected_sha256" in
+                *[!0-9a-f]*|'') echo "ERROR: malformed SHA256 for $binary_name" >&2; exit 1 ;;
+            esac
+            [ "${#expected_sha256}" -eq 64 ] || {
+                echo "ERROR: non-64-byte SHA256 for $binary_name" >&2
+                exit 1
+            }
+            source_path="/dcent-binaries/$relative_path"
+            destination="$release_dir/$binary_name"
+            [ -f "$source_path" ] && [ ! -L "$source_path" ] || {
+                echo "ERROR: exported source is missing or linked: $source_path" >&2
+                exit 1
+            }
+            [ ! -e "$destination" ] && [ ! -L "$destination" ] || {
+                echo "ERROR: binary destination unexpectedly exists: $destination" >&2
+                exit 1
+            }
+            source_sha256="$(sha256sum "$source_path" | cut -d" " -f1)"
+            [ "$source_sha256" = "$expected_sha256" ] || {
+                echo "ERROR: exported source digest mismatch for $binary_name" >&2
+                exit 1
+            }
+            install -m 0755 "$source_path" "$destination"
+            destination_sha256="$(sha256sum "$destination" | cut -d" " -f1)"
+            [ "$destination_sha256" = "$expected_sha256" ] || {
+                echo "ERROR: installed destination digest mismatch for $binary_name" >&2
+                exit 1
+            }
+            file "$destination"
+            ls -lh "$destination"
+        done
         # W1.2 (2026-05-07): when a manifest pubkey was pinned, prove it is
         # actually embedded in the prebuilt binary. dcentrald-api uses
         # `option_env!("DCENT_MANIFEST_PUBLIC_KEY_HEX")` which only embeds
@@ -975,16 +1639,6 @@ docker run --rm \
                 "build_in_docker Phase 5 ($TARGET)" \
                 "/build/dcentos/dcentrald/Cargo.toml"
         fi
-        if [ "$TARGET" = "am3-bb" ] || [ "$TARGET" = "am3-bb-s19jpro" ] || [ "$TARGET" = "am3-bb-s19jpro-vnish" ]; then
-            if [ ! -f "/target/$BUILD_ARCH/release/dcentos-discovery" ]; then
-                echo "ERROR: dcentos-discovery is required for $TARGET but absent on host at /target/$BUILD_ARCH/release/dcentos-discovery" >&2
-                exit 1
-            fi
-            cp "/target/$BUILD_ARCH/release/dcentos-discovery" \
-               "/build/dcentos/dcentrald/target/$BUILD_ARCH/release/dcentos-discovery"
-            file "/build/dcentos/dcentrald/target/$BUILD_ARCH/release/dcentos-discovery"
-            ls -lh "/build/dcentos/dcentrald/target/$BUILD_ARCH/release/dcentos-discovery"
-        fi
     '
 echo ""
 
@@ -1045,7 +1699,7 @@ esac
 # W4-5: release/verified builds fail closed on missing or mismatched toolchain
 # SHA. The advisory path is only for dev/lab builds.
 TOOLCHAIN_SHA256_MANDATORY=0
-if is_release_status "${DCENT_PACKAGE_STATUS:-release}" || is_truthy "${DCENT_RELEASE_IMAGE:-0}"; then
+if dcent_release_provenance_required; then
     TOOLCHAIN_SHA256_MANDATORY=1
     if ! is_truthy "${DCENT_TOOLCHAIN_SHA256_VERIFIED:-0}"; then
         echo "WARNING (DEVOPS-002): release build will enforce the recorded Linaro toolchain SHA256 pin," >&2
@@ -1074,12 +1728,20 @@ fi
 TOOLCHAIN_FALLBACK_URL="https://mirrors.dotsrc.org/armbian-dl/_toolchain/${TOOLCHAIN_FILE}"
 TOOLCHAIN_LOCAL_MOUNT_ARGS=()
 if [ -n "${DCENT_TOOLCHAIN_LOCAL_DIR:-}" ]; then
+    dcent_require_absolute_host_path "$DCENT_TOOLCHAIN_LOCAL_DIR" || {
+        echo "ERROR: DCENT_TOOLCHAIN_LOCAL_DIR must be an absolute host path" >&2
+        exit 1
+    }
     if [ -f "$DCENT_TOOLCHAIN_LOCAL_DIR/$TOOLCHAIN_FILE" ]; then
         if command -v cygpath >/dev/null 2>&1; then
             TOOLCHAIN_LOCAL_MOUNT="$(cygpath -w "$DCENT_TOOLCHAIN_LOCAL_DIR")"
         else
             TOOLCHAIN_LOCAL_MOUNT="$DCENT_TOOLCHAIN_LOCAL_DIR"
         fi
+        dcent_validate_docker_transport_path "$TOOLCHAIN_LOCAL_MOUNT" || {
+            echo "ERROR: local toolchain path is unsafe for Docker transport" >&2
+            exit 1
+        }
         TOOLCHAIN_LOCAL_MOUNT_ARGS=(-v "${TOOLCHAIN_LOCAL_MOUNT}:/toolchain-local:ro")
         echo "Toolchain local source: $DCENT_TOOLCHAIN_LOCAL_DIR/$TOOLCHAIN_FILE"
     else
@@ -1098,7 +1760,7 @@ docker run --rm \
     -e TOOLCHAIN_SHA256_MANDATORY="$TOOLCHAIN_SHA256_MANDATORY" \
     "${TOOLCHAIN_LOCAL_MOUNT_ARGS[@]}" \
     -v "${VOLUME_NAME}:/build" \
-    "$IMAGE_NAME" bash -c '
+    "$BUILD_CONTAINER_ID" bash -c '
         set -e
         # BUG-3 + BUG-5 (2026-07-09): the toolchain is cached in a persistent
         # dir OUTSIDE buildroot/ so the Phase 6 fresh-clone rm -rf buildroot
@@ -1231,7 +1893,7 @@ docker run --rm \
 echo ""
 
 # -------- Phase 6: Buildroot --------
-echo "--- Phase 6: Buildroot make setup + make -j$(docker run --rm $IMAGE_NAME nproc) ---"
+echo "--- Phase 6: Buildroot make setup + make -j$(docker run --rm "$BUILD_CONTAINER_ID" nproc) ---"
 echo "(first build downloads ~500 MB of tarballs — expect 30–90 min)"
 # Mount knowledge-base into the container so board post-image.sh can find
 # kernel + FPGA bitstream (am2 needs this; S9 doesn't). Pass an env override
@@ -1243,18 +1905,31 @@ docker run --rm \
     -e TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
     -e BR_DEFCONFIG="$BR_DEFCONFIG" \
     -e BR_DEFCONFIG_FRAGMENTS="$BR_DEFCONFIG_FRAGMENTS" \
+    -e BUILDROOT_REPOSITORY="$BUILDROOT_REPOSITORY" \
+    -e BUILDROOT_COMMIT="$BUILDROOT_COMMIT" \
     -e DCENT_RELEASE_IMAGE="${DCENT_RELEASE_IMAGE:-0}" \
     -e DCENT_ALLOW_UNSIGNED_SYSUPGRADE="$DCENT_ALLOW_UNSIGNED_SYSUPGRADE" \
     -e DCENT_PACKAGE_STATUS="$DCENT_PACKAGE_STATUS" \
+    -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+    -e DCENT_SOURCE_COMMIT="$DCENT_SOURCE_COMMIT" \
+    -e DCENT_SOURCE_COMMIT_EPOCH="$DCENT_SOURCE_COMMIT_EPOCH" \
+    -e DCENT_SOURCE_TREE_STATE="$DCENT_SOURCE_TREE_STATE" \
+    -e DCENT_BUILD_TARGET="$DCENT_BUILD_TARGET" \
+    -e DCENT_BUILD_ARCH="$DCENT_BUILD_ARCH" \
+    -e DCENT_TOOLCHAIN_ID="$DCENT_TOOLCHAIN_ID" \
+    -e DCENT_REQUIRE_RELEASE_PROVENANCE="$DCENT_REQUIRE_RELEASE_PROVENANCE" \
+    -e TOOLCHAIN_SHA256_MANDATORY="$TOOLCHAIN_SHA256_MANDATORY" \
     -e DCENT_RELEASE_SIGNING_KEY="$CONTAINER_RELEASE_SIGNING_KEY" \
     -e DCENT_RELEASE_PUBKEY_FILE="$CONTAINER_RELEASE_PUBKEY_FILE" \
     -e DCENT_REQUIRE_RELEASE_KEY="${DCENT_REQUIRE_RELEASE_KEY:-0}" \
-    -e DCENT_AM2_S19J_KERNEL="/kb/extractions/s19j/kernel.bin" \
-    -e DCENT_AM2_S19J_BITSTREAM="/kb/extractions/s19j/fpga_bitstream.bit" \
+    -e DCENT_AM2_S19J_KERNEL="/dcent-inputs/files/knowledge-base/extractions/s19j/kernel.bin" \
+    -e DCENT_AM2_S19J_BITSTREAM="/dcent-inputs/files/knowledge-base/extractions/s19j/fpga_bitstream.bit" \
+    -e DCENT_AM2_S19PRO_KERNEL="/dcent-inputs/files/knowledge-base/extractions/s19j/kernel.bin" \
+    -e DCENT_AM2_S19PRO_BITSTREAM="/dcent-inputs/files/knowledge-base/extractions/s19j/fpga_bitstream.bit" \
     "${SIGNING_MOUNT_ARGS[@]}" \
+    "${BUILD_INPUT_MOUNT_ARGS[@]}" \
     -v "${VOLUME_NAME}:/build" \
-    -v "${POSIX_KB_PARENT}:/kb:ro" \
-    "$IMAGE_NAME" bash -c '
+    "$BUILD_CONTAINER_ID" bash -c '
         set -e
         # HTTP/1.1 + larger buffer: avoids "RPC failed; curl 92 HTTP/2 stream 0
         # was not closed cleanly" on flaky networks when cloning Buildroot.
@@ -1337,19 +2012,32 @@ docker run --rm \
                 cp -aln buildroot/dl/. "$PERSIST_DL_DIR/" 2>/dev/null || true
             fi
             rm -rf buildroot
-            REPO="https://github.com/buildroot/buildroot.git"
-            COMMIT="7c8edc1b402efcd7bba2dabfe0b3be877adaed7a"
             N=1; MAX=4
             while [ $N -le $MAX ]; do
                 echo "[clone try $N/$MAX]"
-                if git clone "$REPO" buildroot; then break; fi
+                if git clone "$BUILDROOT_REPOSITORY" buildroot; then break; fi
                 rm -rf buildroot
                 N=$((N + 1)); sleep 5
             done
             [ -d buildroot ] || { echo "ERROR: clone failed after $MAX tries"; exit 1; }
-            ( cd buildroot && git checkout "$COMMIT" )
+            ( cd buildroot && git checkout --detach "$BUILDROOT_COMMIT" )
         else
             echo "[setup] Buildroot present"
+        fi
+
+        # Source-closure boundary: a persistent Docker volume may contain an
+        # old or locally modified checkout. Refuse it before Buildroot can
+        # consume source bytes that the release receipt would not describe.
+        ACTUAL_BUILDROOT_COMMIT="$(git -C buildroot rev-parse HEAD)"
+        [ "$ACTUAL_BUILDROOT_COMMIT" = "$BUILDROOT_COMMIT" ] || {
+            echo "ERROR: warm Buildroot checkout is not at the pinned commit" >&2
+            echo "  expected: $BUILDROOT_COMMIT" >&2
+            echo "  actual:   $ACTUAL_BUILDROOT_COMMIT" >&2
+            exit 1
+        }
+        if [ -n "$(git -C buildroot status --porcelain --untracked-files=normal)" ]; then
+            echo "ERROR: Buildroot source tree has modified, staged, or untracked inputs; refusing unbound release input" >&2
+            exit 1
         fi
 
         # BUG-5 (2026-07-09): (re)stage the persistent dl-cache into
@@ -1393,6 +2081,12 @@ docker run --rm \
         fi
         printf "%s\n" "$DESIRED_STAMP" > "$STAMP_FILE"
 
+        # The ownership ledger is a per-build receipt. Remove the previous
+        # generated sidecar even on a warm same-target build so Phase 7 cannot
+        # accidentally collect evidence from an earlier target-tree state if a
+        # post-image hook is skipped or regresses.
+        rm -f buildroot/output/images/rootfs-ownership.json
+
         echo "[setup] applying merged defconfig $FULL_DEFCONFIG_NAME"
         make -C buildroot BR2_EXTERNAL=/build/dcentos/br2_external_dcentos \
             "$FULL_DEFCONFIG_NAME"
@@ -1400,6 +2094,19 @@ docker run --rm \
         echo ""
         echo "[build] make -j$(nproc)"
         time make -j$(nproc)
+
+        # Buildroot legal-info is release evidence, not a reusable build
+        # product. Delete any warm-volume copy before regeneration so a
+        # skipped or failed producer cannot be mistaken for the current build
+        # package/source/license observation. The compact inventory is
+        # generated and material-reverified later, after the firmware artifact
+        # has its final name.
+        if [ "$TOOLCHAIN_SHA256_MANDATORY" = "1" ]; then
+            echo ""
+            echo "[evidence] regenerating Buildroot legal-info"
+            rm -rf buildroot/output/legal-info
+            make -C buildroot BR2_EXTERNAL=/build/dcentos/br2_external_dcentos legal-info
+        fi
     '
 echo ""
 
@@ -1415,7 +2122,7 @@ if [ "$BOARD_POST_IMAGE" = "vnish-bootbin-sd" ]; then
     docker run --rm \
         -v "${VOLUME_NAME}:/build" \
         -v "${POSIX_PROJECT_DIR}:/project:ro" \
-        "$IMAGE_NAME" bash -c '
+        "$BUILD_CONTAINER_ID" bash -c '
             set -e
             cd /build/dcentos
             BOOTBIN_REF="/project/output/vnish-extracted-artifacts/boot.bin-s19jpro-bb-v1.2.6"
@@ -1460,7 +2167,7 @@ elif [ "$BOARD_POST_IMAGE" = "am2-sd-disk" ]; then
     docker run --rm \
         -v "${VOLUME_NAME}:/build" \
         -v "${POSIX_PROJECT_DIR}:/project:ro" \
-        "$IMAGE_NAME" bash -c '
+        "$BUILD_CONTAINER_ID" bash -c '
             set -e
             cd /build/dcentos
             PAYLOAD_TAR="/build/dcentos/buildroot/output/images/dcentos-sysupgrade-am2-s19jpro.tar"
@@ -1492,7 +2199,7 @@ elif [ "$BOARD_POST_IMAGE" = "board-script" ]; then
     echo "--- Phase 7: collecting $TARGET tarball from Buildroot output ---"
     docker run --rm \
         -v "${VOLUME_NAME}:/build" \
-        "$IMAGE_NAME" bash -c '
+        "$BUILD_CONTAINER_ID" bash -c '
             set -e
             SRC="/build/dcentos/buildroot/output/images/'"$TARBALL_NAME"'"
             if [ ! -f "$SRC" ]; then
@@ -1510,13 +2217,23 @@ else
         -e DCENT_ALLOW_UNSIGNED_SYSUPGRADE="$DCENT_ALLOW_UNSIGNED_SYSUPGRADE" \
         -e DCENT_PACKAGE_STATUS="$DCENT_PACKAGE_STATUS" \
         -e DCENT_RELEASE_IMAGE="${DCENT_RELEASE_IMAGE:-0}" \
+        -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+        -e DCENT_SOURCE_COMMIT="$DCENT_SOURCE_COMMIT" \
+        -e DCENT_SOURCE_COMMIT_EPOCH="$DCENT_SOURCE_COMMIT_EPOCH" \
+        -e DCENT_SOURCE_TREE_STATE="$DCENT_SOURCE_TREE_STATE" \
+        -e DCENT_BUILD_TARGET="$DCENT_BUILD_TARGET" \
+        -e DCENT_BUILD_ARCH="$DCENT_BUILD_ARCH" \
+        -e DCENT_TOOLCHAIN_ID="$DCENT_TOOLCHAIN_ID" \
+        -e DCENT_REQUIRE_RELEASE_PROVENANCE="$DCENT_REQUIRE_RELEASE_PROVENANCE" \
+        -e DCENT_EXTRACTIONS_DIR="/dcent-inputs/files/knowledge-base/extractions/s9" \
         -e DCENT_RELEASE_SIGNING_KEY="$CONTAINER_RELEASE_SIGNING_KEY" \
         -e DCENT_RELEASE_PUBKEY_FILE="$CONTAINER_RELEASE_PUBKEY_FILE" \
         -e DCENT_REQUIRE_RELEASE_KEY="${DCENT_REQUIRE_RELEASE_KEY:-0}" \
         -e BOARD_PKG_NAME="$BOARD_PKG_NAME" \
         "${SIGNING_MOUNT_ARGS[@]}" \
+        "${BUILD_INPUT_MOUNT_ARGS[@]}" \
         -v "${VOLUME_NAME}:/build" \
-        "$IMAGE_NAME" bash -c '
+        "$BUILD_CONTAINER_ID" bash -c '
             set -e
             cd /build/dcentos
             bash scripts/package_sysupgrade.sh \
@@ -1524,6 +2241,32 @@ else
                 --output "/build/'"$TARBALL_NAME"'"
         '
 fi
+
+# The S9, AM2 S19j Pro, and CV1835 post-image hooks emit the bounded
+# final-rootfs ownership ledger while Buildroot's finalized TARGET_DIR and
+# package .files-list.txt evidence are still available. Collect it beside the
+# release artifact; absence is a pipeline failure for these integrated lanes.
+ROOTFS_OWNERSHIP_LEDGER_PATH=""
+case "$TARGET" in
+    s9|am2-s19jpro|cv1835-s19jpro)
+        ROOTFS_OWNERSHIP_LEDGER_NAME="${TARBALL_NAME}.rootfs-ownership.json"
+        docker run --rm \
+            -v "${VOLUME_NAME}:/build" \
+            "$BUILD_CONTAINER_ID" bash -c '
+                set -e
+                SRC=/build/dcentos/buildroot/output/images/rootfs-ownership.json
+                DST=/build/'"$ROOTFS_OWNERSHIP_LEDGER_NAME"'
+                [ -f "$SRC" ] || {
+                    echo "ERROR: integrated final-rootfs ownership ledger missing: $SRC" >&2
+                    exit 1
+                }
+                cp "$SRC" "$DST"
+            '
+        ;;
+    *)
+        ROOTFS_OWNERSHIP_LEDGER_NAME=""
+        ;;
+esac
 echo ""
 
 # -------- Phase 8: extract tarball back to Windows --------
@@ -1534,12 +2277,16 @@ docker run --rm \
     -e DCENT_RELEASE_PUBKEY_FILE="$CONTAINER_RELEASE_PUBKEY_FILE" \
     -e DCENT_REQUIRE_RELEASE_KEY="${DCENT_REQUIRE_RELEASE_KEY:-0}" \
     -e BOARD_POST_IMAGE="$BOARD_POST_IMAGE" \
+    -e ROOTFS_OWNERSHIP_LEDGER_NAME="$ROOTFS_OWNERSHIP_LEDGER_NAME" \
     "${PUBKEY_MOUNT_ARGS[@]}" \
     -v "${VOLUME_NAME}:/build" \
     -v "${POSIX_OUTPUT_DIR}:/out" \
-    "$IMAGE_NAME" bash -c '
+    "$BUILD_CONTAINER_ID" bash -c '
         set -e
         cp /build/'"$TARBALL_NAME"' /out/
+        if [ -n "$ROOTFS_OWNERSHIP_LEDGER_NAME" ]; then
+            cp "/build/$ROOTFS_OWNERSHIP_LEDGER_NAME" /out/
+        fi
         ls -la /out/'"$TARBALL_NAME"'
         echo ""
         echo "SHA256:"
@@ -1672,6 +2419,205 @@ if [ "$BOARD_POST_IMAGE" = "am2-sd-disk" ]; then
     fi
 fi
 
+if [ -n "$ROOTFS_OWNERSHIP_LEDGER_NAME" ]; then
+    ROOTFS_OWNERSHIP_LEDGER_PATH="$OUTPUT_DIR/$ROOTFS_OWNERSHIP_LEDGER_NAME"
+    [ -f "$ROOTFS_OWNERSHIP_LEDGER_PATH" ] || {
+        echo "ERROR: final-rootfs ownership ledger was not extracted: $ROOTFS_OWNERSHIP_LEDGER_PATH" >&2
+        exit 1
+    }
+    echo "Final-rootfs ownership ledger: $ROOTFS_OWNERSHIP_LEDGER_PATH"
+fi
+
+# Retain the exact Phase-0 export bytes that Phase 5 consumed. These flat,
+# release-scoped pairs are semantic inputs to source-closure v4. They remain
+# snapshot-consistency evidence only: compiler causality, build execution, and
+# equivalence to the installed payload are deliberately not claimed.
+if [ "$TOOLCHAIN_SHA256_MANDATORY" = "1" ]; then
+    dcent_remove_prebuilt_rust_sidecars "$TARBALL_NAME"
+    python3 "$SCRIPT_DIR/binary_build_receipt.py" \
+        retain-export-snapshot-set \
+        --stage "$BINARY_EXPORT_STAGE" \
+        --output-dir "$OUTPUT_DIR" \
+        --artifact-prefix "$TARBALL_NAME" >/dev/null
+    for binary_name in $(dcent_required_prebuilt_binaries); do
+        retained_binary="$OUTPUT_DIR/${TARBALL_NAME}.prebuilt-rust.${binary_name}.bin"
+        retained_receipt="$OUTPUT_DIR/${TARBALL_NAME}.prebuilt-rust.${binary_name}.build-receipt.json"
+        [ -f "$retained_binary" ] && [ ! -L "$retained_binary" ] || {
+            echo "ERROR: retained prebuilt Rust binary is missing or a symlink: $retained_binary" >&2
+            exit 1
+        }
+        [ -f "$retained_receipt" ] && [ ! -L "$retained_receipt" ] || {
+            echo "ERROR: retained prebuilt Rust receipt is missing or a symlink: $retained_receipt" >&2
+            exit 1
+        }
+        PREBUILT_RUST_INPUT_ARGS+=(
+            --prebuilt-rust-input "$binary_name" "$retained_binary" "$retained_receipt"
+        )
+        PREBUILT_RUST_INPUT_COUNT=$((PREBUILT_RUST_INPUT_COUNT + 1))
+    done
+fi
+
+# -------- Phase 8: deterministic partial source-closure receipt --------
+# This binds the exact declared source/build definitions and produced artifact
+# bytes. It explicitly records that kernel/rootfs byte reproducibility and
+# Buildroot legal-info completeness/correctness remain unproven.
+SOURCE_CLOSURE_PATH=""
+SOURCE_CLOSURE_SIGNATURE_PATH=""
+BUILDROOT_LEGAL_INVENTORY_PATH=""
+if [ "$TOOLCHAIN_SHA256_MANDATORY" = "1" ]; then
+    BUILDROOT_LEGAL_INVENTORY_PATH="$OUTPUT_DIR/${TARBALL_NAME}.buildroot-legal.json"
+    docker run --rm \
+        -e TARGET="$TARGET" \
+        -e BUILD_ARCH="$BUILD_ARCH" \
+        -e BUILDROOT_REPOSITORY="$BUILDROOT_REPOSITORY" \
+        -e BUILDROOT_COMMIT="$BUILDROOT_COMMIT" \
+        -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+        -e ARTIFACT_NAME="$TARBALL_NAME" \
+        -v "${VOLUME_NAME}:/build" \
+        -v "${POSIX_PROJECT_DIR}:/project:ro" \
+        -v "${POSIX_OUTPUT_DIR}:/out" \
+        "$BUILD_CONTAINER_ID" bash -c '
+            set -e
+            INVENTORY="/out/${ARTIFACT_NAME}.buildroot-legal.json"
+            python3 /project/scripts/buildroot_legal_inventory.py generate \
+                --legal-info-dir /build/dcentos/buildroot/output/legal-info \
+                --buildroot-repository "$BUILDROOT_REPOSITORY" \
+                --buildroot-commit "$BUILDROOT_COMMIT" \
+                --target "$TARGET" \
+                --arch "$BUILD_ARCH" \
+                --artifact "/out/$ARTIFACT_NAME" \
+                --source-date-epoch "$SOURCE_DATE_EPOCH" \
+                --output "$INVENTORY" >/dev/null
+            python3 /project/scripts/buildroot_legal_inventory.py verify \
+                --artifact-dir /out \
+                --legal-info-dir /build/dcentos/buildroot/output/legal-info \
+                "$INVENTORY" >/dev/null
+        '
+    [ -f "$BUILDROOT_LEGAL_INVENTORY_PATH" ] || {
+        echo "ERROR: Buildroot legal-info inventory was not emitted" >&2
+        exit 1
+    }
+    echo "Buildroot legal-info inventory: $BUILDROOT_LEGAL_INVENTORY_PATH"
+
+    RUST_INVENTORY_PATH="$OUTPUT_DIR/${TARBALL_NAME}.rust-dependencies.json"
+    python3 "$SCRIPT_DIR/rust_dependency_inventory.py" generate \
+        --workspace "$PROJECT_DIR/dcentrald" \
+        --source-root "$REPO_ROOT" \
+        --metadata-json "$RUST_METADATA_FILE" \
+        --metadata-path-map "/src=$PROJECT_DIR/dcentrald" \
+        --metadata-path-map "/dcent-schema=$REPO_ROOT/projects/dcent-schema" \
+        --target "$BUILD_ARCH" \
+        --artifact "$OUTPUT_DIR/$TARBALL_NAME" \
+        --source-date-epoch "$SOURCE_DATE_EPOCH" \
+        --output "$RUST_INVENTORY_PATH" >/dev/null
+    python3 "$SCRIPT_DIR/rust_dependency_inventory.py" verify \
+        --workspace "$PROJECT_DIR/dcentrald" \
+        --source-root "$REPO_ROOT" \
+        --metadata-json "$RUST_METADATA_FILE" \
+        --metadata-path-map "/src=$PROJECT_DIR/dcentrald" \
+        --metadata-path-map "/dcent-schema=$REPO_ROOT/projects/dcent-schema" \
+        --artifact-dir "$OUTPUT_DIR" \
+        "$RUST_INVENTORY_PATH" >/dev/null
+    echo "Rust dependency inventory: $RUST_INVENTORY_PATH"
+
+    SOURCE_CLOSURE_PATH="$OUTPUT_DIR/${TARBALL_NAME}.source-closure.json"
+    SOURCE_CLOSURE_CONFIG_ARGS=()
+    for SOURCE_CLOSURE_FRAGMENT in $BR_DEFCONFIG_FRAGMENTS; do
+        SOURCE_CLOSURE_CONFIG_ARGS+=(
+            --buildroot-config "$PROJECT_DIR/br2_external_dcentos/configs/$SOURCE_CLOSURE_FRAGMENT"
+        )
+    done
+    SOURCE_CLOSURE_CONFIG_ARGS+=(
+        --buildroot-config "$PROJECT_DIR/br2_external_dcentos/configs/$BR_DEFCONFIG"
+    )
+    SOURCE_CLOSURE_ARTIFACT_ARGS=(
+        --artifact "$OUTPUT_DIR/$TARBALL_NAME"
+        --artifact "$BUILDROOT_LEGAL_INVENTORY_PATH"
+        --artifact "$RUST_INVENTORY_PATH"
+    )
+    if [ -n "$ROOTFS_OWNERSHIP_LEDGER_PATH" ]; then
+        SOURCE_CLOSURE_ARTIFACT_ARGS+=(--artifact "$ROOTFS_OWNERSHIP_LEDGER_PATH")
+    fi
+    python3 "$SCRIPT_DIR/source_closure.py" generate \
+        --repo-root "$GIT_OBJECT_REPO" \
+        --source-commit "$DCENT_SOURCE_COMMIT" \
+        --source-snapshot "$CAPSULE_SOURCE_SNAPSHOT" \
+        --release-invocation "$CAPSULE_INVOCATION_STAGE" \
+        --source-date-epoch "$SOURCE_DATE_EPOCH" \
+        --target "$TARGET" \
+        --arch "$BUILD_ARCH" \
+        --cargo-lock "$PROJECT_DIR/dcentrald/Cargo.lock" \
+        --cargo-build-script "$SCRIPT_DIR/build-dcentrald.sh" \
+        --buildroot-repository "$BUILDROOT_REPOSITORY" \
+        --buildroot-commit "$BUILDROOT_COMMIT" \
+        "${SOURCE_CLOSURE_CONFIG_ARGS[@]}" \
+        --external-tree "$PROJECT_DIR/br2_external_dcentos" \
+        --toolchain-id "$DCENT_TOOLCHAIN_ID" \
+        --toolchain-sha256 "$TOOLCHAIN_SHA256" \
+        --toolchain-verified \
+        --container-image-id "$BUILD_CONTAINER_ID" \
+        --container-definition "$PROJECT_DIR/Dockerfile.build" \
+        --build-input-snapshot "$BUILD_INPUT_SNAPSHOT" \
+        "${PREBUILT_RUST_INPUT_ARGS[@]}" \
+        "${SOURCE_CLOSURE_ARTIFACT_ARGS[@]}" \
+        --receipt-authentication detached_ed25519_required_for_release \
+        --output "$SOURCE_CLOSURE_PATH" >/dev/null
+    # Authenticate the canonical receipt that binds the firmware artifact,
+    # Rust inventory, and (for integrated targets) rootfs ownership ledger.
+    # This does not widen the receipt's deliberately partial claim scope.
+    [ -n "${DCENT_RELEASE_SIGNING_KEY:-}" ] || {
+        echo "ERROR: release source closure requires DCENT_RELEASE_SIGNING_KEY" >&2
+        exit 1
+    }
+    [ -n "${DCENT_RELEASE_PUBKEY_FILE:-}" ] || {
+        echo "ERROR: release source closure requires a pinned DCENT_RELEASE_PUBKEY_FILE" >&2
+        exit 1
+    }
+    SOURCE_CLOSURE_SIGNATURE_PATH="${SOURCE_CLOSURE_PATH}.sig"
+    docker run --rm \
+        -v "${POSIX_OUTPUT_DIR}:/out" \
+        -v "${POSIX_PROJECT_DIR}:/project:ro" \
+        "${SIGNING_MOUNT_ARGS[@]}" \
+        -e RECEIPT_NAME="$(basename "$SOURCE_CLOSURE_PATH")" \
+        "$BUILD_CONTAINER_ID" bash -c '
+            set -e
+            bash /project/scripts/sign_release_receipt.sh \
+                "/out/$RECEIPT_NAME" \
+                /dcent-release-signing-key.pem \
+                /dcent-release-ed25519.pub \
+                "/out/$RECEIPT_NAME.sig"
+        '
+    [ -f "$SOURCE_CLOSURE_SIGNATURE_PATH" ] || {
+        echo "ERROR: signed source-closure receipt was not emitted" >&2
+        exit 1
+    }
+    [ "$(wc -c < "$SOURCE_CLOSURE_SIGNATURE_PATH" | tr -d '[:space:]')" = "64" ] || {
+        echo "ERROR: Ed25519 source-closure signature must be exactly 64 bytes" >&2
+        exit 1
+    }
+    python3 "$SCRIPT_DIR/source_closure.py" verify \
+        --repo-root "$GIT_OBJECT_REPO" \
+        --artifact-dir "$OUTPUT_DIR" \
+        --source-snapshot "$CAPSULE_SOURCE_SNAPSHOT" \
+        --release-invocation "$CAPSULE_INVOCATION_STAGE" \
+        --build-input-snapshot "$BUILD_INPUT_SNAPSHOT" \
+        --signature "$SOURCE_CLOSURE_SIGNATURE_PATH" \
+        --public-key "$DCENT_RELEASE_PUBKEY_FILE" \
+        "$SOURCE_CLOSURE_PATH" >/dev/null
+    # Retain only the canonical path/hash/ID descriptor. The restricted input
+    # bytes remain private and the live snapshot is still required above for
+    # release admission; this copy is post-cleanup audit evidence only.
+    python3 "$SCRIPT_DIR/release_publication.py" copy \
+        --source "$BUILD_INPUT_SNAPSHOT" \
+        --output "$OUTPUT_DIR/release-packaging-input.json" >/dev/null
+    echo "Source closure: $SOURCE_CLOSURE_PATH"
+    echo "Source closure signature: $SOURCE_CLOSURE_SIGNATURE_PATH"
+else
+    RUST_INVENTORY_PATH=""
+    echo "Rust dependency inventory: skipped for non-release lab build"
+    echo "Source closure: skipped for non-release lab build with advisory toolchain integrity"
+fi
+
 # -------- Phase 8a: standardized release name (operator directive 2026-06-14) --------
 # Auto-name the compiled artifact per the canonical DCENT_OS convention
 # (DCENTOS_<BOARD><GEN>_<MODEL>_<channel><YYYYMMDD>) via the single-source-of-truth
@@ -1680,13 +2626,10 @@ fi
 # standardized name + firmware version + SHA256 next to it and drops a same-named copy.
 # Channel override: DCENT_RELEASE_CHANNEL (default beta). See
 #  + scripts/firmware_release_name.sh.
-if RELEASE_NAME="$(sh "$SCRIPT_DIR/firmware_release_name.sh" "$TARGET" "${DCENT_RELEASE_CHANNEL:-beta}" 2>/dev/null)"; then
+if [ -n "$RELEASE_NAME" ]; then
     RELEASE_ARTIFACT_SRC="$OUTPUT_DIR/$TARBALL_NAME"
     if [ -f "$RELEASE_ARTIFACT_SRC" ]; then
-        RELEASE_EXT="tar"
-        case "$TARBALL_NAME" in *.img) RELEASE_EXT="img" ;; *.tar) RELEASE_EXT="tar" ;; esac
         FW_VERSION="$(awk -F'"' '/^version = /{print $2; exit}' "$PROJECT_DIR/dcentrald/Cargo.toml" 2>/dev/null || echo unknown)"
-        RELEASE_SHA="$(sha256sum "$RELEASE_ARTIFACT_SRC" | awk '{print $1}')"
         # CE-341: a canonical alias like DCENTOS_XIL1_S9_beta<date>.tar must NOT
         # be emitted for a lab/unsigned build — that would let an unsigned lab
         # artifact carry the exact published beta stem + a release-looking
@@ -1706,14 +2649,31 @@ if RELEASE_NAME="$(sh "$SCRIPT_DIR/firmware_release_name.sh" "$TARGET" "${DCENT_
         if [ "$RELEASE_GRADE" = "1" ]; then
             SIGNATURE_TRUST="signed"
             PROOF_SCOPE="release_grade"
-            RELEASE_COPY="$OUTPUT_DIR/${RELEASE_NAME}.${RELEASE_EXT}"
+            RELEASE_COPY="$RELEASE_GRADE_PATH"
         else
             SIGNATURE_TRUST="unsigned"
             PROOF_SCOPE="lab_local"
-            RELEASE_COPY="$OUTPUT_DIR/${RELEASE_NAME}-LAB-UNSIGNED-NOT-FOR-RELEASE.${RELEASE_EXT}"
+            RELEASE_COPY="$RELEASE_LAB_PATH"
         fi
-        cp -f "$RELEASE_ARTIFACT_SRC" "$RELEASE_COPY"
-        {
+        RELEASE_EXPECTED_SHA_ARGS=()
+        if [ -n "$SOURCE_CLOSURE_PATH" ]; then
+            RELEASE_CLOSURE_SHA="$(
+                python3 "$SCRIPT_DIR/source_closure.py" query-artifact \
+                    --manifest "$SOURCE_CLOSURE_PATH" \
+                    --path "$TARBALL_NAME" \
+                    --field sha256
+            )"
+            RELEASE_EXPECTED_SHA_ARGS=(--expected-sha256 "$RELEASE_CLOSURE_SHA")
+        fi
+        RELEASE_PUBLICATION_RESULT="$(python3 "$SCRIPT_DIR/release_publication.py" copy \
+            --source "$RELEASE_ARTIFACT_SRC" \
+            --output "$RELEASE_COPY" \
+            "${RELEASE_EXPECTED_SHA_ARGS[@]}")"
+        RELEASE_SHA="$(
+            printf '%s\n' "$RELEASE_PUBLICATION_RESULT" \
+                | python3 "$SCRIPT_DIR/release_publication.py" query-result --field sha256
+        )"
+        RELEASE_METADATA_CONTENT="$({
             echo "release_name=$RELEASE_NAME"
             echo "firmware_version=$FW_VERSION"
             echo "build_target=$TARGET"
@@ -1724,19 +2684,57 @@ if RELEASE_NAME="$(sh "$SCRIPT_DIR/firmware_release_name.sh" "$TARGET" "${DCENT_
             echo "package_status=$DCENT_PACKAGE_STATUS"
             echo "allow_unsigned=$DCENT_ALLOW_UNSIGNED_SYSUPGRADE"
             echo "release_image=${DCENT_RELEASE_IMAGE:-0}"
+            echo "created_at_utc=$DCENT_CREATED_AT_UTC"
+            echo "source_date_epoch=$SOURCE_DATE_EPOCH"
+            echo "source_commit=$DCENT_SOURCE_COMMIT"
+            echo "source_tree_state=$DCENT_SOURCE_TREE_STATE"
+            echo "release_invocation_id=$CAPSULE_INVOCATION_ID"
+            echo "source_snapshot_id=$CAPSULE_SOURCE_ID"
+            echo "source_snapshot_descriptor_sha256=$CAPSULE_SOURCE_DESCRIPTOR_SHA256"
+            echo "publication_model=private_exact_set_pending_atomic_directory_promotion"
+            echo "build_arch=$DCENT_BUILD_ARCH"
+            echo "toolchain_id=$DCENT_TOOLCHAIN_ID"
+            if [ -n "$SOURCE_CLOSURE_PATH" ]; then
+                echo "source_closure=$(basename "$SOURCE_CLOSURE_PATH")"
+                echo "source_closure_signature=$(basename "$SOURCE_CLOSURE_SIGNATURE_PATH")"
+                echo "prebuilt_rust_inputs=bound_in_signed_source_closure_v4"
+                echo "prebuilt_rust_input_count=$PREBUILT_RUST_INPUT_COUNT"
+                echo "prebuilt_rust_build_execution_attestation=not_attested"
+                echo "prebuilt_rust_installed_payload_equivalence=not_evaluated"
+                echo "buildroot_legal_inventory=$(basename "$BUILDROOT_LEGAL_INVENTORY_PATH")"
+                echo "rust_dependency_inventory=$(basename "$RUST_INVENTORY_PATH")"
+            else
+                echo "source_closure=not_emitted_non_release_lab"
+                echo "source_closure_signature=not_emitted_non_release_lab"
+                echo "prebuilt_rust_inputs=not_retained_non_release_lab"
+                echo "prebuilt_rust_input_count=0"
+                echo "prebuilt_rust_build_execution_attestation=not_attested"
+                echo "prebuilt_rust_installed_payload_equivalence=not_evaluated"
+                echo "buildroot_legal_inventory=not_emitted_non_release_lab"
+                echo "rust_dependency_inventory=not_emitted_non_release_lab"
+            fi
+            if [ -n "$ROOTFS_OWNERSHIP_LEDGER_PATH" ]; then
+                echo "rootfs_ownership_ledger=$(basename "$ROOTFS_OWNERSHIP_LEDGER_PATH")"
+            else
+                echo "rootfs_ownership_ledger=not_integrated_for_target"
+            fi
             echo "signature_trust=$SIGNATURE_TRUST"
             echo "proof_scope=$PROOF_SCOPE"
             echo "release_grade=$RELEASE_GRADE"
-        } > "$OUTPUT_DIR/${RELEASE_NAME}.release.txt"
+        })"
         echo "--- Standardized release name (Phase 8a) ---"
         echo "  name:     $RELEASE_NAME   (firmware $FW_VERSION)"
         echo "  artifact: $RELEASE_COPY"
         echo "  sha256:   $RELEASE_SHA"
         echo "  trust:    signature_trust=$SIGNATURE_TRUST proof_scope=$PROOF_SCOPE release_grade=$RELEASE_GRADE"
-        echo "  metadata: $OUTPUT_DIR/${RELEASE_NAME}.release.txt"
+        echo "  metadata: $RELEASE_METADATA_PATH (published after signing stages)"
         echo ""
     fi
 else
+    if dcent_release_provenance_required; then
+        echo "ERROR: release build has no canonical publication name for target '$TARGET'" >&2
+        exit 1
+    fi
     echo "WARN: firmware_release_name.sh produced no name for target '$TARGET'; artifact stays '$TARBALL_NAME' only." >&2
 fi
 
@@ -1770,7 +2768,7 @@ if [ "$TARGET" = "am3-bb" ] || [ "$TARGET" = "am3-bb-s19jpro" ]; then
             "${PUBKEY_MOUNT_ARGS[@]}" \
             -e TARBALL_NAME="$TARBALL_NAME" \
             -e DCENT_RELEASE_PUBKEY_FILE="$CONTAINER_RELEASE_PUBKEY_FILE" \
-            "$IMAGE_NAME" bash -c '
+            "$BUILD_CONTAINER_ID" bash -c '
                 set -e
                 command -v openssl >/dev/null 2>&1 || { echo "ERROR: openssl required for am3-bb signing"; exit 1; }
                 SIG_OUT="/out/${TARBALL_NAME}.sig"
@@ -1795,10 +2793,20 @@ if [ "$TARGET" = "am3-bb" ] || [ "$TARGET" = "am3-bb-s19jpro" ]; then
                     -inkey /tmp/release_ed25519.pub \
                     -sigfile "$SIG_OUT" \
                     -in "/out/${TARBALL_NAME}" >/dev/null \
-                    || { echo "ERROR: ${TARBALL_NAME}.sig verification failed"; exit 1; }
+                    || { echo "ERROR: ${TARBALL_NAME}.sig verification failed"; rm -f "$SIG_OUT"; exit 1; }
                 ls -la "$SIG_OUT"
                 echo "Signed ${TARBALL_NAME}.sig"
             '
+        if [ "${RELEASE_GRADE:-0}" = "1" ] && [ -n "${RELEASE_COPY:-}" ]; then
+            RELEASE_SIGNATURE_PATH="${RELEASE_COPY}.sig"
+            python3 "$SCRIPT_DIR/release_publication.py" copy \
+                --source "$OUTPUT_DIR/${TARBALL_NAME}.sig" \
+                --output "$RELEASE_SIGNATURE_PATH" >/dev/null
+            openssl pkeyutl -verify -rawin -pubin \
+                -inkey "$DCENT_RELEASE_PUBKEY_FILE" \
+                -sigfile "$RELEASE_SIGNATURE_PATH" \
+                -in "$RELEASE_COPY" >/dev/null
+        fi
     elif is_truthy "$DCENT_ALLOW_UNSIGNED_SYSUPGRADE"; then
         echo "--- Phase 8b: skipping $TARGET tarball signing (lab/unsigned build) ---"
     fi
@@ -1836,10 +2844,18 @@ if [ "$BOARD_POST_IMAGE" = "vnish-bootbin-sd" ] || [ "$BOARD_POST_IMAGE" = "am2-
             "${PUBKEY_MOUNT_ARGS[@]}" \
             -e TARBALL_NAME="$TARBALL_NAME" \
             -e DCENT_RELEASE_PUBKEY_FILE="$CONTAINER_RELEASE_PUBKEY_FILE" \
-            "$IMAGE_NAME" bash -c '
+            "$BUILD_CONTAINER_ID" bash -c '
                 set -e
                 bash /project/scripts/sign_sd_image.sh "/out/${TARBALL_NAME}" --key /signkey
             '
+        if [ "${RELEASE_GRADE:-0}" = "1" ] && [ -n "${RELEASE_COPY:-}" ]; then
+            RELEASE_SIGNATURE_PATH="${RELEASE_COPY}.sig"
+            python3 "$SCRIPT_DIR/release_publication.py" copy \
+                --source "$OUTPUT_DIR/${TARBALL_NAME}.sig" \
+                --output "$RELEASE_SIGNATURE_PATH" >/dev/null
+            bash "$SCRIPT_DIR/verify_sd_image.sh" "$RELEASE_COPY" \
+                --pubkey "$DCENT_RELEASE_PUBKEY_FILE" >/dev/null
+        fi
     elif is_truthy "$DCENT_ALLOW_UNSIGNED_SYSUPGRADE"; then
         echo "--- Phase 8c: skipping $TARGET SD .img signing (lab/unsigned build) ---"
     else
@@ -1847,6 +2863,11 @@ if [ "$BOARD_POST_IMAGE" = "vnish-bootbin-sd" ] || [ "$BOARD_POST_IMAGE" = "am2-
         # the missing key (script exits 0 in this case — no stale .sig).
         bash "$SCRIPT_DIR/sign_sd_image.sh" "$OUTPUT_DIR/$TARBALL_NAME" || true
     fi
+fi
+if [ -n "${RELEASE_METADATA_CONTENT:-}" ]; then
+    printf '%s\n' "$RELEASE_METADATA_CONTENT" \
+        | python3 "$SCRIPT_DIR/release_publication.py" stdin \
+            --output "$RELEASE_METADATA_PATH" >/dev/null
 fi
 echo ""
 
@@ -1859,6 +2880,13 @@ fi
 echo "  $OUTPUT_DIR/$TARBALL_NAME"
 if [ -f "$OUTPUT_DIR/$TARBALL_NAME.manifest.json" ]; then
     echo "  Manifest: $OUTPUT_DIR/$TARBALL_NAME.manifest.json"
+fi
+if [ -n "$SOURCE_CLOSURE_PATH" ]; then
+    echo "  Source closure: $SOURCE_CLOSURE_PATH"
+    echo "  Closure signature: $SOURCE_CLOSURE_SIGNATURE_PATH"
+fi
+if [ -n "$ROOTFS_OWNERSHIP_LEDGER_PATH" ]; then
+    echo "  Rootfs ownership ledger: $ROOTFS_OWNERSHIP_LEDGER_PATH"
 fi
 echo ""
 if [ "$TARGET" = "am2-s19jpro" ]; then

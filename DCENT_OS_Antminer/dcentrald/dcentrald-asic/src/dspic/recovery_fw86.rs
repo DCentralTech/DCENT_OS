@@ -1,4 +1,4 @@
-//! dsPIC fw=0x86 software recovery — **recovery-tool ONLY**.
+//! dsPIC fw=0x86 recovery protocol research — **not shipped**.
 //!
 //! Per RE3 R3-6 (`DCENT_OS_DEVELOPMENT_KITRE3/.../RE_DELIVERABLES/dspic_fw86_recovery.md`):
 //! fw=0x86 on the dsPIC33EP16GS202 voltage controller is the
@@ -15,10 +15,11 @@
 //! start_app) but the exact wire bytes need a logic-analyzer trace
 //! of bmminer's `_update_pic_app_program_1704`. The
 //! [`reflash_app_via_framed_protocol`] entrypoint is therefore a
-//! **partial implementation**: it stages the seek/erase scaffold
-//! using the same BraiinsOS opcode catalog already documented in
-//! `crate::dspic_flash`, but bails before any write step lands on
-//! the wire. See the `// XXX:` notes in [`reflash_app_via_framed_protocol`].
+//! **partial implementation**: it validates preconditions, then bails before
+//! any seek, erase, or write step lands on the wire. The historical
+//! `crate::dspic_flash` mutating API was removed after its inferred opcode
+//! model conflicted with canonical evidence. See the `// XXX:` notes in
+//! [`reflash_app_via_framed_protocol`].
 //!
 //! # This is NOT a silent override of the production refusal rule
 //!
@@ -30,18 +31,16 @@
 //! for the daemon — fw=0x86 in app context means the application
 //! never started AND the bootloader has no rail telemetry. The
 //! correct response in production is "stop, do not mine, surface
-//! the fault." This module is the **opt-in operator escape hatch**
-//! for an offline `pic-recovery --confirm-bricked` flow that wants
-//! to *recover* the unit by jumping into the application or
-//! reflashing it. Daemon refusal and operator recovery are not in
-//! conflict; they are the two sides of the same lockdown.
+//! the fault." This module is retained as compile-gated protocol research;
+//! no shipped binary calls it. Operator recovery remains ICSP-only until a
+//! typed executor satisfies the controller-recovery authority contract.
 //!
-//! # Layered safety contract (mirrors `pic1704::programmer`)
+//! # Preserved research invariants (not deployment authority)
 //!
 //! 1. **Compile-time gate**: this entire module is
-//!    `#[cfg(feature = "recovery-tool")]`. Production `dcentrald`
-//!    cannot link any symbol below — every call site is a compile
-//!    error in the daemon build.
+//!    `#[cfg(feature = "recovery-tool")]`. No shipped package enables the
+//!    feature; `dcentrald` and diagnostic-only controller tools cannot link
+//!    any symbol below.
 //! 2. **Platform gate (am2 dsPIC ONLY)**: every public op runs the
 //!    [`refuse_if_not_am2_dspic`] guard against a [`RecoveryPlatform`]
 //!    enum. Calling `jump_to_app` or `reflash_app_via_framed_protocol`
@@ -49,21 +48,19 @@
 //!    S19j Pro) returns [`AsicError::Pic`] with an explicit "wrong
 //!    family" error — for why
 //!    cross-family destructive ops MUST fail closed.
-//! 3. **Operator confirmation gate (Path B — jump-only)**: [`jump_to_app`]
-//!    consumes a [`ConfirmedBrickedToken`] (re-using the canonical
-//!    token from `pic1704::programmer`, mintable only via the recovery
-//!    binary's `--confirm-bricked` flag). 100% confidence per RE3 §5.2.
-//! 4. **Double-gate (Path C — framed reflash)**: [`reflash_app_via_framed_protocol`]
-//!    consumes a [`AcknowledgeSixtyPercentConfidence`] token, which is
-//!    mintable ONLY when BOTH `--confirm-bricked` AND
-//!    `--i-acknowledge-60-percent-byte-exact-confidence` are passed AND
-//!    the typed-serial matches the connected dsPIC's hashboard EEPROM
-//!    serial. (W13.A3,
-//!    2026-05-10): RE3 §6 confidence on framed-reflash byte-format is
-//!    only 60% — sacrificial-dsPIC + logic-analyzer hardware validation
-//!    is the R4-8 carry-forward blocker. Path C invocations are
-//!    persistently logged to `$DCENT_PIC_RECOVERY_LOG_DIR/pic_recovery_path_c.log`
-//!    (default `/var/log/dcent/`) for forensic audit.
+//! 3. **Legacy acknowledgement token (Path B — jump-only)**:
+//!    [`jump_to_app`] consumes a [`ConfirmedBrickedToken`]. This pins the
+//!    historical call boundary for tests; a string token is not sufficient
+//!    authority for a future executor.
+//! 4. **Legacy double acknowledgement (Path C — framed reflash)**:
+//!    [`reflash_app_via_framed_protocol`] consumes an
+//!    [`AcknowledgeSixtyPercentConfidence`] token and verifies a typed serial.
+//!    These checks preserve uncertainty and target-binding requirements for
+//!    research, but no shipped CLI mints the token. A future executor must put
+//!    them behind the separate controller-recovery authority architecture.
+//! (W13.A3, 2026-05-10),
+//!    RE3 §6 confidence on the framed-reflash byte format is only 60%;
+//!    sacrificial-dsPIC and logic-analyzer validation remain prerequisites.
 //!
 //! Tokens are `!Clone` / `!Copy` so a fresh token is required at each
 //! op boundary.
@@ -92,7 +89,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use dcentrald_hal::i2c::{I2cServiceHandle, I2cTransactionStep};
+use dcentrald_hal::i2c::{I2cMutationLabel, I2cServiceHandle, I2cTransactionStep};
 use tracing::{info, warn};
 
 use crate::pic1704::programmer::ConfirmedBrickedToken;
@@ -105,15 +102,14 @@ use crate::Result;
 
 /// Platform identity passed to every recovery op.
 ///
-/// Recovery is only valid on **am2 dsPIC** voltage controllers (S17 / S19 Pro
-/// / S19j Pro Zynq am2 / S19jpro). Every other family — PIC1704
-/// (CV1835 / AM335x BB / Amlogic S19j Pro), S9 PIC16F1704, S21 NoPic — has
-/// its own recovery surface (`pic1704::programmer`, `pic-recovery`'s
-/// PIC16F1704 path, ICSP rework respectively). Mixing them risks
-/// destroying the wrong chip.
+/// The retained protocol model applies only to **am2 dsPIC** voltage
+/// controllers (S17 / S19 Pro / S19j Pro Zynq am2 / S19jpro). It must never be
+/// mixed with PIC1704, S9 PIC16F1704, or S21 NoPic families. Shipped software
+/// provides no mutation surface for any of them; physical ICSP is the current
+/// recovery path. Mixing families risks destroying the wrong chip.
 ///
-/// This enum exists only inside `recovery-tool` builds; the production
-/// daemon cannot construct it.
+/// This enum exists only inside explicit `recovery-tool` research/test builds;
+/// no shipped package enables the feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryPlatform {
     /// Antminer S17 (am1-s17 / am2-s17). dsPIC33EP16GS202 at I²C
@@ -211,7 +207,7 @@ pub fn read_version_steps() -> Vec<I2cTransactionStep> {
 //  Internal guards
 // ===========================================================================
 
-/// Refuse if the operator passed a non-am2-dsPIC platform marker.
+/// Refuse if a research caller supplies a non-am2-dsPIC platform marker.
 ///
 /// This is the load-bearing safety guard that prevents accidental
 /// destructive ops on PIC1704 platforms — those have their own
@@ -241,38 +237,33 @@ fn refuse_if_not_am2_dspic(platform: RecoveryPlatform) -> Result<()> {
 //  AcknowledgeSixtyPercentConfidence — Path C double-gate token
 // ===========================================================================
 
-/// Proof-of-double-confirmation token for the **Path C framed-reflash**
-/// flow.
+/// Legacy double-acknowledgement token for the **Path C framed-reflash**
+/// research model.
 ///
 /// (W13.A3, 2026-05-10):
 /// the dsPIC fw=0x86 framed-reflash protocol is only ~60% byte-exact per
 /// RE3 §3.4 + §6 confidence table. Sacrificial-dsPIC + logic-analyzer
 /// validation is the R4-8 hardware-acquisition carry-forward blocker.
-/// Until that hardware lands, the framed-reflash path MUST require:
+/// The retained research API therefore pins all of these invariants:
 ///
-/// 1. The canonical [`ConfirmedBrickedToken`] (proves the operator typed
-///    `--confirm-bricked`).
-/// 2. An additional `--i-acknowledge-60-percent-byte-exact-confidence`
-///    flag (proves the operator read the RE3 confidence note).
-/// 3. A typed-serial confirmation that matches the connected dsPIC's
-///    hashboard EEPROM serial (proves the operator is targeting the
-///    intended unit, not the wrong board on a multi-hashboard miner).
+/// 1. The canonical [`ConfirmedBrickedToken`] acknowledgement literal.
+/// 2. A second acknowledgement of the 60% byte-exact confidence.
+/// 3. A typed serial matching the connected dsPIC's hashboard EEPROM serial.
 ///
-/// Path B (jump-only, [`jump_to_app`]) does NOT require this token —
-/// the unlock+jump sequence is 100% byte-exact per RE3 §5.2 and is
-/// non-destructive (no flash writes), so single-flag UX is correct
-/// for that path.
+/// These are testable protocol defenses, not a complete authority model, and
+/// no shipped CLI exposes either path. Path B (jump-only, [`jump_to_app`]) has
+/// stronger byte evidence but still requires the future controller-recovery
+/// authority architecture before runtime use.
 ///
 /// `!Clone` / `!Copy` so a fresh token is required at each call site.
 #[derive(Debug)]
 pub struct AcknowledgeSixtyPercentConfidence {
     // Private field with private type so the token cannot be constructed
-    // via struct literal syntax outside this module — even with both
-    // flags in scope, only `mint_with_double_confirmation` can produce
-    // an instance.
+    // via struct literal syntax outside this module; only
+    // `mint_with_double_confirmation` can produce an instance.
     _seal: AcknowledgeSeal,
-    // Carry the operator-typed serial through to the op site so the
-    // log line + post-write audit trail can record it without re-reading.
+    // Carry the confirmed serial through to the op site so research audit
+    // records can bind results without re-reading it.
     confirmed_serial: String,
 }
 
@@ -280,9 +271,8 @@ pub struct AcknowledgeSixtyPercentConfidence {
 struct AcknowledgeSeal;
 
 impl AcknowledgeSixtyPercentConfidence {
-    /// Mint a Path C token from the recovery binary's two flags + a
-    /// typed-serial confirmation that matched the connected dsPIC's
-    /// hashboard EEPROM serial.
+    /// Mint the legacy Path C research token from two acknowledgement literals
+    /// plus a typed serial matching the connected dsPIC's hashboard EEPROM.
     ///
     /// `confirm_bricked_flag` MUST be exactly `"--confirm-bricked"`.
     /// `acknowledge_flag` MUST be exactly
@@ -348,14 +338,13 @@ impl AcknowledgeSixtyPercentConfidence {
         })
     }
 
-    /// Operator-confirmed serial carried through from minting. Used by
+    /// Confirmed serial carried through from minting. Used by
     /// [`reflash_app_via_framed_protocol`] for the persistent audit log.
     pub fn confirmed_serial(&self) -> &str {
         &self.confirmed_serial
     }
 
-    /// Test-only constructor bypassing the runtime double-confirmation.
-    /// Compile-gated so it cannot ship in any release artifact.
+    /// Test-only constructor bypassing the acknowledgement literals.
     #[cfg(test)]
     pub fn for_tests(serial: &str) -> Self {
         Self {
@@ -388,13 +377,12 @@ pub const HASHBOARD_SERIAL_LEN: usize = 16;
 /// sanctioned read-only one-shot helper.
 ///
 /// Returns the serial as a UTF-8 string (with trailing zero/whitespace
-/// trimmed). On read failure, returns [`AsicError::Pic`] so the recovery
-/// binary surfaces a clear "cannot identify connected unit, refusing to
-/// flash" message rather than silently flashing the wrong board.
+/// trimmed). On read failure, returns [`AsicError::Pic`] so a future authority
+/// layer can fail closed rather than target an unidentified board.
 ///
-/// Used by the Path C entrypoint to compare against the operator's
-/// typed-serial confirmation. Reads are denylist-safe; writes are
-/// blocked at the HAL layer regardless of caller.
+/// Used by the Path C research entrypoint to compare against its typed-serial
+/// confirmation. Reads are denylist-safe; writes are blocked at the HAL layer
+/// regardless of caller. No shipped package invokes this entrypoint.
 pub fn read_dspic_serial_proxy(bus: u8) -> Result<String> {
     let bytes = dcentrald_hal::i2c::read_eeprom_bytes(
         bus,
@@ -426,9 +414,9 @@ pub fn parse_serial_bytes(bytes: &[u8]) -> String {
 //  Path C persistent invocation log — forensic audit trail
 // ===========================================================================
 
-/// Default directory for the Path C invocation log on production
-/// hardware. Overridden via the `DCENT_PIC_RECOVERY_LOG_DIR` env var so
-/// host tests can redirect to a `tempfile::tempdir()`.
+/// Historical default directory retained for Path C audit-log tests.
+/// `DCENT_PIC_RECOVERY_LOG_DIR` redirects host tests to a temporary directory;
+/// no shipped package invokes Path C.
 pub const DEFAULT_PATH_C_LOG_DIR: &str = "/var/log/dcent";
 
 /// Filename within the log directory.
@@ -454,9 +442,10 @@ pub fn path_c_log_path() -> PathBuf {
 /// `success_unimplemented` (the partial implementation cannot reach
 /// success today — this is reserved for the post-R4-8 wire-up).
 ///
-/// Failure to write the log is logged via `tracing::warn!` but does NOT
-/// abort the recovery flow — losing forensic logging is preferable to
-/// blocking a hardware recovery attempt on disk-full conditions.
+/// This retained research helper warns on log-write failure without changing
+/// the protocol-validation result. That historical behavior is not authority
+/// guidance: a future executor must define fail-closed, durable audit semantics
+/// in the controller-recovery authority contract.
 pub fn append_path_c_invocation_log(
     addr: u8,
     platform: RecoveryPlatform,
@@ -518,9 +507,9 @@ pub fn append_path_c_invocation_log(
 ///
 /// Then polls `REG_VERSION` every 100 ms (up to 5 s) until it observes
 /// 0x88 / 0x89 / 0x8A (application started successfully) or times out.
-/// A timeout returning fw=0x86 means the application partition is
-/// corrupt → caller should follow up with
-/// [`reflash_app_via_framed_protocol`] or ICSP rework.
+/// A timeout returning fw=0x86 means the application partition may be corrupt.
+/// Shipped recovery remains ICSP-only; the framed-reflash function below is
+/// retained protocol research, not an executable follow-up.
 ///
 /// On error path, the bootloader is left in a known state: the unlock
 /// + jump bytes are atomic, so the dsPIC either jumped (and we observe
@@ -532,7 +521,7 @@ pub fn append_path_c_invocation_log(
 /// * `i2c` — the process-wide I²C service handle (am2 single-owner rule).
 /// * `addr` — 7-bit dsPIC address (typically 0x20, 0x21, or 0x22).
 /// * `platform` — must be an am2 dsPIC family marker.
-/// * `_token` — proof-of-operator-confirmation. Consumed.
+/// * `_token` — legacy research acknowledgement token. Consumed.
 ///
 /// # Errors
 ///
@@ -555,7 +544,7 @@ pub fn jump_to_app(
     );
 
     // Issue the two-step unlock+jump as one atomic service transaction.
-    i2c.transaction(addr, jump_steps())
+    i2c.transaction_mutating(I2cMutationLabel::Recovery, addr, jump_steps())
         .map_err(|e| AsicError::Pic {
             addr,
             detail: format!("dspic fw=0x86 jump_to_app transaction: {}", e),
@@ -572,7 +561,7 @@ pub fn jump_to_app(
     let poll = Duration::from_millis(POLL_INTERVAL_MS);
     loop {
         let bytes = i2c
-            .transaction(addr, read_version_steps())
+            .transaction_mutating(I2cMutationLabel::QueryPrelude, addr, read_version_steps())
             .map_err(|e| AsicError::Pic {
                 addr,
                 detail: format!("dspic post-jump REG_VERSION read: {}", e),
@@ -653,20 +642,18 @@ pub fn jump_to_app(
 /// 2. Reads `REG_VERSION` to confirm the chip is in fw=0x86 bootloader
 ///    state. If it's already in app mode, returns `Ok(())` (no reflash
 ///    needed — caller probably wanted [`jump_to_app`] instead).
-/// 3. Validates `hex` is non-empty and fits in the writable app
-///    region (placeholder bounds check using
-///    [`crate::dspic_flash::APP_REGION_START`] / `APP_REGION_END`).
-/// 4. Returns a `PartialNotImplemented` error citing the RE3 reference
-///    so the operator gets a clear "do not retry blindly" signal.
+/// 3. Validates `hex` is non-empty and fits in the controller-specific
+///    writable application-region bounds.
+/// 4. Returns a `PartialNotImplemented` error citing the RE3 reference so a
+///    research caller cannot mistake validation for a completed mutation.
 ///
 /// # What this function INTENTIONALLY does NOT do
 ///
 /// * Issue any `WRITE_DATA_INTO_PIC` / `ERASE_PIC_APP_PROGRAM` /
 ///   `SEND_DATA_TO_PIC` opcodes on the wire. Without confirmed
 ///   wire-byte traces, those would risk a permanent brick.
-/// * Touch `crate::dspic_flash::reflash` or its address-pointer
-///   helpers — those target a different (still-RE-incomplete) framed
-///   path and bringing them online is a separate RE Round 4 task.
+/// * Use the removed historical `crate::dspic_flash` mutation helpers — their
+///   inferred opcode model conflicted with the canonical protocol catalog.
 ///
 /// // XXX: framed-reflash protocol partial — see RE3
 /// // dspic_fw86_recovery.md §3.4 ("Path C: Framed Protocol Full
@@ -676,17 +663,14 @@ pub fn jump_to_app(
 /// // Ghidra disassembly of the bootloader portion of the dsPIC
 /// // application hex. Track in RE Round 4 backlog.
 ///
-/// # W13.D4 — double-gate token migration (2026-05-10)
+/// # Historical W13.D4 double-gate design (2026-05-10)
 ///
-///: this entrypoint
-/// now consumes [`AcknowledgeSixtyPercentConfidence`] instead of
-/// [`ConfirmedBrickedToken`]. The double-gate token is mintable ONLY
-/// when both `--confirm-bricked` AND
-/// `--i-acknowledge-60-percent-byte-exact-confidence` are passed AND
-/// the typed-serial matches the connected dsPIC's hashboard EEPROM
-/// serial (read via [`read_dspic_serial_proxy`]). Path B
-/// ([`jump_to_app`]) keeps the single-flag UX because its wire bytes
-/// are 100% confident.
+///, this research entrypoint
+/// consumes [`AcknowledgeSixtyPercentConfidence`] and binds a typed serial
+/// (read via [`read_dspic_serial_proxy`]). Those invariants remain useful test
+/// fixtures, but the former CLI UX no longer exists and no shipped package
+/// enables this module. A future executor requires the separate typed authority
+/// architecture for both Path B and Path C.
 pub fn reflash_app_via_framed_protocol(
     i2c: &I2cServiceHandle,
     addr: u8,
@@ -722,7 +706,7 @@ pub fn reflash_app_via_framed_protocol(
     // Phase 1 (specified, safe): probe REG_VERSION to confirm chip is in
     // fw=0x86 bootloader. Refuse to proceed if it's anything else.
     let bytes = i2c
-        .transaction(addr, read_version_steps())
+        .transaction_mutating(I2cMutationLabel::QueryPrelude, addr, read_version_steps())
         .map_err(|e| {
             append_path_c_invocation_log(
                 addr,
@@ -781,8 +765,8 @@ pub fn reflash_app_via_framed_protocol(
 
     // Phase 2 (PARTIAL — RE3 60% confidence): the actual seek/erase/write
     // wire format is not byte-confirmed. Bail with an explicit
-    // partial-not-implemented error so the operator knows this is by
-    // design, not a missing feature, and so a future RE round can
+    // partial-not-implemented error so a research caller knows this is by
+    // design, not a completed mutation path, and so a future RE round can
     // close it without having to reverse a blind implementation.
     //
     // XXX: framed-reflash protocol partial — see RE3
@@ -1004,8 +988,8 @@ mod tests {
             err,
         );
 
-        // Empty typed-serial is also refused (operator must actually type
-        // something — silent empty-string is not a confirmation).
+        // Empty typed serial is also refused; an empty string cannot bind the
+        // research token to a target fixture.
         let r2 = AcknowledgeSixtyPercentConfidence::mint_with_double_confirmation(
             "--confirm-bricked",
             "--i-acknowledge-60-percent-byte-exact-confidence",
@@ -1069,7 +1053,7 @@ mod tests {
         assert_eq!(p, dir.join(PATH_C_LOG_FILENAME));
         std::env::remove_var("DCENT_PIC_RECOVERY_LOG_DIR");
 
-        // With env unset, the default production path applies.
+        // With env unset, the retained historical default path applies.
         let p = path_c_log_path();
         assert_eq!(
             p,

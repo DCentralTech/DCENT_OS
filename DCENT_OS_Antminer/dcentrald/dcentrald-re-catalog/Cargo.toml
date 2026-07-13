@@ -3,7 +3,7 @@ name = "dcentrald-re-catalog"
 version.workspace = true  # Single source: dcentrald/Cargo.toml [workspace.package]
 edition = "2021"
 license = "GPL-3.0"
-description = "STUB (content not yet ported): intended pure-no-HAL Rust mirror of the RE competitor-firmware catalogs (fan curves, PLL register bibles, model rolls) for DCENT_OS — currently exports nothing and has no consumers"
+description = "Pure no-HAL reverse-engineering catalog for DCENT_OS offline bring-up proofs"
 
 #  W7.1 + W7.2 + W7.3 (DCENT_RE + DCENT_Thermal + DCENT_Perf, 2026-05-07):
 #

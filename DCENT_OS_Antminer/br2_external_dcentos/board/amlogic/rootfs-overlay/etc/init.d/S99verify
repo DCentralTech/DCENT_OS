@@ -30,7 +30,7 @@
 #                                  am3-bb*       : gpio59 (S19J_IO_BOARD_V2_0).
 #                                  am3-aml*      : gpio437 (Amlogic A113D PWR_EN).
 #                                  cv1835*       : /etc/dcentos/rail_gpio (TBD).
-#   V6  pic-fw-validated       : per-family voltage-controller proof.
+#   V6  pic-fw-validated       : daemon-published voltage-controller proof.
 #                                  zynq am2 / am3-bb: dsPIC fw whitelist
 #                                    {0x82,0x89,0x8A,0xB9,0xFE}, reject 0x86.
 #                                  am3-aml*: skipped (TAS5782M NoPic).
@@ -41,19 +41,19 @@
 #                                  am2 22 chips, am3-bb 3 chains, am3-aml 80
 #                                  chips, cv1835 144 chips).
 #   V8  stratum-handshake      : Stratum HANDSHAKE COMPLETE within 60 s of
-#                                dcentrald start (state.json marker).
+#                                dcentrald start (transitional state snapshot).
 #   V9  first-nonce            : First nonce parsed within 120 s.
 #   V10 first-share            : First accepted share within 180 s.
 #   V11 fan-cap-honored        : per-family fan PWM cap.
-#                                  am2: dcentrald --get-fan UIO readback
-#                                    (devmem is stale/no-op on am2). When
+#                                  am2: dcentrald /api/status fan snapshot.
+#                                    When
 #                                    mining is disabled, require idle cap
 #                                    instead of the mining cap.
 #                                  am3-bb/aml/cv1835: sysfs PWM duty_cycle
 #                                    <= 30% of period.
 #   V12 thermal-supervisor-ok  : per-family thermal proof.
 #                                  am2: last Am2ThermalSupervisor sample.
-#                                  am3-bb: LM75A @ 0x48 via i2cget.
+#                                  am3-bb: daemon-owned thermal snapshot.
 #                                  am3-aml: state.json supervisor (NoPic).
 #                                  cv1835: /sys/class/thermal/thermal_zone0.
 #   V13 no-no-nonce-stall      : per-family no_nonce_stall event name from
@@ -62,9 +62,9 @@
 #                                  am3-bb: am3_bb_no_nonce_stall.
 #                                  am3-aml: am3_aml_no_nonce_stall.
 #                                  cv1835: cv1835_no_nonce_stall.
-#   V14 upgrade-stage-cleared  : `fw_setenv upgrade_stage` cleared (commit OK
-#                                signal to U-Boot). Fail-soft if fw_setenv is
-#                                missing (still report check with detail).
+#   V14 upgrade-commit-state   : report the platform upgrader's commit state.
+#                                S99verify is a proof consumer and never
+#                                mutates U-Boot environment state.
 #
 # CONTRACT: failures are logged loudly to syslog. S99verify does NOT
 # auto-revert -- that authority belongs to S99upgrade / U-Boot bootcount.
@@ -83,6 +83,8 @@ FAN_CAP_FILE=$CONFIG_DIR/fan_max_pwm
 BOARD_TARGET_FILE=$CONFIG_DIR/board_target
 BOARD_FAMILY_FILE=$CONFIG_DIR/board_family
 RAIL_GPIO_FILE=$CONFIG_DIR/rail_gpio
+UPGRADE_COMMIT_MARKER=${UPGRADE_COMMIT_MARKER:-/tmp/dcentos-upgrade-committed}
+MIN_DAEMON_AGE_S=${MIN_DAEMON_AGE_S:-30}
 
 # PHASE 2K (2026-05-15): per-variant override include. The shared script is
 # byte-identical across all 4 base overlays (zynq, beaglebone, amlogic,
@@ -115,7 +117,6 @@ DEFAULT_SHARE_BUDGET_S=180
 # under 5 minutes total.
 PORT_PROBE_TIMEOUT_S=3
 HTTP_PROBE_TIMEOUT_S=5
-I2C_PROBE_TIMEOUT_S=3
 
 mkdir -p "$(dirname $OUT_JSON)" 2>/dev/null
 mkdir -p "$(dirname $LOGFILE)" 2>/dev/null
@@ -281,6 +282,21 @@ http_probe_status() {
     echo "fail"
 }
 
+# Fetch a daemon-owned JSON snapshot without creating a hardware owner. Empty
+# output means unavailable; callers must fail the proof rather than probe a
+# transport directly.
+http_get_body() {
+    url=$1
+    timeout=$2
+    if command -v wget > /dev/null 2>&1; then
+        wget -q -T "$timeout" -t 1 -O - "$url" 2>/dev/null && return
+    fi
+    if command -v curl > /dev/null 2>&1; then
+        curl -fsS --max-time "$timeout" "$url" 2>/dev/null && return
+    fi
+    echo ""
+}
+
 # JSON helper: append a check entry. Quotes detail string conservatively.
 # Args: id passed_bool detail
 emit_check() {
@@ -432,8 +448,16 @@ check_dcentrald_running() {
             age_ticks=$((sys_uptime_hz - proc_uptime))
             # ticks are typically jiffies @ 100 Hz; convert to seconds.
             age_s=$((age_ticks / 100))
-            if [ "$age_s" -lt 30 ]; then
-                emit_check V4 false "dcentrald PID $pid is only ${age_s}s old (possible crash-loop)"
+            if [ "$age_s" -lt "$MIN_DAEMON_AGE_S" ]; then
+                wait_s=$((MIN_DAEMON_AGE_S - age_s))
+                logline "waiting ${wait_s}s for dcentrald PID $pid stability proof"
+                sleep "$wait_s"
+                current_pid=$(pidof dcentrald 2>/dev/null | awk '{print $1}')
+                if [ "$current_pid" != "$pid" ]; then
+                    emit_check V4 false "dcentrald PID changed during ${MIN_DAEMON_AGE_S}s stability window ($pid -> ${current_pid:-missing})"
+                    return
+                fi
+                emit_check V4 true "dcentrald PID $pid survived ${MIN_DAEMON_AGE_S}s stability window"
                 return
             fi
             emit_check V4 true "dcentrald PID $pid alive for ${age_s}s"
@@ -457,7 +481,7 @@ check_rail_gpio() {
             ;;
     esac
     if [ -z "$rail_gpio" ]; then
-        emit_check V5 true "rail GPIO unknown for platform=$PLATFORM family=$BOARD_FAMILY -- capture from bench (skipped, non-blocking)"
+        emit_check V5 false "rail GPIO unknown for platform=$PLATFORM family=$BOARD_FAMILY; PSU engagement cannot be proven"
         return
     fi
     val=""
@@ -487,28 +511,22 @@ check_pic_fw() {
             return
             ;;
         cv1835)
-            # CV1835 uses PIC1704 (not dsPIC). Bootloader = 0xCC, app = 0x60.
-            # Bootloader is dangerous: writing JUMP from bootloader trashes
-            # OTP fuses.
-            if ! command -v i2cget > /dev/null 2>&1; then
-                emit_check V6 false "PIC1704 probe needed but i2cget unavailable"
-                return
-            fi
-            raw=$(timeout "$I2C_PROBE_TIMEOUT_S" i2cget -y 0 0x20 2>/dev/null | head -1)
-            case "$raw" in
+            # CV1835 uses PIC1704 (not dsPIC). Consume only the daemon's
+            # service-owned snapshot; S99 runs after dcentrald and must never
+            # become a second bus owner.
+            fw=$(read_state_key "pic1704_fw_byte")
+            case "$fw" in
                 0x60)
-                    emit_check V6 true "PIC1704 @ 0x20 in APPLICATION mode (raw=$raw)"
+                    emit_check V6 true "PIC1704 in APPLICATION mode (daemon snapshot=$fw)"
                     ;;
                 0xCC|0xcc)
-                    emit_check V6 false "PIC1704 @ 0x20 in BOOTLOADER mode (raw=$raw) - JUMP from bootloader is destructive"
+                    emit_check V6 false "PIC1704 in BOOTLOADER mode (daemon snapshot=$fw)"
                     ;;
                 "")
-                    emit_check V6 false "PIC1704 @ 0x20 did not respond to i2cget"
+                    emit_check V6 false "PIC1704 daemon snapshot unavailable; raw fallback is prohibited"
                     ;;
                 *)
-                    # Some PIC1704 stocks return values other than 0x60/0xCC
-                    # during steady state; surface the byte for triage.
-                    emit_check V6 true "PIC1704 @ 0x20 responded raw=$raw (assumed app)"
+                    emit_check V6 false "PIC1704 daemon snapshot=$fw is outside the validated state set"
                     ;;
             esac
             return
@@ -536,31 +554,7 @@ check_pic_fw() {
                 ;;
         esac
     fi
-    # Fallback: live i2cget probe. Best-effort -- if i2cget is missing we
-    # don't fail the check on its own.
-    if ! command -v i2cget > /dev/null 2>&1; then
-        emit_check V6 false "state.json missing fw_byte AND i2cget unavailable"
-        return
-    fi
-    # am3-bb uses bus 1 for the dsPIC; am2 uses bus 0.
-    i2c_bus=0
-    case "$PLATFORM" in
-        am3-bb) i2c_bus=1 ;;
-    esac
-    for addr in 0x20 0x21 0x22; do
-        raw=$(timeout "$I2C_PROBE_TIMEOUT_S" i2cget -y $i2c_bus $addr 2>/dev/null | head -1)
-        case "$raw" in
-            0x86)
-                emit_check V6 false "i2cget probe of $addr returned 0x86 (corruption-state)"
-                return
-                ;;
-            0x82|0x89|0x8A|0xB9|0xFE)
-                emit_check V6 true "i2cget probe of $addr returned $raw (validated whitelist)"
-                return
-                ;;
-        esac
-    done
-    emit_check V6 false "No dsPIC reply matched validated whitelist on 0x20/0x21/0x22 (bus=$i2c_bus)"
+    emit_check V6 false "state.json missing daemon-owned dsPIC firmware snapshot; raw fallback is prohibited"
 }
 
 # V7: per-family chain-yield floor.
@@ -660,13 +654,12 @@ check_fan_cap() {
                 cap_detail="management-only idle_cap=$cap"
                 am2_quiet_rpm_proof=1
             fi
-            # Zynq am2 fan-control is UIO-bound. devmem can read/write a stale
-            # shadow and must not be used as proof of fan cap.
-            if [ -x "$DAEMON" ]; then
-                fan_out=$("$DAEMON" --get-fan 2>/tmp/s99verify-fan.err || true)
-                cur=$(echo "$fan_out" | sed -n 's/.*commanded_pwm=\([0-9][0-9]*\).*/\1/p' | head -1)
-                rpm=$(echo "$fan_out" | sed -n 's/.*max_rpm=\([0-9][0-9]*\).*/\1/p' | head -1)
-            fi
+            # Fan UIO is owned by the running mining engine. Consume its
+            # serialized status snapshot; never launch a second dcentrald
+            # process or fall back to devmem/UIO from this verifier.
+            fan_out=$(http_get_body "http://127.0.0.1:8080/api/status" "$HTTP_PROBE_TIMEOUT_S")
+            cur=$(printf '%s\n' "$fan_out" | sed -n 's/.*"fans"[[:space:]]*:[[:space:]]*{[^}]*"pwm"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
+            rpm=$(printf '%s\n' "$fan_out" | sed -n 's/.*"fans"[[:space:]]*:[[:space:]]*{[^}]*"rpm"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
             if [ -n "$cur" ] && [ "$cur" -le "$cap" ] 2>/dev/null; then
                 if [ "$am2_quiet_rpm_proof" = "1" ]; then
                     case "$rpm" in *[!0-9]*|'') rpm="" ;; esac
@@ -677,13 +670,13 @@ check_fan_cap() {
                     elif [ "$rpm" -ge "$DEFAULT_FAN_QUIET_MAX_RPM" ] 2>/dev/null; then
                         emit_check V11 false "LOW_PWM_FLOOR_PRESENT commanded_pwm=$cur max_rpm=$rpm threshold=$DEFAULT_FAN_QUIET_MAX_RPM ($cap_detail)"
                     else
-                        emit_check V11 true "fan commanded_pwm=$cur within $cap_detail via UIO; max_rpm=$rpm"
+                        emit_check V11 true "fan pwm=$cur within $cap_detail via daemon snapshot; rpm=$rpm"
                     fi
                 else
-                    emit_check V11 true "fan commanded_pwm=$cur within $cap_detail via UIO; max_rpm=${rpm:-unknown}"
+                    emit_check V11 true "fan pwm=$cur within $cap_detail via daemon snapshot; rpm=${rpm:-unknown}"
                 fi
             else
-                emit_check V11 false "fan cap not proven via UIO (commanded_pwm=${cur:-unknown}, $cap_detail)"
+                emit_check V11 false "fan cap not proven by daemon snapshot (pwm=${cur:-unknown}, $cap_detail)"
             fi
             ;;
         am3-bb|am3-aml|cv1835)
@@ -707,8 +700,7 @@ check_fan_cap() {
                 fi
             done
             if [ "$period" -eq 0 ] 2>/dev/null; then
-                # No sysfs PWM found; report as fail-soft (cannot prove).
-                emit_check V11 true "fan PWM sysfs not present (no /sys/class/pwm/pwmchip*); cap=$cap%, check skipped"
+                emit_check V11 false "fan PWM sysfs not present (no /sys/class/pwm/pwmchip*); cap compliance cannot be proven"
                 return
             fi
             if [ "$cur" -le "$cap" ] 2>/dev/null; then
@@ -718,7 +710,7 @@ check_fan_cap() {
             fi
             ;;
         *)
-            emit_check V11 true "fan PWM check skipped (unknown platform=$PLATFORM)"
+            emit_check V11 false "fan PWM check unavailable for unknown platform=$PLATFORM"
             ;;
     esac
 }
@@ -730,7 +722,7 @@ check_thermal_supervisor() {
             # NoPic platform: state.json supervisor is the only proof.
             last=$(read_state_key "thermal_supervisor_last_sample_unix")
             if [ -z "$last" ]; then
-                emit_check V12 true "am3-aml: NoPic platform - thermal handled by state.json supervisor (no live snapshot)"
+                emit_check V12 false "am3-aml: state.json missing daemon-owned thermal supervisor sample"
                 return
             fi
             now=$(date +%s 2>/dev/null)
@@ -747,19 +739,11 @@ check_thermal_supervisor() {
             fi
             ;;
         am3-bb)
-            # LM75A @ 0x48 on i2c-1. The dsPIC bridge reads it too, but
-            # direct i2cget is a quick independent proof.
-            if command -v i2cget > /dev/null 2>&1; then
-                raw=$(timeout "$I2C_PROBE_TIMEOUT_S" i2cget -y 1 0x48 0x00 w 2>/dev/null | head -1)
-                if [ -n "$raw" ]; then
-                    emit_check V12 true "am3-bb: LM75A @ 0x48 responded raw=$raw"
-                    return
-                fi
-            fi
-            # Fall through to state.json supervisor.
+            # The daemon owns the sensor/controller bus. Verify freshness of
+            # its published supervisor sample instead of probing in parallel.
             last=$(read_state_key "thermal_supervisor_last_sample_unix")
             if [ -z "$last" ]; then
-                emit_check V12 false "am3-bb: LM75A read failed AND state.json missing supervisor sample"
+                emit_check V12 false "am3-bb: state.json missing daemon-owned thermal supervisor sample"
                 return
             fi
             now=$(date +%s 2>/dev/null)
@@ -835,7 +819,7 @@ check_no_nonce_stall() {
         if [ -r /tmp/dcentrald.log ] && grep -q "$evt" /tmp/dcentrald.log 2>/dev/null; then
             emit_check V13 false "$evt event observed in dcentrald.log"
         else
-            emit_check V13 true "no $evt counter and none in log"
+            emit_check V13 false "no daemon-owned $evt counter; absence in the log is not proof"
         fi
         return
     fi
@@ -847,47 +831,44 @@ check_no_nonce_stall() {
 }
 
 check_upgrade_stage_cleared() {
-    # The U-Boot upgrade_stage flag is set by S99upgrade right before reboot
-    # to mark "this slot is staged but unproven". S99verify clears it (via
-    # fw_setenv) to signal "this slot has run a full proof matrix at least
-    # once" -- this is the commit-OK signal to U-Boot, which decrements its
-    # bootcount on success.
-    if ! command -v fw_setenv > /dev/null 2>&1; then
-        # No fw_setenv on this image -- this is normal for Zynq base images
-        # without libubootenv-tools. Fail-soft: report the check but with
-        # detail so the operator/dashboard knows what happened. Pass=true
-        # because we cannot prove failure either; the check is not blocking
-        # in this configuration.
-        emit_check V14 true "fw_setenv unavailable (libubootenv-tools not installed); upgrade_stage check skipped"
+    # S99verify is a report-only proof consumer. Platform-specific S99upgrade
+    # owns every durable boot-commit mutation; a lighter verifier must never
+    # re-commit a slot that the upgrade gate rejected.
+    case "$PLATFORM" in
+        am3-aml)
+            emit_check V14 true "commit authority delegated to Amlogic S99upgrade (firstboot); S99verify is report-only"
+            return
+            ;;
+        am3-bb|cv1835)
+            emit_check V14 true "platform upgrade verifier is report-only; S99verify performs no U-Boot env mutation"
+            return
+            ;;
+        am2)
+            ;;
+        *)
+            emit_check V14 false "unknown platform=$PLATFORM; S99verify refuses to mutate boot-commit state"
+            return
+            ;;
+    esac
+
+    if ! command -v fw_printenv >/dev/null 2>&1; then
+        emit_check V14 false "cannot observe Zynq upgrade_stage: fw_printenv unavailable; S99verify remains report-only"
         return
     fi
-    # Read current value. If empty or absent, nothing to clear -- that's
-    # also a success state.
-    cur=$(fw_printenv upgrade_stage 2>/dev/null | sed 's/^upgrade_stage=//')
-    if [ -z "$cur" ]; then
-        emit_check V14 true "upgrade_stage already empty in U-Boot env"
+    stage_line=$(fw_printenv upgrade_stage 2>/dev/null || true)
+    if [ -z "$stage_line" ]; then
+        emit_check V14 true "upgrade_stage already absent; commit authority remained with S99upgrade"
         return
     fi
-    # Commit authority belongs to the health-gated S99upgrade. If the V1..V13
-    # proof matrix is NOT all-green, S99verify must NOT clear upgrade_stage:
-    # leaving it set keeps U-Boot bootcount auto-revert (and S99upgrade's
-    # health-gated commit) armed so a broken/unhealthy slot is reverted on the
-    # next power cycle instead of being silently committed. S99verify is
-    # report-only here and never commits a failed slot.
-    if [ "$ALL_PASSED" != "true" ]; then
-        emit_check V14 true "upgrade_stage left SET ($cur) — proof matrix not all-green; auto-recovery armed (S99verify does not commit a failed slot)"
-        return
+    cur=$(printf '%s\n' "$stage_line" | sed 's/^upgrade_stage=//')
+    decision=""
+    if [ -r "$UPGRADE_COMMIT_MARKER" ]; then
+        decision=$(head -1 "$UPGRADE_COMMIT_MARKER" 2>/dev/null | tr -d '\r\n')
     fi
-    if fw_setenv upgrade_stage 2>/dev/null; then
-        # Confirm readback is empty.
-        readback=$(fw_printenv upgrade_stage 2>/dev/null | sed 's/^upgrade_stage=//')
-        if [ -z "$readback" ]; then
-            emit_check V14 true "upgrade_stage cleared (was: $cur)"
-        else
-            emit_check V14 false "fw_setenv ran but upgrade_stage readback still '$readback'"
-        fi
+    if [ "$decision" = "blocked" ]; then
+        emit_check V14 true "upgrade_stage left SET ($cur) - S99upgrade blocked commit; auto-recovery remains armed"
     else
-        emit_check V14 false "fw_setenv upgrade_stage failed"
+        emit_check V14 false "upgrade_stage still SET ($cur), S99upgrade decision='${decision:-missing}'; S99verify refuses to mutate commit state"
     fi
 }
 

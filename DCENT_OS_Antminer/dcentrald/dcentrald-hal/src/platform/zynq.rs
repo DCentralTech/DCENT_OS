@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 use std::fs;
 
-use super::{BoardType, ChainAccess, FanAccess, GpioAccess, Platform};
+use super::{BoardType, ChainAccess, FanAccess, GpioAccess, Platform, VoltageControllerKind};
 use crate::board_control::BoardControl;
 use crate::fan::{FanController, FanVariant};
 use crate::fpga_chain::FpgaChain;
@@ -425,6 +425,16 @@ impl Platform for ZynqPlatform {
         // on a different bank and is owned by the PSU module).
         let controller = GpioController::new()?;
         Ok(Box::new(ZynqGpioAccess { controller }))
+    }
+
+    fn voltage_controller(&self) -> VoltageControllerKind {
+        // `new()` refuses an inconclusive UIO/board-target identity, so this
+        // explicit compatibility value does not rely on the fail-closed trait
+        // default or on control-board family alone.
+        match self.variant {
+            ZynqVariant::S9 => VoltageControllerKind::Pic16f1704,
+            ZynqVariant::S17 | ZynqVariant::S19 => VoltageControllerKind::Dspic33Ep,
+        }
     }
 }
 

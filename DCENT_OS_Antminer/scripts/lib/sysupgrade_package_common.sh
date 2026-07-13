@@ -2,6 +2,23 @@
 #
 # Shared manifest/signature helpers for Buildroot board post-image scripts.
 
+if ! command -v dcent_release_provenance_init >/dev/null 2>&1; then
+    dcent_release_envelope_lib=""
+    if [ -n "${PROJECT_ROOT:-}" ] && [ -f "${PROJECT_ROOT}/scripts/lib/release_envelope.sh" ]; then
+        dcent_release_envelope_lib="${PROJECT_ROOT}/scripts/lib/release_envelope.sh"
+    elif [ -n "${BR2_EXTERNAL_DCENTOS_PATH:-}" ] &&
+         [ -f "${BR2_EXTERNAL_DCENTOS_PATH}/../scripts/lib/release_envelope.sh" ]; then
+        dcent_release_envelope_lib="${BR2_EXTERNAL_DCENTOS_PATH}/../scripts/lib/release_envelope.sh"
+    elif [ -f "scripts/lib/release_envelope.sh" ]; then
+        dcent_release_envelope_lib="scripts/lib/release_envelope.sh"
+    fi
+    [ -n "$dcent_release_envelope_lib" ] || {
+        echo "ERROR: cannot locate scripts/lib/release_envelope.sh" >&2
+        exit 1
+    }
+    . "$dcent_release_envelope_lib"
+fi
+
 dcent_is_truthy() {
     case "${1:-}" in
         1|true|TRUE|yes|YES|y|Y) return 0 ;;
@@ -105,6 +122,7 @@ dcent_stage_release_key() {
 
 dcent_write_sysupgrade_manifest() {
     dcent_require_release_image_hardening
+    dcent_release_provenance_init
     install_command="${DCENT_TOOLBOX_INSTALL_COMMAND:-dcent install <ip> -f dcentos-sysupgrade.tar}"
     update_command="${DCENT_TOOLBOX_UPDATE_COMMAND-$install_command}"
     upload_endpoint="${DCENT_TOOLBOX_UPLOAD_ENDPOINT:-null}"
@@ -149,8 +167,17 @@ dcent_write_sysupgrade_manifest() {
   "board": "${BOARD_NAME}",
   "board_target": "${BOARD_NAME}",
   "version": "${PACKAGE_VERSION}",
-  "created_at_utc": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "created_at_utc": "${DCENT_CREATED_AT_UTC}",
   "status": "${package_status}",${psu_config_mode_block}
+  "provenance": {
+    "source_commit": "${DCENT_SOURCE_COMMIT}",
+    "source_tree_state": "${DCENT_SOURCE_TREE_STATE}",
+    "source_date_epoch": ${SOURCE_DATE_EPOCH},
+    "source_commit_epoch": ${DCENT_SOURCE_COMMIT_EPOCH},
+    "build_target": "${DCENT_BUILD_TARGET}",
+    "build_arch": "${DCENT_BUILD_ARCH}",
+    "toolchain_id": "${DCENT_TOOLCHAIN_ID}"
+  },
   "target_side_sysupgrade": ${target_side_sysupgrade},
   "payloads": {
     "kernel": {
@@ -217,6 +244,7 @@ dcent_sign_sysupgrade_manifest() {
 # DCENT_RELEASE_KEY_STAGED/_SIZE/_SHA256 from dcent_stage_release_key, same as
 # dcent_write_sysupgrade_manifest.
 dcent_write_sdcard_payload_manifest() {
+    dcent_release_provenance_init
     package_status="${DCENT_PACKAGE_STATUS:-release}"
     sdcard_tar_prefix="${DCENT_SDCARD_TAR_PREFIX:-dcentos-${BOARD_NAME}-sdcard}"
 
@@ -242,8 +270,17 @@ dcent_write_sdcard_payload_manifest() {
   "board": "${BOARD_NAME}",
   "board_target": "${BOARD_NAME}",
   "version": "${PACKAGE_VERSION}",
-  "created_at_utc": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "created_at_utc": "${DCENT_CREATED_AT_UTC}",
   "status": "${package_status}",
+  "provenance": {
+    "source_commit": "${DCENT_SOURCE_COMMIT}",
+    "source_tree_state": "${DCENT_SOURCE_TREE_STATE}",
+    "source_date_epoch": ${SOURCE_DATE_EPOCH},
+    "source_commit_epoch": ${DCENT_SOURCE_COMMIT_EPOCH},
+    "build_target": "${DCENT_BUILD_TARGET}",
+    "build_arch": "${DCENT_BUILD_ARCH}",
+    "toolchain_id": "${DCENT_TOOLCHAIN_ID}"
+  },
   "nand_install": false,
   "payloads": {${payload_block}${verification_block}
   }

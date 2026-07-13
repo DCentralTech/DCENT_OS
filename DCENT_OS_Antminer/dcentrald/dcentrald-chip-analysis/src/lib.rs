@@ -18,11 +18,15 @@
 //! This crate is intentionally independent from HAL, async runtimes,
 //! sockets, the filesystem, and any miner hardware. It is reusable chip-
 //! health math for **any** multi-chip hashboard (Antminer + WhatsMiner) —
-//! the per-chip telemetry pipeline that feeds it does not exist yet, so
-//! nothing depends on this crate today. It is a **precursor** to the B26
-//! autotuner chip-health integration, which is a separate, expert-review-
-//! gated follow-up (Group B). Adding a dependency edge into a live
-//! mining/voltage/thermal path is explicitly NOT done here.
+//! # Consumers
+//!
+//! - `dcentrald-diagnostics::chip_analysis_bridge` (2026-07-11) — first dependency
+//!   edge; pure host-testable bridge. Live ChipMap enrichment still optional.
+//! - Future: autotuner B26 chip-health, toolbox, bench (`dcent-diag-core`).
+//!
+//! Do not re-implement Laplacian / z-score / nonce-deficit outside this crate.
+//! Adding a dependency edge into a live mining/voltage/thermal path remains
+//! expert-review-gated.
 //!
 //! All three primitives share the same "hot-spot only" convention from the
 //! source: they report **0.0** when a chip is performing at-or-better-than

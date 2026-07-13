@@ -90,6 +90,8 @@ pub const PWM_MAX_LEGACY_7BIT: u8 = 127;
 pub const PWM_QUIET_BOOT: u8 = 10;
 
 /// Safety maximum PWM command for the home-mining cap.
+///
+/// Must stay equal to `dcentrald_common::HOME_FAN_PWM_SAFETY_MAX` (pinned in tests).
 pub const PWM_SAFETY_MAX: u8 = 30;
 
 /// Safety maximum PWM for industrial full-power S19j Pro / S19 hashrates.
@@ -130,6 +132,21 @@ impl FanVariant {
             Self::Am2Uio16 => 2,
         }
     }
+
+    /// Tach register wired to a physical fan position, when observable.
+    ///
+    /// AM1/S9 fan position 0 is physically present but its FAN0 tach input is
+    /// known to be unwired. Keeping that as `None` is important: callers must
+    /// neither mistake the permanent zero for a stalled fan nor silently treat
+    /// a max-across-channels reading as evidence for every physical position.
+    pub const fn tach_channel_for_physical_fan(self, physical_fan: u8) -> Option<u8> {
+        match (self, physical_fan) {
+            (Self::Am1S9, 0) => None,
+            (Self::Am1S9, 1) => Some(1),
+            (Self::Am2Uio16, 0..=3) => Some(physical_fan),
+            _ => None,
+        }
+    }
 }
 
 /// Name-based discovery result for the `fan-control` UIO device.
@@ -150,6 +167,34 @@ pub struct FanRawRegister {
     pub offset: u32,
     /// Raw 32-bit register value read at `offset`.
     pub value: u32,
+}
+
+/// One bounded tach read for every physical fan position in a variant.
+///
+/// `rpm_by_physical_fan.len()` is always [`FanVariant::physical_fan_count`].
+/// `None` means the variant explicitly declares that physical position's tach
+/// input unwired; `Some(0)` means an observable channel reported no motion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FanTachSnapshot {
+    /// Hardware layout used to interpret the register block.
+    pub variant: FanVariant,
+    /// RPM evidence indexed by physical fan position.
+    pub rpm_by_physical_fan: Vec<Option<u32>>,
+}
+
+impl FanTachSnapshot {
+    /// True only when at least one tach is observable and every observable
+    /// physical-fan channel reports motion in this snapshot.
+    pub fn all_required_channels_moving(&self) -> bool {
+        let mut observable = 0usize;
+        for rpm in self.rpm_by_physical_fan.iter().flatten() {
+            observable += 1;
+            if *rpm == 0 {
+                return false;
+            }
+        }
+        observable > 0
+    }
 }
 
 /// Aligned fan-control offsets read by the raw diagnostic dump.
@@ -572,6 +617,24 @@ impl FanController {
         max_rps * 60
     }
 
+    /// Read RPM evidence by physical fan position using the variant's explicit
+    /// wiring map. Unlike [`get_rpm`], this never hides a stalled required fan
+    /// behind another channel's higher RPM.
+    pub fn get_tach_snapshot(&self) -> FanTachSnapshot {
+        let rps = self.read_all_rps();
+        let rpm_by_physical_fan = (0..self.variant.physical_fan_count())
+            .map(|physical_fan| {
+                self.variant
+                    .tach_channel_for_physical_fan(physical_fan)
+                    .map(|tach_channel| rps.get(tach_channel as usize).copied().unwrap_or(0) * 60)
+            })
+            .collect();
+        FanTachSnapshot {
+            variant: self.variant,
+            rpm_by_physical_fan,
+        }
+    }
+
     /// Get the current PWM value (0-100).
     pub fn get_speed_pwm(&self) -> u8 {
         self.get_speed_pwm_channels().0
@@ -732,6 +795,16 @@ mod tests {
     /// pre-existing `PWM_SAFETY_MAX <= PWM_MAX` check would still pass if someone
     /// bumped this to 90 — which would silently un-cap (blast) every safety fan
     /// path. Pin the exact value so that regression fails here.
+    /// Must match `dcentrald_common::HOME_FAN_PWM_SAFETY_MAX` / FanCommand policy.
+    #[test]
+    fn pwm_safety_max_matches_common_home_cap() {
+        assert_eq!(
+            PWM_SAFETY_MAX,
+            dcentrald_common::HOME_FAN_PWM_SAFETY_MAX,
+            "HAL PWM_SAFETY_MAX drifted from dcentrald-common home cap"
+        );
+    }
+
     #[test]
     fn pwm_safety_max_is_thirty() {
         assert_eq!(
@@ -789,10 +862,18 @@ mod tests {
         assert_eq!(FanVariant::Am1S9.physical_fan_count(), 2);
         assert_eq!(FanVariant::Am1S9.tach_channel_count(), 2);
         assert_eq!(FanVariant::Am1S9.pwm_command_channel_count(), 2);
+        assert_eq!(FanVariant::Am1S9.tach_channel_for_physical_fan(0), None);
+        assert_eq!(FanVariant::Am1S9.tach_channel_for_physical_fan(1), Some(1));
 
         assert_eq!(FanVariant::Am2Uio16.physical_fan_count(), 4);
         assert_eq!(FanVariant::Am2Uio16.tach_channel_count(), 4);
         assert_eq!(FanVariant::Am2Uio16.pwm_command_channel_count(), 2);
+        for physical_fan in 0..4 {
+            assert_eq!(
+                FanVariant::Am2Uio16.tach_channel_for_physical_fan(physical_fan),
+                Some(physical_fan)
+            );
+        }
 
         assert_eq!(
             per_fan_rpm_from_rps(FanVariant::Am1S9, &[0, 42]),
@@ -804,6 +885,27 @@ mod tests {
             vec![(0, 0), (1, 2520), (2, 0), (3, 60)],
             "AM2 must expose all four fans, including stalled zero-RPM channels"
         );
+    }
+
+    #[test]
+    fn tach_snapshot_requires_motion_on_every_observable_physical_channel() {
+        let s9 = FanTachSnapshot {
+            variant: FanVariant::Am1S9,
+            rpm_by_physical_fan: vec![None, Some(2_400)],
+        };
+        assert!(s9.all_required_channels_moving());
+
+        let one_stalled_am2 = FanTachSnapshot {
+            variant: FanVariant::Am2Uio16,
+            rpm_by_physical_fan: vec![Some(2_400), Some(2_300), Some(0), Some(2_200)],
+        };
+        assert!(!one_stalled_am2.all_required_channels_moving());
+
+        let all_moving_am2 = FanTachSnapshot {
+            variant: FanVariant::Am2Uio16,
+            rpm_by_physical_fan: vec![Some(2_400), Some(2_300), Some(2_100), Some(2_200)],
+        };
+        assert!(all_moving_am2.all_required_channels_moving());
     }
 
     #[test]

@@ -29,7 +29,7 @@
 //!    communicating over mpsc channels (the same channels `serial_mining.rs` uses).
 //!  - `dcentrald_stratum::WorkBuilder::next_work` (coinbase → merkle root →
 //!    midstate → `MiningWork`).
-//!  - `dcentrald_stratum::work::validate_full_header` (the same SHA-256d share
+//!  - `dcentrald_stratum::share_pipeline::validate_full_header` (the same SHA-256d share
 //!    gate that got DCENT_axe / S9 their accepted shares) + dedup-before-submit
 //!.
 //!  - `dcentrald_asic::bm1362::Am335xUartTransport` for paced 88-byte BM1362
@@ -56,7 +56,7 @@
 //!    BM1366-family full-header payload][CRC16-CCITT-FALSE hi, lo]` — built here
 //!    by [`build_bm1362_serial_work_frame`] (verbatim from the proven
 //!    `serial_mining.rs` builder, which operates on the same
-//!    `dcentrald_stratum::work::MiningWork`). Payload: `job_id(1) num_midstates=0x01(1)
+//!    `dcentrald_stratum::share_pipeline::MiningWork`). Payload: `job_id(1) num_midstates=0x01(1)
 //!    starting_nonce=0(4) nbits(4 LE) ntime(4 LE) merkle_root(32, 32-bit-word-reversed)
 //!    prev_block_hash(32, 32-bit-word-reversed) version(4 LE)`.
 //!  - **NO open-core dummy-work**: BM1362 is not the BM1387 14 nm — it activates
@@ -101,16 +101,19 @@
 //! -  — the v1 cold-boot sequence + the LuxOS wire capture
 
 use std::collections::{HashSet, VecDeque};
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+
+use dcentrald_api_types::dspic_frame::{decode_framed_sum_reply_body, DspicOpcode};
 
 use dcentrald_asic::bm1362::{
     build_broadcast_write_frame, build_chain_inactive_frame, build_get_address_frame,
@@ -124,18 +127,29 @@ use dcentrald_asic::bm1362::{
 };
 use dcentrald_asic::drivers::bm1362::{
     pll_lookup as bm1362_pll_lookup, pll_ramp_sequence as bm1362_pll_ramp_sequence,
-    BM1362_INIT_PLAN,
+    BM1362_INIT_PLAN, CHIP_ID as BM1362_CHIP_ID,
 };
 use dcentrald_hal::i2c::{
-    spawn_i2c_service_no_register_touch_with_denylist, I2cServiceHandle, I2cTransactionStep,
+    spawn_i2c_service_no_register_touch_with_denylist, I2cDspicDisableProtocol, I2cMutationLabel,
+    I2cServiceHandle, I2cTransactionStep,
 };
-use dcentrald_hal::platform::beaglebone::BeagleBonePlatform;
-use dcentrald_hal::platform::{FanAccess, Platform};
+use dcentrald_hal::platform::beaglebone::{
+    authorize_am3_bb_identity, read_active_board_target_name, BeagleBonePlatform,
+};
+use dcentrald_hal::platform::{
+    FanAccess, FanCommandReceipt, HardwareMutationGate, HardwareMutationGateOwner, Platform,
+};
 use dcentrald_hal::psu_apw_uart_tunnel::{ApwUartTunnel, ApwUartTunnelBus};
 use dcentrald_hal::serial::DevmemUart;
 use dcentrald_hal::serial_chain::SerialChainBackend;
 
 use crate::config::DcentraldConfig;
+use crate::model;
+use crate::runtime::safety_watchdog::{
+    SafetyLiveness, SafetyWatchdogOwner, WatchdogCloseoutReceipt, WatchdogDisarmPermit,
+    DEFAULT_WATCHDOG_STOP_TIMEOUT, DEFAULT_WATCHDOG_TEARDOWN_GRACE,
+};
+use crate::runtime::thread_guard::{RuntimeThreadGuard, ThreadStopSummary};
 
 /// Number of distinct nonce→work correlation slots (`work_by_id` length).
 ///
@@ -145,7 +159,7 @@ use crate::config::DcentraldConfig;
 /// table 256 (indexing by the 0..120 echoed value is always in range) and let
 /// the dispatcher step by [`JOB_ID_INCREMENT`].
 const ASIC_JOB_ID_SPAN: usize = 256;
-const WORK_HISTORY_PER_ECHOED_JOB_ID: usize = 128;
+const WORK_HISTORY_PER_ECHOED_JOB_ID: usize = dcentrald_common::AM3_BB_WORK_HISTORY_PER_ID;
 const ASIC_JOB_ID_MASK: u8 = 0x7F;
 
 /// Dispatcher job-id step. Must be a multiple of 8 so it round-trips through the
@@ -167,6 +181,115 @@ const VERSION_ROLLING_FIELD_MASK: u32 = 0x1FFF_E000;
 /// the full 88-byte wire frame including this preamble.
 const BM13XX_CMD_PREAMBLE: [u8; 2] = [0x55, 0xAA];
 
+/// Wire shape observed in the accepted-share AM3-BB captures for a BM1362
+/// GetAddress response: `AA 55 13 62 03 00 00 00 0D` (9 bytes total).
+///
+/// Other BM1362 protocol material describes an 11-byte nonce response, not this
+/// discovery shape. The lower five trailer bits are covered by the distinct
+/// response-specific CRC state machine; they are not the shared host-command
+/// CRC5. Trailer bits 6:5 remain opaque. The repeated live frame is explicitly
+/// an unassigned observation: repetitions do not prove unique chips or a chip
+/// count, and this diagnostic surface cannot authorize Measured/High identity.
+const BM13XX_GET_ADDRESS_RESPONSE_FRAME_BYTES: usize = 9;
+const BM13XX_RESPONSE_PREAMBLE: [u8; 2] = [0xAA, 0x55];
+const BM1362_UNASSIGNED_GET_ADDRESS_PAYLOAD: [u8; 6] = [0x13, 0x62, 0x03, 0x00, 0x00, 0x00];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GetAddressIntegrity {
+    /// Lower-five-bit command-response CRC verified. Bits 6:5 remain opaque.
+    CommandResponseCrc5Verified,
+}
+
+/// Diagnostic-only interpretation of one raw AM3-BB GetAddress capture.
+///
+/// `response_frames` counts byte frames, not unique ASICs. The type contains no
+/// chip-count or assigned-address claim and cannot be converted into the
+/// standard daemon's enumeration receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CrcVerifiedUnassignedGetAddressObservation {
+    response_frames: usize,
+    raw_bytes: usize,
+    integrity: GetAddressIntegrity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GetAddressInspectionError {
+    Empty,
+    IncompleteFrame {
+        raw_bytes: usize,
+    },
+    BadPreamble {
+        frame_index: usize,
+    },
+    JobResponseTrailer {
+        frame_index: usize,
+    },
+    BadResponseCrc5 {
+        frame_index: usize,
+        expected: u8,
+        observed: u8,
+    },
+    NotRecordedUnassignedPayload {
+        frame_index: usize,
+    },
+}
+
+/// Strictly split a raw AM3-BB GetAddress capture into the 9-byte response
+/// frames proven by live logs. No resynchronization is attempted: leading
+/// noise, truncated UART reads, job responses, CRC failures, and any payload
+/// other than the retained unassigned observation are rejected.
+///
+/// Trailer bits 6:5 are deliberately ignored. Frame repetition is not unique
+/// chip or count evidence, so this remains diagnostic-only.
+fn inspect_am3_bb_get_address_stream(
+    raw: &[u8],
+) -> std::result::Result<CrcVerifiedUnassignedGetAddressObservation, GetAddressInspectionError> {
+    if raw.is_empty() {
+        return Err(GetAddressInspectionError::Empty);
+    }
+    if !raw
+        .len()
+        .is_multiple_of(BM13XX_GET_ADDRESS_RESPONSE_FRAME_BYTES)
+    {
+        return Err(GetAddressInspectionError::IncompleteFrame {
+            raw_bytes: raw.len(),
+        });
+    }
+
+    let mut response_frames = 0usize;
+    for (frame_index, frame) in raw
+        .chunks_exact(BM13XX_GET_ADDRESS_RESPONSE_FRAME_BYTES)
+        .enumerate()
+    {
+        if frame[..2] != BM13XX_RESPONSE_PREAMBLE {
+            return Err(GetAddressInspectionError::BadPreamble { frame_index });
+        }
+        let trailer = frame[8];
+        if trailer & 0x80 != 0 {
+            return Err(GetAddressInspectionError::JobResponseTrailer { frame_index });
+        }
+        let expected = dcentrald_asic::protocol::bm13xx_command_response_crc5(&frame[2..8]);
+        let observed = trailer & 0x1F;
+        if observed != expected {
+            return Err(GetAddressInspectionError::BadResponseCrc5 {
+                frame_index,
+                expected,
+                observed,
+            });
+        }
+        if frame[2..8] != BM1362_UNASSIGNED_GET_ADDRESS_PAYLOAD {
+            return Err(GetAddressInspectionError::NotRecordedUnassignedPayload { frame_index });
+        }
+        response_frames += 1;
+    }
+
+    Ok(CrcVerifiedUnassignedGetAddressObservation {
+        response_frames,
+        raw_bytes: raw.len(),
+        integrity: GetAddressIntegrity::CommandResponseCrc5Verified,
+    })
+}
+
 /// Reverse 32-bit word order within a 32-byte array (8 words, MSB-first ↔
 /// LSB-first). Verbatim from `dcentrald_asic::drivers::bm1362::reverse_32bit_words`
 /// / `serial_mining.rs::reverse_32bit_words` — BM1362 expects `merkle_root` and
@@ -180,7 +303,7 @@ fn reverse_32bit_words(data: &[u8; 32]) -> [u8; 32] {
 }
 
 /// Build the PROVEN 88-byte BM1362 serial-work wire frame from a Stratum
-/// [`dcentrald_stratum::work::MiningWork`].
+/// [`dcentrald_stratum::share_pipeline::MiningWork`].
 ///
 /// Verbatim port of the canonical BM1362 builder in `serial_mining.rs`
 /// (the Amlogic-NoPic / BeagleBone serial path): wire =
@@ -190,7 +313,7 @@ fn reverse_32bit_words(data: &[u8; 32]) -> [u8; 32] {
 /// `dcentrald_asic::drivers::bm1362::build_serial_work_frame` (which takes the
 /// other `MiningWork` type) byte-for-byte.
 fn build_bm1362_serial_work_frame(
-    work: &dcentrald_stratum::work::MiningWork,
+    work: &dcentrald_stratum::share_pipeline::MiningWork,
     asic_job_id: u8,
 ) -> [u8; 88] {
     let mut payload = [0u8; 82];
@@ -228,7 +351,7 @@ fn build_bm1362_serial_work_frame(
 /// description. Keeping this builder next to the serial88 builder lets the
 /// bench prove or kill that hypothesis without changing the default path.
 fn build_bm1362_asic86_work_frame(
-    work: &dcentrald_stratum::work::MiningWork,
+    work: &dcentrald_stratum::share_pipeline::MiningWork,
     asic_job_id: u8,
     sno: u32,
 ) -> AsicWorkFrame {
@@ -389,6 +512,8 @@ const ENV_AM3_BB_WORK_CODEC: &str = "DCENT_AM3_BB_WORK_CODEC";
 const AM3_BB_DSPIC_I2C_BUS: u8 = 0;
 const AM3_BB_DSPIC_BASE_ADDR: u8 = 0x20;
 const AM3_BB_DSPIC_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
+const AM3_BB_DSPIC_HEARTBEAT_READINESS_TIMEOUT_MS: u64 = 5_000;
+const AM3_BB_DSPIC_HEARTBEAT_STOP_TIMEOUT_MS: u64 = 2_000;
 const AM3_BB_DSPIC_POST_ENABLE_RESET_ASSERT_MS: u64 = 200;
 const AM3_BB_DSPIC_POST_ENABLE_RESET_RELEASE_MS: u64 = 1_100;
 const AM3_BB_DSPIC_INTER_CHAIN_RESET_MS: u64 = 10;
@@ -402,6 +527,10 @@ const AM3_BB_FAN_SAFE_FLOOR_PWM: u8 = 10;
 const AM3_BB_FAN_HARD_CAP_PWM: u8 = 30;
 const AM3_BB_HASHBOARD_EEPROM_DENYLIST: [u8; 8] = [0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57];
 const AM3_BB_LM75_SENSOR_ADDRS: [u8; 4] = [0x48, 0x49, 0x4A, 0x4B];
+/// A chain contributes fresh thermal proof only when at least one of its LM75
+/// bridge reads decodes successfully. Requiring this independently for every
+/// expected chain prevents a healthy board from masking a silent peer.
+const AM3_BB_THERMAL_MIN_SAMPLES_PER_CHAIN: usize = 1;
 const AM3_BB_LM75_REPLY_LEN: usize = 7;
 const AM3_BB_LM75_MIN_VALID_C: f32 = -20.0;
 const AM3_BB_LM75_MAX_VALID_C: f32 = 125.0;
@@ -419,13 +548,31 @@ const AM3_BB_THERMAL_MIN_POLL_MS: u64 = 1_000;
 // 3-step ceiling reaches the cap in ~7 ticks (~14 s at the 2 s default) — fast
 // enough for the 2-4 s BM1362 thermal time constant, slow enough to stay quiet.
 const AM3_BB_FAN_PID_MAX_STEP_PWM: u8 = 3;
+const AM3_BB_GPIO_SYSFS_ROOT: &str = "/sys/class/gpio";
+const AM3_BB_WATCHDOG_BRINGUP_GRACE: Duration = Duration::from_secs(180);
+const AM3_BB_API_MUTATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn am3_bb_thermal_poll_interval(pid_interval_s: f32) -> Duration {
+    let millis =
+        ((pid_interval_s.max(1.0) * 1000.0).round() as u64).max(AM3_BB_THERMAL_MIN_POLL_MS);
+    Duration::from_millis(millis)
+}
+
+fn am3_bb_expected_safety_liveness_interval(pid_interval_s: f32) -> Duration {
+    // Allow one bounded controller/I2C margin beyond the configured thermal
+    // cadence. The watchdog derives its stall limit from this value, so a
+    // legitimate slow policy does not look like a dead safety loop.
+    am3_bb_thermal_poll_interval(pid_interval_s).saturating_add(Duration::from_secs(2))
+}
 
 const AM3_BB_DSPIC_RESET_FRAME: &[u8] = &[0x55, 0xAA, 0x04, 0x07, 0x00, 0x0B];
 const AM3_BB_DSPIC_JUMP_FRAME: &[u8] = &[0x55, 0xAA, 0x04, 0x06, 0x00, 0x0A];
 const AM3_BB_DSPIC_GET_VERSION_FRAME: &[u8] = &[0x55, 0xAA, 0x04, 0x17, 0x00, 0x1B];
+#[cfg(test)]
 const AM3_BB_DSPIC_DISABLE_FRAME: &[u8] = &[0x55, 0xAA, 0x05, 0x15, 0x00, 0x00, 0x1A];
 const AM3_BB_DSPIC_ENABLE_FRAME: &[u8] = &[0x55, 0xAA, 0x05, 0x15, 0x01, 0x00, 0x1B];
 const AM3_BB_DSPIC_HEARTBEAT_FRAME: &[u8] = &[0x55, 0xAA, 0x04, 0x16, 0x00, 0x1A];
+const AM3_BB_DSPIC_HEARTBEAT_REPLY_PAYLOAD: &[u8] = &[0x01, 0x00, 0x00];
 const AM3_BB_DSPIC_PROBE_3B_48_FRAME: &[u8] = &[0x55, 0xAA, 0x06, 0x3B, 0x48, 0x00, 0x00, 0x89];
 const AM3_BB_DSPIC_READ_VOLTAGE_FRAME: &[u8] = &[0x55, 0xAA, 0x04, 0x3A, 0x00, 0x3E];
 
@@ -628,17 +775,62 @@ impl ApwUartTunnelBus for DirectI2cApwBus {
 ///    `/proc/device-tree/model` contains `S19J_IO_BOARD` (LuxOS bring-up
 ///    unit before the DCENT_OS board-target file has been written).
 pub fn auto_detect_am3_bb() -> bool {
-    let board_target = std::fs::read_to_string("/etc/dcentos/board_target")
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if board_target == "am3-bb-s19jpro" {
-        return true;
+    let Ok(marker) = read_active_board_target_name() else {
+        return false;
+    };
+    let compatible = std::fs::read("/proc/device-tree/compatible").unwrap_or_default();
+    let dt_model = std::fs::read("/proc/device-tree/model").unwrap_or_default();
+    authorize_am3_bb_identity(marker.as_deref(), &compatible, &dt_model).is_ok()
+}
+
+/// Resolve the BM1362 chain geometry without manufacturing a default.
+///
+/// The exact AM3-BB identity gate authorizes the S19j Pro catalog entry. An
+/// operator may override its per-chain count explicitly, but any explicit
+/// model/chip-family declarations must agree with that hardware identity.
+fn resolve_am3_bb_chips_per_chain(
+    configured_model: Option<&str>,
+    configured_chip_type: Option<&str>,
+    configured_count: Option<u8>,
+) -> Result<usize> {
+    if let Some(chip_type) = configured_chip_type {
+        if !chip_type.trim().eq_ignore_ascii_case("BM1362") {
+            anyhow::bail!(
+                "am3-bb: mining.serial_chip_type={chip_type:?} conflicts with the authorized BM1362 S19j Pro topology"
+            );
+        }
     }
 
-    let compatible = std::fs::read_to_string("/proc/device-tree/compatible").unwrap_or_default();
-    let model = std::fs::read_to_string("/proc/device-tree/model").unwrap_or_default();
-    compatible.contains("am335x") && model.contains("S19J_IO_BOARD")
+    let catalog = if let Some(configured_model) = configured_model {
+        let spec = model::lookup_model(configured_model).ok_or_else(|| {
+            anyhow::anyhow!(
+                "am3-bb: mining.model={configured_model:?} is not a supported catalog model"
+            )
+        })?;
+        if spec.model_key != "s19jpro" || spec.chip_label != "BM1362" {
+            anyhow::bail!(
+                "am3-bb: mining.model={configured_model:?} resolves to {}/{} and conflicts with S19j Pro/BM1362",
+                spec.model_key,
+                spec.chip_label
+            );
+        }
+        spec
+    } else {
+        model::lookup_model("s19jpro")
+            .ok_or_else(|| anyhow::anyhow!("am3-bb: S19j Pro catalog geometry is unavailable"))?
+    };
+
+    if let Some(count) = configured_count {
+        if count == 0 {
+            anyhow::bail!("am3-bb: mining.serial_chip_count must be at least 1");
+        }
+        return Ok(usize::from(count));
+    }
+
+    catalog
+        .chips_per_chain_hint
+        .map(usize::from)
+        .ok_or_else(|| anyhow::anyhow!("am3-bb: catalog has no S19j Pro chips-per-chain evidence"))
 }
 
 // ===========================================================================
@@ -710,17 +902,61 @@ pub fn chain_uart_specs(platform: &BeagleBonePlatform) -> Vec<ChainUartSpec> {
 /// plumbing (LIVE-VALIDATED on `a lab unit`); step 8 is the Stratum mining loop
 /// (Option B2 — reuses `dcentrald_stratum` + the `Am335xUartTransport`).
 /// `DCENT_AM3_BB_STUB_LOOP=1` keeps the old logging-only stub instead.
-pub async fn run_am3_bb_mining(config: DcentraldConfig, shutdown: CancellationToken) -> Result<()> {
+/// Pre-energize ownership bundle shared by the AM3-BB engine and its API.
+/// Construction is possible only after the SoC watchdog reports an initial
+/// kick. The mutation gate is then the single API admission domain retained
+/// through teardown.
+pub(crate) struct Am3BbSafetyAdmission {
+    watchdog: SafetyWatchdogOwner,
+    liveness: SafetyLiveness,
+    hardware_mutation_owner: HardwareMutationGateOwner,
+}
+
+impl Am3BbSafetyAdmission {
+    pub(crate) async fn start(config: &DcentraldConfig) -> Result<Self> {
+        let liveness = SafetyLiveness::default();
+        let expected_liveness =
+            am3_bb_expected_safety_liveness_interval(config.thermal.pid_interval_s);
+        let (watchdog, admission) = SafetyWatchdogOwner::start_before_energizing(
+            &config.watchdog,
+            AM3_BB_WATCHDOG_BRINGUP_GRACE,
+            expected_liveness,
+            liveness.clone(),
+        )
+        .await?;
+        let receipt = admission.require_armed("am3-bb")?;
+        info!(
+            requested_timeout_s = receipt.requested_timeout_s,
+            effective_timeout_s = receipt.effective_timeout_s,
+            kick_interval_s = receipt.kick_interval_s,
+            bringup_grace_s = AM3_BB_WATCHDOG_BRINGUP_GRACE.as_secs(),
+            expected_liveness_ms = expected_liveness.as_millis(),
+            "am3-bb: pre-energize watchdog ownership admitted"
+        );
+        let hardware_mutation_owner = HardwareMutationGateOwner::new_pending();
+        Ok(Self {
+            watchdog,
+            liveness,
+            hardware_mutation_owner,
+        })
+    }
+
+    pub(crate) fn hardware_mutation_gate(&self) -> HardwareMutationGate {
+        self.hardware_mutation_owner.gate()
+    }
+}
+
+pub async fn run_am3_bb_mining(
+    config: DcentraldConfig,
+    shutdown: CancellationToken,
+    safety_admission: Am3BbSafetyAdmission,
+) -> Result<()> {
     info!("Entering AM335x BB mining mode (--am3-bb-mining) — S19J_IO_BOARD_V2_0 / .79-class");
 
     if !config.mining_start_enabled() && std::env::var_os("DCENT_AM3_BB_STUB_LOOP").is_none() {
-        warn!(
-            mining_enabled = config.mining.enabled,
-            pool_configured = config.has_configured_pool(),
-            "am3-bb: mining is disabled or no pool is configured; keeping API/MCP reachable and refusing hardware cold-boot"
+        anyhow::bail!(
+            "am3-bb: mining is disabled or no pool is configured; refusing hardware cold-boot after safety admission"
         );
-        shutdown.cancelled().await;
-        return Ok(());
     }
 
     // The cold-boot + chip-init is blocking device I/O (mmap UART, i2c-gpio
@@ -730,10 +966,11 @@ pub async fn run_am3_bb_mining(config: DcentraldConfig, shutdown: CancellationTo
     // called) keep ticking, and the `StratumRouter` runs on the captured
     // runtime handle (mpsc channels bridge the two).
     let rt_handle = tokio::runtime::Handle::current();
-    let result =
-        tokio::task::spawn_blocking(move || run_am3_bb_blocking(config, shutdown, rt_handle))
-            .await
-            .context("am3-bb mining blocking task panicked")?;
+    let result = tokio::task::spawn_blocking(move || {
+        run_am3_bb_blocking(config, shutdown, rt_handle, safety_admission)
+    })
+    .await
+    .context("am3-bb mining blocking task panicked")?;
     result
 }
 
@@ -742,12 +979,45 @@ fn run_am3_bb_blocking(
     config: DcentraldConfig,
     shutdown: CancellationToken,
     rt_handle: tokio::runtime::Handle,
+    safety_admission: Am3BbSafetyAdmission,
 ) -> Result<()> {
+    // Declare the watchdog first so every later hardware owner drops before
+    // its fail-closed owner on early-return paths.
+    let Am3BbSafetyAdmission {
+        mut watchdog,
+        liveness: watchdog_liveness,
+        hardware_mutation_owner,
+    } = safety_admission;
+    // Validate every operator assertion and resolve catalog-backed geometry
+    // before BeagleBonePlatform::new can probe I2C controller identity.
+    let expected_chips_per_chain = resolve_am3_bb_chips_per_chain(
+        config.mining.model.as_deref(),
+        config.mining.serial_chip_type.as_deref(),
+        config.mining.serial_chip_count,
+    )?;
+
     // ── 1. Build the platform (loads /etc/dcentos/board_targets/<name>.toml,
     //       or the hardcoded .79 defaults; side-effect-free). ──
     let platform = BeagleBonePlatform::new().context("BeagleBonePlatform::new() failed")?;
     let bt = platform.board_target();
     let chain_specs = chain_uart_specs(&platform);
+    let stub_loop = std::env::var_os("DCENT_AM3_BB_STUB_LOOP").is_some();
+    if !stub_loop {
+        for forbidden_override in [
+            ENV_AM3_BB_SKIP_DSPIC_INIT,
+            ENV_AM3_BB_SKIP_DSPIC_HEARTBEAT,
+            ENV_AM3_BB_DSPIC_EARLY_ENABLE,
+            ENV_AM3_BB_DISABLE_HEARTBEAT_SUPERVISOR,
+            ENV_AM3_BB_SKIP_THERMAL_SUPERVISOR,
+            ENV_AM3_BB_DISABLE_FAN_PID,
+        ] {
+            if env_flag_set(forbidden_override) {
+                anyhow::bail!(
+                    "am3-bb: watched Mining admission forbids safety override {forbidden_override}"
+                );
+            }
+        }
+    }
     info!(
         board_target = %platform.board_target_name(),
         chain_count = bt.uart.chain_count,
@@ -762,10 +1032,9 @@ fn run_am3_bb_blocking(
         voltage_controller = ?platform.voltage_controller(),
         "am3-bb: loaded board topology"
     );
-    // Expected per-chain chip count (operator config; `a lab unit` says 126; fallback
-    // 126). Used for address assignment because the live GetAddress response
-    // can be truncated before all 126 chips are counted.
-    let expected_chips_per_chain = config.mining.serial_chip_count.unwrap_or(126) as usize;
+    // Expected per-chain chip count comes from an explicit override or the
+    // S19j Pro catalog. It is used for address assignment because the live
+    // GetAddress response can be truncated before every chip is counted.
     let target_freq_mhz = config.mining.frequency_mhz.clamp(400, 597);
     info!(
         expected_chips_per_chain,
@@ -792,7 +1061,7 @@ fn run_am3_bb_blocking(
         chain_specs.len(),
         config.thermal.fan_min_pwm,
         config.thermal.fan_max_pwm,
-    ));
+    )?);
     // Arm the crash-panic-hook teardown (panic="abort" bypasses the guard's Drop).
     // Done here, before board-enable is driven HIGH, so even a panic during
     // cold-boot cuts board power via main()'s panic hook. (wf_7c757213 safety audit.)
@@ -1003,7 +1272,7 @@ fn run_am3_bb_blocking(
     // BM1362 work starts. Keep EEPROM writes denied on 0x50..=0x57, replay the
     // traced app-mode sequence, and keep 1 Hz heartbeat replies drained while
     // mining.
-    let mut _dspic_heartbeat_guard: Option<Am3BbDspicHeartbeatGuard> = None;
+    let mut dspic_heartbeat_guard: Option<Am3BbDspicHeartbeatGuard> = None;
     let mut dspic_i2c_main: Option<I2cServiceHandle> = None;
     let mut active_dspic_addrs: Vec<u8> = Vec::new();
     let dspic_target_voltage_mv = am3_bb_dspic_target_voltage_mv(config.mining.voltage_mv);
@@ -1040,6 +1309,16 @@ fn run_am3_bb_blocking(
                 "am3-bb: LuxOS-style dsPIC sequence active - controller init now, rail enable after BM1362 chip init"
             );
         }
+        let conservatively_owned_dspic_addrs = (0..chain_specs.len())
+            .map(am3_bb_dspic_addr_for_chain)
+            .collect::<Vec<_>>();
+        if let Some(guard) = _run_safety_guard.as_mut() {
+            // Take ownership before the first controller sequence. With the
+            // installed early-enable policy, an enable can complete before a
+            // later readback/heartbeat fails; that address must never vanish
+            // from teardown merely because init did not return success.
+            guard.set_dspic(dspic_i2c.clone(), conservatively_owned_dspic_addrs.clone());
+        }
         active_dspic_addrs = am3_bb_dspic_init_all(
             &dspic_i2c,
             chain_specs.len(),
@@ -1052,6 +1331,13 @@ fn run_am3_bb_blocking(
                 AM3_BB_DSPIC_I2C_BUS
             );
         }
+        if !stub_loop && active_dspic_addrs != conservatively_owned_dspic_addrs {
+            anyhow::bail!(
+                "am3-bb: production mining requires exact dsPIC topology {:?}, observed {:?}; refusing partially owned hash power",
+                conservatively_owned_dspic_addrs,
+                active_dspic_addrs
+            );
+        }
         info!(
             active_dspic_addrs = format_args!("{:02X?}", active_dspic_addrs),
             "am3-bb: hashboard dsPIC controllers initialized"
@@ -1061,25 +1347,37 @@ fn run_am3_bb_blocking(
             guard.set_dspic(dspic_i2c.clone(), active_dspic_addrs.clone());
         }
 
-        am3_bb_post_dspic_reset_chains(&platform, chain_specs.len())
-            .context("am3-bb: post-dsPIC ASIC reset pulse failed")?;
-
         if env_flag_set(ENV_AM3_BB_SKIP_DSPIC_HEARTBEAT) {
             warn!(
                 env = ENV_AM3_BB_SKIP_DSPIC_HEARTBEAT,
                 "am3-bb: lab override active — dsPIC runtime heartbeat thread disabled"
             );
         } else {
-            _dspic_heartbeat_guard = Some(start_am3_bb_dspic_heartbeat(
+            let mut heartbeat_guard = start_am3_bb_dspic_heartbeat(
                 dspic_i2c.clone(),
                 active_dspic_addrs.clone(),
                 shutdown.clone(),
-            )?);
+                &platform,
+            )?;
+            let readiness = heartbeat_guard
+                .wait_for_verified_heartbeat_readiness(&shutdown)
+                .context("am3-bb: dsPIC heartbeat readiness admission failed")?;
             info!(
                 interval_ms = AM3_BB_DSPIC_HEARTBEAT_INTERVAL_MS,
-                "am3-bb: dsPIC runtime heartbeat thread started"
+                readiness_timeout_ms = AM3_BB_DSPIC_HEARTBEAT_READINESS_TIMEOUT_MS,
+                validated_chains = readiness.validated_chains,
+                "am3-bb: dsPIC runtime heartbeat owner established framed protocol readiness"
             );
+            dspic_heartbeat_guard = Some(heartbeat_guard);
         }
+        am3_bb_require_heartbeat_for_energizing_boundary(
+            dspic_heartbeat_guard.as_mut(),
+            &shutdown,
+            !stub_loop,
+            "post-dsPIC ASIC reset release",
+        )?;
+        am3_bb_post_dspic_reset_chains(&platform, chain_specs.len())
+            .context("am3-bb: post-dsPIC ASIC reset pulse failed")?;
         dspic_i2c_main = Some(dspic_i2c);
     }
 
@@ -1094,9 +1392,18 @@ fn run_am3_bb_blocking(
                 "am3-bb: dsPIC I2C service is unavailable; refusing to mine without thermal supervisor"
             );
         };
+        // Production requires one thermally covered dsPIC per declared
+        // hash-chain. The enum-only stub may inspect a partial topology, but it
+        // never enters watchdog Mining or opens hardware mutation admission.
+        let expected_thermal_chains = if stub_loop {
+            active_dspic_addrs.len()
+        } else {
+            chain_specs.len()
+        };
         Am3BbThermalSupervisor::new(
             dspic_i2c.clone(),
             active_dspic_addrs.clone(),
+            expected_thermal_chains,
             config.thermal.hot_temp_c,
             config.thermal.dangerous_temp_c,
         )?
@@ -1179,6 +1486,12 @@ fn run_am3_bb_blocking(
     let mut total_chips: usize = 0;
     let mut init_results: Vec<Bm1362ChainInitResult> = Vec::with_capacity(uarts.len());
     for (idx, uart) in uarts.iter_mut().enumerate() {
+        am3_bb_require_heartbeat_for_energizing_boundary(
+            dspic_heartbeat_guard.as_mut(),
+            &shutdown,
+            !stub_loop,
+            "BM1362 chain initialization",
+        )?;
         let init = bm1362_chip_init_one_chain(
             uart,
             idx,
@@ -1190,11 +1503,19 @@ fn run_am3_bb_blocking(
             bt.cold_boot.run_miscctrl_triple_write,
         )
         .with_context(|| format!("am3-bb: BM1362 chip-init failed on chain {}", idx))?;
+        am3_bb_require_heartbeat_for_energizing_boundary(
+            dspic_heartbeat_guard.as_mut(),
+            &shutdown,
+            !stub_loop,
+            "post-BM1362 chain initialization",
+        )?;
         info!(
             chain = idx,
             chips = init.assigned_chips,
             initial_get_address_rx_bytes = init.initial_get_address_rx_bytes,
             fast_get_address_rx_bytes = init.fast_get_address_rx_bytes,
+            initial_get_address_observation = ?init.initial_get_address_observation,
+            fast_get_address_observation = ?init.fast_get_address_observation,
             rx_proven = init.rx_proven(),
             "am3-bb: BM1362 chip-init complete"
         );
@@ -1210,17 +1531,34 @@ fn run_am3_bb_blocking(
         .iter()
         .map(|r| r.fast_get_address_rx_bytes)
         .collect();
+    let crc_verified_unassigned_observation_chains = init_results
+        .iter()
+        .filter(|result| {
+            result.initial_get_address_observation.is_some()
+                || result.fast_get_address_observation.is_some()
+        })
+        .count();
+    let crc_verified_unassigned_response_frames: usize = init_results
+        .iter()
+        .filter_map(|result| {
+            result
+                .initial_get_address_observation
+                .or(result.fast_get_address_observation)
+        })
+        .map(|observation| observation.response_frames)
+        .sum();
     info!(
         chains = uarts.len(),
         total_chips,
         rx_proven_chains,
+        crc_verified_unassigned_observation_chains,
+        crc_verified_unassigned_response_frames,
         initial_rx_bytes = ?initial_rx_bytes,
         fast_rx_bytes = ?fast_rx_bytes,
         "am3-bb: BM1362 enumeration complete across all chains"
     );
 
     // ── 6. Build the work-dispatch transport over the per-chain UARTs. ──
-    let stub_loop = std::env::var_os("DCENT_AM3_BB_STUB_LOOP").is_some();
     let allow_no_rx_mining = env_flag_set(ENV_AM3_BB_ALLOW_NO_RX_MINING);
     if rx_proven_chains == 0 && !stub_loop && !allow_no_rx_mining {
         anyhow::bail!(
@@ -1243,6 +1581,12 @@ fn run_am3_bb_blocking(
     }
 
     if let Some(dspic_i2c) = dspic_i2c_main.as_ref() {
+        am3_bb_require_heartbeat_for_energizing_boundary(
+            dspic_heartbeat_guard.as_mut(),
+            &shutdown,
+            !stub_loop,
+            "dsPIC open-core voltage",
+        )?;
         let open_core_mv = parse_env_u32(ENV_AM3_BB_OPEN_CORE_MV)
             .unwrap_or(u32::from(AM3_BB_DSPIC_DEFAULT_OPEN_CORE_MV))
             .clamp(
@@ -1262,17 +1606,35 @@ fn run_am3_bb_blocking(
         am3_bb_dspic_set_voltage_all(
             dspic_i2c,
             &active_dspic_addrs,
+            dspic_heartbeat_guard.as_mut(),
+            &shutdown,
+            !stub_loop,
             open_core_mv,
             true,
             "open-core-voltage",
         )
         .context("am3-bb: dsPIC open-core rail stage failed")?;
         if open_core_hold_ms > 0 {
-            thread::sleep(Duration::from_millis(open_core_hold_ms));
+            am3_bb_wait_with_heartbeat_ownership(
+                dspic_heartbeat_guard.as_mut(),
+                &shutdown,
+                !stub_loop,
+                Duration::from_millis(open_core_hold_ms),
+                "dsPIC open-core hold",
+            )?;
         }
+        am3_bb_require_heartbeat_for_energizing_boundary(
+            dspic_heartbeat_guard.as_mut(),
+            &shutdown,
+            !stub_loop,
+            "dsPIC steady voltage",
+        )?;
         am3_bb_dspic_set_voltage_all(
             dspic_i2c,
             &active_dspic_addrs,
+            dspic_heartbeat_guard.as_mut(),
+            &shutdown,
+            !stub_loop,
             dspic_target_voltage_mv,
             false,
             "steady-voltage",
@@ -1300,6 +1662,12 @@ fn run_am3_bb_blocking(
     //       chips after the post-baud init. The APW set-voltage payload is still
     //       a Phase-D stub, so this direct call logs the intent without touching
     //       ASIC resets. ──
+    am3_bb_require_heartbeat_for_energizing_boundary(
+        dspic_heartbeat_guard.as_mut(),
+        &shutdown,
+        !stub_loop,
+        "APW steady-voltage request",
+    )?;
     if let Err(e) = psu.set_voltage_mv(bt.cold_boot.apw12_rail_steady_mv) {
         warn!(
             target_mv = bt.cold_boot.apw12_rail_steady_mv,
@@ -1320,60 +1688,123 @@ fn run_am3_bb_blocking(
         }
     }
 
-    // ── 7b. Arm the hardware watchdog (AFTER cold-boot + chain enum complete).
-    //       `--am3-bb-mining` runs entirely outside `Daemon::run()`, so this path
-    //       historically armed NO `/dev/watchdog` — a CPU/runtime hang in the
-    //       blocking mining loop below left the boards energized & unsupervised.
-    //       Arm it now via the shared, config-gated helper. This body runs on a
-    //       `spawn_blocking` thread with no ambient Tokio context, so enter the
-    //       captured runtime handle first (the helper spawns the async kicker via
-    //       `tokio::spawn`). Placed AFTER bring-up so the DTB-default window can
-    //       never trip during the slow cold-boot. ──
-    let watchdog_liveness = Arc::new(AtomicU64::new(0));
-    {
-        let _rt_enter = rt_handle.enter();
-        // SAF-5: gate kicks on the am3-bb mining/stub loop so a live-locked
-        // blocking runtime stops feeding `/dev/watchdog` after the counter has
-        // started advancing.
-        crate::daemon::spawn_watchdog_kicker(
-            &config.watchdog,
-            shutdown.clone(),
-            Some(watchdog_liveness.clone()),
-        );
-    }
-
+    // ── 7b. Transfer the pre-energize watchdog owner into the mining loop.
+    //       `Am3BbSafetyAdmission` armed and initially kicked `/dev/watchdog`
+    //       before this engine or its Pending API mutation gate was constructed.
+    //       There is no detached kicker here: the owned worker remains in
+    //       Bringup until the thermal/fan/heartbeat/transport prerequisites below
+    //       admit Mining, and it can disarm only through the receipt-bearing
+    //       closeout funnel. ──
     // ── 8. Mining loop (Option B2 — reuse dcentrald_stratum + the transport).
     //       `DCENT_AM3_BB_STUB_LOOP=1` keeps the old logging-only stub for a
     //       cold-boot/enum-only diagnostic run. ──
-    if stub_loop {
+    let mining_result = if stub_loop {
         warn!("am3-bb: DCENT_AM3_BB_STUB_LOOP set — running the cold-boot/enum-only logging stub, NOT the mining loop");
-        run_mining_loop_stub(
-            &mut transport,
-            total_chips,
-            &shutdown,
-            watchdog_liveness.clone(),
-        );
+        run_mining_loop_stub(&mut transport, total_chips, &shutdown);
+        Ok(())
     } else {
         // Borrow the run guard's clamp-enforced fan view for the continuous
         // PR-021 PID. The guard keeps ownership for the fail-closed teardown;
         // this is `None` if the BeagleBone PWM never opened (the PID then
         // simply doesn't run — the fail-closed supervisor still does).
         let pid_fan = _run_safety_guard.as_ref().and_then(|g| g.capped_fan());
+        let heartbeat = dspic_heartbeat_guard
+            .as_mut()
+            .context("am3-bb: dsPIC heartbeat owner is missing before mining loop")?;
         run_mining_loop(
             &config,
             &mut transport,
             total_chips,
             &shutdown,
+            heartbeat,
             &rt_handle,
             dspic_i2c_main.clone(),
             active_dspic_addrs.clone(),
             pid_fan,
-            watchdog_liveness.clone(),
+            &mut watchdog,
+            watchdog_liveness,
+            &hardware_mutation_owner,
+            platform.board_enable_gpio_v2_0(),
+            platform.board_target().board_enable_active_high(),
         )
-        .context("am3-bb: mining loop exited with error")?;
-    }
+        .context("am3-bb: mining loop exited with error")
+    };
 
-    info!("am3-bb: mining mode stopped cleanly");
+    // Every exit, including a mining-loop error, enters the same bounded
+    // closeout. A missing prerequisite prevents Disarm submission and leaves
+    // the watchdog armed. Once Disarm is submitted, timeout means the
+    // magic-close outcome is unknown; a later join error may follow a completed
+    // magic-close and must not be collapsed into an "armed" claim.
+    rt_handle
+        .block_on(watchdog.begin_teardown(DEFAULT_WATCHDOG_TEARDOWN_GRACE))
+        .context("am3-bb: watchdog refused Teardown admission")?;
+    let api_barrier = hardware_mutation_owner
+        .close_and_drain(AM3_BB_API_MUTATION_DRAIN_TIMEOUT)
+        .context("am3-bb: API mutation admission did not drain")?;
+    let dspic_i2c = dspic_i2c_main
+        .as_ref()
+        .context("am3-bb: dsPIC I2C ownership is missing at teardown")?;
+    let pre_quiescence_i2c_barrier = dspic_i2c.latch_terminal_safe_off();
+    info!(
+        safety_generation = pre_quiescence_i2c_barrier.generation(),
+        no_controller_mutation_stage_in_flight =
+            pre_quiescence_i2c_barrier.no_controller_mutation_stage_in_flight(),
+        "am3-bb: terminal I2C admission latched before actor shutdown"
+    );
+
+    let heartbeat_shutdown = dspic_heartbeat_guard
+        .as_mut()
+        .context("am3-bb: dsPIC heartbeat owner is missing at teardown")?
+        .stop_and_join(&rt_handle);
+    if !heartbeat_shutdown.graceful() {
+        let evidence = heartbeat_shutdown;
+        if evidence.worker_timed_out {
+            let guard = _run_safety_guard
+                .as_mut()
+                .expect("AM3 run safety guard remains armed through shutdown");
+            // A timed-out feeder may still own or await the shared I2C service.
+            // The out-of-band board-enable cutoff above is the terminal safety
+            // action; do not re-enter that shared controller during teardown.
+            guard.dspic_i2c = None;
+            guard.active_dspic_addrs.clear();
+        }
+        let heartbeat_error = anyhow::anyhow!(
+            "am3-bb: dsPIC heartbeat shutdown was degraded; worker_timed_out={}, worker_panicked={}, timeout_ms={}, hard_board_cut_attempted={}, hard_board_cut_succeeded={}",
+            evidence.worker_timed_out,
+            evidence.worker_panicked,
+            AM3_BB_DSPIC_HEARTBEAT_STOP_TIMEOUT_MS,
+            evidence.hard_board_cut_attempted,
+            evidence.hard_board_cut_succeeded
+        );
+        return match mining_result {
+            Ok(()) => Err(heartbeat_error),
+            Err(mining_error) => {
+                Err(heartbeat_error.context(format!("mining loop also failed: {mining_error:#}")))
+            }
+        };
+    }
+    let i2c_barrier = dspic_i2c.latch_terminal_safe_off();
+    info!(
+        safety_generation = i2c_barrier.generation(),
+        no_controller_mutation_stage_in_flight =
+            i2c_barrier.no_controller_mutation_stage_in_flight(),
+        "am3-bb: terminal I2C mutation barrier observed after actor shutdown"
+    );
+    let safe_off = _run_safety_guard
+        .as_mut()
+        .context("am3-bb: run safety guard is missing at teardown")?
+        .teardown_checked()?;
+    let barriers: [&dyn crate::runtime::safety_watchdog::MutationBarrierEvidence; 2] =
+        [&api_barrier, &i2c_barrier];
+    let permit =
+        WatchdogDisarmPermit::from_evidence_set(&barriers, &heartbeat_shutdown.summary, &safe_off)?;
+    let closeout =
+        rt_handle.block_on(watchdog.disarm_and_join(permit, DEFAULT_WATCHDOG_STOP_TIMEOUT))?;
+    let WatchdogCloseoutReceipt::MagicCloseWriteCompletedAndWorkerExitObserved = closeout;
+
+    mining_result?;
+
+    info!("am3-bb: mining mode stopped with complete shutdown evidence");
     Ok(())
 }
 
@@ -1891,6 +2322,7 @@ fn am3_bb_dspic_command(
     i2c: &I2cServiceHandle,
     chain_idx: usize,
     addr: u8,
+    label: I2cMutationLabel,
     frame: &[u8],
     read_count: usize,
     after_write_ms: u64,
@@ -1909,12 +2341,14 @@ fn am3_bb_dspic_command(
         }
     }
 
-    let reads = i2c.transaction(addr, steps).with_context(|| {
-        format!(
-            "am3-bb chain {} dsPIC 0x{:02X}: {} transaction failed",
-            chain_idx, addr, what
-        )
-    })?;
+    let reads = i2c
+        .transaction_mutating(label, addr, steps)
+        .with_context(|| {
+            format!(
+                "am3-bb chain {} dsPIC 0x{:02X}: {} transaction failed",
+                chain_idx, addr, what
+            )
+        })?;
     let out: Vec<u8> = reads.into_iter().flatten().collect();
     if out.len() != read_count {
         warn!(
@@ -1943,6 +2377,7 @@ fn am3_bb_dspic_read_lm75_temps(
             i2c,
             chain_idx,
             addr,
+            I2cMutationLabel::QueryPrelude,
             &frame,
             AM3_BB_LM75_REPLY_LEN,
             20,
@@ -1991,7 +2426,33 @@ fn am3_bb_dspic_read_lm75_temps(
 #[derive(Debug, Clone, Copy)]
 struct Am3BbThermalSnapshot {
     samples: usize,
+    covered_chains: usize,
+    expected_chains: usize,
     max_temp_c: f32,
+    /// True only when this exact poll produced acceptable sensor coverage for
+    /// every expected chain. A tolerated last-known-good value may guide
+    /// logging but must not drive a new fan command or advance watchdog safety
+    /// liveness.
+    fresh: bool,
+}
+
+fn am3_bb_thermal_snapshot_from_chain_samples(
+    samples_per_chain: &[usize],
+    max_temp_c: f32,
+) -> Am3BbThermalSnapshot {
+    let samples = samples_per_chain.iter().sum();
+    let covered_chains = samples_per_chain
+        .iter()
+        .filter(|&&samples| samples >= AM3_BB_THERMAL_MIN_SAMPLES_PER_CHAIN)
+        .count();
+    let expected_chains = samples_per_chain.len();
+    Am3BbThermalSnapshot {
+        samples,
+        covered_chains,
+        expected_chains,
+        max_temp_c,
+        fresh: expected_chains > 0 && covered_chains == expected_chains && max_temp_c.is_finite(),
+    }
 }
 
 fn am3_bb_poll_dspic_temps(
@@ -1999,19 +2460,59 @@ fn am3_bb_poll_dspic_temps(
     active_addrs: &[u8],
     stage: &'static str,
 ) -> Am3BbThermalSnapshot {
-    let mut samples = 0usize;
+    let mut samples_per_chain = Vec::with_capacity(active_addrs.len());
     let mut max_temp_c = f32::NEG_INFINITY;
     for &addr in active_addrs {
         let chain_idx = addr.saturating_sub(AM3_BB_DSPIC_BASE_ADDR) as usize;
-        for (_sensor, temp_c) in am3_bb_dspic_read_lm75_temps(i2c, chain_idx, addr, stage) {
-            samples += 1;
+        let chain_temps = am3_bb_dspic_read_lm75_temps(i2c, chain_idx, addr, stage);
+        samples_per_chain.push(chain_temps.len());
+        for (_sensor, temp_c) in chain_temps {
             max_temp_c = max_temp_c.max(temp_c);
         }
     }
-    Am3BbThermalSnapshot {
-        samples,
-        max_temp_c,
+    am3_bb_thermal_snapshot_from_chain_samples(&samples_per_chain, max_temp_c)
+}
+
+fn am3_bb_poll_thermal_attempts<F>(
+    stage: &'static str,
+    dangerous_temp_c: f32,
+    retry_delay: Duration,
+    mut poll: F,
+) -> Result<Am3BbThermalSnapshot>
+where
+    F: FnMut(&'static str) -> Am3BbThermalSnapshot,
+{
+    let snapshot = poll(stage);
+    am3_bb_reject_dangerous_thermal_attempt(&snapshot, dangerous_temp_c, stage)?;
+
+    if stage == "runtime" && !snapshot.fresh {
+        thread::sleep(retry_delay);
+        let retry_stage = "runtime-retry";
+        let retry = poll(retry_stage);
+        am3_bb_reject_dangerous_thermal_attempt(&retry, dangerous_temp_c, retry_stage)?;
+        Ok(retry)
+    } else {
+        Ok(snapshot)
     }
+}
+
+fn am3_bb_reject_dangerous_thermal_attempt(
+    snapshot: &Am3BbThermalSnapshot,
+    dangerous_temp_c: f32,
+    stage: &'static str,
+) -> Result<()> {
+    // Any responding chain can prove danger even when aggregate coverage is
+    // incomplete. Evaluate each attempt before a retry is allowed to replace
+    // it so a cooler or missing retry can never hide an over-temperature.
+    if snapshot.max_temp_c >= dangerous_temp_c {
+        anyhow::bail!(
+            "am3-bb: hashboard temperature {:.1}C reached dangerous threshold {:.1}C during {}",
+            snapshot.max_temp_c,
+            dangerous_temp_c,
+            stage
+        );
+    }
+    Ok(())
 }
 
 struct Am3BbThermalSupervisor {
@@ -2027,11 +2528,28 @@ impl Am3BbThermalSupervisor {
     fn new(
         i2c: I2cServiceHandle,
         active_addrs: Vec<u8>,
+        expected_chains: usize,
         hot_temp_c: u8,
         dangerous_temp_c: u8,
     ) -> Result<Self> {
         if active_addrs.is_empty() {
             anyhow::bail!("am3-bb: thermal supervisor requires at least one active dsPIC");
+        }
+        if active_addrs.len() != expected_chains {
+            anyhow::bail!(
+                "am3-bb: thermal supervisor owns {} dsPIC controller(s), but {} chain(s) require thermal coverage",
+                active_addrs.len(),
+                expected_chains
+            );
+        }
+        let mut unique_addrs = active_addrs.clone();
+        unique_addrs.sort_unstable();
+        unique_addrs.dedup();
+        if unique_addrs.len() != active_addrs.len() {
+            anyhow::bail!(
+                "am3-bb: thermal supervisor received duplicate dsPIC addresses: {:02X?}",
+                active_addrs
+            );
         }
         Ok(Self {
             i2c,
@@ -2044,12 +2562,13 @@ impl Am3BbThermalSupervisor {
     }
 
     fn poll_and_check(&mut self, stage: &'static str) -> Result<Am3BbThermalSnapshot> {
-        let mut snapshot = am3_bb_poll_dspic_temps(&self.i2c, &self.active_addrs, stage);
-        if stage == "runtime" && snapshot.samples == 0 {
-            thread::sleep(Duration::from_millis(AM3_BB_THERMAL_RUNTIME_RETRY_MS));
-            snapshot = am3_bb_poll_dspic_temps(&self.i2c, &self.active_addrs, "runtime-retry");
-        }
-        if snapshot.samples == 0 {
+        let snapshot = am3_bb_poll_thermal_attempts(
+            stage,
+            self.dangerous_temp_c,
+            Duration::from_millis(AM3_BB_THERMAL_RUNTIME_RETRY_MS),
+            |poll_stage| am3_bb_poll_dspic_temps(&self.i2c, &self.active_addrs, poll_stage),
+        )?;
+        if !snapshot.fresh {
             self.consecutive_misses = self.consecutive_misses.saturating_add(1);
             if stage == "runtime" {
                 if let Some((sample_at, last_good)) = self.last_good {
@@ -2059,36 +2578,39 @@ impl Am3BbThermalSupervisor {
                     {
                         warn!(
                             consecutive_misses = self.consecutive_misses,
+                            observed_samples = snapshot.samples,
+                            covered_chains = snapshot.covered_chains,
+                            expected_chains = snapshot.expected_chains,
                             last_good_age_ms = age.as_millis(),
                             last_good_samples = last_good.samples,
                             last_good_max_temp_c = last_good.max_temp_c,
                             max_consecutive_misses = AM3_BB_THERMAL_MAX_CONSECUTIVE_MISSES,
                             max_stale_ms = AM3_BB_THERMAL_MAX_STALE_MS,
-                            "am3-bb: runtime LM75 poll was noisy; using fresh last-known-good sample"
+                            "am3-bb: runtime LM75 coverage was incomplete; retaining bounded last-known-good context without driving fan policy or watchdog liveness"
                         );
-                        return Ok(last_good);
+                        return Ok(Am3BbThermalSnapshot {
+                            fresh: false,
+                            ..last_good
+                        });
                     }
                 }
             }
             anyhow::bail!(
-                "am3-bb: no valid LM75 temperature samples during {} after {} consecutive miss(es) - refusing to mine without fresh thermal proof",
+                "am3-bb: LM75 coverage reached only {}/{} chain(s) with {} sample(s) during {} after {} consecutive miss(es) - refusing to mine without fresh per-chain thermal proof",
+                snapshot.covered_chains,
+                snapshot.expected_chains,
+                snapshot.samples,
                 stage,
                 self.consecutive_misses
             );
         }
         self.last_good = Some((Instant::now(), snapshot));
         self.consecutive_misses = 0;
-        if snapshot.max_temp_c >= self.dangerous_temp_c {
-            anyhow::bail!(
-                "am3-bb: hashboard temperature {:.1}C reached dangerous threshold {:.1}C during {}",
-                snapshot.max_temp_c,
-                self.dangerous_temp_c,
-                stage
-            );
-        }
         if snapshot.max_temp_c >= self.hot_temp_c {
             warn!(
                 samples = snapshot.samples,
+                covered_chains = snapshot.covered_chains,
+                expected_chains = snapshot.expected_chains,
                 max_temp_c = snapshot.max_temp_c,
                 hot_temp_c = self.hot_temp_c,
                 dangerous_temp_c = self.dangerous_temp_c,
@@ -2098,6 +2620,8 @@ impl Am3BbThermalSupervisor {
         } else {
             info!(
                 samples = snapshot.samples,
+                covered_chains = snapshot.covered_chains,
+                expected_chains = snapshot.expected_chains,
                 max_temp_c = snapshot.max_temp_c,
                 hot_temp_c = self.hot_temp_c,
                 dangerous_temp_c = self.dangerous_temp_c,
@@ -2114,16 +2638,48 @@ fn am3_bb_dspic_heartbeat_once(
     chain_idx: usize,
     addr: u8,
 ) -> Result<Vec<u8>> {
-    am3_bb_dspic_command(
+    let reply = am3_bb_dspic_command(
         i2c,
         chain_idx,
         addr,
+        I2cMutationLabel::KeepAlive,
         AM3_BB_DSPIC_HEARTBEAT_FRAME,
         6,
         20,
         20,
         "heartbeat",
-    )
+    )?;
+    am3_bb_validate_heartbeat_reply(chain_idx, addr, reply)
+}
+
+/// Validate the exact framed heartbeat response established by the `a lab unit`
+/// capture.
+///
+/// The shared codec owns framing, length, checksum, and opcode decoding. This
+/// target policy owns the evidence-backed heartbeat opcode and payload. Keeping
+/// those layers separate lets future dsPIC generations use the same codec
+/// without inheriting `a lab unit` response policy.
+fn am3_bb_validate_heartbeat_reply(chain_idx: usize, addr: u8, reply: Vec<u8>) -> Result<Vec<u8>> {
+    let frame = decode_framed_sum_reply_body(&reply).map_err(|error| {
+        anyhow::anyhow!(
+            "am3-bb chain {chain_idx} dsPIC 0x{addr:02X}: invalid framed heartbeat reply: {error:?}"
+        )
+    })?;
+    if frame.opcode != DspicOpcode::Heartbeat {
+        anyhow::bail!(
+            "am3-bb chain {chain_idx} dsPIC 0x{addr:02X}: heartbeat reply opcode was 0x{:02X}; expected 0x{:02X}",
+            frame.opcode.as_u8(),
+            DspicOpcode::Heartbeat.as_u8()
+        );
+    }
+    if frame.payload.as_slice() != AM3_BB_DSPIC_HEARTBEAT_REPLY_PAYLOAD {
+        anyhow::bail!(
+            "am3-bb chain {chain_idx} dsPIC 0x{addr:02X}: heartbeat reply payload was {:02X?}; expected exact .79 payload {:02X?}",
+            frame.payload,
+            AM3_BB_DSPIC_HEARTBEAT_REPLY_PAYLOAD
+        );
+    }
+    Ok(reply)
 }
 
 fn am3_bb_dspic_read_voltage(
@@ -2136,6 +2692,7 @@ fn am3_bb_dspic_read_voltage(
         i2c,
         chain_idx,
         addr,
+        I2cMutationLabel::QueryPrelude,
         AM3_BB_DSPIC_READ_VOLTAGE_FRAME,
         7,
         50,
@@ -2164,7 +2721,17 @@ fn am3_bb_dspic_set_voltage(
         );
         return Ok(Vec::new());
     }
-    am3_bb_dspic_command(i2c, chain_idx, addr, &frame, 0, 0, 0, stage)?;
+    am3_bb_dspic_command(
+        i2c,
+        chain_idx,
+        addr,
+        I2cMutationLabel::Energize,
+        &frame,
+        0,
+        0,
+        0,
+        stage,
+    )?;
     thread::sleep(Duration::from_millis(50));
     Ok(frame.to_vec())
 }
@@ -2179,6 +2746,7 @@ fn am3_bb_dspic_enable_voltage(
         i2c,
         chain_idx,
         addr,
+        I2cMutationLabel::Energize,
         AM3_BB_DSPIC_ENABLE_FRAME,
         2,
         50,
@@ -2202,19 +2770,36 @@ fn am3_bb_dspic_enable_voltage(
 fn am3_bb_dspic_set_voltage_all(
     i2c: &I2cServiceHandle,
     active_addrs: &[u8],
+    heartbeat: Option<&mut Am3BbDspicHeartbeatGuard>,
+    shutdown: &CancellationToken,
+    heartbeat_required: bool,
     voltage_mv: u16,
     enable: bool,
     stage: &'static str,
 ) -> Result<()> {
+    let mut heartbeat = heartbeat;
+    let mut admit = |_: usize, _: u8| {
+        am3_bb_require_heartbeat_for_energizing_boundary(
+            heartbeat.as_deref_mut(),
+            shutdown,
+            heartbeat_required,
+            stage,
+        )
+    };
+
     for &addr in active_addrs {
         let chain_idx = addr.saturating_sub(AM3_BB_DSPIC_BASE_ADDR) as usize;
         let voltage_before =
             am3_bb_dspic_read_voltage(i2c, chain_idx, addr, "read-voltage-before-rail-stage")?;
-        let set_frame = am3_bb_dspic_set_voltage(i2c, chain_idx, addr, voltage_mv, stage)?;
+        let set_frame = am3_bb_with_energize_admission(chain_idx, addr, &mut admit, || {
+            am3_bb_dspic_set_voltage(i2c, chain_idx, addr, voltage_mv, stage)
+        })?;
         let voltage_after_set =
             am3_bb_dspic_read_voltage(i2c, chain_idx, addr, "read-voltage-after-rail-set")?;
         let enable_ack = if enable {
-            let ack = am3_bb_dspic_enable_voltage(i2c, chain_idx, addr, stage)?;
+            let ack = am3_bb_with_energize_admission(chain_idx, addr, &mut admit, || {
+                am3_bb_dspic_enable_voltage(i2c, chain_idx, addr, stage)
+            })?;
             thread::sleep(Duration::from_millis(70));
             ack
         } else {
@@ -2239,6 +2824,26 @@ fn am3_bb_dspic_set_voltage_all(
     Ok(())
 }
 
+/// Execute exactly one energizing mutation behind fresh safety admission.
+///
+/// Queries can take long enough for heartbeat failure or cancellation to
+/// arrive, so admission belongs adjacent to `SetVoltage` and `Enable`, not at
+/// the start of an address sweep. Keeping the sequencing wrapper transport-free
+/// makes the no-mutation-after-cancellation property deterministic to test.
+fn am3_bb_with_energize_admission<T, Admit, Energize>(
+    chain_idx: usize,
+    addr: u8,
+    admit: &mut Admit,
+    energize: Energize,
+) -> Result<T>
+where
+    Admit: FnMut(usize, u8) -> Result<()>,
+    Energize: FnOnce() -> Result<T>,
+{
+    admit(chain_idx, addr)?;
+    energize()
+}
+
 fn am3_bb_dspic_init_one(
     i2c: &I2cServiceHandle,
     chain_idx: usize,
@@ -2256,6 +2861,7 @@ fn am3_bb_dspic_init_one(
         i2c,
         chain_idx,
         addr,
+        I2cMutationLabel::Recovery,
         AM3_BB_DSPIC_RESET_FRAME,
         2,
         50,
@@ -2277,6 +2883,7 @@ fn am3_bb_dspic_init_one(
         i2c,
         chain_idx,
         addr,
+        I2cMutationLabel::Recovery,
         AM3_BB_DSPIC_JUMP_FRAME,
         2,
         50,
@@ -2298,6 +2905,7 @@ fn am3_bb_dspic_init_one(
         i2c,
         chain_idx,
         addr,
+        I2cMutationLabel::QueryPrelude,
         AM3_BB_DSPIC_GET_VERSION_FRAME,
         5,
         135,
@@ -2324,16 +2932,27 @@ fn am3_bb_dspic_init_one(
         return Ok(None);
     }
 
-    let disable_ack = am3_bb_dspic_command(
-        i2c,
-        chain_idx,
-        addr,
-        AM3_BB_DSPIC_DISABLE_FRAME,
-        2,
-        50,
-        20,
-        "disable-voltage",
-    )?;
+    i2c.disable_dspic_voltage(addr, I2cDspicDisableProtocol::VnishPaddedFramed)
+        .with_context(|| {
+            format!(
+                "am3-bb chain {} dsPIC 0x{:02X}: disable-voltage SafeOff failed",
+                chain_idx, addr
+            )
+        })?;
+    thread::sleep(Duration::from_millis(50));
+    let mut disable_ack = i2c.read_bytes(addr, 1).with_context(|| {
+        format!(
+            "am3-bb chain {} dsPIC 0x{:02X}: first disable ACK read failed",
+            chain_idx, addr
+        )
+    })?;
+    thread::sleep(Duration::from_millis(20));
+    disable_ack.extend(i2c.read_bytes(addr, 1).with_context(|| {
+        format!(
+            "am3-bb chain {} dsPIC 0x{:02X}: second disable ACK read failed",
+            chain_idx, addr
+        )
+    })?);
     if disable_ack.first().copied() != Some(0x15) {
         warn!(
             chain = chain_idx,
@@ -2348,6 +2967,7 @@ fn am3_bb_dspic_init_one(
         i2c,
         chain_idx,
         addr,
+        I2cMutationLabel::Unclassified,
         AM3_BB_DSPIC_PROBE_3B_48_FRAME,
         2,
         20,
@@ -2375,6 +2995,7 @@ fn am3_bb_dspic_init_one(
             i2c,
             chain_idx,
             addr,
+            I2cMutationLabel::QueryPrelude,
             &frame,
             7,
             20,
@@ -2394,6 +3015,7 @@ fn am3_bb_dspic_init_one(
         i2c,
         chain_idx,
         addr,
+        I2cMutationLabel::QueryPrelude,
         AM3_BB_DSPIC_READ_VOLTAGE_FRAME,
         7,
         50,
@@ -2467,45 +3089,95 @@ fn am3_bb_dspic_init_all(
 }
 
 fn am3_bb_write_reset_gpio(gpio: u32, asserted: bool) -> Result<()> {
-    let path = format!("/sys/class/gpio/gpio{}/value", gpio);
-    std::fs::write(&path, if asserted { "1" } else { "0" }).with_context(|| {
-        format!(
-            "am3-bb: write {} to {} failed",
-            if asserted { "assert" } else { "release" },
-            path
-        )
-    })
+    am3_bb_prepare_output_gpio(gpio, true)?;
+    am3_bb_write_gpio_attr_checked(gpio, "value", if asserted { "1" } else { "0" }).with_context(
+        || {
+            format!(
+                "am3-bb: checked {} of active-low reset gpio{} failed",
+                if asserted { "assert" } else { "release" },
+                gpio
+            )
+        },
+    )
 }
 
-fn am3_bb_export_gpio_if_needed(gpio: u32) -> Result<()> {
-    let path = format!("/sys/class/gpio/gpio{}", gpio);
-    if std::path::Path::new(&path).exists() {
+fn am3_bb_gpio_dir_at(sysfs_root: &Path, gpio: u32) -> std::path::PathBuf {
+    sysfs_root.join(format!("gpio{gpio}"))
+}
+
+fn am3_bb_export_gpio_if_needed_at(sysfs_root: &Path, gpio: u32) -> Result<()> {
+    let gpio_dir = am3_bb_gpio_dir_at(sysfs_root, gpio);
+    if gpio_dir.exists() {
         return Ok(());
     }
-    std::fs::write("/sys/class/gpio/export", gpio.to_string())
+    std::fs::write(sysfs_root.join("export"), gpio.to_string())
         .with_context(|| format!("am3-bb: export gpio{} failed", gpio))?;
     thread::sleep(Duration::from_millis(10));
-    Ok(())
-}
-
-fn am3_bb_write_gpio_attr(gpio: u32, attr: &str, value: &str) -> Result<()> {
-    let path = format!("/sys/class/gpio/gpio{}/{}", gpio, attr);
-    std::fs::write(&path, value)
-        .with_context(|| format!("am3-bb: write gpio{} {}={} failed", gpio, attr, value))
-}
-
-fn am3_bb_prepare_output_gpio(gpio: u32, active_low: bool) -> Result<()> {
-    am3_bb_export_gpio_if_needed(gpio)?;
-    am3_bb_write_gpio_attr(gpio, "direction", "out")?;
-    if let Err(e) = am3_bb_write_gpio_attr(gpio, "active_low", if active_low { "1" } else { "0" }) {
-        debug!(
+    if !gpio_dir.exists() {
+        anyhow::bail!(
+            "am3-bb: gpio{} export command completed but {} did not appear",
             gpio,
-            active_low,
-            error = %e,
-            "am3-bb: active_low sysfs write failed during safety teardown"
+            gpio_dir.display()
         );
     }
     Ok(())
+}
+
+fn am3_bb_export_gpio_if_needed(gpio: u32) -> Result<()> {
+    am3_bb_export_gpio_if_needed_at(Path::new(AM3_BB_GPIO_SYSFS_ROOT), gpio)
+}
+
+fn am3_bb_validate_gpio_attr_readback(
+    gpio: u32,
+    attr: &str,
+    expected: &str,
+    observed: &str,
+) -> Result<()> {
+    let observed = observed.trim();
+    if observed != expected {
+        anyhow::bail!(
+            "am3-bb: gpio{} {} readback mismatch: expected {:?}, observed {:?}",
+            gpio,
+            attr,
+            expected,
+            observed
+        );
+    }
+    Ok(())
+}
+
+fn am3_bb_write_gpio_attr_checked_at(
+    sysfs_root: &Path,
+    gpio: u32,
+    attr: &str,
+    value: &str,
+) -> Result<()> {
+    let path = am3_bb_gpio_dir_at(sysfs_root, gpio).join(attr);
+    std::fs::write(&path, value)
+        .with_context(|| format!("am3-bb: write gpio{} {}={} failed", gpio, attr, value))?;
+    let observed = std::fs::read_to_string(&path)
+        .with_context(|| format!("am3-bb: read gpio{} {} after write failed", gpio, attr))?;
+    am3_bb_validate_gpio_attr_readback(gpio, attr, value, &observed)
+}
+
+fn am3_bb_write_gpio_attr_checked(gpio: u32, attr: &str, value: &str) -> Result<()> {
+    am3_bb_write_gpio_attr_checked_at(Path::new(AM3_BB_GPIO_SYSFS_ROOT), gpio, attr, value)
+}
+
+fn am3_bb_prepare_output_gpio_at(sysfs_root: &Path, gpio: u32, active_low: bool) -> Result<()> {
+    am3_bb_export_gpio_if_needed_at(sysfs_root, gpio)?;
+    am3_bb_write_gpio_attr_checked_at(sysfs_root, gpio, "direction", "out")?;
+    am3_bb_write_gpio_attr_checked_at(
+        sysfs_root,
+        gpio,
+        "active_low",
+        if active_low { "1" } else { "0" },
+    )?;
+    Ok(())
+}
+
+fn am3_bb_prepare_output_gpio(gpio: u32, active_low: bool) -> Result<()> {
+    am3_bb_prepare_output_gpio_at(Path::new(AM3_BB_GPIO_SYSFS_ROOT), gpio, active_low)
 }
 
 fn am3_bb_quiet_safe_pwm(config_min_pwm: u8, config_max_pwm: u8) -> u8 {
@@ -2597,10 +3269,10 @@ impl Am3BbCappedFan {
 
     /// Apply a PID-requested PWM, clamped to the quiet envelope. Returns the
     /// PWM actually written so the caller can log/track it.
-    fn apply(&self, requested: u8) -> u8 {
+    fn apply(&self, requested: u8) -> Result<u8> {
         let pwm = am3_bb_clamp_pid_pwm(self.fan_min_pwm, self.fan_max_pwm, requested);
-        self.fan.set_speed(pwm);
-        pwm
+        let receipt = self.fan.set_speed_checked(pwm)?;
+        Ok(receipt.observed_pwm())
     }
 
     fn get_rpm(&self) -> u32 {
@@ -2633,17 +3305,17 @@ struct Am3BbFanPid {
 }
 
 impl Am3BbFanPid {
-    fn new(fan: Am3BbCappedFan, target_temp_c: u8) -> Self {
+    fn new(fan: Am3BbCappedFan, target_temp_c: u8) -> Result<Self> {
         let pid = dcentrald_thermal::controller::PidController::new(f32::from(target_temp_c));
         // Start at the quiet floor — the boot/whisper level. The PID only ever
         // climbs from here on measured need, and only within the cap.
         let floor = fan.floor();
-        let commanded_pwm = fan.apply(floor);
-        Self {
+        let commanded_pwm = fan.apply(floor)?;
+        Ok(Self {
             pid,
             fan,
             commanded_pwm,
-        }
+        })
     }
 
     /// Feed the supervisor's just-validated snapshot to the PID and move the
@@ -2651,11 +3323,11 @@ impl Am3BbFanPid {
     /// the supervisor served a tolerated last-known-good window or is about to
     /// fail closed — either way we must NOT compute a fan action from absent
     /// data; hold station and return.
-    fn step(&mut self, snapshot: &Am3BbThermalSnapshot, dangerous_temp_c: f32) {
-        if snapshot.samples == 0 || !snapshot.max_temp_c.is_finite() {
+    fn step(&mut self, snapshot: &Am3BbThermalSnapshot, dangerous_temp_c: f32) -> Result<()> {
+        if !snapshot.fresh || snapshot.samples == 0 || !snapshot.max_temp_c.is_finite() {
             // Invariant #3: no board/LM75 data → do not drive fans off empty
             // readings. The fail-closed supervisor decides stale-vs-tolerate.
-            return;
+            return Ok(());
         }
 
         // Invariant #2: at/above dangerous, the response is cut-hash-first.
@@ -2666,7 +3338,7 @@ impl Am3BbFanPid {
         if am3_bb_thermal_action(snapshot.max_temp_c, dangerous_temp_c)
             == Am3BbThermalAction::CutHashThenFan
         {
-            return;
+            return Ok(());
         }
 
         let target = self.pid.update(snapshot.max_temp_c);
@@ -2688,7 +3360,8 @@ impl Am3BbFanPid {
         };
         // `apply` re-clamps defensively — even a logic bug above cannot leak a
         // PWM above the home cap past this point.
-        self.commanded_pwm = self.fan.apply(next);
+        self.commanded_pwm = self.fan.apply(next)?;
+        Ok(())
     }
 
     fn commanded_pwm(&self) -> u8 {
@@ -2745,16 +3418,107 @@ pub fn am3_bb_panic_hook_best_effort_teardown() {
     if let Some(params) = AM3BB_TEARDOWN_ARMED.get() {
         for &gpio in &params.reset_gpios {
             let _ = am3_bb_prepare_output_gpio(gpio, true)
-                .and_then(|_| am3_bb_write_gpio_attr(gpio, "value", "1"));
+                .and_then(|_| am3_bb_write_gpio_attr_checked(gpio, "value", "1"));
         }
         let off_level = if params.board_enable_active_high {
             "0"
         } else {
             "1"
         };
-        let _ = am3_bb_prepare_output_gpio(params.board_enable_gpio, false)
-            .and_then(|_| am3_bb_write_gpio_attr(params.board_enable_gpio, "value", off_level));
+        let _ = am3_bb_prepare_output_gpio(params.board_enable_gpio, false).and_then(|_| {
+            am3_bb_write_gpio_attr_checked(params.board_enable_gpio, "value", off_level)
+        });
     }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Am3BbDspicShutdownEvidence {
+    delivery_attempts: usize,
+    delivery_failures: usize,
+    observation_attempts: usize,
+    observation_failures: usize,
+}
+
+impl Am3BbDspicShutdownEvidence {
+    fn all_delivered(self) -> bool {
+        self.delivery_failures == 0
+    }
+}
+
+/// Disable every active dsPIC in two ordered phases.
+///
+/// SafeOff delivery is the safety action; ACK reads are only observation.  The
+/// first pass therefore admits every write-only SafeOff before the second pass
+/// performs any optional read. A slow or broken chain-0 ACK can no longer delay
+/// voltage-disable delivery to chains 1 and 2, and an observation failure does
+/// not get misreported as a delivery failure.
+fn am3_bb_disable_dspics_two_phase<D, O>(
+    active_addrs: &[u8],
+    observe_replies: bool,
+    mut deliver: D,
+    mut observe: O,
+) -> Am3BbDspicShutdownEvidence
+where
+    D: FnMut(usize, u8) -> Result<()>,
+    O: FnMut(usize, u8) -> Result<Vec<u8>>,
+{
+    let mut evidence = Am3BbDspicShutdownEvidence::default();
+    let mut delivered = Vec::with_capacity(active_addrs.len());
+
+    for &addr in active_addrs {
+        let chain_idx = addr.saturating_sub(AM3_BB_DSPIC_BASE_ADDR) as usize;
+        evidence.delivery_attempts += 1;
+        match deliver(chain_idx, addr) {
+            Ok(()) => {
+                delivered.push((chain_idx, addr));
+                info!(
+                    chain = chain_idx,
+                    addr = format_args!("0x{:02X}", addr),
+                    "am3-bb: safety guard delivered dsPIC voltage-disable SafeOff"
+                );
+            }
+            Err(e) => {
+                evidence.delivery_failures += 1;
+                warn!(
+                    chain = chain_idx,
+                    addr = format_args!("0x{:02X}", addr),
+                    error = %e,
+                    "am3-bb: safety guard failed to deliver dsPIC voltage-disable SafeOff"
+                );
+            }
+        }
+    }
+
+    if !observe_replies {
+        return evidence;
+    }
+
+    if !delivered.is_empty() {
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    for (chain_idx, addr) in delivered {
+        evidence.observation_attempts += 1;
+        match observe(chain_idx, addr) {
+            Ok(reply) => info!(
+                chain = chain_idx,
+                addr = format_args!("0x{:02X}", addr),
+                reply = format_args!("{:02X?}", reply),
+                "am3-bb: safety guard observed dsPIC voltage-disable reply"
+            ),
+            Err(e) => {
+                evidence.observation_failures += 1;
+                warn!(
+                    chain = chain_idx,
+                    addr = format_args!("0x{:02X}", addr),
+                    error = %e,
+                    "am3-bb: dsPIC voltage-disable was delivered, but optional reply observation failed"
+                );
+            }
+        }
+    }
+
+    evidence
 }
 
 struct Am3BbRunSafetyGuard {
@@ -2775,6 +3539,16 @@ struct Am3BbRunSafetyGuard {
     teardown_done: bool,
 }
 
+/// Software safe-off evidence for AM3-BB. This proves checked sysfs command
+/// and readback plus delivery of every conservatively owned dsPIC SafeOff; it
+/// is not an independent measurement that the physical hash rail reached 0 V.
+#[derive(Debug)]
+pub(crate) struct Am3BbSafeOffReceipt {
+    board_enable_gpio: u32,
+    reset_count: usize,
+    dspic_count: usize,
+}
+
 impl Am3BbRunSafetyGuard {
     fn new(
         platform: &BeagleBonePlatform,
@@ -2783,33 +3557,27 @@ impl Am3BbRunSafetyGuard {
         chain_count: usize,
         fan_min_pwm: u8,
         fan_max_pwm: u8,
-    ) -> Self {
+    ) -> Result<Self> {
         let safe_pwm = am3_bb_quiet_safe_pwm(fan_min_pwm, fan_max_pwm);
-        let fan: Option<Arc<dyn FanAccess>> = match platform.open_fan() {
-            Ok(fan) => {
-                let fan: Arc<dyn FanAccess> = Arc::from(fan);
-                fan.set_speed(safe_pwm);
-                let rpm = fan.get_rpm();
-                info!(
-                    safe_pwm,
-                    rpm,
-                    tach_available = fan.tach_available(),
-                    fan_count = fan.fan_count(),
-                    "am3-bb: quiet fan guard armed"
-                );
-                Some(fan)
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    safe_pwm,
-                    "am3-bb: fan guard could not open BeagleBone PWM; ASIC voltage/reset guard remains armed"
-                );
-                None
-            }
-        };
+        let fan: Arc<dyn FanAccess> = Arc::from(
+            platform
+                .open_fan()
+                .context("am3-bb: checked cooling admission could not open BeagleBone PWM")?,
+        );
+        let fan_receipt = fan
+            .set_speed_checked(safe_pwm)
+            .context("am3-bb: checked cooling admission failed")?;
+        let rpm = fan.get_rpm();
+        info!(
+            requested_pwm = fan_receipt.requested_pwm(),
+            observed_pwm = fan_receipt.observed_pwm(),
+            rpm,
+            tach_available = fan.tach_available(),
+            fan_count = fan.fan_count(),
+            "am3-bb: checked quiet fan guard armed"
+        );
 
-        Self {
+        Ok(Self {
             dspic_i2c,
             active_dspic_addrs,
             reset_gpios: platform
@@ -2819,20 +3587,22 @@ impl Am3BbRunSafetyGuard {
                 .collect(),
             board_enable_gpio: platform.board_enable_gpio_v2_0(),
             board_enable_active_high: platform.board_target().board_enable_active_high(),
-            fan,
+            fan: Some(fan),
             fan_min_pwm,
             fan_max_pwm,
             safe_pwm,
             teardown_done: false,
-        }
+        })
     }
 
     fn set_dspic(&mut self, dspic_i2c: I2cServiceHandle, active_dspic_addrs: Vec<u8>) {
         self.dspic_i2c = Some(dspic_i2c);
-        self.active_dspic_addrs = active_dspic_addrs;
+        self.active_dspic_addrs.extend(active_dspic_addrs);
+        self.active_dspic_addrs.sort_unstable();
+        self.active_dspic_addrs.dedup();
         info!(
-            active_dspic_addrs = format_args!("{:02X?}", self.active_dspic_addrs),
-            "am3-bb: quiet safety guard attached to dsPIC voltage controllers"
+            owned_dspic_addrs = format_args!("{:02X?}", self.active_dspic_addrs),
+            "am3-bb: safety guard owns every dsPIC that may have been energized"
         );
     }
 
@@ -2850,57 +3620,56 @@ impl Am3BbRunSafetyGuard {
         })
     }
 
-    fn teardown(&mut self) {
+    fn teardown_checked(&mut self) -> Result<Am3BbSafeOffReceipt> {
         if self.teardown_done {
-            return;
+            anyhow::bail!("am3-bb: safe-off was already attempted; receipt cannot be replayed");
         }
         self.teardown_done = true;
-
-        if let Some(fan) = self.fan.as_ref() {
-            fan.set_speed(self.safe_pwm);
-        }
 
         // prod-readiness hunt #4 (log-honesty): track the two best-effort legs
         // (dsPIC disable + reset-assert) so the final summary doesn't affirm
         // "voltage off, resets asserted" when only the board-enable-off write
         // (the load-bearing cut) succeeded. Log-only — no command/ordering change.
-        let mut dspic_disable_ok = true;
-        if let Some(i2c) = self.dspic_i2c.as_ref() {
-            for &addr in &self.active_dspic_addrs {
-                let chain_idx = addr.saturating_sub(AM3_BB_DSPIC_BASE_ADDR) as usize;
-                match am3_bb_dspic_command(
-                    i2c,
-                    chain_idx,
-                    addr,
-                    AM3_BB_DSPIC_DISABLE_FRAME,
-                    2,
-                    50,
-                    20,
-                    "safety-guard-disable-voltage",
-                ) {
-                    Ok(reply) => info!(
-                        chain = chain_idx,
-                        addr = format_args!("0x{:02X}", addr),
-                        reply = format_args!("{:02X?}", reply),
-                        "am3-bb: safety guard disabled dsPIC voltage"
-                    ),
-                    Err(e) => {
-                        dspic_disable_ok = false;
-                        warn!(
-                            chain = chain_idx,
-                            addr = format_args!("0x{:02X}", addr),
-                            error = %e,
-                            "am3-bb: safety guard dsPIC disable-voltage failed"
-                        );
-                    }
-                }
-            }
-        }
+        let dspic_shutdown = self
+            .dspic_i2c
+            .as_ref()
+            .map(|i2c| {
+                // Terminal teardown deliberately skips optional ACK reads.
+                // Once every write-only SafeOff is admitted, assert resets and
+                // cut board-enable immediately; observation belongs to an
+                // explicit diagnostic path and must never extend Drop latency.
+                am3_bb_disable_dspics_two_phase(
+                    &self.active_dspic_addrs,
+                    false,
+                    |chain_idx, addr| {
+                        i2c.disable_dspic_voltage(
+                            addr,
+                            I2cDspicDisableProtocol::VnishPaddedFramed,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "am3-bb chain {} dsPIC 0x{:02X}: safety-guard-disable-voltage SafeOff write failed",
+                                chain_idx, addr
+                            )
+                        })?;
+                        Ok(())
+                    },
+                    |_chain_idx, _addr| {
+                        unreachable!(
+                            "run-scope teardown skips optional ACK reads before the hard cutoff"
+                        )
+                    },
+                )
+            })
+            .unwrap_or_default();
+        let dspic_disable_ok = !self.active_dspic_addrs.is_empty()
+            && self.dspic_i2c.is_some()
+            && dspic_shutdown.all_delivered();
 
-        let mut resets_asserted_ok = true;
+        let mut resets_asserted_ok = !self.reset_gpios.is_empty();
         for &gpio in &self.reset_gpios {
             if let Err(e) = am3_bb_prepare_output_gpio(gpio, true)
-                .and_then(|_| am3_bb_write_gpio_attr(gpio, "value", "1"))
+                .and_then(|_| am3_bb_write_gpio_attr_checked(gpio, "value", "1"))
             {
                 resets_asserted_ok = false;
                 warn!(
@@ -2916,23 +3685,50 @@ impl Am3BbRunSafetyGuard {
         } else {
             "1"
         };
-        if let Err(e) = am3_bb_prepare_output_gpio(self.board_enable_gpio, false)
-            .and_then(|_| am3_bb_write_gpio_attr(self.board_enable_gpio, "value", off_level))
-        {
-            warn!(
-                gpio = self.board_enable_gpio,
-                off_level,
-                error = %e,
-                "am3-bb: safety guard failed to drive board-enable off"
-            );
-        } else if dspic_disable_ok && resets_asserted_ok {
+        let board_enable_off_ok = match am3_bb_prepare_output_gpio(self.board_enable_gpio, false)
+            .and_then(|_| {
+                am3_bb_write_gpio_attr_checked(self.board_enable_gpio, "value", off_level)
+            }) {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(
+                    gpio = self.board_enable_gpio,
+                    off_level,
+                    %error,
+                    "am3-bb: safety guard failed checked board-enable cutoff"
+                );
+                false
+            }
+        };
+
+        // Acoustic coast-down follows the power cut. Once GPIO59 is checked
+        // OFF, a fan readback failure is degraded evidence rather than a reason
+        // to reboot and potentially re-energize a software-off rail.
+        if let Some(fan) = self.fan.as_ref() {
+            if let Err(error) = fan.set_speed_checked(self.safe_pwm) {
+                warn!(
+                    %error,
+                    safe_pwm = self.safe_pwm,
+                    "am3-bb: power is checked off, but quiet fan coast-down failed"
+                );
+            }
+        }
+
+        if dspic_disable_ok && resets_asserted_ok && board_enable_off_ok {
             info!(
                 reset_gpios = ?self.reset_gpios,
                 board_enable_gpio = self.board_enable_gpio,
                 board_enable_off_level = off_level,
                 safe_pwm = self.safe_pwm,
-                "am3-bb: safety guard teardown complete (voltage off, resets asserted, quiet fan cap preserved)"
+                dspic_delivery_attempts = dspic_shutdown.delivery_attempts,
+                dspic_observation_failures = dspic_shutdown.observation_failures,
+                "am3-bb: every owned dsPIC SafeOff and checked reset/GPIO59 readback completed; physical rail-off was not independently measured"
             );
+            Ok(Am3BbSafeOffReceipt {
+                board_enable_gpio: self.board_enable_gpio,
+                reset_count: self.reset_gpios.len(),
+                dspic_count: self.active_dspic_addrs.len(),
+            })
         } else {
             // prod-readiness hunt #4: board-enable-off (the load-bearing power
             // cut) succeeded, but one or more best-effort legs did NOT — say so
@@ -2943,18 +3739,31 @@ impl Am3BbRunSafetyGuard {
                 board_enable_off_level = off_level,
                 safe_pwm = self.safe_pwm,
                 dspic_disable_ok,
+                dspic_delivery_attempts = dspic_shutdown.delivery_attempts,
+                dspic_delivery_failures = dspic_shutdown.delivery_failures,
+                dspic_observation_failures = dspic_shutdown.observation_failures,
                 resets_asserted_ok,
                 "am3-bb: safety guard drove board-enable OFF (the load-bearing power cut + quiet fan cap), \
                  but did NOT confirm all legs — dsPIC-disable and/or reset-assert reported errors above. \
-                 Board-enable-off remains the safety net."
+                 The board-enable OFF command remains the safety net; physical rail-off was not independently measured."
             );
+            anyhow::bail!(
+                "am3-bb: incomplete safe-off evidence: dspic_disable_ok={}, resets_asserted_ok={}, board_enable_off_ok={}",
+                dspic_disable_ok,
+                resets_asserted_ok,
+                board_enable_off_ok
+            )
         }
     }
 }
 
 impl Drop for Am3BbRunSafetyGuard {
     fn drop(&mut self) {
-        self.teardown();
+        if !self.teardown_done {
+            if let Err(error) = self.teardown_checked() {
+                warn!(%error, "am3-bb: fail-closed Drop safe-off was incomplete");
+            }
+        }
     }
 }
 
@@ -2989,18 +3798,324 @@ fn am3_bb_post_dspic_reset_chains(platform: &BeagleBonePlatform, chain_count: us
     Ok(())
 }
 
+#[derive(Debug)]
+struct Am3BbHeartbeatShutdownEvidence {
+    summary: ThreadStopSummary,
+    worker_timed_out: bool,
+    worker_panicked: bool,
+    hard_board_cut_attempted: bool,
+    hard_board_cut_succeeded: bool,
+}
+
+impl Am3BbHeartbeatShutdownEvidence {
+    fn graceful(&self) -> bool {
+        !self.worker_timed_out && !self.worker_panicked
+    }
+}
+
+fn am3_bb_force_board_enable_off(
+    board_enable_gpio: u32,
+    board_enable_active_high: bool,
+    reason: &'static str,
+) -> bool {
+    let off_level = if board_enable_active_high { "0" } else { "1" };
+    match am3_bb_prepare_output_gpio(board_enable_gpio, false)
+        .and_then(|_| am3_bb_write_gpio_attr_checked(board_enable_gpio, "value", off_level))
+    {
+        Ok(()) => {
+            warn!(
+                gpio = board_enable_gpio,
+                off_level, reason, "am3-bb: hard board-enable cutoff applied"
+            );
+            true
+        }
+        Err(e) => {
+            warn!(
+                gpio = board_enable_gpio,
+                off_level,
+                reason,
+                error = %e,
+                "am3-bb: hard board-enable cutoff failed"
+            );
+            false
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Am3BbHeartbeatEvent {
+    VerifiedHeartbeatReady { validated_chains: usize },
+    TerminalFailure { reason: String },
+    WorkerPanicked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Am3BbHeartbeatReadinessReceipt {
+    validated_chains: usize,
+}
+
+struct Am3BbHeartbeatAdmission {
+    events: std_mpsc::Receiver<Am3BbHeartbeatEvent>,
+    expected_chains: usize,
+    receipt: Option<Am3BbHeartbeatReadinessReceipt>,
+    terminal_failure: Option<String>,
+}
+
+impl Am3BbHeartbeatAdmission {
+    fn new(events: std_mpsc::Receiver<Am3BbHeartbeatEvent>, expected_chains: usize) -> Self {
+        Self {
+            events,
+            expected_chains,
+            receipt: None,
+            terminal_failure: None,
+        }
+    }
+
+    fn apply_event(&mut self, event: Am3BbHeartbeatEvent) {
+        match event {
+            Am3BbHeartbeatEvent::VerifiedHeartbeatReady { validated_chains }
+                if validated_chains == self.expected_chains && validated_chains > 0 =>
+            {
+                self.receipt = Some(Am3BbHeartbeatReadinessReceipt { validated_chains });
+            }
+            Am3BbHeartbeatEvent::VerifiedHeartbeatReady { validated_chains } => {
+                self.terminal_failure = Some(format!(
+                    "heartbeat worker reported readiness for {validated_chains} chains; expected {}",
+                    self.expected_chains
+                ));
+            }
+            Am3BbHeartbeatEvent::TerminalFailure { reason } => {
+                self.terminal_failure = Some(reason);
+            }
+            Am3BbHeartbeatEvent::WorkerPanicked => {
+                self.terminal_failure = Some("heartbeat worker panicked".to_string());
+            }
+        }
+    }
+
+    fn drain_events(&mut self, stage: &'static str) -> Result<()> {
+        loop {
+            match self.events.try_recv() {
+                Ok(event) => self.apply_event(event),
+                Err(std_mpsc::TryRecvError::Empty) => break,
+                Err(std_mpsc::TryRecvError::Disconnected) => {
+                    if self.terminal_failure.is_none() {
+                        self.terminal_failure = Some(
+                            "heartbeat worker exited without terminal ownership evidence"
+                                .to_string(),
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+        if let Some(reason) = &self.terminal_failure {
+            anyhow::bail!("am3-bb: dsPIC heartbeat failed during {stage}: {reason}");
+        }
+        Ok(())
+    }
+
+    fn wait_for_verified_heartbeat_readiness(
+        &mut self,
+        shutdown: &CancellationToken,
+        timeout: Duration,
+    ) -> Result<Am3BbHeartbeatReadinessReceipt> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.drain_events("bring-up readiness")?;
+            if let Some(receipt) = self.receipt {
+                return Ok(receipt);
+            }
+            if shutdown.is_cancelled() {
+                anyhow::bail!("am3-bb: shutdown requested before dsPIC framed heartbeat readiness");
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!(
+                    "am3-bb: dsPIC heartbeat did not establish framed protocol readiness for {} chains within {} ms",
+                    self.expected_chains,
+                    timeout.as_millis()
+                );
+            }
+            match self
+                .events
+                .recv_timeout(remaining.min(Duration::from_millis(50)))
+            {
+                Ok(event) => self.apply_event(event),
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                    self.terminal_failure =
+                        Some("heartbeat worker exited before readiness admission".to_string());
+                }
+            }
+        }
+    }
+
+    fn require_ready_and_healthy(&mut self, stage: &'static str) -> Result<()> {
+        self.drain_events(stage)?;
+        if self.receipt.is_none() {
+            anyhow::bail!("am3-bb: verified dsPIC heartbeat readiness is missing before {stage}");
+        }
+        Ok(())
+    }
+}
+
 struct Am3BbDspicHeartbeatGuard {
-    stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
+    threads: RuntimeThreadGuard,
+    admission: Am3BbHeartbeatAdmission,
+    board_enable_gpio: u32,
+    board_enable_active_high: bool,
+    explicitly_stopped: bool,
+}
+
+impl Am3BbDspicHeartbeatGuard {
+    fn wait_for_verified_heartbeat_readiness(
+        &mut self,
+        shutdown: &CancellationToken,
+    ) -> Result<Am3BbHeartbeatReadinessReceipt> {
+        self.admission.wait_for_verified_heartbeat_readiness(
+            shutdown,
+            Duration::from_millis(AM3_BB_DSPIC_HEARTBEAT_READINESS_TIMEOUT_MS),
+        )
+    }
+
+    fn require_ready_and_healthy(&mut self, stage: &'static str) -> Result<()> {
+        self.admission.require_ready_and_healthy(stage)
+    }
+
+    fn stop_and_join(
+        &mut self,
+        rt_handle: &tokio::runtime::Handle,
+    ) -> Am3BbHeartbeatShutdownEvidence {
+        let summary = rt_handle.block_on(self.threads.stop_and_join(Duration::from_millis(
+            AM3_BB_DSPIC_HEARTBEAT_STOP_TIMEOUT_MS,
+        )));
+        let worker_timed_out = summary.any_timed_out();
+        let worker_panicked = summary.any_panicked();
+        let hard_board_cut_succeeded = worker_timed_out
+            && am3_bb_force_board_enable_off(
+                self.board_enable_gpio,
+                self.board_enable_active_high,
+                "dspic-heartbeat-stop-timeout",
+            );
+        self.explicitly_stopped = true;
+        Am3BbHeartbeatShutdownEvidence {
+            summary,
+            worker_timed_out,
+            worker_panicked,
+            hard_board_cut_attempted: worker_timed_out,
+            hard_board_cut_succeeded,
+        }
+    }
 }
 
 impl Drop for Am3BbDspicHeartbeatGuard {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.handle.take() {
-            if handle.join().is_err() {
-                warn!("am3-bb: dsPIC heartbeat thread panicked during shutdown");
+        // Drop must never wait on a transport thread. If the owner did not run
+        // the explicit bounded stop path, cancel the worker and cut the board
+        // enable out of band before detaching its JoinHandle.
+        self.threads.request_stop();
+        if !self.explicitly_stopped {
+            let hard_board_cut_succeeded = am3_bb_force_board_enable_off(
+                self.board_enable_gpio,
+                self.board_enable_active_high,
+                "dspic-heartbeat-owner-drop-without-quiescence",
+            );
+            warn!(
+                hard_board_cut_succeeded,
+                "am3-bb: dsPIC heartbeat owner dropped without explicit quiescence; worker detached after hard cutoff attempt"
+            );
+        }
+    }
+}
+
+fn run_am3_bb_dspic_heartbeat_worker(
+    i2c: I2cServiceHandle,
+    active_addrs: Vec<u8>,
+    stop_worker: CancellationToken,
+    shutdown: CancellationToken,
+    supervisor_disabled: bool,
+    events: std_mpsc::Sender<Am3BbHeartbeatEvent>,
+) {
+    let mut tick = 0u64;
+    let mut readiness_reported = false;
+    let mut consecutive_failures = vec![0u8; active_addrs.len()];
+    while !stop_worker.is_cancelled() {
+        tick = tick.wrapping_add(1);
+        let mut sweep_protocol_valid = true;
+        for (chain_idx, addr) in active_addrs.iter().copied().enumerate() {
+            if stop_worker.is_cancelled() {
+                return;
             }
+            match am3_bb_dspic_heartbeat_once(&i2c, chain_idx, addr) {
+                Ok(reply) => {
+                    consecutive_failures[chain_idx] = 0;
+                    if tick.is_multiple_of(30) {
+                        debug!(
+                            chain = chain_idx,
+                            addr = format_args!("0x{:02X}", addr),
+                            reply = format_args!("{:02X?}", reply),
+                            "am3-bb: dsPIC runtime heartbeat framed protocol check OK"
+                        );
+                    }
+                }
+                Err(e) => {
+                    sweep_protocol_valid = false;
+                    consecutive_failures[chain_idx] =
+                        consecutive_failures[chain_idx].saturating_add(1);
+                    if tick == 1 || tick.is_multiple_of(10) {
+                        warn!(
+                            chain = chain_idx,
+                            addr = format_args!("0x{:02X}", addr),
+                            consecutive_failures = consecutive_failures[chain_idx],
+                            error = %e,
+                            "am3-bb: dsPIC runtime heartbeat failed"
+                        );
+                    }
+                    if !supervisor_disabled
+                        && consecutive_failures[chain_idx] >= AM3_BB_DSPIC_HEARTBEAT_MAX_FAILURES
+                    {
+                        let reason = format!(
+                            "chain {chain_idx} dsPIC 0x{addr:02X} reached {} consecutive heartbeat failures: {e:#}",
+                            consecutive_failures[chain_idx]
+                        );
+                        warn!(
+                            chain = chain_idx,
+                            addr = format_args!("0x{:02X}", addr),
+                            consecutive_failures = consecutive_failures[chain_idx],
+                            max_failures = AM3_BB_DSPIC_HEARTBEAT_MAX_FAILURES,
+                            "am3-bb: dsPIC heartbeat supervisor cancelling mining; safety guard will cut voltage"
+                        );
+                        let _ = events.send(Am3BbHeartbeatEvent::TerminalFailure { reason });
+                        shutdown.cancel();
+                        return;
+                    }
+                }
+            }
+            if stop_worker.is_cancelled() {
+                return;
+            }
+        }
+
+        if !readiness_reported && sweep_protocol_valid {
+            if events
+                .send(Am3BbHeartbeatEvent::VerifiedHeartbeatReady {
+                    validated_chains: active_addrs.len(),
+                })
+                .is_err()
+            {
+                return;
+            }
+            readiness_reported = true;
+        }
+
+        let sleep_start = Instant::now();
+        while sleep_start.elapsed() < Duration::from_millis(AM3_BB_DSPIC_HEARTBEAT_INTERVAL_MS) {
+            if stop_worker.is_cancelled() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
         }
     }
 }
@@ -3009,9 +4124,14 @@ fn start_am3_bb_dspic_heartbeat(
     i2c: I2cServiceHandle,
     active_addrs: Vec<u8>,
     shutdown: CancellationToken,
+    platform: &BeagleBonePlatform,
 ) -> Result<Am3BbDspicHeartbeatGuard> {
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_worker = Arc::clone(&stop);
+    if active_addrs.is_empty() {
+        anyhow::bail!("am3-bb: refusing to start dsPIC heartbeat owner with zero controllers");
+    }
+    let expected_chains = active_addrs.len();
+    let worker_stop = CancellationToken::new();
+    let stop_worker = worker_stop.clone();
     let supervisor_disabled = env_flag_set(ENV_AM3_BB_DISABLE_HEARTBEAT_SUPERVISOR);
     if supervisor_disabled {
         warn!(
@@ -3019,73 +4139,82 @@ fn start_am3_bb_dspic_heartbeat(
             "am3-bb: lab override active - dsPIC heartbeat failures will not cancel mining"
         );
     }
+    let (events_tx, events_rx) = std_mpsc::channel();
+    let panic_events = events_tx.clone();
+    let panic_shutdown = shutdown.clone();
     let handle = thread::Builder::new()
         .name("am3-bb-dspic-heartbeat".to_string())
         .spawn(move || {
-            let mut tick = 0u64;
-            let mut consecutive_failures = vec![0u8; active_addrs.len()];
-            while !stop_worker.load(Ordering::SeqCst) {
-                tick = tick.wrapping_add(1);
-                for (chain_idx, addr) in active_addrs.iter().copied().enumerate() {
-                    match am3_bb_dspic_heartbeat_once(&i2c, chain_idx, addr) {
-                        Ok(reply) => {
-                            consecutive_failures[chain_idx] = 0;
-                            if tick.is_multiple_of(30) {
-                                debug!(
-                                    chain = chain_idx,
-                                    addr = format_args!("0x{:02X}", addr),
-                                    reply = format_args!("{:02X?}", reply),
-                                    "am3-bb: dsPIC runtime heartbeat OK"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            consecutive_failures[chain_idx] =
-                                consecutive_failures[chain_idx].saturating_add(1);
-                            if tick == 1 || tick.is_multiple_of(10) {
-                                warn!(
-                                    chain = chain_idx,
-                                    addr = format_args!("0x{:02X}", addr),
-                                    consecutive_failures = consecutive_failures[chain_idx],
-                                    error = %e,
-                                    "am3-bb: dsPIC runtime heartbeat failed"
-                                );
-                            }
-                            if !supervisor_disabled
-                                && consecutive_failures[chain_idx]
-                                    >= AM3_BB_DSPIC_HEARTBEAT_MAX_FAILURES
-                            {
-                                warn!(
-                                    chain = chain_idx,
-                                    addr = format_args!("0x{:02X}", addr),
-                                    consecutive_failures = consecutive_failures[chain_idx],
-                                    max_failures = AM3_BB_DSPIC_HEARTBEAT_MAX_FAILURES,
-                                    "am3-bb: dsPIC heartbeat supervisor cancelling mining; safety guard will cut voltage"
-                                );
-                                shutdown.cancel();
-                                return;
-                            }
-                        }
-                    }
-                }
-
-                let sleep_start = Instant::now();
-                while sleep_start.elapsed()
-                    < Duration::from_millis(AM3_BB_DSPIC_HEARTBEAT_INTERVAL_MS)
-                {
-                    if stop_worker.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    thread::sleep(Duration::from_millis(50));
-                }
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                run_am3_bb_dspic_heartbeat_worker(
+                    i2c,
+                    active_addrs,
+                    stop_worker,
+                    shutdown,
+                    supervisor_disabled,
+                    events_tx,
+                )
+            }));
+            if let Err(payload) = outcome {
+                let _ = panic_events.send(Am3BbHeartbeatEvent::WorkerPanicked);
+                panic_shutdown.cancel();
+                resume_unwind(payload);
             }
         })
         .context("am3-bb: spawn dsPIC heartbeat thread failed")?;
 
+    let mut threads = RuntimeThreadGuard::new(worker_stop);
+    threads.push("am3-bb-dspic-heartbeat", handle);
     Ok(Am3BbDspicHeartbeatGuard {
-        stop,
-        handle: Some(handle),
+        threads,
+        admission: Am3BbHeartbeatAdmission::new(events_rx, expected_chains),
+        board_enable_gpio: platform.board_enable_gpio_v2_0(),
+        board_enable_active_high: platform.board_target().board_enable_active_high(),
+        explicitly_stopped: false,
     })
+}
+
+fn am3_bb_require_heartbeat_for_energizing_boundary(
+    heartbeat: Option<&mut Am3BbDspicHeartbeatGuard>,
+    shutdown: &CancellationToken,
+    heartbeat_required: bool,
+    stage: &'static str,
+) -> Result<()> {
+    match heartbeat {
+        Some(heartbeat) => heartbeat.require_ready_and_healthy(stage)?,
+        None if heartbeat_required => {
+            anyhow::bail!("am3-bb: dsPIC heartbeat owner is missing before {stage}");
+        }
+        None => {}
+    }
+    if shutdown.is_cancelled() {
+        anyhow::bail!("am3-bb: shutdown requested before energizing phase {stage}");
+    }
+    Ok(())
+}
+
+fn am3_bb_wait_with_heartbeat_ownership(
+    heartbeat: Option<&mut Am3BbDspicHeartbeatGuard>,
+    shutdown: &CancellationToken,
+    heartbeat_required: bool,
+    duration: Duration,
+    stage: &'static str,
+) -> Result<()> {
+    let deadline = Instant::now() + duration;
+    let mut heartbeat = heartbeat;
+    loop {
+        am3_bb_require_heartbeat_for_energizing_boundary(
+            heartbeat.as_deref_mut(),
+            shutdown,
+            heartbeat_required,
+            stage,
+        )?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
 }
 
 /// BM1362 chip-side init for ONE chain. Returns the detected chip count
@@ -3114,6 +4243,8 @@ struct Bm1362ChainInitResult {
     assigned_chips: usize,
     initial_get_address_rx_bytes: usize,
     fast_get_address_rx_bytes: usize,
+    initial_get_address_observation: Option<CrcVerifiedUnassignedGetAddressObservation>,
+    fast_get_address_observation: Option<CrcVerifiedUnassignedGetAddressObservation>,
 }
 
 impl Bm1362ChainInitResult {
@@ -3145,28 +4276,43 @@ fn bm1362_chip_init_one_chain(
         "am3-bb: BM1362 init values selected"
     );
 
-    // a. GetAddress broadcast @ 115200. Phase D parses the chip-address
-    //    responses to count chips; here we send the broadcast and read
-    //    whatever comes back, logging the byte count as a liveness signal.
+    // a. GetAddress broadcast @ 115200. Read whatever comes back as liveness;
+    //    the parser can recognize the retained CRC-verified unassigned frame,
+    //    but repeated frames are not unique-chip or chip-count evidence.
     let get_addr = build_get_address_frame();
     bm1362_write_cmd_frame(uart, &get_addr)
         .with_context(|| format!("am3-bb chain {}: GetAddress write failed", chain_idx))?;
     std::thread::sleep(Duration::from_millis(50));
     let mut rx = [0u8; 2048];
     let n = uart.read_bytes_timeout(&mut rx, 100);
-    // Each BM1362 chip-address response is a few bytes; this is a rough
-    // count, refined in Phase D. If nothing comes back, we still proceed —
-    // the live unit may need a different enum baud / settle time.
-    let approx_chips = n / 5;
+    let initial_get_address_observation = if n == 0 {
+        None
+    } else {
+        match inspect_am3_bb_get_address_stream(&rx[..n]) {
+            Ok(observation) => Some(observation),
+            Err(reason) => {
+                warn!(
+                    chain = chain_idx,
+                    ?reason,
+                    raw_bytes = n,
+                    "am3-bb: GetAddress bytes are not a complete CRC-verified BM1362 unassigned-response stream; retaining liveness only"
+                );
+                None
+            }
+        }
+    };
+    // If nothing comes back, we still proceed — the live unit may need a
+    // different enum baud / settle time. Repeated unassigned responses are
+    // liveness frames, not unique-chip or chip-count evidence.
     let n_assign = expected_chips_per_chain.clamp(1, BM1362_MAX_CHIPS_PER_CHAIN);
     let addr_interval = (256u16 / n_assign as u16).max(1);
     let mut n_fast = 0usize;
+    let mut fast_get_address_observation = None;
     info!(
         chain = chain_idx,
         backend = uart.backend_name(),
         get_address_rx_bytes = n,
-        approx_chips,
-        approx_9b_frames = n / 9,
+        parsed_observation = ?initial_get_address_observation,
         assigned_chips = n_assign,
         addr_interval,
         rx_preview = %hex_preview(&rx[..n], 96),
@@ -3490,6 +4636,17 @@ fn bm1362_chip_init_one_chain(
             .unwrap_or(300);
         std::thread::sleep(Duration::from_millis(fast_getaddr_delay_ms));
         n_fast = uart.read_bytes_timeout(&mut rx, fast_getaddr_read_ms);
+        if n_fast > 0 {
+            match inspect_am3_bb_get_address_stream(&rx[..n_fast]) {
+                Ok(observation) => fast_get_address_observation = Some(observation),
+                Err(reason) => warn!(
+                    chain = chain_idx,
+                    ?reason,
+                    raw_bytes = n_fast,
+                    "am3-bb: fast-baud GetAddress bytes are not a complete CRC-verified BM1362 unassigned-response stream; retaining liveness only"
+                ),
+            }
+        }
         uart.flush_io();
         if n_fast == 0 {
             warn!(
@@ -3510,8 +4667,7 @@ fn bm1362_chip_init_one_chain(
                 fast_getaddr_delay_ms,
                 fast_getaddr_read_ms,
                 fast_get_address_rx_bytes = n_fast,
-                approx_chips = n_fast / 5,
-                approx_9b_frames = n_fast / 9,
+                parsed_observation = ?fast_get_address_observation,
                 rx_preview = %hex_preview(&rx[..n_fast], 96),
                 "am3-bb: fast-baud GetAddress liveness response"
             );
@@ -3607,6 +4763,8 @@ fn bm1362_chip_init_one_chain(
         assigned_chips: n_assign,
         initial_get_address_rx_bytes: n,
         fast_get_address_rx_bytes: n_fast,
+        initial_get_address_observation,
+        fast_get_address_observation,
     })
 }
 
@@ -3843,7 +5001,7 @@ fn am3_bb_replay_bm1362_nonce_decodes(
                 am3_bb_update_best_replay(&mut best_any, replay.clone());
 
                 if !is_current
-                    && dcentrald_stratum::work::validate_full_header(
+                    && dcentrald_stratum::share_pipeline::validate_full_header(
                         &header,
                         &candidate.share_target,
                     )
@@ -3887,13 +5045,18 @@ fn run_mining_loop<U: ChainUart>(
     transport: &mut Am335xUartTransport<U>,
     total_chips: usize,
     shutdown: &CancellationToken,
+    heartbeat: &mut Am3BbDspicHeartbeatGuard,
     rt_handle: &tokio::runtime::Handle,
     thermal_i2c: Option<I2cServiceHandle>,
     thermal_dspic_addrs: Vec<u8>,
     pid_fan: Option<Am3BbCappedFan>,
-    watchdog_liveness: Arc<AtomicU64>,
+    watchdog: &mut SafetyWatchdogOwner,
+    watchdog_liveness: SafetyLiveness,
+    hardware_mutation_owner: &HardwareMutationGateOwner,
+    board_enable_gpio: u32,
+    board_enable_active_high: bool,
 ) -> Result<()> {
-    use dcentrald_stratum::work::{validate_full_header, WorkBuilder};
+    use dcentrald_stratum::share_pipeline::{validate_full_header, WorkBuilder};
 
     if config.pool.url.trim().is_empty() || config.pool.worker.trim().is_empty() {
         anyhow::bail!(
@@ -3902,27 +5065,25 @@ fn run_mining_loop<U: ChainUart>(
         );
     }
 
-    let mut thermal_supervisor = if env_flag_set(ENV_AM3_BB_SKIP_THERMAL_SUPERVISOR) {
-        warn!(
-            env = ENV_AM3_BB_SKIP_THERMAL_SUPERVISOR,
-            "am3-bb: lab override active - runtime LM75 thermal supervisor disabled"
+    if env_flag_set(ENV_AM3_BB_SKIP_THERMAL_SUPERVISOR) {
+        anyhow::bail!(
+            "am3-bb: watched Mining admission forbids {}",
+            ENV_AM3_BB_SKIP_THERMAL_SUPERVISOR
         );
-        None
-    } else {
-        let Some(i2c) = thermal_i2c else {
-            anyhow::bail!("am3-bb: runtime LM75 thermal supervisor requires dsPIC I2C access");
-        };
-        let mut supervisor = Am3BbThermalSupervisor::new(
-            i2c,
-            thermal_dspic_addrs,
-            config.thermal.hot_temp_c,
-            config.thermal.dangerous_temp_c,
-        )?;
-        supervisor.poll_and_check("pre-stratum")?;
-        Some(supervisor)
+    }
+    let Some(i2c) = thermal_i2c else {
+        anyhow::bail!("am3-bb: runtime LM75 thermal supervisor requires dsPIC I2C access");
     };
-    let thermal_poll_ms = ((config.thermal.pid_interval_s.max(1.0) * 1000.0).round() as u64)
-        .max(AM3_BB_THERMAL_MIN_POLL_MS);
+    let mut thermal_supervisor = Am3BbThermalSupervisor::new(
+        i2c,
+        thermal_dspic_addrs,
+        transport.chain_count(),
+        config.thermal.hot_temp_c,
+        config.thermal.dangerous_temp_c,
+    )?;
+    thermal_supervisor.poll_and_check("pre-stratum")?;
+    let thermal_poll_ms =
+        am3_bb_thermal_poll_interval(config.thermal.pid_interval_s).as_millis() as u64;
 
     // PR-021: the CONTINUOUS, capped fan PID. Default-ON. The lab escape hatch
     // can only park the PID (revert to the pre-PR-021 pinned-fan behaviour) —
@@ -3930,40 +5091,35 @@ fn run_mining_loop<U: ChainUart>(
     // skipped (gracefully, not fatally) when the BeagleBone PWM never opened or
     // when the fail-closed supervisor itself is disabled (lab override): with
     // no validated thermal proof there is nothing safe to drive a PID from.
-    let fan_pid_disabled = env_flag_set(ENV_AM3_BB_DISABLE_FAN_PID);
-    let mut fan_pid = if fan_pid_disabled {
-        warn!(
-            env = ENV_AM3_BB_DISABLE_FAN_PID,
-            "am3-bb: lab override active - continuous fan PID parked; fan stays pinned at the quiet \
-             safe floor by the run guard (fail-closed LM75 supervisor still fully active)"
+    if env_flag_set(ENV_AM3_BB_DISABLE_FAN_PID) {
+        anyhow::bail!(
+            "am3-bb: watched Mining admission forbids {}",
+            ENV_AM3_BB_DISABLE_FAN_PID
         );
-        None
-    } else if thermal_supervisor.is_none() {
-        warn!(
-            "am3-bb: fan PID not started - the fail-closed LM75 supervisor is disabled, so there is \
-             no validated thermal proof to drive a PID from"
-        );
-        None
-    } else {
-        match pid_fan {
-            Some(fan) => {
-                let pid = Am3BbFanPid::new(fan, config.thermal.target_temp_c);
-                info!(
-                    target_temp_c = config.thermal.target_temp_c,
-                    start_pwm = pid.commanded_pwm(),
-                    "am3-bb: continuous fan PID armed (clamped to the quiet home cap)"
-                );
-                Some(pid)
-            }
-            None => {
-                warn!(
-                    "am3-bb: continuous fan PID requested but BeagleBone PWM is unavailable; \
-                     fail-closed LM75 supervisor + run-guard quiet cap remain in force"
-                );
-                None
-            }
-        }
-    };
+    }
+    let fan = pid_fan
+        .context("am3-bb: watched Mining admission requires checked BeagleBone fan ownership")?;
+    let mut fan_pid = Am3BbFanPid::new(fan, config.thermal.target_temp_c)?;
+    info!(
+        target_temp_c = config.thermal.target_temp_c,
+        start_pwm = fan_pid.commanded_pwm(),
+        "am3-bb: continuous checked fan PID armed (clamped to the quiet home cap)"
+    );
+
+    // Mining liveness begins only after transport, fresh thermal proof, the
+    // dsPIC heartbeat owner, and checked fan actuation are all established.
+    am3_bb_require_heartbeat_for_energizing_boundary(
+        Some(heartbeat),
+        shutdown,
+        true,
+        "watched Mining admission",
+    )?;
+    rt_handle.block_on(watchdog.enter_mining())?;
+    let api_admission = hardware_mutation_owner.open()?;
+    info!(
+        opened_at = ?api_admission.opened_at(),
+        "am3-bb: API hardware-mutation admission opened after Mining readiness"
+    );
 
     info!(
         fan_min_pwm = config.thermal.fan_min_pwm,
@@ -3973,8 +5129,8 @@ fn run_mining_loop<U: ChainUart>(
         hot_temp_c = config.thermal.hot_temp_c,
         dangerous_temp_c = config.thermal.dangerous_temp_c,
         thermal_poll_ms,
-        supervisor_enabled = thermal_supervisor.is_some(),
-        fan_pid_enabled = fan_pid.is_some(),
+        supervisor_enabled = true,
+        fan_pid_enabled = true,
         "am3-bb: quiet thermal guard active (fail-closed LM75 hard-stop + continuous capped fan PID)"
     );
 
@@ -4070,6 +5226,9 @@ fn run_mining_loop<U: ChainUart>(
     let mut best_target_miss_difficulty: Option<f64> = None;
 
     loop {
+        // Observe terminal heartbeat failure/panic before interpreting the
+        // worker's cancellation as an ordinary operator shutdown.
+        heartbeat.require_ready_and_healthy("runtime supervision")?;
         if shutdown.is_cancelled() {
             info!(
                 uptime_s = start.elapsed().as_secs(),
@@ -4091,9 +5250,7 @@ fn run_mining_loop<U: ChainUart>(
             );
             return Ok(());
         }
-        watchdog_liveness.fetch_add(1, Ordering::Relaxed);
-
-        if let Some(supervisor) = thermal_supervisor.as_mut() {
+        {
             if last_thermal_poll.elapsed() >= Duration::from_millis(thermal_poll_ms) {
                 last_thermal_poll = Instant::now();
                 // INVARIANT #2 + #4 ORDERING: `?` fires FIRST. If the
@@ -4104,9 +5261,31 @@ fn run_mining_loop<U: ChainUart>(
                 // can only ever see a snapshot the supervisor already deemed
                 // safe and fresh — it never "out-cools" a dangerous temp by
                 // ramping the fan; hash power is cut first, by construction.
-                let snapshot = supervisor.poll_and_check("runtime")?;
-                if let Some(pid) = fan_pid.as_mut() {
-                    pid.step(&snapshot, f32::from(config.thermal.dangerous_temp_c));
+                let snapshot = match thermal_supervisor.poll_and_check("runtime") {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        am3_bb_force_board_enable_off(
+                            board_enable_gpio,
+                            board_enable_active_high,
+                            "thermal-supervisor-failure",
+                        );
+                        return Err(error);
+                    }
+                };
+                if snapshot.fresh {
+                    if let Err(error) =
+                        fan_pid.step(&snapshot, f32::from(config.thermal.dangerous_temp_c))
+                    {
+                        am3_bb_force_board_enable_off(
+                            board_enable_gpio,
+                            board_enable_active_high,
+                            "checked-fan-command-failure",
+                        );
+                        return Err(error);
+                    }
+                    // One tick proves fresh thermal sensing plus a checked fan
+                    // policy iteration; loop activity alone is not liveness.
+                    watchdog_liveness.mark_progress();
                 }
             }
         }
@@ -4509,8 +5688,8 @@ fn run_mining_loop<U: ChainUart>(
                 rx_non_job_frames = ?rx_non_job_frames,
                 rx_resync_bytes = ?rx_resync_bytes,
                 rx_buffered_bytes = ?rx_buffered_bytes,
-                fan_pid_pwm = fan_pid.as_ref().map(|p| p.commanded_pwm()),
-                fan_pid_rpm = fan_pid.as_ref().map(|p| p.fan.get_rpm()),
+                fan_pid_pwm = fan_pid.commanded_pwm(),
+                fan_pid_rpm = fan_pid.fan.get_rpm(),
                 "am3-bb: mining loop alive"
             );
             last_heartbeat = Instant::now();
@@ -4538,14 +5717,16 @@ fn run_mining_loop_stub<U: ChainUart>(
     transport: &mut Am335xUartTransport<U>,
     total_chips: usize,
     shutdown: &CancellationToken,
-    watchdog_liveness: Arc<AtomicU64>,
 ) {
     info!(
         chains = transport.chain_count(),
         total_chips,
+        watchdog_bringup_grace_s = AM3_BB_WATCHDOG_BRINGUP_GRACE.as_secs(),
         "am3-bb: DCENT_AM3_BB_STUB_LOOP — cold-boot complete, transport ready. This is the \
          enum-only diagnostic stub: no pool, no work dispatch. Idling; will log any nonce frames \
-         the chain returns from residual state. Unset DCENT_AM3_BB_STUB_LOOP for the mining loop."
+         the chain returns from residual state. It never enters watchdog Mining or advances safety \
+         liveness, so the bounded Bringup deadline remains the backstop. Unset \
+         DCENT_AM3_BB_STUB_LOOP for the mining loop."
     );
 
     let start = Instant::now();
@@ -4554,7 +5735,6 @@ fn run_mining_loop_stub<U: ChainUart>(
     let mut job_response_nonces: u64 = 0;
     let mut non_job_frames: u64 = 0;
     loop {
-        watchdog_liveness.fetch_add(1, Ordering::Relaxed);
         if shutdown.is_cancelled() {
             info!(
                 uptime_s = start.elapsed().as_secs(),
@@ -4610,6 +5790,10 @@ fn run_mining_loop_stub<U: ChainUart>(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
     use dcentrald_hal::platform::beaglebone::BeagleBonePlatform;
     use dcentrald_hal::platform::beaglebone_cold_boot::ColdBootOptsV2;
@@ -4621,6 +5805,562 @@ mod tests {
         // defaults — the same topology the runtime sees on a LuxOS unit with
         // no `/etc/dcentos/board_targets/<name>.toml` present.
         BeagleBonePlatform::with_config(PlatformConfig::s19j_beaglebone())
+    }
+
+    // Golden frame from the accepted-share `a lab unit` captures. The live stream is
+    // 126 repetitions (1134 bytes); two frames keep the host fixture compact
+    // while pinning the exact response shape.
+    const LIVE_BM1362_GET_ADDRESS_FRAME: [u8; 9] =
+        [0xAA, 0x55, 0x13, 0x62, 0x03, 0x00, 0x00, 0x00, 0x0D];
+
+    fn live_get_address_stream(frames: usize) -> Vec<u8> {
+        LIVE_BM1362_GET_ADDRESS_FRAME.repeat(frames)
+    }
+
+    struct TempGpioRoot(PathBuf);
+
+    impl TempGpioRoot {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "dcentos-am3-gpio-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("export"), b"").unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn add_gpio(&self, gpio: u32) -> PathBuf {
+            let dir = self.0.join(format!("gpio{gpio}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for (name, value) in [("direction", "in"), ("active_low", "0"), ("value", "0")] {
+                std::fs::write(dir.join(name), value).unwrap();
+            }
+            dir
+        }
+    }
+
+    impl Drop for TempGpioRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn gpio_readback_validation_requires_an_exact_trimmed_value() {
+        assert!(am3_bb_validate_gpio_attr_readback(59, "value", "0", "0\n").is_ok());
+        assert!(am3_bb_validate_gpio_attr_readback(59, "value", "0", "1").is_err());
+        assert!(am3_bb_validate_gpio_attr_readback(59, "value", "0", "00").is_err());
+        assert!(am3_bb_validate_gpio_attr_readback(59, "direction", "out", "unknown").is_err());
+    }
+
+    #[test]
+    fn checked_gpio_prepare_and_value_write_read_back_every_safety_attribute() {
+        let root = TempGpioRoot::new();
+        let gpio = root.add_gpio(59);
+
+        am3_bb_prepare_output_gpio_at(root.path(), 59, false).unwrap();
+        am3_bb_write_gpio_attr_checked_at(root.path(), 59, "value", "0").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(gpio.join("direction")).unwrap(),
+            "out"
+        );
+        assert_eq!(
+            std::fs::read_to_string(gpio.join("active_low")).unwrap(),
+            "0"
+        );
+        assert_eq!(std::fs::read_to_string(gpio.join("value")).unwrap(), "0");
+    }
+
+    #[test]
+    fn unusable_active_low_attribute_refuses_gpio_ownership() {
+        let root = TempGpioRoot::new();
+        let gpio = root.add_gpio(49);
+        std::fs::remove_file(gpio.join("active_low")).unwrap();
+        std::fs::create_dir(gpio.join("active_low")).unwrap();
+
+        let error = am3_bb_prepare_output_gpio_at(root.path(), 49, true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("active_low"), "{error}");
+    }
+
+    #[test]
+    fn export_command_without_a_materialized_gpio_directory_is_rejected() {
+        let root = TempGpioRoot::new();
+
+        let error = am3_bb_export_gpio_if_needed_at(root.path(), 22)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("did not appear"), "{error}");
+    }
+
+    #[test]
+    fn am3_bb_get_address_stream_reports_only_crc_verified_unassigned_frames() {
+        let raw = live_get_address_stream(2);
+        let observation = inspect_am3_bb_get_address_stream(&raw).unwrap();
+
+        assert_eq!(observation.response_frames, 2);
+        assert_eq!(observation.raw_bytes, 18);
+        assert_eq!(
+            observation.integrity,
+            GetAddressIntegrity::CommandResponseCrc5Verified
+        );
+    }
+
+    #[test]
+    fn am3_bb_get_address_stream_rejects_truncated_live_fixture() {
+        let mut raw = live_get_address_stream(2);
+        raw.pop();
+
+        assert_eq!(
+            inspect_am3_bb_get_address_stream(&raw),
+            Err(GetAddressInspectionError::IncompleteFrame { raw_bytes: 17 })
+        );
+    }
+
+    #[test]
+    fn am3_bb_get_address_stream_rejects_bad_preamble_and_non_fixture_payload() {
+        let mut bad_preamble = live_get_address_stream(2);
+        bad_preamble[0] = 0x55;
+        assert_eq!(
+            inspect_am3_bb_get_address_stream(&bad_preamble),
+            Err(GetAddressInspectionError::BadPreamble { frame_index: 0 })
+        );
+
+        let mut mixed = live_get_address_stream(2);
+        mixed[12] = 0x66;
+        mixed[17] = dcentrald_asic::protocol::bm13xx_command_response_crc5(&mixed[11..17]);
+        assert_eq!(
+            inspect_am3_bb_get_address_stream(&mixed),
+            Err(GetAddressInspectionError::NotRecordedUnassignedPayload { frame_index: 1 })
+        );
+    }
+
+    #[test]
+    fn am3_bb_get_address_stream_rejects_bad_low_five_crc() {
+        let mut raw = live_get_address_stream(1);
+        raw[8] ^= 0x01;
+
+        assert_eq!(
+            inspect_am3_bb_get_address_stream(&raw),
+            Err(GetAddressInspectionError::BadResponseCrc5 {
+                frame_index: 0,
+                expected: 0x0D,
+                observed: 0x0C,
+            })
+        );
+    }
+
+    #[test]
+    fn am3_bb_get_address_stream_ignores_opaque_trailer_bits_six_and_five() {
+        let mut raw = live_get_address_stream(1);
+        raw[8] |= 0x60;
+        let observation = inspect_am3_bb_get_address_stream(&raw).unwrap();
+
+        assert_eq!(observation.response_frames, 1);
+        assert_eq!(
+            observation.integrity,
+            GetAddressIntegrity::CommandResponseCrc5Verified
+        );
+    }
+
+    #[test]
+    fn am3_bb_get_address_stream_rejects_job_response_trailer() {
+        let mut raw = live_get_address_stream(1);
+        raw[8] |= 0x80;
+
+        assert_eq!(
+            inspect_am3_bb_get_address_stream(&raw),
+            Err(GetAddressInspectionError::JobResponseTrailer { frame_index: 0 })
+        );
+    }
+
+    #[test]
+    fn am3_bb_get_address_uses_response_crc_not_shared_command_crc5() {
+        let frame = LIVE_BM1362_GET_ADDRESS_FRAME;
+        let observed_trailer = frame[8];
+
+        assert_eq!(observed_trailer, 0x0D);
+        assert_eq!(
+            dcentrald_asic::protocol::bm13xx_command_response_crc5(&frame[2..8]),
+            observed_trailer & 0x1F
+        );
+        assert_eq!(dcentrald_asic::protocol::crc5(&frame[2..8]), 0x05);
+        assert_eq!(dcentrald_asic::protocol::crc5(&frame[..8]), 0x01);
+        assert_ne!(
+            observed_trailer,
+            dcentrald_asic::protocol::crc5(&frame[2..8])
+        );
+        assert_ne!(
+            observed_trailer,
+            dcentrald_asic::protocol::crc5(&frame[..8])
+        );
+    }
+
+    #[test]
+    fn dspic_shutdown_delivers_every_safeoff_before_observing_any_ack() {
+        let events = RefCell::new(Vec::new());
+        let evidence = am3_bb_disable_dspics_two_phase(
+            &[0x20, 0x21, 0x22],
+            true,
+            |chain, _| {
+                events.borrow_mut().push(format!("deliver-{chain}"));
+                Ok(())
+            },
+            |chain, _| {
+                events.borrow_mut().push(format!("observe-{chain}"));
+                Ok(vec![0x15, 0x00])
+            },
+        );
+
+        assert_eq!(
+            events.into_inner(),
+            vec![
+                "deliver-0",
+                "deliver-1",
+                "deliver-2",
+                "observe-0",
+                "observe-1",
+                "observe-2",
+            ]
+        );
+        assert_eq!(
+            evidence,
+            Am3BbDspicShutdownEvidence {
+                delivery_attempts: 3,
+                delivery_failures: 0,
+                observation_attempts: 3,
+                observation_failures: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn dspic_shutdown_separates_delivery_and_observation_failures() {
+        let observed = RefCell::new(Vec::new());
+        let evidence = am3_bb_disable_dspics_two_phase(
+            &[0x20, 0x21, 0x22],
+            true,
+            |chain, _| {
+                if chain == 1 {
+                    anyhow::bail!("delivery failed")
+                }
+                Ok(())
+            },
+            |chain, _| {
+                observed.borrow_mut().push(chain);
+                if chain == 2 {
+                    anyhow::bail!("observation failed")
+                }
+                Ok(vec![0x15, 0x00])
+            },
+        );
+
+        assert_eq!(observed.into_inner(), vec![0, 2]);
+        assert_eq!(evidence.delivery_attempts, 3);
+        assert_eq!(evidence.delivery_failures, 1);
+        assert_eq!(evidence.observation_attempts, 2);
+        assert_eq!(evidence.observation_failures, 1);
+        assert!(!evidence.all_delivered());
+    }
+
+    #[test]
+    fn terminal_dspic_shutdown_skips_ack_observation_before_hard_cutoff() {
+        let delivered = RefCell::new(Vec::new());
+        let evidence = am3_bb_disable_dspics_two_phase(
+            &[0x20, 0x21, 0x22],
+            false,
+            |chain, _| {
+                delivered.borrow_mut().push(chain);
+                Ok(())
+            },
+            |_chain, _| -> Result<Vec<u8>> {
+                panic!("terminal teardown must not attempt optional ACK observation")
+            },
+        );
+
+        assert_eq!(delivered.into_inner(), vec![0, 1, 2]);
+        assert_eq!(evidence.delivery_attempts, 3);
+        assert_eq!(evidence.delivery_failures, 0);
+        assert_eq!(evidence.observation_attempts, 0);
+        assert_eq!(evidence.observation_failures, 0);
+    }
+
+    #[test]
+    fn dspic_voltage_mutations_each_receive_adjacent_admission() {
+        let events = RefCell::new(Vec::new());
+        let mut admit = |chain, addr| {
+            events
+                .borrow_mut()
+                .push(format!("admit-{chain}-0x{addr:02X}"));
+            Ok(())
+        };
+
+        for (chain, addr) in [(0, 0x20), (1, 0x21)] {
+            events
+                .borrow_mut()
+                .push(format!("query-before-{chain}-0x{addr:02X}"));
+            am3_bb_with_energize_admission(chain, addr, &mut admit, || {
+                events
+                    .borrow_mut()
+                    .push(format!("set-voltage-{chain}-0x{addr:02X}"));
+                Ok(())
+            })
+            .unwrap();
+            events
+                .borrow_mut()
+                .push(format!("query-after-set-{chain}-0x{addr:02X}"));
+            am3_bb_with_energize_admission(chain, addr, &mut admit, || {
+                events
+                    .borrow_mut()
+                    .push(format!("enable-{chain}-0x{addr:02X}"));
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        assert_eq!(
+            events.into_inner(),
+            vec![
+                "query-before-0-0x20",
+                "admit-0-0x20",
+                "set-voltage-0-0x20",
+                "query-after-set-0-0x20",
+                "admit-0-0x20",
+                "enable-0-0x20",
+                "query-before-1-0x21",
+                "admit-1-0x21",
+                "set-voltage-1-0x21",
+                "query-after-set-1-0x21",
+                "admit-1-0x21",
+                "enable-1-0x21",
+            ]
+        );
+    }
+
+    #[test]
+    fn dspic_voltage_query_cancellation_stops_current_controller_energize() {
+        let shutdown = CancellationToken::new();
+        let events = RefCell::new(Vec::new());
+        events.borrow_mut().push("query-before-0-0x20".to_string());
+        shutdown.cancel();
+
+        let error = am3_bb_with_energize_admission(
+            0,
+            0x20,
+            &mut |chain, addr| {
+                events
+                    .borrow_mut()
+                    .push(format!("admit-{chain}-0x{addr:02X}"));
+                if shutdown.is_cancelled() {
+                    anyhow::bail!("shutdown before chain {chain} energize");
+                }
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("set-voltage-0-0x20".to_string());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("shutdown before chain 0 energize"));
+        assert_eq!(
+            events.into_inner(),
+            vec!["query-before-0-0x20", "admit-0-0x20"]
+        );
+    }
+
+    #[test]
+    fn heartbeat_protocol_validation_requires_exact_verified_reply() {
+        let verified = vec![0x06, 0x16, 0x01, 0x00, 0x00, 0x1D];
+        assert_eq!(
+            am3_bb_validate_heartbeat_reply(0, 0x20, verified.clone()).unwrap(),
+            verified
+        );
+
+        // Correct length is insufficient: framing checksum, opcode, and the
+        // exact target payload are independent admission requirements.
+        assert!(
+            am3_bb_validate_heartbeat_reply(0, 0x20, vec![0x06, 0x16, 0x01, 0x00, 0x00, 0x1E])
+                .unwrap_err()
+                .to_string()
+                .contains("CksumMismatch")
+        );
+        assert!(
+            am3_bb_validate_heartbeat_reply(0, 0x20, vec![0x06, 0x17, 0x01, 0x00, 0x00, 0x1E])
+                .unwrap_err()
+                .to_string()
+                .contains("opcode")
+        );
+        assert!(
+            am3_bb_validate_heartbeat_reply(0, 0x20, vec![0x06, 0x16, 0x00, 0x00, 0x00, 0x1C])
+                .unwrap_err()
+                .to_string()
+                .contains("payload")
+        );
+    }
+
+    #[test]
+    fn heartbeat_admission_requires_all_expected_protocol_valid_chains() {
+        let (events_tx, events_rx) = std_mpsc::channel();
+        let mut admission = Am3BbHeartbeatAdmission::new(events_rx, 3);
+        events_tx
+            .send(Am3BbHeartbeatEvent::VerifiedHeartbeatReady {
+                validated_chains: 2,
+            })
+            .unwrap();
+
+        let error = admission
+            .wait_for_verified_heartbeat_readiness(
+                &CancellationToken::new(),
+                Duration::from_millis(50),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("expected 3"));
+    }
+
+    #[test]
+    fn heartbeat_terminal_failure_remains_observable_after_readiness() {
+        let (events_tx, events_rx) = std_mpsc::channel();
+        let mut admission = Am3BbHeartbeatAdmission::new(events_rx, 3);
+        events_tx
+            .send(Am3BbHeartbeatEvent::VerifiedHeartbeatReady {
+                validated_chains: 3,
+            })
+            .unwrap();
+        let receipt = admission
+            .wait_for_verified_heartbeat_readiness(
+                &CancellationToken::new(),
+                Duration::from_millis(50),
+            )
+            .unwrap();
+        assert_eq!(receipt.validated_chains, 3);
+
+        events_tx
+            .send(Am3BbHeartbeatEvent::TerminalFailure {
+                reason: "controller stopped answering".to_string(),
+            })
+            .unwrap();
+        let error = admission
+            .require_ready_and_healthy("test-runtime")
+            .unwrap_err();
+        assert!(error.to_string().contains("controller stopped answering"));
+    }
+
+    #[test]
+    fn heartbeat_bringup_and_energizing_boundaries_are_ordered() {
+        let source = include_str!("am3_bb_mining.rs");
+        let start = source.find("fn run_am3_bb_blocking(").unwrap();
+        let end = source[start..]
+            .find("fn bm1362_command_wire_frame(")
+            .map(|offset| start + offset)
+            .unwrap();
+        let bringup = &source[start..end];
+
+        let readiness = bringup
+            .find(".wait_for_verified_heartbeat_readiness(&shutdown)")
+            .unwrap();
+        let reset_boundary = bringup.find("\"post-dsPIC ASIC reset release\"").unwrap();
+        let reset = bringup
+            .find("am3_bb_post_dspic_reset_chains(&platform")
+            .unwrap();
+        let bm_boundary = bringup.find("\"BM1362 chain initialization\"").unwrap();
+        let bm_init = bringup.find("bm1362_chip_init_one_chain(").unwrap();
+        let open_core_boundary = bringup.find("\"dsPIC open-core voltage\"").unwrap();
+        let open_core = bringup
+            .find("\"open-core-voltage\",")
+            .expect("open-core voltage mutation exists");
+
+        assert!(readiness < reset_boundary && reset_boundary < reset);
+        assert!(reset < bm_boundary && bm_boundary < bm_init);
+        assert!(bm_init < open_core_boundary && open_core_boundary < open_core);
+
+        let mining_loop = &source[source.find("fn run_mining_loop<U").unwrap()..];
+        let heartbeat_admission = mining_loop.find("\"watched Mining admission\"").unwrap();
+        let watchdog_mining = mining_loop.find("watchdog.enter_mining()").unwrap();
+        assert!(heartbeat_admission < watchdog_mining);
+    }
+
+    #[test]
+    fn heartbeat_owner_has_no_unbounded_join_path() {
+        let source = include_str!("am3_bb_mining.rs");
+        let forbidden_join = [".", "join", "()"].concat();
+        assert!(!source.contains(&forbidden_join));
+        assert!(source.contains("stop_and_join(&rt_handle)"));
+        assert!(source.contains("dspic-heartbeat-stop-timeout"));
+        assert!(source.contains("dspic-heartbeat-owner-drop-without-quiescence"));
+        assert!(source.contains("catch_unwind(AssertUnwindSafe"));
+        assert!(source.contains("Am3BbHeartbeatEvent::WorkerPanicked"));
+    }
+
+    #[test]
+    fn watchdog_closeout_orders_barriers_quiescence_and_safeoff_before_disarm() {
+        let source = include_str!("am3_bb_mining.rs");
+        let start = source
+            .find("// Every exit, including a mining-loop error")
+            .unwrap();
+        let end = source[start..]
+            .find("mining_result?;")
+            .map(|offset| start + offset)
+            .unwrap();
+        let closeout = &source[start..end];
+
+        let teardown = closeout.find("watchdog.begin_teardown(").unwrap();
+        let api_barrier = closeout.find("close_and_drain(").unwrap();
+        let i2c_latch = closeout.find("latch_terminal_safe_off()").unwrap();
+        let actor_join = closeout.find("stop_and_join(&rt_handle)").unwrap();
+        let safeoff = closeout.find("teardown_checked()").unwrap();
+        let permit = closeout
+            .find("WatchdogDisarmPermit::from_evidence_set")
+            .unwrap();
+        let disarm = closeout.find("watchdog.disarm_and_join(").unwrap();
+
+        assert!(
+            teardown < api_barrier
+                && api_barrier < i2c_latch
+                && i2c_latch < actor_join
+                && actor_join < safeoff
+                && safeoff < permit
+                && permit < disarm
+        );
+    }
+
+    #[test]
+    fn watchdog_progress_requires_fresh_thermal_and_checked_fan_work() {
+        let source = include_str!("am3_bb_mining.rs");
+        let loop_start = source.find("fn run_mining_loop<U: ChainUart>(").unwrap();
+        let stub_start = source
+            .find("fn run_mining_loop_stub<U: ChainUart>(")
+            .unwrap();
+        let mining_loop = &source[loop_start..stub_start];
+        let thermal = mining_loop.find("poll_and_check(\"runtime\")").unwrap();
+        let fresh = mining_loop.find("if snapshot.fresh").unwrap();
+        let fan = mining_loop.find("fan_pid.step(").unwrap();
+        let progress = mining_loop
+            .find("watchdog_liveness.mark_progress()")
+            .unwrap();
+        assert!(thermal < fresh && fresh < fan && fan < progress);
+
+        let stub_end = source[stub_start..]
+            .find("//  Tests (host-safe")
+            .map(|offset| stub_start + offset)
+            .unwrap();
+        let stub = &source[stub_start..stub_end];
+        assert!(!stub.contains("watchdog_liveness.mark_progress()"));
+        assert!(!stub.contains("watchdog.enter_mining()"));
     }
 
     #[test]
@@ -4824,6 +6564,45 @@ mod tests {
     }
 
     #[test]
+    fn am3_bb_geometry_is_explicit_or_catalog_backed() {
+        assert_eq!(
+            resolve_am3_bb_chips_per_chain(None, None, None).unwrap(),
+            126
+        );
+        assert_eq!(
+            resolve_am3_bb_chips_per_chain(Some("s19jpro"), Some("bm1362"), None).unwrap(),
+            126
+        );
+        assert_eq!(
+            resolve_am3_bb_chips_per_chain(Some("s19jpro"), Some("BM1362"), Some(120)).unwrap(),
+            120,
+            "an explicit nonzero geometry override remains available for repair/bring-up"
+        );
+    }
+
+    #[test]
+    fn am3_bb_geometry_rejects_conflicting_or_missing_evidence() {
+        assert!(
+            resolve_am3_bb_chips_per_chain(Some("s19xp"), Some("BM1362"), None)
+                .unwrap_err()
+                .to_string()
+                .contains("conflicts")
+        );
+        assert!(
+            resolve_am3_bb_chips_per_chain(Some("s19jpro"), Some("BM1398"), None)
+                .unwrap_err()
+                .to_string()
+                .contains("serial_chip_type")
+        );
+        assert!(resolve_am3_bb_chips_per_chain(Some("not-a-model"), None, None).is_err());
+        assert!(resolve_am3_bb_chips_per_chain(None, None, Some(0)).is_err());
+        assert!(
+            resolve_am3_bb_chips_per_chain(Some("s19jproam2"), None, None).is_err(),
+            "a BM1362 model on a different control-board family must not authorize AM3-BB"
+        );
+    }
+
+    #[test]
     fn devmem_chain_uart_is_a_thin_newtype() {
         // We can't construct a real DevmemUart on the host (it mmaps
         // /dev/mem), so this just pins the adapter shape: `DevmemChainUart`
@@ -4911,7 +6690,7 @@ mod tests {
         //   [50..82] = prev_block_hash, 32-bit-word-reversed
         //   [82..86] = version LE  ·  [86..88] = CRC16-CCITT-FALSE, BE-appended,
         //              over frame[2..86] (the 84 bytes from 0x21)
-        let work = dcentrald_stratum::work::MiningWork {
+        let work = dcentrald_stratum::share_pipeline::MiningWork {
             midstates: vec![[0u8; 32]],
             merkle4: [0u8; 4],
             ntime: 0x1122_3344,
@@ -4985,7 +6764,7 @@ mod tests {
         for (i, b) in midstate.iter_mut().enumerate() {
             *b = 0x40 + i as u8;
         }
-        let work = dcentrald_stratum::work::MiningWork {
+        let work = dcentrald_stratum::share_pipeline::MiningWork {
             midstates: vec![midstate],
             merkle4: [0u8; 4],
             ntime: 0x1122_3344,
@@ -5251,6 +7030,10 @@ mod tests {
         fn set_speed(&self, pwm: u8) {
             self.pwm_log.lock().unwrap().push(pwm);
         }
+        fn set_speed_checked(&self, pwm: u8) -> dcentrald_hal::Result<FanCommandReceipt> {
+            self.set_speed(pwm);
+            FanCommandReceipt::from_matching_readback(pwm, self.get_speed_pwm())
+        }
         fn get_rpm(&self) -> u32 {
             self.rpm
         }
@@ -5312,6 +7095,61 @@ mod tests {
         assert_eq!(am3_bb_clamp_pid_pwm(10, 30, 22), 22);
     }
 
+    #[test]
+    fn watchdog_liveness_expectation_tracks_the_configured_thermal_cadence() {
+        assert_eq!(am3_bb_thermal_poll_interval(0.1), Duration::from_secs(1));
+        assert_eq!(
+            am3_bb_thermal_poll_interval(2.5),
+            Duration::from_millis(2_500)
+        );
+        assert_eq!(
+            am3_bb_expected_safety_liveness_interval(2.5),
+            Duration::from_millis(4_500)
+        );
+        assert_eq!(
+            am3_bb_expected_safety_liveness_interval(30.0),
+            Duration::from_secs(32)
+        );
+    }
+
+    #[test]
+    fn thermal_snapshot_rejects_one_missing_chain_even_when_peers_are_healthy() {
+        let complete = am3_bb_thermal_snapshot_from_chain_samples(&[4, 1, 3], 68.0);
+        assert!(complete.fresh);
+        assert_eq!(complete.covered_chains, 3);
+        assert_eq!(complete.expected_chains, 3);
+
+        // Chains 0 and 2 together provide eight valid samples. That aggregate
+        // must never mask chain 1 contributing no fresh thermal evidence.
+        let missing_middle = am3_bb_thermal_snapshot_from_chain_samples(&[4, 0, 4], 68.0);
+        assert_eq!(missing_middle.samples, 8);
+        assert_eq!(missing_middle.covered_chains, 2);
+        assert_eq!(missing_middle.expected_chains, 3);
+        assert!(!missing_middle.fresh);
+    }
+
+    #[test]
+    fn dangerous_incomplete_first_poll_cannot_be_hidden_by_cooler_retry() {
+        let dangerous_incomplete = am3_bb_thermal_snapshot_from_chain_samples(&[4, 0, 4], 80.0);
+        let cooler_incomplete = am3_bb_thermal_snapshot_from_chain_samples(&[4, 0, 4], 60.0);
+        let mut scripted_attempts = [dangerous_incomplete, cooler_incomplete].into_iter();
+        let mut polled_stages = Vec::new();
+
+        let error = am3_bb_poll_thermal_attempts("runtime", 75.0, Duration::ZERO, |poll_stage| {
+            polled_stages.push(poll_stage);
+            scripted_attempts.next().unwrap()
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("80.0C"));
+        assert_eq!(polled_stages, ["runtime"]);
+        assert_eq!(
+            scripted_attempts.count(),
+            1,
+            "the cooler retry must remain unconsumed after the first attempt proves danger"
+        );
+    }
+
     /// INVARIANT #2: at/above the dangerous threshold the decision is always
     /// CutHashThenFan (hash power is cut first; the PID never tries to
     /// out-cool a dangerous temp by ramping the fan).
@@ -5341,16 +7179,20 @@ mod tests {
     #[test]
     fn pid_does_not_ramp_fan_on_dangerous_temp() {
         let (fan, rec) = recording_capped_fan(0, 30);
-        let mut pid = Am3BbFanPid::new(fan, 55);
+        let mut pid = Am3BbFanPid::new(fan, 55).unwrap();
         let writes_after_init = rec.pwm_log.lock().unwrap().len();
         // Dangerous reading: the PID must NOT issue a new fan command.
         pid.step(
             &Am3BbThermalSnapshot {
                 samples: 3,
+                covered_chains: 3,
+                expected_chains: 3,
                 max_temp_c: 80.0,
+                fresh: true,
             },
             75.0,
-        );
+        )
+        .unwrap();
         assert_eq!(
             rec.pwm_log.lock().unwrap().len(),
             writes_after_init,
@@ -5363,22 +7205,49 @@ mod tests {
     #[test]
     fn pid_holds_station_on_empty_sample() {
         let (fan, rec) = recording_capped_fan(0, 30);
-        let mut pid = Am3BbFanPid::new(fan, 55);
+        let mut pid = Am3BbFanPid::new(fan, 55).unwrap();
         let start_pwm = pid.commanded_pwm();
         let writes_after_init = rec.pwm_log.lock().unwrap().len();
         pid.step(
             &Am3BbThermalSnapshot {
                 samples: 0,
+                covered_chains: 0,
+                expected_chains: 3,
                 max_temp_c: f32::NEG_INFINITY,
+                fresh: false,
             },
             75.0,
-        );
+        )
+        .unwrap();
         assert_eq!(
             rec.pwm_log.lock().unwrap().len(),
             writes_after_init,
             "PID drove the fan from an empty sample — must NOT act on absent sensor data"
         );
         assert_eq!(pid.commanded_pwm(), start_pwm, "commanded PWM unchanged");
+    }
+
+    #[test]
+    fn pid_holds_station_on_stale_last_known_good_sample() {
+        let (fan, rec) = recording_capped_fan(0, 30);
+        let mut pid = Am3BbFanPid::new(fan, 55).unwrap();
+        let start_pwm = pid.commanded_pwm();
+        let writes_after_init = rec.pwm_log.lock().unwrap().len();
+
+        pid.step(
+            &Am3BbThermalSnapshot {
+                samples: 3,
+                covered_chains: 3,
+                expected_chains: 3,
+                max_temp_c: 68.0,
+                fresh: false,
+            },
+            75.0,
+        )
+        .unwrap();
+
+        assert_eq!(rec.pwm_log.lock().unwrap().len(), writes_after_init);
+        assert_eq!(pid.commanded_pwm(), start_pwm);
     }
 
     /// INVARIANT #6 + quiet posture: at/below the setpoint the PID stays at
@@ -5388,16 +7257,20 @@ mod tests {
     #[test]
     fn pid_steady_state_is_quiet_and_ramps_bounded_within_cap() {
         let (fan, _rec) = recording_capped_fan(0, 30);
-        let mut pid = Am3BbFanPid::new(fan, 55);
+        let mut pid = Am3BbFanPid::new(fan, 55).unwrap();
         // Cool: a few ticks well below the setpoint → stays at the floor.
         for _ in 0..5 {
             pid.step(
                 &Am3BbThermalSnapshot {
                     samples: 3,
+                    covered_chains: 3,
+                    expected_chains: 3,
                     max_temp_c: 45.0,
+                    fresh: true,
                 },
                 75.0,
-            );
+            )
+            .unwrap();
         }
         assert_eq!(
             pid.commanded_pwm(),
@@ -5412,10 +7285,14 @@ mod tests {
             pid.step(
                 &Am3BbThermalSnapshot {
                     samples: 3,
+                    covered_chains: 3,
+                    expected_chains: 3,
                     max_temp_c: 68.0,
+                    fresh: true,
                 },
                 75.0,
-            );
+            )
+            .unwrap();
             let now = pid.commanded_pwm();
             assert!(
                 now <= AM3_BB_FAN_HARD_CAP_PWM,
@@ -5444,9 +7321,9 @@ mod tests {
     #[test]
     fn capped_fan_apply_is_clamped() {
         let (fan, rec) = recording_capped_fan(0, 30);
-        let written = fan.apply(255);
+        let written = fan.apply(255).unwrap();
         assert_eq!(written, AM3_BB_FAN_HARD_CAP_PWM);
         assert_eq!(*rec.pwm_log.lock().unwrap().last().unwrap(), 30);
-        assert_eq!(fan.apply(0), AM3_BB_FAN_SAFE_FLOOR_PWM);
+        assert_eq!(fan.apply(0).unwrap(), AM3_BB_FAN_SAFE_FLOOR_PWM);
     }
 }

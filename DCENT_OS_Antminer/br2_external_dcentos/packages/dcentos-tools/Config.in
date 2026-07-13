@@ -2,8 +2,10 @@ config BR2_PACKAGE_DCENTOS_TOOLS
 	bool "dcentos-tools"
 	depends on BR2_PACKAGE_PYTHON3
 	help
-	  DCENTos Hacker Shell research and diagnostic tools.
-	  Includes: register scanner, ASIC enumerator, PSU probe,
-	  temperature finder, assumption verifier, and test suite.
+	  DCENT_OS Python dashboard and local MCP API adapters.
+
+	  Standalone raw-hardware research tools are intentionally not installed
+	  in normal runtime images. They must eventually be delivered through an
+	  explicit repair environment with exclusive hardware ownership.
 
 	  https://d-central.tech/

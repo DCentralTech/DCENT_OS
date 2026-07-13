@@ -10,6 +10,7 @@
 use std::io::Write;
 use std::net::TcpStream;
 use std::sync::mpsc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use log::{debug, error, info, warn};
@@ -17,6 +18,26 @@ use serde_json::Value;
 
 use crate::mask::{mask_wallet, sanitize_pool_url};
 use crate::types::*;
+
+/// Optional hook for solo-mesh share candidates (`job_id` starts with `solo-`).
+/// Binary mesh runtime registers this so candidates never hit `mining.submit`.
+type SoloShareHook = fn(&ShareSubmission);
+static SOLO_SHARE_HOOK: Mutex<Option<SoloShareHook>> = Mutex::new(None);
+
+/// Register (or clear with `None`) the solo-mesh share hook. Fail-closed: when
+/// unset, solo shares are logged and dropped rather than submitted to a pool.
+pub fn set_solo_share_hook(hook: Option<SoloShareHook>) {
+    if let Ok(mut g) = SOLO_SHARE_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+fn take_solo_share_hook_ref() -> Option<SoloShareHook> {
+    SOLO_SHARE_HOOK
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().copied())
+}
 
 /// User agent string sent to pools.
 const USER_AGENT: &str = concat!("DCENTaxe/", env!("CARGO_PKG_VERSION"));
@@ -1509,6 +1530,34 @@ impl StratumClient {
     // Main Message Loop
     // -----------------------------------------------------------------------
 
+    /// Handle one share from the mining thread. Solo `job_id` prefix is diverted
+    /// to the mesh hook (never `mining.submit`). This is the real entry point
+    /// for share intercept tests.
+    pub fn handle_mining_share(&mut self, share: ShareSubmission) -> Result<(), String> {
+        if share.job_id.starts_with("solo-") {
+            if let Some(hook) = take_solo_share_hook_ref() {
+                hook(&share);
+            } else {
+                log::info!(
+                    "Stratum: solo job {} share retained (no mesh hook)",
+                    share.job_id
+                );
+            }
+            return Ok(());
+        }
+        self.submit_share(&share)
+    }
+
+    /// Drain pending share channel once (host tests + message_loop body).
+    pub fn drain_pending_shares(&mut self) -> Result<(), String> {
+        while let Ok(event) = self.share_rx.try_recv() {
+            match event {
+                MiningEvent::SubmitShare(share) => self.handle_mining_share(share)?,
+            }
+        }
+        Ok(())
+    }
+
     /// Process incoming pool messages and outgoing share submissions.
     fn message_loop(&mut self) -> Result<MessageLoopExit, String> {
         // Dead connection detection: if no message arrives for 5 minutes,
@@ -1522,7 +1571,7 @@ impl StratumClient {
             while let Ok(event) = self.share_rx.try_recv() {
                 match event {
                     MiningEvent::SubmitShare(share) => {
-                        if let Err(e) = self.submit_share(&share) {
+                        if let Err(e) = self.handle_mining_share(share) {
                             error!("Stratum: failed to submit share: {}", e);
                             return Err(e);
                         }
@@ -2813,6 +2862,7 @@ mod tests {
                 .send(MiningEvent::SubmitShare(submission(&format!("job-{i}"))))
                 .unwrap();
         }
+        // silence if submission helper differs below
 
         client.drain_pending_share_queue();
 

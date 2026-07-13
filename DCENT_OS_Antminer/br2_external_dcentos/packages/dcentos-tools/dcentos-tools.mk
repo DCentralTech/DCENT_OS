@@ -10,19 +10,9 @@ DCENTOS_TOOLS_SITE_METHOD = local
 DCENTOS_TOOLS_LICENSE = GPL-3.0+
 
 define DCENTOS_TOOLS_INSTALL_TARGET_CMDS
-	mkdir -p $(TARGET_DIR)/root/tools
-	cp -a $(@D)/*.py $(TARGET_DIR)/root/tools/
-	cp -a $(@D)/*.sh $(TARGET_DIR)/root/tools/ 2>/dev/null || true
-	chmod +x $(TARGET_DIR)/root/tools/*.py
-	chmod +x $(TARGET_DIR)/root/tools/*.sh 2>/dev/null || true
-
-	# Install dcent-shell launcher
-	if [ -f $(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/rootfs-overlay/usr/bin/dcent-shell ]; then \
-		install -D -m 0755 $(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/rootfs-overlay/usr/bin/dcent-shell \
-			$(TARGET_DIR)/usr/bin/dcent-shell; \
-	fi
-
-	# Install web dashboard and MCP server
+	# Runtime package contains API adapters only. Standalone hardware research
+	# executors remain source artifacts and are deliberately absent from normal
+	# images because they bypass dcentrald's exclusive hardware owner.
 	mkdir -p $(TARGET_DIR)/root/web/static
 	install -m 0755 $(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/rootfs-overlay/root/web/server.py \
 		$(TARGET_DIR)/root/web/server.py

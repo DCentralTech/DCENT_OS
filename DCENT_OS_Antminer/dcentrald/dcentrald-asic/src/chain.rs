@@ -17,6 +17,253 @@ fn production_chip_id_known(chip_id: u16) -> bool {
         .is_some()
 }
 
+/// Why a successful enumeration cannot authorize Measured ASIC identity.
+///
+/// These reasons do not necessarily stop mining. They describe the narrower
+/// identity-proof contract: a transport may have enough liveness to preserve a
+/// proven mining path while still lacking complete, uniform, CRC-clean evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnumerationIdentityIneligibility {
+    IncompleteFpgaResponsePair,
+    UnknownChipId {
+        response_index: usize,
+        chip_id: u16,
+    },
+    MixedChipIds {
+        response_index: usize,
+        first: u16,
+        observed: u16,
+    },
+    FpgaCrcErrorCounterChanged {
+        before: u32,
+        after: u32,
+    },
+    IncompleteSerialResponse {
+        response_index: usize,
+        observed_bytes: usize,
+    },
+    SerialResponseTrailerUnverified,
+}
+
+/// Parser-minted identity evidence accepted by the daemon publication layer.
+///
+/// Fields are private so model/config geometry and raw serial response counts
+/// cannot be rewrapped as measured enumeration by an orchestration caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeasuredEnumeration {
+    chip_count: u8,
+    chip_id: u16,
+}
+
+impl MeasuredEnumeration {
+    pub fn chip_count(self) -> u8 {
+        self.chip_count
+    }
+
+    pub fn chip_id(self) -> u16 {
+        self.chip_id
+    }
+}
+
+/// One successful chain-enumeration result plus its identity eligibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumerationReport {
+    chip_count: u8,
+    chip_id: u16,
+    identity: std::result::Result<MeasuredEnumeration, Vec<EnumerationIdentityIneligibility>>,
+}
+
+impl EnumerationReport {
+    pub fn chip_count(&self) -> u8 {
+        self.chip_count
+    }
+
+    pub fn chip_id(&self) -> u16 {
+        self.chip_id
+    }
+
+    pub fn measured_identity(
+        &self,
+    ) -> std::result::Result<MeasuredEnumeration, &[EnumerationIdentityIneligibility]> {
+        self.identity.as_ref().copied().map_err(Vec::as_slice)
+    }
+}
+
+fn normalize_enumerated_chip_id(word0: u32) -> u16 {
+    let mut chip_id = (word0 & 0xFFFF) as u16;
+    if chip_id & 0xFF00 > chip_id & 0x00FF {
+        chip_id = chip_id.swap_bytes();
+    }
+    chip_id
+}
+
+/// Pure FPGA FIFO enumeration validator.
+///
+/// Every pair must be present, every response must name the same production
+/// ASIC, and the FPGA CRC error counter must remain unchanged across the
+/// GetAddress window. A failure rejects the whole baud attempt: using the first
+/// response's family or a truncated count could select the wrong production
+/// driver and is therefore unsafe even when some liveness was observed.
+fn validate_fpga_enumeration_words(
+    chain_id: u8,
+    words: &[u32],
+    crc_errors_before: u32,
+    crc_errors_after: u32,
+) -> Result<EnumerationReport> {
+    let complete_pairs = words.len() / 2;
+    if complete_pairs == 0 {
+        return Err(crate::AsicError::NoChipsDetected { chain_id });
+    }
+    let chip_count = u8::try_from(complete_pairs).map_err(|_| crate::AsicError::InitFailed {
+        chain_id,
+        detail: format!(
+            "GetAddress returned {complete_pairs} complete response pairs, exceeding the u8 chain-count representation"
+        ),
+    })?;
+
+    if !words.len().is_multiple_of(2) {
+        return Err(crate::AsicError::EnumerationIntegrity {
+            chain_id,
+            reason: EnumerationIdentityIneligibility::IncompleteFpgaResponsePair,
+        });
+    }
+    let first_chip_id = normalize_enumerated_chip_id(words[0]);
+    if !production_chip_id_known(first_chip_id) {
+        return Err(crate::AsicError::EnumerationIntegrity {
+            chain_id,
+            reason: EnumerationIdentityIneligibility::UnknownChipId {
+                response_index: 0,
+                chip_id: first_chip_id,
+            },
+        });
+    }
+    for (response_index, pair) in words.chunks_exact(2).enumerate() {
+        let chip_id = normalize_enumerated_chip_id(pair[0]);
+        if !production_chip_id_known(chip_id) {
+            return Err(crate::AsicError::EnumerationIntegrity {
+                chain_id,
+                reason: EnumerationIdentityIneligibility::UnknownChipId {
+                    response_index,
+                    chip_id,
+                },
+            });
+        } else if chip_id != first_chip_id {
+            return Err(crate::AsicError::EnumerationIntegrity {
+                chain_id,
+                reason: EnumerationIdentityIneligibility::MixedChipIds {
+                    response_index,
+                    first: first_chip_id,
+                    observed: chip_id,
+                },
+            });
+        }
+    }
+    if crc_errors_after != crc_errors_before {
+        return Err(crate::AsicError::EnumerationIntegrity {
+            chain_id,
+            reason: EnumerationIdentityIneligibility::FpgaCrcErrorCounterChanged {
+                before: crc_errors_before,
+                after: crc_errors_after,
+            },
+        });
+    }
+
+    Ok(EnumerationReport {
+        chip_count,
+        chip_id: first_chip_id,
+        identity: Ok(MeasuredEnumeration {
+            chip_count,
+            chip_id: first_chip_id,
+        }),
+    })
+}
+
+fn unverified_serial_enumeration_report(chip_count: u8, chip_id: u16) -> EnumerationReport {
+    EnumerationReport {
+        chip_count,
+        chip_id,
+        identity: Err(vec![
+            EnumerationIdentityIneligibility::SerialResponseTrailerUnverified,
+        ]),
+    }
+}
+
+fn normalize_serial_enumerated_chip_id(response: &[u8]) -> u16 {
+    let chip_id = u16::from_le_bytes([response[0], response[1]]);
+    if chip_id & 0xFF00 > chip_id & 0x00FF {
+        chip_id.swap_bytes()
+    } else {
+        chip_id
+    }
+}
+
+/// Validate the family/count portion of serial GetAddress responses.
+///
+/// This deliberately does not validate or infer the opaque response trailer.
+/// A uniform stream is safe enough to preserve the existing mining path, but
+/// its report remains `SerialResponseTrailerUnverified` and cannot mint
+/// Measured identity.
+fn validate_serial_enumeration_responses(
+    chain_id: u8,
+    responses: &[Vec<u8>],
+) -> Result<EnumerationReport> {
+    if responses.is_empty() {
+        return Err(crate::AsicError::NoChipsDetected { chain_id });
+    }
+    let chip_count = u8::try_from(responses.len()).map_err(|_| crate::AsicError::InitFailed {
+        chain_id,
+        detail: format!(
+            "serial GetAddress returned {} responses, exceeding the u8 chain-count representation",
+            responses.len()
+        ),
+    })?;
+
+    let mut first_chip_id = None;
+    for (response_index, response) in responses.iter().enumerate() {
+        if response.len() < 2 {
+            return Err(crate::AsicError::EnumerationIntegrity {
+                chain_id,
+                reason: EnumerationIdentityIneligibility::IncompleteSerialResponse {
+                    response_index,
+                    observed_bytes: response.len(),
+                },
+            });
+        }
+        let chip_id = normalize_serial_enumerated_chip_id(response);
+        if !production_chip_id_known(chip_id) {
+            return Err(crate::AsicError::EnumerationIntegrity {
+                chain_id,
+                reason: EnumerationIdentityIneligibility::UnknownChipId {
+                    response_index,
+                    chip_id,
+                },
+            });
+        }
+        if let Some(first) = first_chip_id {
+            if chip_id != first {
+                return Err(crate::AsicError::EnumerationIntegrity {
+                    chain_id,
+                    reason: EnumerationIdentityIneligibility::MixedChipIds {
+                        response_index,
+                        first,
+                        observed: chip_id,
+                    },
+                });
+            }
+        } else {
+            first_chip_id = Some(chip_id);
+        }
+    }
+
+    let Some(first_chip_id) = first_chip_id else {
+        return Err(crate::AsicError::NoChipsDetected { chain_id });
+    };
+    Ok(unverified_serial_enumeration_report(
+        chip_count,
+        first_chip_id,
+    ))
+}
+
 /// Return whether a detected chain satisfies an operator-configured minimum
 /// chip-population fraction.
 ///
@@ -164,8 +411,8 @@ impl Chain {
     /// In hybrid mode (serial present), enumeration goes through the serial UART
     /// instead of the FPGA CMD FIFO.
     ///
-    /// Returns (chip_count, chip_id).
-    pub fn enumerate_chips(&mut self) -> Result<(u8, u16)> {
+    /// Returns detected geometry plus transport-typed identity eligibility.
+    pub fn enumerate_chips(&mut self) -> Result<EnumerationReport> {
         // Hybrid mode: enumerate via serial UART
         if self.serial.is_some() {
             return self.enumerate_chips_serial();
@@ -226,12 +473,17 @@ impl Chain {
     ///
     /// Sends GetAddress broadcast, waits for responses, extracts ChipID.
     /// Response word 0 format: 0x00908713 -> ChipID = bytes[1:0] = 0x1387
-    fn try_enumerate_at_baud(&mut self, baud_reg: u32, baud_label: &str) -> Result<(u8, u16)> {
+    fn try_enumerate_at_baud(
+        &mut self,
+        baud_reg: u32,
+        baud_label: &str,
+    ) -> Result<EnumerationReport> {
         use crate::protocol;
 
         // Set baud rate and reset FIFOs
         self.fpga.set_baud(baud_reg);
         self.fpga.reset_fifos();
+        let crc_errors_before = self.fpga.read_error_count();
 
         // Send BOTH GetAddress formats: BM1387 (0x54) AND BM1397+ (0x52).
         // We don't know the chip type yet -- after power cycle, ASICs reset to default.
@@ -295,71 +547,47 @@ impl Chain {
             },
         );
 
-        // Read all responses (each chip sends 2 words)
-        let mut count = 0u8;
-        let mut first_chip_id: u16 = 0;
-
+        // Read all raw response words. Validation below rejects an incomplete
+        // final pair for identity while preserving complete-pair mining
+        // geometry. Never synthesize a missing word with zero.
+        let mut response_words = Vec::new();
         while self.fpga.cmd_rx_has_data() {
-            let word0 = self.fpga.read_cmd_response().unwrap_or(0);
-            let _word1 = self.fpga.read_cmd_response().unwrap_or(0);
-
-            if count == 0 {
-                first_chip_id = (word0 & 0xFFFF) as u16;
-                if first_chip_id & 0xFF00 > first_chip_id & 0x00FF {
-                    first_chip_id = ((first_chip_id & 0xFF) << 8) | ((first_chip_id >> 8) & 0xFF);
-                }
-                tracing::debug!(
-                    chain_id = self.chain_id,
-                    raw_word0 = format_args!("0x{:08X}", word0),
-                    chip_id = format_args!("0x{:04X}", first_chip_id),
-                    baud = baud_label,
-                    "First chip responded at {} baud -- ChipID extracted",
-                    baud_label,
-                );
+            let Some(word) = self.fpga.read_cmd_response() else {
+                break;
+            };
+            response_words.push(word);
+            if response_words.len() > 2 * usize::from(u8::MAX) + 1 {
+                return Err(crate::AsicError::InitFailed {
+                    chain_id: self.chain_id,
+                    detail: "GetAddress response stream exceeds the supported u8 chain-count representation"
+                        .to_string(),
+                });
             }
-            count += 1;
         }
-
-        if count == 0 {
-            return Err(crate::AsicError::NoChipsDetected {
-                chain_id: self.chain_id,
-            });
-        }
-
-        // Validate chip_id is a production ASIC type -- reject noise/garbage responses.
-        // Electromagnetic interference on the UART lines can produce valid-looking
-        // responses with bogus chip IDs. Mining with a wrong driver = zero nonces.
-        if !production_chip_id_known(first_chip_id) {
-            tracing::error!(
-                chain_id = self.chain_id,
-                chip_id = format_args!("0x{:04X}", first_chip_id),
-                chip_count = count,
-                baud = baud_label,
-                "REJECTED: ChipID 0x{:04X} is not a known ASIC type -- likely noise on UART. \
-                 Known types: BM1387, BM1397, BM1398, BM1362, BM1366, BM1368, BM1370",
-                first_chip_id,
-            );
-            return Err(crate::AsicError::NoChipsDetected {
-                chain_id: self.chain_id,
-            });
-        }
-
-        self.chip_count = count;
-        self.chip_id = first_chip_id;
+        let crc_errors_after = self.fpga.read_error_count();
+        let report = validate_fpga_enumeration_words(
+            self.chain_id,
+            &response_words,
+            crc_errors_before,
+            crc_errors_after,
+        )?;
+        self.chip_count = report.chip_count();
+        self.chip_id = report.chip_id();
 
         tracing::info!(
             chain_id = self.chain_id,
-            chip_count = count,
-            chip_id = format_args!("0x{:04X}", first_chip_id),
+            chip_count = report.chip_count(),
+            chip_id = format_args!("0x{:04X}", report.chip_id()),
             baud = baud_label,
+            identity_evidence = ?report.measured_identity(),
             "Chain {} enumeration: {} chips at {} baud, ChipID 0x{:04X}",
             self.chain_id,
-            count,
+            report.chip_count(),
             baud_label,
-            first_chip_id,
+            report.chip_id(),
         );
 
-        Ok((count, first_chip_id))
+        Ok(report)
     }
 
     /// Assign addresses to all chips on the chain.
@@ -533,7 +761,7 @@ impl Chain {
     ///
     /// Tries GetAddress at multiple baud rates, same fallback logic as
     /// the FPGA path but using the serial backend.
-    fn enumerate_chips_serial(&mut self) -> Result<(u8, u16)> {
+    fn enumerate_chips_serial(&mut self) -> Result<EnumerationReport> {
         // Guarded by the `self.serial.is_some()` check at the sole caller, but
         // return a clean chain error rather than panic if a future caller ever
         // reaches here without a serial backend. The workspace is
@@ -548,6 +776,7 @@ impl Chain {
                 detail: "serial backend not initialized for serial enumeration".to_string(),
             })?;
 
+        let mut last_integrity_error = None;
         for (baud, label) in [
             (115_200u32, "115200"),
             (1_562_500, "1.5625M"),
@@ -593,50 +822,34 @@ impl Chain {
             };
 
             if !responses.is_empty() {
-                let mut count = 0u8;
-                let mut first_chip_id: u16 = 0;
-                for resp in &responses {
-                    if resp.len() >= 2 {
-                        if count == 0 {
-                            // Extract ChipID from response body (same format as FPGA path).
-                            // Response body bytes are after preamble stripping.
-                            first_chip_id = ((resp[1] as u16) << 8) | (resp[0] as u16);
-                            if first_chip_id & 0xFF00 > first_chip_id & 0x00FF {
-                                first_chip_id =
-                                    ((first_chip_id & 0xFF) << 8) | ((first_chip_id >> 8) & 0xFF);
-                            }
-                        }
-                        count += 1;
+                match validate_serial_enumeration_responses(self.chain_id, &responses) {
+                    Ok(report) => {
+                        let chip_count = report.chip_count();
+                        let chip_id = report.chip_id();
+                        tracing::info!(
+                            chain_id = self.chain_id,
+                            chip_count,
+                            chip_id = format_args!("0x{:04X}", chip_id),
+                            baud = label,
+                            "Serial enumeration: {} chips at {} baud, ChipID 0x{:04X}",
+                            chip_count,
+                            label,
+                            chip_id,
+                        );
+                        self.chip_count = chip_count;
+                        self.chip_id = chip_id;
+                        return Ok(report);
                     }
-                }
-
-                if count > 0 {
-                    // Validate chip_id against production ASIC types.
-                    if !production_chip_id_known(first_chip_id) {
+                    Err(error) => {
                         tracing::warn!(
                             chain_id = self.chain_id,
-                            chip_id = format_args!("0x{:04X}", first_chip_id),
-                            chip_count = count,
                             baud = label,
-                            "Serial: ChipID 0x{:04X} is not a known ASIC type -- trying next baud",
-                            first_chip_id,
+                            error = %error,
+                            "Serial GetAddress family/count validation failed -- trying next baud"
                         );
+                        last_integrity_error = Some(error);
                         continue;
                     }
-
-                    tracing::info!(
-                        chain_id = self.chain_id,
-                        chip_count = count,
-                        chip_id = format_args!("0x{:04X}", first_chip_id),
-                        baud = label,
-                        "Serial enumeration: {} chips at {} baud, ChipID 0x{:04X}",
-                        count,
-                        label,
-                        first_chip_id,
-                    );
-                    self.chip_count = count;
-                    self.chip_id = first_chip_id;
-                    return Ok((count, first_chip_id));
                 }
             }
             tracing::warn!(
@@ -647,9 +860,11 @@ impl Chain {
             );
         }
 
-        Err(crate::AsicError::NoChipsDetected {
-            chain_id: self.chain_id,
-        })
+        Err(
+            last_integrity_error.unwrap_or(crate::AsicError::NoChipsDetected {
+                chain_id: self.chain_id,
+            }),
+        )
     }
 
     /// Assign addresses via serial UART (hybrid mode).
@@ -751,7 +966,9 @@ impl Chain {
 mod tests {
     use super::{
         chain_meets_min_fraction, driver_for_chain, driver_for_chain_with_policy,
-        production_chip_id_known, ChainDriverDecision, DivergentChipPolicy,
+        production_chip_id_known, validate_fpga_enumeration_words,
+        validate_serial_enumeration_responses, ChainDriverDecision, DivergentChipPolicy,
+        EnumerationIdentityIneligibility,
     };
     use crate::drivers::{bm1362, bm1366, bm1368, bm1370, bm1373, bm1387, bm1397, bm1398};
 
@@ -780,6 +997,166 @@ mod tests {
             !production_chip_id_known(0xFFFF),
             "noise chip IDs must stay fail-closed"
         );
+    }
+
+    fn fpga_response_pair(chip_id: u16, metadata: u32) -> [u32; 2] {
+        [u32::from(chip_id.swap_bytes()), metadata]
+    }
+
+    #[test]
+    fn fpga_enumeration_uniform_complete_and_crc_clean_is_measured_eligible() {
+        let words = [
+            fpga_response_pair(bm1387::CHIP_ID, 0x1111_1111),
+            fpga_response_pair(bm1387::CHIP_ID, 0x2222_2222),
+        ]
+        .concat();
+        let report = validate_fpga_enumeration_words(6, &words, 7, 7).unwrap();
+
+        assert_eq!(
+            (report.chip_count(), report.chip_id()),
+            (2, bm1387::CHIP_ID)
+        );
+        let measured = report.measured_identity().unwrap();
+        assert_eq!(measured.chip_count(), 2);
+        assert_eq!(measured.chip_id(), bm1387::CHIP_ID);
+    }
+
+    #[test]
+    fn fpga_enumeration_incomplete_pair_rejects_the_baud_attempt() {
+        let mut words = fpga_response_pair(bm1387::CHIP_ID, 0x1111_1111).to_vec();
+        words.push(u32::from(bm1387::CHIP_ID.swap_bytes()));
+        assert!(matches!(
+            validate_fpga_enumeration_words(6, &words, 0, 0),
+            Err(crate::AsicError::EnumerationIntegrity {
+                chain_id: 6,
+                reason: EnumerationIdentityIneligibility::IncompleteFpgaResponsePair,
+            })
+        ));
+    }
+
+    #[test]
+    fn fpga_enumeration_mixed_or_unknown_later_response_rejects_identity() {
+        let mixed = [
+            fpga_response_pair(bm1387::CHIP_ID, 0),
+            fpga_response_pair(bm1397::CHIP_ID, 0),
+        ]
+        .concat();
+        assert!(matches!(
+            validate_fpga_enumeration_words(6, &mixed, 0, 0),
+            Err(crate::AsicError::EnumerationIntegrity {
+                chain_id: 6,
+                reason: EnumerationIdentityIneligibility::MixedChipIds {
+                    response_index: 1,
+                    first: bm1387::CHIP_ID,
+                    observed: bm1397::CHIP_ID,
+                },
+            })
+        ));
+
+        let unknown = [
+            fpga_response_pair(bm1387::CHIP_ID, 0),
+            fpga_response_pair(0xFFFF, 0),
+        ]
+        .concat();
+        assert!(matches!(
+            validate_fpga_enumeration_words(6, &unknown, 0, 0),
+            Err(crate::AsicError::EnumerationIntegrity {
+                chain_id: 6,
+                reason: EnumerationIdentityIneligibility::UnknownChipId {
+                    response_index: 1,
+                    chip_id: 0xFFFF,
+                },
+            })
+        ));
+    }
+
+    #[test]
+    fn fpga_enumeration_crc_delta_rejects_the_baud_attempt() {
+        let words = fpga_response_pair(bm1387::CHIP_ID, 0);
+        assert!(matches!(
+            validate_fpga_enumeration_words(6, &words, 41, 42),
+            Err(crate::AsicError::EnumerationIntegrity {
+                chain_id: 6,
+                reason: EnumerationIdentityIneligibility::FpgaCrcErrorCounterChanged {
+                    before: 41,
+                    after: 42,
+                },
+            })
+        ));
+    }
+
+    #[test]
+    fn fpga_enumeration_count_overflow_fails_without_u8_wrap() {
+        let words = (0..=u8::MAX)
+            .flat_map(|_| fpga_response_pair(bm1387::CHIP_ID, 0))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            validate_fpga_enumeration_words(6, &words, 0, 0),
+            Err(crate::AsicError::InitFailed { chain_id: 6, .. })
+        ));
+    }
+
+    #[test]
+    fn serial_enumeration_is_typed_unverified_and_never_measured_eligible() {
+        let responses = vec![vec![0x13, 0x87, 0, 0, 0]; 63];
+        let report = validate_serial_enumeration_responses(6, &responses).unwrap();
+        assert_eq!(
+            (report.chip_count(), report.chip_id()),
+            (63, bm1387::CHIP_ID)
+        );
+        assert_eq!(
+            report.measured_identity().unwrap_err(),
+            [EnumerationIdentityIneligibility::SerialResponseTrailerUnverified]
+        );
+    }
+
+    #[test]
+    fn serial_enumeration_rejects_mixed_unknown_and_incomplete_families() {
+        let mixed = vec![vec![0x13, 0x87], vec![0x13, 0x97]];
+        assert!(matches!(
+            validate_serial_enumeration_responses(6, &mixed),
+            Err(crate::AsicError::EnumerationIntegrity {
+                reason: EnumerationIdentityIneligibility::MixedChipIds {
+                    response_index: 1,
+                    first: bm1387::CHIP_ID,
+                    observed: bm1397::CHIP_ID,
+                },
+                ..
+            })
+        ));
+
+        let unknown = vec![vec![0x13, 0x87], vec![0xFF, 0xFF]];
+        assert!(matches!(
+            validate_serial_enumeration_responses(6, &unknown),
+            Err(crate::AsicError::EnumerationIntegrity {
+                reason: EnumerationIdentityIneligibility::UnknownChipId {
+                    response_index: 1,
+                    chip_id: 0xFFFF,
+                },
+                ..
+            })
+        ));
+
+        let incomplete = vec![vec![0x13, 0x87], vec![0x97]];
+        assert!(matches!(
+            validate_serial_enumeration_responses(6, &incomplete),
+            Err(crate::AsicError::EnumerationIntegrity {
+                reason: EnumerationIdentityIneligibility::IncompleteSerialResponse {
+                    response_index: 1,
+                    observed_bytes: 1,
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn serial_enumeration_count_overflow_fails_without_u8_wrap() {
+        let responses = vec![vec![0x13, 0x87]; usize::from(u8::MAX) + 1];
+        assert!(matches!(
+            validate_serial_enumeration_responses(6, &responses),
+            Err(crate::AsicError::InitFailed { chain_id: 6, .. })
+        ));
     }
 
     #[test]

@@ -4,12 +4,11 @@
 # gitignored out-of-band build inputs listed in build_inputs.manifest.
 # =============================================================================
 #
-# WHY: the firmware build depends on several binary inputs that are NOT in
-# git (extracted Bitmain/BraiinsOS boot components + the Linaro toolchain —
-# not redistributable). A clean checkout (fresh clone, CI/GitHub runner)
-# fails to build without them; the first failure is the compile-time
-# include_bytes!("../firmware/stock_fpga_s9.bin") in pic-recovery.
-# See DCENT_OS_Antminer/docs/RC_BUILD_RUNBOOK.md (blocker #1).
+# WHY: full firmware packaging depends on target-selected binary inputs that
+# are NOT in git (extracted Bitmain/BraiinsOS boot components + the Linaro
+# toolchain — not redistributable). The Rust workspace builds without them;
+# release-image packaging fails closed until the required target inputs are
+# provisioned. See DCENT_OS_Antminer/docs/RC_BUILD_RUNBOOK.md.
 #
 # USAGE:
 #   sh DCENT_OS_Antminer/scripts/provision_build_inputs.sh [options]

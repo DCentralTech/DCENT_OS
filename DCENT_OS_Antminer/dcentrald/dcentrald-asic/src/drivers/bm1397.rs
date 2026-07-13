@@ -513,8 +513,8 @@ impl ChipDriver for Bm1397Driver {
             std::thread::sleep(std::time::Duration::from_millis(50));
 
             let pll_readback = if chain.cmd_rx_has_data() {
-                let r0 = chain.cmd.read_reg(fpga_chain::REG_CMD_RX_FIFO);
-                let _r1 = chain.cmd.read_reg(fpga_chain::REG_CMD_RX_FIFO);
+                let r0 = chain.read_cmd_response().unwrap_or_default();
+                let _r1 = chain.read_cmd_response();
                 let bytes = unpack_lsb_first(r0);
                 Some(u32::from_be_bytes(bytes))
             } else {
@@ -610,8 +610,8 @@ impl ChipDriver for Bm1397Driver {
             // Wrong FIFO -- try CMD RX below.
         }
         let readback = if chain.cmd_rx_has_data() {
-            let r0 = chain.cmd.read_reg(fpga_chain::REG_CMD_RX_FIFO);
-            let _r1 = chain.cmd.read_reg(fpga_chain::REG_CMD_RX_FIFO);
+            let r0 = chain.read_cmd_response().unwrap_or_default();
+            let _r1 = chain.read_cmd_response();
             let bytes = unpack_lsb_first(r0);
             Some(u32::from_be_bytes(bytes))
         } else {

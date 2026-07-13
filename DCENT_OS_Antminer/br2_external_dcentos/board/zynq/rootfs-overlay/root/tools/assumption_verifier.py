@@ -38,6 +38,11 @@ import time
 import json
 import collections
 
+from dcentos_asic_wire import (
+    crc5_bm13xx_command,
+    require_captured_bm1387_protocol_profile,
+)
+
 try:
     import fcntl
     HAS_FCNTL = True
@@ -111,29 +116,6 @@ PIC_VOLTAGE_INTERCEPT = 1608.420446
 # CRC5 for BM1387
 # ============================================================================
 
-def crc5_bm1387(data, bit_length=None):
-    """CRC5 polynomial 0x05, init 0x1F, bit-by-bit."""
-    crc = 0x1F
-    poly = 0x05
-    if bit_length is None:
-        bit_length = len(data) * 8
-    bit_index = 0
-    for byte in data:
-        for i in range(7, -1, -1):
-            if bit_index >= bit_length:
-                break
-            bit = (byte >> i) & 1
-            top_bit = (crc >> 4) & 1
-            crc = ((crc << 1) | bit) & 0x3F
-            if top_bit ^ ((crc >> 5) & 1):
-                crc ^= poly
-            crc &= 0x1F
-            bit_index += 1
-            if bit_index >= bit_length:
-                break
-    return crc & 0x1F
-
-
 # ============================================================================
 # BM1387 Command Builders
 # ============================================================================
@@ -141,34 +123,31 @@ def crc5_bm1387(data, bit_length=None):
 def build_read_register_cmd(chip_addr, reg_addr):
     """Build read register: [0x54, chip_addr, reg_addr, CRC5]."""
     cmd_data = bytes([CMD_READ_REGISTER, chip_addr, reg_addr])
-    crc = crc5_bm1387(cmd_data)
+    crc = crc5_bm13xx_command(cmd_data)
     return bytes([CMD_READ_REGISTER, chip_addr, reg_addr, crc & 0x1F])
 
 
 def build_chain_inactive_cmd():
     """Build chain_inactive: [0x55, 0x05, 0x00, 0x00, CRC5]."""
     cmd_data = bytes([CMD_CHAIN_INACTIVE, 0x05, 0x00, 0x00])
-    crc = crc5_bm1387(cmd_data)
+    crc = crc5_bm13xx_command(cmd_data)
     return cmd_data + bytes([crc & 0x1F])
 
 
 def build_set_address_cmd(chip_addr):
     """Build set_address: [0x41, chip_addr, CRC5]."""
     cmd_data = bytes([CMD_SET_ADDRESS, chip_addr])
-    crc = crc5_bm1387(cmd_data)
+    crc = crc5_bm13xx_command(cmd_data)
     return bytes([CMD_SET_ADDRESS, chip_addr, crc & 0x1F])
 
 
 def parse_read_response(response):
-    """Parse 7-byte response: [reg, D3, D2, D1, D0, CRC_hi, CRC_lo]."""
-    if len(response) < READ_RESPONSE_LEN:
+    """Structurally parse a response and preserve unverified raw bytes."""
+    if len(response) != READ_RESPONSE_LEN:
         return None
     reg_addr = response[0]
     value = (response[1] << 24) | (response[2] << 16) | (response[3] << 8) | response[4]
-    resp_crc = response[5] & 0x1F
-    calc_crc = crc5_bm1387(response[:5])
-    crc_ok = (calc_crc == resp_crc)
-    return (reg_addr, value, crc_ok)
+    return (reg_addr, value, "unverified", bytes(response[:READ_RESPONSE_LEN]))
 
 
 def decode_pll_freq(pll_value):
@@ -203,6 +182,7 @@ class UARTInterface:
         self.timeout = timeout
         self.fd = None
         self.fobj = None
+        self.last_response_observation = None
 
     def open(self):
         self.fd = os.open(self.device, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
@@ -231,6 +211,7 @@ class UARTInterface:
             self.fd = None
 
     def write(self, data):
+        require_captured_bm1387_protocol_profile()
         if self.fobj:
             self.fobj.write(data)
             self.fobj.flush()
@@ -275,7 +256,16 @@ class UARTInterface:
             if len(resp) == READ_RESPONSE_LEN:
                 parsed = parse_read_response(resp)
                 if parsed is not None:
-                    return parsed
+                    self.last_response_observation = {
+                        "requested_register": reg_addr,
+                        "returned_register": parsed[0],
+                        "register_matches": parsed[0] == reg_addr,
+                        "response_integrity": parsed[2],
+                        "raw_response_hex": parsed[3].hex(),
+                        "raw_response_bytes": list(parsed[3]),
+                    }
+                    if parsed[0] == reg_addr:
+                        return parsed
             if attempt < retries:
                 time.sleep(0.02)
         return None
@@ -516,7 +506,7 @@ def test_a1_1_preamble(uart=None, safe=True):
     # Check: first byte should be the register address (0x00)
     first_byte_is_reg = resp[0] == REG_CHIP_ADDRESS
 
-    if not has_preamble and first_byte_is_reg and len(resp) >= READ_RESPONSE_LEN:
+    if not has_preamble and first_byte_is_reg and len(resp) == READ_RESPONSE_LEN:
         result.passed(
             "Response starts with register byte 0x{:02X}, no preamble present. "
             "BM1387 confirmed NO preamble.".format(resp[0]),
@@ -560,22 +550,27 @@ def test_a1_3_crc5(uart=None, safe=True):
         result.raw_data = raw
         return result
 
-    reg_addr, value, crc_ok = resp_data
+    reg_addr, value, integrity, raw_response = resp_data
     raw["response_reg"] = "0x{:02X}".format(reg_addr)
-    raw["response_value"] = "0x{:08X}".format(value)
-    raw["response_crc_ok"] = crc_ok
+    raw["register_matches"] = reg_addr == REG_VERSION
+    raw["response_integrity"] = integrity
+    raw["response_hex"] = raw_response.hex()
 
-    if crc_ok:
-        result.passed(
-            "Chip accepted CRC5 command and responded with valid CRC5. "
-            "Version register = 0x{:08X}".format(value),
-            raw
+    if reg_addr != REG_VERSION:
+        result.skipped(
+            "Requested register 0x{:02X}, but response returned 0x{:02X}; "
+            "value was not interpreted".format(REG_VERSION, reg_addr)
         )
-    else:
-        result.failed(
-            "Response received but CRC5 validation failed on response",
-            raw
-        )
+        result.raw_data = raw
+        return result
+
+    raw["response_value"] = "0x{:08X}".format(value)
+
+    result.skipped(
+        "Command elicited a structural response, but response integrity is "
+        "unverified; this cannot prove command acceptance",
+    )
+    result.raw_data = raw
     return result
 
 
@@ -604,20 +599,26 @@ def test_a1_5_response_7byte(uart=None, safe=True):
 
     if len(resp) == READ_RESPONSE_LEN:
         parsed = parse_read_response(resp)
-        if parsed:
+        if parsed and parsed[0] == REG_VERSION:
             result.passed(
-                "Response is exactly 7 bytes. Reg=0x{:02X} Value=0x{:08X}".format(
-                    parsed[0], parsed[1]),
+                "Response is exactly 7 bytes and returned requested register 0x{:02X}".format(
+                    parsed[0]),
+                raw
+            )
+        elif parsed:
+            raw["returned_register"] = parsed[0]
+            raw["register_matches"] = False
+            result.failed(
+                "Response is 7 bytes but returned register 0x{:02X}, expected 0x{:02X}".format(
+                    parsed[0], REG_VERSION),
                 raw
             )
         else:
             result.failed("Got 7 bytes but parse failed", raw)
     elif len(resp) > READ_RESPONSE_LEN:
-        # Multiple responses possible if broadcast
-        result.passed(
-            "Got {} bytes (possibly {} responses of 7 bytes each). "
-            "Individual responses are 7 bytes.".format(
-                len(resp), len(resp) // READ_RESPONSE_LEN),
+        result.failed(
+            "Response is {} bytes, expected exactly 7; refusing to split or truncate it".format(
+                len(resp)),
             raw
         )
     else:
@@ -659,28 +660,33 @@ def test_a1_7_chain_inactive(uart=None, safe=True):
         result.raw_data = raw
         return result
 
-    _, addr_val, crc_ok = resp_addr0
+    returned_reg, addr_val, integrity, raw_response = resp_addr0
+    raw["addr0_returned_register"] = returned_reg
+    raw["addr0_register_matches"] = returned_reg == REG_CHIP_ADDRESS
+    raw["addr0_response_integrity"] = integrity
+    raw["addr0_response_hex"] = raw_response.hex()
+
+    if returned_reg != REG_CHIP_ADDRESS:
+        result.skipped(
+            "Post-chain-inactive response returned register 0x{:02X}, expected "
+            "0x{:02X}; value was not interpreted".format(
+                returned_reg, REG_CHIP_ADDRESS)
+        )
+        result.raw_data = raw
+        return result
+
     raw["addr0_value"] = "0x{:08X}".format(addr_val)
-    raw["addr0_crc_ok"] = crc_ok
 
     # After chain_inactive, reading address 4 should get no response
     # (all chips are at address 0)
     resp_addr4 = uart.read_register(0x04, REG_CHIP_ADDRESS)
     raw["addr4_responded"] = resp_addr4 is not None
 
-    if crc_ok and resp_addr4 is None:
-        result.passed(
-            "After chain_inactive: address 0 responds, address 4 does not. "
-            "All chips reset to address 0.",
-            raw
-        )
-    elif crc_ok and resp_addr4 is not None:
-        result.failed(
-            "Address 4 still responds after chain_inactive -- chips NOT fully reset",
-            raw
-        )
-    else:
-        result.failed("Unexpected state after chain_inactive", raw)
+    result.skipped(
+        "Observed post-command response shape, but response integrity is "
+        "unverified; chain reset cannot be certified",
+    )
+    result.raw_data = raw
     return result
 
 
@@ -706,6 +712,8 @@ def test_a1_8_address_interval(uart=None, safe=True):
 
     # Enumerate: assign addresses 0, 4, 8, ...
     addresses_found = []
+    observations = []
+    unsafe_observation_reason = None
     for chip_idx in range(MAX_CHIPS):
         chip_addr = chip_idx * ADDR_INTERVAL
         cmd_sa = build_set_address_cmd(chip_addr)
@@ -714,10 +722,54 @@ def test_a1_8_address_interval(uart=None, safe=True):
 
         resp = uart.read_register(chip_addr, REG_CHIP_ADDRESS)
         if resp is None:
+            observations.append({
+                "expected_address": chip_addr,
+                "status": "no_response",
+                "response_integrity": "unknown",
+                "response_hex": None,
+            })
+            break
+
+        reg_addr, observed_value, integrity, raw_response = resp
+        observation = {
+            "expected_address": chip_addr,
+            "requested_register": REG_CHIP_ADDRESS,
+            "returned_register": reg_addr,
+            "register_matches": reg_addr == REG_CHIP_ADDRESS,
+            "status": "observed",
+            "response_integrity": integrity,
+            "response_hex": raw_response.hex(),
+            "response_bytes": list(raw_response),
+        }
+        observations.append(observation)
+        if reg_addr != REG_CHIP_ADDRESS:
+            observation["status"] = "register_mismatch"
+            unsafe_observation_reason = (
+                "Address response returned register 0x{:02X}, expected 0x{:02X}; "
+                "refusing to interpret it or continue enumeration".format(
+                    reg_addr, REG_CHIP_ADDRESS))
+            break
+        observation["observed_value"] = observed_value
+        observation["observed_value_hex"] = "0x{:08X}".format(observed_value)
+        if integrity != "verified":
+            # Do not let an unverified response authorize another mutating
+            # SET_ADDRESS command or mint an address-interval PASS.
+            unsafe_observation_reason = (
+                "Address response integrity is unverified; refusing to continue "
+                "enumeration or certify the interval")
             break
         addresses_found.append(chip_addr)
 
-    raw = {"addresses": addresses_found, "count": len(addresses_found)}
+    raw = {
+        "addresses": addresses_found,
+        "count": len(addresses_found),
+        "observations": observations,
+    }
+
+    if unsafe_observation_reason:
+        result.skipped(unsafe_observation_reason)
+        result.raw_data = raw
+        return result
 
     if len(addresses_found) < 2:
         result.skipped(
@@ -762,11 +814,36 @@ def test_a1_10_pll_formula(uart=None, safe=True):
         result.skipped("No PLL register response (chain not powered)")
         return result
 
-    _, pll_value, crc_ok = resp
+    returned_reg, pll_value, integrity, raw_response = resp
+
+    raw = {
+        "requested_register": REG_PLL,
+        "returned_register": returned_reg,
+        "register_matches": returned_reg == REG_PLL,
+        "response_integrity": integrity,
+        "response_hex": raw_response.hex(),
+    }
+    if returned_reg != REG_PLL:
+        result.skipped(
+            "PLL read returned register 0x{:02X}, expected 0x{:02X}; value was not interpreted".format(
+                returned_reg, REG_PLL)
+        )
+        result.raw_data = raw
+        return result
+
     freq = decode_pll_freq(pll_value)
 
-    raw = {"pll_raw": "0x{:08X}".format(pll_value), "crc_ok": crc_ok,
-           "decoded_freq_mhz": freq}
+    raw["pll_raw"] = "0x{:08X}".format(pll_value)
+    raw["decoded_freq_mhz"] = freq
+
+    if integrity != "verified":
+        result.skipped(
+            "PLL response integrity is {}; decoded value is diagnostic only".format(
+                integrity
+            )
+        )
+        result.raw_data = raw
+        return result
 
     # S9 stock PLL is typically 500-700 MHz
     if 400 <= freq <= 800:
@@ -1463,7 +1540,7 @@ class MockUART:
                 value = 0x00000000
             else:
                 return None
-        return (reg_addr, value, True)
+        return (reg_addr, value, "simulated", b"")
 
 
 class MockI2C:
@@ -1579,22 +1656,24 @@ def run_self_tests():
     print("Section 1: CRC5 Engine Verification")
     print("=" * 70)
 
-    crc1 = crc5_bm1387(bytes([0x54, 0x00, 0x00]))
-    crc2 = crc5_bm1387(bytes([0x54, 0x00, 0x00]))
+    crc1 = crc5_bm13xx_command(bytes([0x52, 0x05, 0x00, 0x00]))
+    crc2 = crc5_bm13xx_command(bytes([0x52, 0x05, 0x00, 0x00]))
+    check("CRC5: captured get-address body -> 0x0A", crc1 == 0x0A,
+          "crc=0x{:02X}".format(crc1))
     check("CRC5: deterministic output", crc1 == crc2,
           "c1=0x{:02X} c2=0x{:02X}".format(crc1, crc2))
 
     check("CRC5: output in 5-bit range",
-          all(0 <= crc5_bm1387(bytes([0x54, i, 0])) <= 0x1F for i in range(256)))
+          all(0 <= crc5_bm13xx_command(bytes([0x54, i, 0])) <= 0x1F for i in range(256)))
 
-    crc_a = crc5_bm1387(bytes([0x54, 0x00, 0x00]))
-    crc_b = crc5_bm1387(bytes([0x54, 0x00, 0x04]))
+    crc_a = crc5_bm13xx_command(bytes([0x54, 0x00, 0x00]))
+    crc_b = crc5_bm13xx_command(bytes([0x54, 0x00, 0x04]))
     check("CRC5: different inputs -> different CRCs", crc_a != crc_b)
 
-    crc_z = crc5_bm1387(bytes([0x00, 0x00, 0x00]))
+    crc_z = crc5_bm13xx_command(bytes([0x00, 0x00, 0x00]))
     check("CRC5: all-zeros valid", 0 <= crc_z <= 0x1F)
 
-    crc_f = crc5_bm1387(bytes([0xFF, 0xFF, 0xFF]))
+    crc_f = crc5_bm13xx_command(bytes([0xFF, 0xFF, 0xFF]))
     check("CRC5: all-0xFF valid", 0 <= crc_f <= 0x1F)
 
     # =======================================================================
@@ -1634,18 +1713,18 @@ def run_self_tests():
     print("Section 3: Response Parser Verification")
     print("=" * 70)
 
-    # Build a valid 7-byte response
+    # Build a structural 7-byte response with deliberately unverified trailer.
     val = 0x00680261  # PLL 600 MHz
     resp_data = bytes([0x0C, (val >> 24) & 0xFF, (val >> 16) & 0xFF,
                        (val >> 8) & 0xFF, val & 0xFF])
-    resp_crc = crc5_bm1387(resp_data)
-    full_resp = resp_data + bytes([resp_crc, 0x00])
+    full_resp = resp_data + bytes([0xA5, 0x5A])
 
     parsed = parse_read_response(full_resp)
     check("Parse response: valid 7-byte", parsed is not None)
     check("Parse response: correct register", parsed and parsed[0] == 0x0C)
     check("Parse response: correct value", parsed and parsed[1] == val)
-    check("Parse response: CRC OK", parsed and parsed[2] is True)
+    check("Parse response: integrity unverified", parsed and parsed[2] == "unverified")
+    check("Parse response: raw bytes preserved", parsed and parsed[3] == full_resp)
 
     check("Parse response: rejects short data",
           parse_read_response(bytes([0x0C, 0x00])) is None)
@@ -1693,8 +1772,8 @@ def run_self_tests():
 
     # Test A1.3 - CRC5
     r_a13 = test_a1_3_crc5(uart=mock_uart)
-    check("A1.3 mock: CRC5 accepted",
-          r_a13.status == "PASS",
+    check("A1.3 mock: unverified response cannot prove acceptance",
+          r_a13.status == "SKIP",
           r_a13.explanation[:60])
 
     # Test A1.5 - 7-byte response
@@ -1705,8 +1784,8 @@ def run_self_tests():
 
     # Test A1.10 - PLL formula
     r_a110 = test_a1_10_pll_formula(uart=mock_uart)
-    check("A1.10 mock: PLL decodes to ~600 MHz",
-          r_a110.status == "PASS",
+    check("A1.10 mock: unverified PLL response cannot pass",
+          r_a110.status == "SKIP",
           r_a110.explanation[:60])
 
     # Verify mock version register

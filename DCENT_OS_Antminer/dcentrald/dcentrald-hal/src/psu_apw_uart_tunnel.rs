@@ -96,6 +96,10 @@ pub const TUNNEL_PREAMBLE: [u8; 2] = [0x55, 0xAA];
 /// 16-bit checksum field; only the low byte — [`checksum`] — is meaningful).
 pub const TUNNEL_TRAILER: u8 = 0x00;
 
+/// Largest parameter block representable by the tunnel's 8-bit LEN field.
+/// LEN counts itself, OPCODE, checksum, and trailer.
+pub const TUNNEL_MAX_PARAMS_LEN: usize = u8::MAX as usize - 4;
+
 /// Pad byte the APW returns for any read bytes past its actual reply length.
 pub const TUNNEL_PAD_BYTE: u8 = 0xF5;
 
@@ -170,18 +174,27 @@ pub const WATCHDOG_DISABLE_PARAMS: [u8; 2] = [0x00, 0x00];
 
 /// Additive 8-bit checksum over `[LEN, OPCODE, params…]` (live-confirmed).
 pub fn checksum(len: u8, opcode: u8, params: &[u8]) -> u8 {
-    let mut s = len as u16 + opcode as u16;
-    for &p in params {
-        s += p as u16;
-    }
-    s as u8
+    params
+        .iter()
+        .copied()
+        .fold(len.wrapping_add(opcode), u8::wrapping_add)
 }
 
 /// Build a request frame for `(opcode, params)`:
 /// `[0x11, 0x55, 0xAA, LEN, OPCODE, params…, CKSUM, 0x00]` where
 /// `LEN = 4 + params.len()`. Host-safe.
-pub fn build_request(opcode: u8, params: &[u8]) -> Vec<u8> {
-    let len = (4 + params.len()) as u8;
+///
+/// Returns an error before allocating when `params` cannot be represented by
+/// the wire format's 8-bit LEN field.
+pub fn build_request(opcode: u8, params: &[u8]) -> Result<Vec<u8>> {
+    if params.len() > TUNNEL_MAX_PARAMS_LEN {
+        return Err(HalError::PsuProtocolOwned(format!(
+            "APW UART-tunnel request parameters are {} bytes; maximum is {}",
+            params.len(),
+            TUNNEL_MAX_PARAMS_LEN
+        )));
+    }
+    let len = u8::try_from(params.len() + 4).expect("TUNNEL_MAX_PARAMS_LEN proves LEN fits in u8");
     let mut f = Vec::with_capacity(3 + len as usize);
     f.push(TUNNEL_REG_BYTE);
     f.extend_from_slice(&TUNNEL_PREAMBLE);
@@ -190,11 +203,12 @@ pub fn build_request(opcode: u8, params: &[u8]) -> Vec<u8> {
     f.extend_from_slice(params);
     f.push(checksum(len, opcode, params));
     f.push(TUNNEL_TRAILER);
-    f
+    Ok(f)
 }
 
 /// Convenience: a no-param request frame.
-pub fn build_request_noparams(opcode: u8) -> Vec<u8> {
+/// Returns the same fallible frame-builder result as [`build_request`].
+pub fn build_request_noparams(opcode: u8) -> Result<Vec<u8>> {
     build_request(opcode, &[])
 }
 
@@ -303,16 +317,30 @@ pub fn parse_response_lenient(buf: &[u8]) -> Result<ApwTunnelResponse> {
 /// [`crate::i2c::I2cServiceHandle`]. Tests use a mock that records the frames
 /// written and replies with canned responses.
 ///
-/// **Important: `write_frame` and `read_reply` are SEPARATE I²C transactions
-/// with a caller-controlled delay in between** — the APW needs ≥ ~400 ms to
-/// produce a reply (see [`APW_READ_DELAY_MS`]). Do NOT collapse them into a
-/// repeated-START WriteRead — that's the original bug (read-too-soon → all
-/// `0xF5`).
+/// **Important: the APW requires a write, a caller-controlled delay, and then
+/// a separate read** — it needs ≥ ~400 ms to produce a reply (see
+/// [`APW_READ_DELAY_MS`]). Service-backed implementations retain worker
+/// ownership across that sequence, but must not collapse it into a
+/// repeated-START WriteRead (read-too-soon → all `0xF5`).
 pub trait ApwUartTunnelBus {
     /// Write `frame` to the PSU at `addr`.
     fn write_frame(&mut self, addr: u8, frame: &[u8]) -> Result<()>;
     /// Read `read_len` bytes from the PSU at `addr`.
     fn read_reply(&mut self, addr: u8, read_len: usize) -> Result<Vec<u8>>;
+    /// Execute one correlated request/delay/reply exchange. The default keeps
+    /// mocks and non-service transports simple; the service-backed runtime
+    /// overrides this to retain single-worker ownership across the delay.
+    fn exchange(
+        &mut self,
+        addr: u8,
+        frame: &[u8],
+        read_len: usize,
+        delay: Duration,
+    ) -> Result<Vec<u8>> {
+        self.write_frame(addr, frame)?;
+        self.delay(delay);
+        self.read_reply(addr, read_len)
+    }
     /// Sleep for `dur` (overridable in tests so they don't actually wait).
     fn delay(&mut self, dur: Duration) {
         std::thread::sleep(dur);
@@ -326,7 +354,7 @@ mod i2c_service_bus {
     //! hardware (no live `a lab unit` DCENT_OS install).
 
     use super::{ApwUartTunnelBus, Result};
-    use crate::i2c::{I2cServiceHandle, I2cTransactionStep};
+    use crate::i2c::{I2cOperationIntent, I2cServiceHandle, I2cTransactionStep};
 
     /// [`ApwUartTunnelBus`] backed by the shared I²C service.
     pub struct I2cServiceApwBus {
@@ -339,22 +367,180 @@ mod i2c_service_bus {
         }
     }
 
+    fn validated_request(frame: &[u8]) -> Option<(u8, &[u8])> {
+        if frame.len() < 7
+            || frame[0] != super::TUNNEL_REG_BYTE
+            || frame[1..3] != super::TUNNEL_PREAMBLE
+            || frame.last() != Some(&0x00)
+            || frame.len() != usize::from(frame[3]) + 3
+        {
+            return None;
+        }
+        let opcode = frame[4];
+        let params = &frame[5..frame.len() - 2];
+        (frame[frame.len() - 2] == super::checksum(frame[3], opcode, params))
+            .then_some((opcode, params))
+    }
+
+    fn frame_intent(frame: &[u8]) -> I2cOperationIntent {
+        match validated_request(frame) {
+            // Watchdog disable is standalone neutral control: it removes a
+            // cutoff without itself moving the rail safe.
+            Some((opcode, params))
+                if opcode == super::OP_WATCHDOG_CONTROL
+                    && params == super::WATCHDOG_DISABLE_PARAMS =>
+            {
+                I2cOperationIntent::NeutralControl
+            }
+            // The gated voltage opcode can raise the rail if this recovery
+            // transport is ever enabled for it.
+            Some((0x83, _)) => I2cOperationIntent::Energize,
+            Some((opcode, params))
+                if params.is_empty()
+                    && matches!(
+                        opcode,
+                        super::OP_READ_HW_TYPE
+                            | super::OP_READ_FW_VERSION
+                            | super::OP_READ_STATUS_0X03
+                    ) =>
+            {
+                I2cOperationIntent::ReadOnly
+            }
+            Some((opcode, params))
+                if opcode == super::OP_READ_CAL_BLOCK && params == super::CAL_BLOCK_PARAMS =>
+            {
+                I2cOperationIntent::ReadOnly
+            }
+            // The opcode catalog is intentionally incomplete. Unknown
+            // commands must never inherit read-only terminal privilege.
+            _ => I2cOperationIntent::UnclassifiedMutation,
+        }
+    }
+
     impl ApwUartTunnelBus for I2cServiceApwBus {
         fn write_frame(&mut self, addr: u8, frame: &[u8]) -> Result<()> {
-            self.handle
-                .transaction(addr, vec![I2cTransactionStep::Write(frame.to_vec())])?;
+            let intent = frame_intent(frame);
+            self.handle.transaction_with_intent(
+                intent,
+                addr,
+                vec![I2cTransactionStep::Write(frame.to_vec())],
+            )?;
             Ok(())
         }
 
         fn read_reply(&mut self, addr: u8, read_len: usize) -> Result<Vec<u8>> {
-            let mut reads = self
-                .handle
-                .transaction(addr, vec![I2cTransactionStep::Read(read_len)])?;
+            let mut reads = self.handle.transaction_with_intent(
+                I2cOperationIntent::ReadOnly,
+                addr,
+                vec![I2cTransactionStep::Read(read_len)],
+            )?;
             reads.pop().ok_or_else(|| {
                 crate::HalError::PsuProtocolOwned(
                     "APW UART-tunnel: read transaction returned no result".into(),
                 )
             })
+        }
+
+        fn exchange(
+            &mut self,
+            addr: u8,
+            frame: &[u8],
+            read_len: usize,
+            delay: std::time::Duration,
+        ) -> Result<Vec<u8>> {
+            let intent = frame_intent(frame);
+            let delay_ms = u64::try_from(delay.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX);
+            let mut reads = self.handle.transaction_with_intent(
+                intent,
+                addr,
+                vec![
+                    I2cTransactionStep::Write(frame.to_vec()),
+                    I2cTransactionStep::SleepMs(delay_ms),
+                    I2cTransactionStep::Read(read_len),
+                ],
+            )?;
+            reads.pop().ok_or_else(|| {
+                crate::HalError::PsuProtocolOwned(
+                    "APW UART-tunnel: exchange returned no read result".into(),
+                )
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn classifies_only_byte_exact_known_requests_as_privileged() {
+            assert_eq!(
+                frame_intent(
+                    &super::super::build_request(super::super::OP_READ_HW_TYPE, &[]).unwrap()
+                ),
+                I2cOperationIntent::ReadOnly
+            );
+            assert_eq!(
+                frame_intent(
+                    &super::super::build_request(
+                        super::super::OP_READ_CAL_BLOCK,
+                        &super::super::CAL_BLOCK_PARAMS
+                    )
+                    .unwrap()
+                ),
+                I2cOperationIntent::ReadOnly
+            );
+            assert_eq!(
+                frame_intent(
+                    &super::super::build_request(
+                        super::super::OP_WATCHDOG_CONTROL,
+                        &super::super::WATCHDOG_DISABLE_PARAMS
+                    )
+                    .unwrap()
+                ),
+                I2cOperationIntent::NeutralControl
+            );
+            assert_eq!(
+                frame_intent(&super::super::build_request(0x83, &[0x2A, 0x00]).unwrap()),
+                I2cOperationIntent::Energize
+            );
+        }
+
+        #[test]
+        fn malformed_or_semantically_unknown_requests_are_unclassified_mutations() {
+            let valid_read =
+                super::super::build_request(super::super::OP_READ_HW_TYPE, &[]).unwrap();
+
+            let mut bad_checksum = valid_read.clone();
+            bad_checksum[5] ^= 0x01;
+            assert_eq!(
+                frame_intent(&bad_checksum),
+                I2cOperationIntent::UnclassifiedMutation
+            );
+
+            let mut bad_length = valid_read.clone();
+            bad_length[3] = bad_length[3].saturating_add(1);
+            assert_eq!(
+                frame_intent(&bad_length),
+                I2cOperationIntent::UnclassifiedMutation
+            );
+
+            assert_eq!(
+                frame_intent(&super::super::build_request(0x7F, &[]).unwrap()),
+                I2cOperationIntent::UnclassifiedMutation
+            );
+            assert_eq!(
+                frame_intent(
+                    &super::super::build_request(super::super::OP_READ_HW_TYPE, &[0x00]).unwrap()
+                ),
+                I2cOperationIntent::UnclassifiedMutation
+            );
+            assert_eq!(
+                frame_intent(
+                    &super::super::build_request(super::super::OP_WATCHDOG_CONTROL, &[0x01, 0x00])
+                        .unwrap()
+                ),
+                I2cOperationIntent::UnclassifiedMutation
+            );
         }
     }
 }
@@ -418,10 +604,8 @@ impl<B: ApwUartTunnelBus> ApwUartTunnel<B> {
         read_len: usize,
         delay: Duration,
     ) -> Result<ApwTunnelResponse> {
-        let frame = build_request(opcode, params);
-        self.bus.write_frame(self.address, &frame)?;
-        self.bus.delay(delay);
-        let raw = self.bus.read_reply(self.address, read_len)?;
+        let frame = build_request(opcode, params)?;
+        let raw = self.bus.exchange(self.address, &frame, read_len, delay)?;
         let resp = parse_response(&raw)?;
         if resp.opcode_echo != opcode {
             return Err(HalError::PsuProtocolOwned(format!(
@@ -509,10 +693,13 @@ impl<B: ApwUartTunnelBus> ApwUartTunnel<B> {
     /// (uninitialised) on the `a lab unit` unit; on a calibrated PSU this is the
     /// voltage/current trim table. Best-effort: never fatal.
     pub fn read_calibration_block(&mut self) -> Result<Vec<u8>> {
-        let frame = build_request(OP_READ_CAL_BLOCK, &CAL_BLOCK_PARAMS);
-        self.bus.write_frame(self.address, &frame)?;
-        self.bus.delay(Duration::from_millis(APW_CAL_READ_DELAY_MS));
-        let raw = self.bus.read_reply(self.address, 40)?;
+        let frame = build_request(OP_READ_CAL_BLOCK, &CAL_BLOCK_PARAMS)?;
+        let raw = self.bus.exchange(
+            self.address,
+            &frame,
+            40,
+            Duration::from_millis(APW_CAL_READ_DELAY_MS),
+        )?;
         let resp = parse_response_lenient(&raw)?;
         if resp.opcode_echo != OP_READ_CAL_BLOCK {
             return Err(HalError::PsuProtocolOwned(format!(
@@ -686,27 +873,27 @@ mod tests {
     fn build_request_byte_exact_against_dot79_trace() {
         // luxminer's actual frames from luxos-wire-capture.md §R7-1:
         assert_eq!(
-            build_request(0x02, &[]),
+            build_request(0x02, &[]).unwrap(),
             vec![0x11, 0x55, 0xAA, 0x04, 0x02, 0x06, 0x00]
         );
         assert_eq!(
-            build_request(0x01, &[]),
+            build_request(0x01, &[]).unwrap(),
             vec![0x11, 0x55, 0xAA, 0x04, 0x01, 0x05, 0x00]
         );
         assert_eq!(
-            build_request(0x03, &[]),
+            build_request(0x03, &[]).unwrap(),
             vec![0x11, 0x55, 0xAA, 0x04, 0x03, 0x07, 0x00]
         );
         assert_eq!(
-            build_request(0x06, &[0x40, 0x20]),
+            build_request(0x06, &[0x40, 0x20]).unwrap(),
             vec![0x11, 0x55, 0xAA, 0x06, 0x06, 0x40, 0x20, 0x6C, 0x00]
         );
         assert_eq!(
-            build_request(0x81, &[0x00, 0x00]),
+            build_request(0x81, &[0x00, 0x00]).unwrap(),
             vec![0x11, 0x55, 0xAA, 0x06, 0x81, 0x00, 0x00, 0x87, 0x00]
         );
         assert_eq!(
-            build_request(0x83, &[0x00, 0x00]),
+            build_request(0x83, &[0x00, 0x00]).unwrap(),
             vec![0x11, 0x55, 0xAA, 0x06, 0x83, 0x00, 0x00, 0x89, 0x00]
         );
     }
@@ -720,6 +907,28 @@ mod tests {
         assert_eq!(checksum(0x06, 0x81, &[0x00, 0x00]), 0x87);
         // wrap test
         assert_eq!(checksum(0xFF, 0xFF, &[0x02]), 0x00);
+
+        // Public checksum input is not length-constrained. Its arithmetic is
+        // explicitly modulo 256 even for inputs larger than any valid frame.
+        let long = vec![0xFF; 1_024];
+        let expected = long
+            .iter()
+            .copied()
+            .fold(0xFEu8, |sum, byte| sum.wrapping_add(byte));
+        assert_eq!(checksum(0xFF, 0xFF, &long), expected);
+    }
+
+    #[test]
+    fn build_request_enforces_u8_length_boundary() {
+        let params = vec![0xFF; TUNNEL_MAX_PARAMS_LEN];
+        let frame = build_request(0xFF, &params).unwrap();
+        assert_eq!(frame[3], u8::MAX);
+        assert_eq!(frame.len(), TUNNEL_MAX_PARAMS_LEN + 7);
+        assert_eq!(frame[frame.len() - 2], checksum(u8::MAX, 0xFF, &params));
+        assert_eq!(frame[frame.len() - 1], TUNNEL_TRAILER);
+
+        let oversized = vec![0xFF; TUNNEL_MAX_PARAMS_LEN + 1];
+        assert!(build_request(0xFF, &oversized).is_err());
     }
 
     #[test]
@@ -776,7 +985,7 @@ mod tests {
         assert_eq!(psu.hw_type(), 0x76);
         // The command must have written the frame, delayed, then read.
         assert_eq!(psu.bus.writes.len(), 1);
-        assert_eq!(psu.bus.writes[0].1, build_request(0x02, &[]));
+        assert_eq!(psu.bus.writes[0].1, build_request(0x02, &[]).unwrap());
         assert_eq!(
             psu.bus.delays,
             vec![Duration::from_millis(APW_READ_DELAY_MS)]

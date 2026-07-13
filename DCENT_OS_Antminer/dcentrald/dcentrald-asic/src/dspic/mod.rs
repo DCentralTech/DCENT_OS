@@ -50,7 +50,10 @@
 //!   -  (dsPIC33EP16GS202 confirmed)
 
 use crate::Result;
-use dcentrald_hal::i2c::{I2cBus, I2cServiceHandle, I2cTransactionStep};
+use dcentrald_hal::i2c::{
+    I2cBus, I2cDspicDisableProtocol, I2cMutationLabel, I2cServiceHandle, I2cTransactionStep,
+};
+use dcentrald_hal::platform::{VoltageControllerEndpoint, VoltageControllerKind};
 
 // -- Per-firmware-revision wire-format modules ------------------------------
 //
@@ -77,8 +80,8 @@ pub mod fw8a;
 //   Always-includes-flush wrapper around the RESET+JUMP chain. See
 //   .
 //   This module is intentionally NOT gated behind `recovery-tool` — the
-//   destructive `dspic_flash::reset_pic` path stays gated (compile error in
-//   `dcentrald`). The wrapper here is safer-by-construction because the
+//   historical raw `dspic_flash::reset_pic` path has been removed entirely.
+//   The wrapper here is safer-by-construction because the
 //   16-byte parser flush is emitted BEFORE the RESET opcode in the same call,
 //   so the `a lab unit` 2026-04-24 "bare RESET without flush" corruption pattern
 //   cannot recur here even if a future agent reuses this module incorrectly.
@@ -86,15 +89,15 @@ pub mod bosminer_warmup;
 
 // W12.1 (RE3 R3-6, 2026-05-10): dsPIC fw=0x86 software recovery.
 //
-// `recovery_fw86` is recovery-tool-only. It exposes `jump_to_app` (the
-// bootloader→application unlock+jump per RE3 §5.2) and a partial
-// `reflash_app_via_framed_protocol` (RE3 §3.4 / §6 — 60% confidence).
+// `recovery_fw86` is research/test-only behind `recovery-tool`. It preserves
+// `jump_to_app` (the bootloader→application unlock+jump per RE3 §5.2) and a
+// partial `reflash_app_via_framed_protocol` (RE3 §3.4 / §6 — 60% confidence).
 //
-// Production `dcentrald` (no `recovery-tool` feature) cannot link any
-// symbol in this module — `pic-recovery --confirm-bricked` is the only
-// caller. The daemon's existing fw=0x86 voltage-command refusal
-// stays in force; recovery is the
-// opt-in operator escape hatch, NOT a daemon-side override.
+// Production `dcentrald` and the diagnostic-only `pic-recovery` package do
+// not enable `recovery-tool`, so no shipped binary can link any symbol in
+// this module. The daemon's existing fw=0x86 voltage-command refusal
+// stays in force. Recovery remains
+// physical ICSP-only until a separate typed authority architecture exists.
 #[cfg(feature = "recovery-tool")]
 pub mod recovery_fw86;
 
@@ -877,9 +880,11 @@ pub fn at3_measure_voltage_firmware_allowed(fw: DspicFirmware) -> bool {
 /// Map an optionally observed Pic0x89-family firmware byte to the exact
 /// dsPIC firmware identity used by voltage guards.
 ///
-/// `None` keeps the historical S19j Pro default of fw=0x89. Explicit 0x86
-/// must stay 0x86 so serial BM1362/BM1398 paths cannot bypass the degraded
-/// voltage refusal by routing through a Pic0x89 wrapper.
+/// `None` means no firmware identity was observed and therefore maps to
+/// [`DspicFirmware::Unknown`]. Missing evidence must never manufacture fw=0x89:
+/// that identity selects the VNish-padded ENABLE encoding and permits voltage
+/// commands. Explicit 0x86 must stay 0x86 so serial BM1362/BM1398 paths cannot
+/// bypass the degraded voltage refusal by routing through a Pic0x89 wrapper.
 ///
 /// **SAFETY (PIC-1, 2026-06-20): the FORCE_FW89_ENCODING remap below is scoped to
 /// `Fw82` ONLY — an observed fw=0x86 must NEVER be remapped to Fw89.** Fw89 is not
@@ -899,7 +904,7 @@ pub fn pic0x89_firmware_from_observed_fw_byte(fw_byte: Option<u8>) -> DspicFirmw
         Some(0xFE) => DspicFirmware::FwFE,
         Some(0x00 | 0xFF) => DspicFirmware::Unknown,
         Some(other) => DspicFirmware::Other(other),
-        None => DspicFirmware::Fw89,
+        None => DspicFirmware::Unknown,
     };
 
     //  (2026-05-23): mirror of `from_version`'s env override —
@@ -947,7 +952,51 @@ pub const fn dspic_voltage_command_allowed(
     firmware: DspicFirmware,
     trust_degraded_fw: bool,
 ) -> bool {
-    !dspic_requires_degraded_fw_voltage_refusal(firmware) || trust_degraded_fw
+    match firmware {
+        // No observed identity means no proven protocol or energizing bytes.
+        // Unlike fw=0x86, this cannot be bypassed by the degraded-firmware lab
+        // override because there is no evidence about what firmware is present.
+        DspicFirmware::Unknown | DspicFirmware::Other(_) => false,
+        DspicFirmware::Fw86 => trust_degraded_fw,
+        _ => true,
+    }
+}
+
+/// Whether a firmware identity has an explicitly modeled runtime wire
+/// protocol. Unknown and merely observed-but-unsupported revisions must not
+/// inherit a generic framed protocol for keepalive or energizing operations.
+pub const fn dspic_runtime_protocol_is_proven(firmware: DspicFirmware) -> bool {
+    matches!(
+        firmware,
+        DspicFirmware::Fw82
+            | DspicFirmware::Fw86
+            | DspicFirmware::Fw89
+            | DspicFirmware::Fw8A
+            | DspicFirmware::FwB9
+            | DspicFirmware::FwFE
+    )
+}
+
+fn ensure_dspic_runtime_protocol_is_proven(
+    address: u8,
+    firmware: DspicFirmware,
+    operation: &str,
+) -> Result<()> {
+    if dspic_runtime_protocol_is_proven(firmware) {
+        return Ok(());
+    }
+
+    let evidence = match firmware {
+        DspicFirmware::Unknown => "no firmware identity was observed".to_string(),
+        DspicFirmware::Other(version) => {
+            format!("observed firmware 0x{version:02X} has no explicitly modeled runtime protocol")
+        }
+        _ => unreachable!("known firmware identities are accepted above"),
+    };
+    Err(crate::AsicError::Pic {
+        addr: address,
+        detail: format!("dsPIC {operation} refused: {evidence}"),
+    })
 }
 
 /// Read the process environment for the lab-only fw=0x86 voltage override.
@@ -974,9 +1023,21 @@ fn ensure_dspic_voltage_command_allowed(
         return Ok(());
     }
 
+    let detail = match firmware {
+        DspicFirmware::Unknown => format!(
+            "dsPIC {} refused without an observed firmware identity: protocol and energizing bytes cannot be selected safely",
+            operation
+        ),
+        DspicFirmware::Other(version) => format!(
+            "dsPIC {} refused for unsupported observed firmware 0x{version:02X}: energizing bytes are not proven",
+            operation
+        ),
+        _ => dspic_voltage_refusal_detail(operation),
+    };
+
     Err(crate::AsicError::Pic {
         addr: address,
-        detail: dspic_voltage_refusal_detail(operation),
+        detail,
     })
 }
 
@@ -1239,6 +1300,27 @@ pub struct DspicController<'a> {
 }
 
 impl<'a> DspicController<'a> {
+    /// Construct from a discovery-issued, bus-bound dsPIC endpoint.
+    ///
+    /// This is the preferred constructor for migrated orchestration paths.
+    /// Unlike [`Self::new`], neither family nor address is caller asserted.
+    pub fn from_endpoint(i2c: &'a mut I2cBus, endpoint: VoltageControllerEndpoint) -> Result<Self> {
+        if endpoint.kind() != VoltageControllerKind::Dspic33Ep {
+            return Err(crate::AsicError::InvalidParameter(format!(
+                "{} endpoint cannot construct a dsPIC controller",
+                endpoint.kind().as_str()
+            )));
+        }
+        if endpoint.bus() != i2c.bus() {
+            return Err(crate::AsicError::InvalidParameter(format!(
+                "dsPIC endpoint is bound to I2C bus {}, but transport owns bus {}",
+                endpoint.bus(),
+                i2c.bus()
+            )));
+        }
+        Ok(Self::new(i2c, endpoint.address()))
+    }
+
     /// Create a new dsPIC controller for the given I2C address.
     /// Firmware type defaults to Unknown (auto-detected on init).
     pub fn new(i2c: &'a mut I2cBus, address: u8) -> Self {
@@ -2514,9 +2596,96 @@ pub struct DspicService {
     bosminer_minimal_enable: bool,
 }
 
+/// Durable authority for creating ephemeral dsPIC service views at one
+/// discovery-bound endpoint.
+///
+/// The daemon historically creates short-lived `DspicService` values for
+/// initialization and heartbeat operations. This session consumes the opaque
+/// HAL endpoint once, validates its serialized-service bus once, and then owns
+/// the only reusable construction seam for migrated routes. Callers cannot
+/// choose or change the family, bus, or address after construction.
+pub struct DspicEndpointSession {
+    i2c: I2cServiceHandle,
+    address: u8,
+}
+
+impl DspicEndpointSession {
+    /// Bind a serialized I2C service to a discovery-issued dsPIC endpoint.
+    pub fn new(i2c: I2cServiceHandle, endpoint: VoltageControllerEndpoint) -> Result<Self> {
+        if endpoint.kind() != VoltageControllerKind::Dspic33Ep {
+            return Err(crate::AsicError::InvalidParameter(format!(
+                "{} endpoint cannot construct a dsPIC session",
+                endpoint.kind().as_str()
+            )));
+        }
+        if endpoint.bus() != i2c.bus() {
+            return Err(crate::AsicError::InvalidParameter(format!(
+                "dsPIC endpoint is bound to I2C bus {}, but service owns bus {}",
+                endpoint.bus(),
+                i2c.bus()
+            )));
+        }
+        Ok(Self {
+            i2c,
+            address: endpoint.address(),
+        })
+    }
+
+    /// Bound address, exposed only for lookup and diagnostics.
+    pub fn address(&self) -> u8 {
+        self.address
+    }
+
+    /// Create a short-lived controller view without reasserting an address.
+    pub fn service(&self) -> DspicService {
+        DspicService::new_legacy_parts(self.i2c.clone(), self.address)
+    }
+
+    /// Create a short-lived controller view with an observed firmware hint.
+    /// Firmware selects revision framing only; family/bus/address remain bound
+    /// by this session.
+    pub fn service_with_firmware(&self, firmware: DspicFirmware) -> DspicService {
+        DspicService::new_legacy_parts_with_firmware(self.i2c.clone(), self.address, firmware)
+    }
+}
+
 impl DspicService {
-    /// Create a service-backed dsPIC controller for the given I2C address.
+    /// Construct from a discovery-issued, bus-bound dsPIC endpoint.
+    ///
+    /// This is the preferred constructor for migrated daemon paths. It
+    /// rejects a legitimate endpoint for another controller family and a
+    /// handle for any bus other than the one on which presence was observed.
+    pub fn from_endpoint(
+        i2c: I2cServiceHandle,
+        endpoint: VoltageControllerEndpoint,
+    ) -> Result<Self> {
+        if endpoint.kind() != VoltageControllerKind::Dspic33Ep {
+            return Err(crate::AsicError::InvalidParameter(format!(
+                "{} endpoint cannot construct a dsPIC service",
+                endpoint.kind().as_str()
+            )));
+        }
+        if endpoint.bus() != i2c.bus() {
+            return Err(crate::AsicError::InvalidParameter(format!(
+                "dsPIC endpoint is bound to I2C bus {}, but service owns bus {}",
+                endpoint.bus(),
+                i2c.bus()
+            )));
+        }
+        Ok(Self::new_legacy_parts(i2c, endpoint.address()))
+    }
+
+    /// Legacy caller-asserted construction seam.
+    ///
+    /// New production routes must use [`DspicEndpointSession`]. This remains
+    /// public temporarily because proven AM2 and recovery paths have not yet
+    /// migrated; removing it now would be a broad, unsafe compatibility break.
+    #[doc(hidden)]
     pub fn new(i2c: I2cServiceHandle, address: u8) -> Self {
+        Self::new_legacy_parts(i2c, address)
+    }
+
+    fn new_legacy_parts(i2c: I2cServiceHandle, address: u8) -> Self {
         Self {
             i2c,
             address,
@@ -2532,8 +2701,19 @@ impl DspicService {
         }
     }
 
-    /// Create a service-backed dsPIC controller with a known firmware type.
+    /// Legacy caller-asserted construction seam with a firmware hint.
+    /// Prefer [`DspicEndpointSession::service_with_firmware`] on migrated
+    /// production routes.
+    #[doc(hidden)]
     pub fn new_with_firmware(i2c: I2cServiceHandle, address: u8, firmware: DspicFirmware) -> Self {
+        Self::new_legacy_parts_with_firmware(i2c, address, firmware)
+    }
+
+    fn new_legacy_parts_with_firmware(
+        i2c: I2cServiceHandle,
+        address: u8,
+        firmware: DspicFirmware,
+    ) -> Self {
         Self {
             i2c,
             address,
@@ -2655,7 +2835,9 @@ impl DspicService {
     /// 16 zero bytes — anything
     /// shorter risks leaving partial parser state after a NACK.
     pub fn flush_parser(&self) {
-        let _ = self.i2c.write_bytes(self.address, &[0u8; 16]);
+        let _ = self
+            .i2c
+            .write_bytes_mutating(I2cMutationLabel::Recovery, self.address, &[0u8; 16]);
     }
 
     fn probe_get_version_once(&self, encoding: GetVersionEncoding) -> Result<Vec<u8>> {
@@ -2668,7 +2850,11 @@ impl DspicService {
         )?;
         let reads = self
             .i2c
-            .transaction(self.address, dspic_get_version_transaction_steps(encoding))
+            .transaction_mutating(
+                I2cMutationLabel::QueryPrelude,
+                self.address,
+                dspic_get_version_transaction_steps(encoding),
+            )
             .map_err(|e| crate::AsicError::Pic {
                 addr: self.address,
                 detail: format!("dsPIC service GET_VERSION transaction: {}", e),
@@ -3551,7 +3737,7 @@ impl DspicService {
             tx_bytes = ?frame,
             "dsPIC service set_voltage tx"
         );
-        self.write_bytes(&frame)?;
+        self.write_bytes_mutating(I2cMutationLabel::Energize, &frame)?;
         self.current_voltage_mv = voltage_mv;
         Ok(())
     }
@@ -3584,7 +3770,8 @@ impl DspicService {
             frame = ?frame,
             "service ENABLE_VOLTAGE frame"
         );
-        let ack = self.bytewise_write_then_read(
+        let ack = self.bytewise_write_then_read_mutating(
+            I2cMutationLabel::Energize,
             frame,
             if self.use_bare_protocol { 1 } else { 2 },
             DSPIC_ENABLE_REPLY_DELAY_MS,
@@ -3667,7 +3854,8 @@ impl DspicService {
                 },
                 "PIC service enable_voltage ACK mismatch; retrying alternate framed ENABLE form"
             );
-            let alt_ack = self.bytewise_write_then_read(
+            let alt_ack = self.bytewise_write_then_read_mutating(
+                I2cMutationLabel::Energize,
                 alt_frame,
                 2,
                 DSPIC_ENABLE_REPLY_DELAY_MS,
@@ -3752,7 +3940,19 @@ impl DspicService {
             frame = ?frame,
             "service DISABLE_VOLTAGE frame"
         );
-        self.write_bytes(frame)?;
+        let protocol = if self.use_bare_protocol {
+            I2cDspicDisableProtocol::Bare
+        } else if matches!(encoding, EnableFrameEncoding::VnishPadded) {
+            I2cDspicDisableProtocol::VnishPaddedFramed
+        } else {
+            I2cDspicDisableProtocol::CanonicalFramed
+        };
+        self.i2c
+            .disable_dspic_voltage(self.address, protocol)
+            .map_err(|e| crate::AsicError::Pic {
+                addr: self.address,
+                detail: format!("svc disable: {}", e),
+            })?;
         self.voltage_enabled = false;
         Ok(())
     }
@@ -3976,7 +4176,7 @@ impl DspicService {
     /// Send heartbeat to prevent dsPIC watchdog timeout.
     pub fn send_heartbeat(&mut self) -> Result<()> {
         let frame = dspic_heartbeat_frame(self.use_bare_protocol);
-        self.write_bytes(frame)
+        self.write_bytes_mutating(I2cMutationLabel::KeepAlive, frame)
     }
 
     fn encode_command_frame(&self, data: &[u8]) -> Vec<u8> {
@@ -4006,6 +4206,10 @@ impl DspicService {
     }
 
     fn write_bytes(&self, data: &[u8]) -> Result<()> {
+        self.write_bytes_mutating(I2cMutationLabel::Recovery, data)
+    }
+
+    fn write_bytes_mutating(&self, label: I2cMutationLabel, data: &[u8]) -> Result<()> {
         ensure_dspic_bootloader_command_allowed(
             self.address,
             self.firmware,
@@ -4013,7 +4217,7 @@ impl DspicService {
             data,
         )?;
         self.i2c
-            .write_bytes(self.address, data)
+            .write_bytes_mutating(label, self.address, data)
             .map_err(|e| crate::AsicError::Pic {
                 addr: self.address,
                 detail: format!("svc write: {}", e),
@@ -4028,7 +4232,12 @@ impl DspicService {
             write_data,
         )?;
         self.i2c
-            .write_read(self.address, write_data, read_len)
+            .write_read_mutating(
+                I2cMutationLabel::QueryPrelude,
+                self.address,
+                write_data,
+                read_len,
+            )
             .map_err(|e| crate::AsicError::Pic {
                 addr: self.address,
                 detail: format!("svc write_read: {}", e),
@@ -4047,6 +4256,23 @@ impl DspicService {
         delay_ms: u64,
         label: &str,
     ) -> Result<Vec<u8>> {
+        self.bytewise_write_then_read_mutating(
+            I2cMutationLabel::QueryPrelude,
+            frame,
+            read_len,
+            delay_ms,
+            label,
+        )
+    }
+
+    fn bytewise_write_then_read_mutating(
+        &self,
+        mutation_label: I2cMutationLabel,
+        frame: &[u8],
+        read_len: usize,
+        delay_ms: u64,
+        label: &str,
+    ) -> Result<Vec<u8>> {
         ensure_dspic_bootloader_command_allowed(
             self.address,
             self.firmware,
@@ -4056,13 +4282,13 @@ impl DspicService {
 
         let steps = dspic_bytewise_write_then_read_steps(frame, read_len, delay_ms);
 
-        let reads =
-            self.i2c
-                .transaction(self.address, steps)
-                .map_err(|e| crate::AsicError::Pic {
-                    addr: self.address,
-                    detail: format!("{} bytewise transaction: {}", label, e),
-                })?;
+        let reads = self
+            .i2c
+            .transaction_mutating(mutation_label, self.address, steps)
+            .map_err(|e| crate::AsicError::Pic {
+                addr: self.address,
+                detail: format!("{} bytewise transaction: {}", label, e),
+            })?;
         let reply = collect_single_byte_i2c_reads(reads);
         if reply.len() != read_len {
             return Err(crate::AsicError::Pic {
@@ -4247,6 +4473,9 @@ pub fn mv_to_v_str(mv: u16) -> String {
 /// 0x8A, 0xB9, and 0xFE (framed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PicVariant {
+    /// Firmware identity has not been observed. Protocol-dependent and
+    /// energizing operations must remain fail-closed.
+    Unknown,
     /// Bare protocol, PIC FW 0x82.
     Bare82,
     /// S19j bare (fw 0x86).
@@ -4267,6 +4496,7 @@ impl PicVariant {
     /// Detect variant from firmware version byte.
     pub fn from_fw_byte(fw: u8) -> Self {
         match fw {
+            0x00 | 0xFF => PicVariant::Unknown,
             0x82 => PicVariant::Bare82,
             0x86 => PicVariant::S19jBare86,
             0x89 => PicVariant::S19jProAm2,
@@ -4291,7 +4521,14 @@ impl PicVariant {
 
     /// Whether the variant uses framed [0x55 0xAA LEN CMD data SUM] protocol.
     pub fn is_framed(self) -> bool {
-        !matches!(self, PicVariant::Bare82 | PicVariant::S19jBare86)
+        matches!(
+            self,
+            PicVariant::S19jProAm2
+                | PicVariant::Framed8A
+                | PicVariant::FramedB9
+                | PicVariant::FramedFE
+                | PicVariant::Other(_)
+        )
     }
 }
 
@@ -4348,9 +4585,10 @@ impl<'a> Pic0x89<'a> {
     /// for both — this type has no
     /// `reset()` method (enforced at compile time).
     ///
-    /// If `fw_byte` is None, defaults to 0x89 semantics. If an unrecognized
-    /// byte is supplied, retain that exact identity instead of silently
-    /// treating it as 0x89; RESET remains banned by this wrapper.
+    /// If `fw_byte` is `None`, retain an explicit unknown identity so
+    /// protocol-dependent voltage operations fail closed. If an unrecognized
+    /// byte is supplied, retain that exact observed identity instead of
+    /// silently treating it as 0x89; RESET remains banned by this wrapper.
     pub fn new(i2c: &'a mut I2cBus, address: u8) -> Self {
         Self::new_with_fw(i2c, address, None)
     }
@@ -4361,7 +4599,7 @@ impl<'a> Pic0x89<'a> {
         let firmware = pic0x89_firmware_from_observed_fw_byte(fw_byte);
         let variant = fw_byte
             .map(PicVariant::from_fw_byte)
-            .unwrap_or(PicVariant::S19jProAm2);
+            .unwrap_or(PicVariant::Unknown);
         Self {
             inner: DspicController::new_with_firmware(i2c, address, firmware),
             variant,
@@ -4396,6 +4634,7 @@ impl<'a> Pic0x89<'a> {
 
     /// Heartbeat tick — must be fired before any voltage ramp.
     pub fn send_heartbeat(&mut self) -> Result<()> {
+        ensure_dspic_runtime_protocol_is_proven(self.address(), self.firmware(), "heartbeat")?;
         self.inner.send_heartbeat()
     }
 
@@ -4450,8 +4689,86 @@ pub struct Pic0x89Service {
     variant: PicVariant,
 }
 
+/// Discovery-bound owner for one service-backed AM2 Pic0x89 controller.
+///
+/// The endpoint must carry a firmware byte observed by the HAL while issuing
+/// the capability. A model string, raw address, or caller-supplied firmware
+/// hint cannot construct this session.
+///
+/// ```compile_fail
+/// use dcentrald_asic::dspic::Pic0x89EndpointSession;
+/// use dcentrald_hal::i2c::I2cServiceHandle;
+///
+/// fn caller_asserted(handle: I2cServiceHandle) {
+///     let _ = Pic0x89EndpointSession::new(handle, 0x20);
+/// }
+/// ```
+pub struct Pic0x89EndpointSession {
+    controller: Pic0x89Service,
+    i2c: I2cServiceHandle,
+    address: u8,
+    firmware_byte: u8,
+}
+
+impl Pic0x89EndpointSession {
+    pub fn new(i2c: I2cServiceHandle, endpoint: VoltageControllerEndpoint) -> Result<Self> {
+        if endpoint.kind() != VoltageControllerKind::Dspic33Ep {
+            return Err(crate::AsicError::InvalidParameter(format!(
+                "{} endpoint cannot construct an AM2 Pic0x89 session",
+                endpoint.kind().as_str()
+            )));
+        }
+        if endpoint.bus() != i2c.bus() {
+            return Err(crate::AsicError::InvalidParameter(format!(
+                "AM2 Pic0x89 endpoint is bound to I2C bus {}, but service owns bus {}",
+                endpoint.bus(),
+                i2c.bus()
+            )));
+        }
+        let firmware_byte = endpoint.observed_firmware().ok_or_else(|| {
+            crate::AsicError::InvalidParameter(
+                "AM2 Pic0x89 endpoint lacks observed firmware evidence".into(),
+            )
+        })?;
+        let firmware = pic0x89_firmware_from_observed_fw_byte(Some(firmware_byte));
+        if !dspic_runtime_protocol_is_proven(firmware) {
+            return Err(crate::AsicError::InvalidParameter(format!(
+                "AM2 Pic0x89 endpoint firmware 0x{firmware_byte:02X} has no modeled runtime protocol"
+            )));
+        }
+        let address = endpoint.address();
+        Ok(Self {
+            controller: Pic0x89Service::new_with_fw(i2c.clone(), address, Some(firmware_byte)),
+            i2c,
+            address,
+            firmware_byte,
+        })
+    }
+
+    pub fn into_controller(self) -> Pic0x89Service {
+        self.controller
+    }
+
+    /// Borrow the discovery-bound controller without discarding its endpoint
+    /// authority. Long-lived orchestrators use this to retain the same exact
+    /// identity/presence/firmware evidence through clean shutdown instead of
+    /// reconstructing a raw address + firmware controller later.
+    pub fn controller_mut(&mut self) -> &mut Pic0x89Service {
+        &mut self.controller
+    }
+
+    /// Create an independent controller view for a concurrent lifecycle owner
+    /// while preserving this session's retained shutdown controller.
+    /// Transport, address, and firmware come only from the consumed opaque
+    /// endpoint; callers cannot substitute any of them.
+    pub fn controller(&self) -> Pic0x89Service {
+        Pic0x89Service::new_with_fw(self.i2c.clone(), self.address, Some(self.firmware_byte))
+    }
+}
+
 impl Pic0x89Service {
-    /// Construct with default fw 0x89 framed semantics.
+    /// Construct without an observed firmware identity. Voltage operations
+    /// remain fail-closed until a preflight or version read establishes one.
     pub fn new(i2c: I2cServiceHandle, address: u8) -> Self {
         Self::new_with_fw(i2c, address, None)
     }
@@ -4461,7 +4778,7 @@ impl Pic0x89Service {
         let firmware = pic0x89_firmware_from_observed_fw_byte(fw_byte);
         let variant = fw_byte
             .map(PicVariant::from_fw_byte)
-            .unwrap_or(PicVariant::S19jProAm2);
+            .unwrap_or(PicVariant::Unknown);
         Self {
             inner: DspicService::new_with_firmware(i2c, address, firmware),
             variant,
@@ -4492,6 +4809,7 @@ impl Pic0x89Service {
     pub fn preflight(&mut self) -> Result<DspicFirmware> {
         let fw = self.inner.preflight()?;
         self.variant = match fw {
+            DspicFirmware::Unknown => PicVariant::Unknown,
             DspicFirmware::Fw82 => PicVariant::Bare82,
             DspicFirmware::Fw86 => PicVariant::S19jBare86,
             DspicFirmware::Fw89 => PicVariant::S19jProAm2,
@@ -4499,7 +4817,6 @@ impl Pic0x89Service {
             DspicFirmware::FwB9 => PicVariant::FramedB9,
             DspicFirmware::FwFE => PicVariant::FramedFE,
             DspicFirmware::Other(v) => PicVariant::Other(v),
-            DspicFirmware::Unknown => self.variant,
         };
         Ok(fw)
     }
@@ -4574,6 +4891,7 @@ impl Pic0x89Service {
 
     /// Heartbeat tick.
     pub fn send_heartbeat(&mut self) -> Result<()> {
+        ensure_dspic_runtime_protocol_is_proven(self.address(), self.firmware(), "heartbeat")?;
         self.inner.send_heartbeat()
     }
 
@@ -5320,6 +5638,8 @@ mod pic0x89_tests {
 
     #[test]
     fn variant_from_fw_byte() {
+        assert_eq!(PicVariant::from_fw_byte(0x00), PicVariant::Unknown);
+        assert_eq!(PicVariant::from_fw_byte(0xFF), PicVariant::Unknown);
         assert_eq!(PicVariant::from_fw_byte(0x82), PicVariant::Bare82);
         assert_eq!(PicVariant::from_fw_byte(0x86), PicVariant::S19jBare86);
         assert_eq!(PicVariant::from_fw_byte(0x89), PicVariant::S19jProAm2);
@@ -5344,14 +5664,22 @@ mod pic0x89_tests {
         );
         assert_eq!(
             pic0x89_firmware_from_observed_fw_byte(None),
-            DspicFirmware::Fw89
+            DspicFirmware::Unknown
         );
         assert_eq!(
             pic0x89_firmware_from_observed_fw_byte(Some(0x00)),
             DspicFirmware::Unknown
         );
+        assert_eq!(
+            pic0x89_firmware_from_observed_fw_byte(Some(0x88)),
+            DspicFirmware::Other(0x88)
+        );
         assert!(!dspic_voltage_command_allowed(
             pic0x89_firmware_from_observed_fw_byte(Some(0x86)),
+            false
+        ));
+        assert!(!dspic_voltage_command_allowed(
+            pic0x89_firmware_from_observed_fw_byte(Some(0x88)),
             false
         ));
     }
@@ -5365,6 +5693,7 @@ mod pic0x89_tests {
         assert!(!PicVariant::FramedB9.reset_allowed());
         assert!(!PicVariant::FramedFE.reset_allowed());
         assert!(!PicVariant::Other(0x88).reset_allowed());
+        assert!(!PicVariant::Unknown.reset_allowed());
     }
 
     #[test]
@@ -5376,6 +5705,7 @@ mod pic0x89_tests {
         assert!(!PicVariant::FramedB9.jump_allowed());
         assert!(!PicVariant::FramedFE.jump_allowed());
         assert!(!PicVariant::Other(0x88).jump_allowed());
+        assert!(!PicVariant::Unknown.jump_allowed());
     }
 
     #[test]
@@ -5675,7 +6005,7 @@ mod pic0x89_tests {
     }
 
     #[test]
-    fn fw86_voltage_commands_are_refused_unless_lab_override_is_trusted() {
+    fn voltage_commands_require_supported_firmware_and_explicit_fw86_trust() {
         assert!(dspic_requires_degraded_fw_voltage_refusal(
             DspicFirmware::Fw86
         ));
@@ -5683,7 +6013,51 @@ mod pic0x89_tests {
         assert!(dspic_voltage_command_allowed(DspicFirmware::Fw86, true));
         assert!(dspic_voltage_command_allowed(DspicFirmware::Fw82, false));
         assert!(dspic_voltage_command_allowed(DspicFirmware::Fw89, false));
-        assert!(dspic_voltage_command_allowed(DspicFirmware::Unknown, false));
+        assert!(dspic_voltage_command_allowed(DspicFirmware::Fw8A, false));
+        assert!(dspic_voltage_command_allowed(DspicFirmware::FwB9, false));
+        assert!(dspic_voltage_command_allowed(DspicFirmware::FwFE, false));
+        assert!(!dspic_voltage_command_allowed(
+            DspicFirmware::Unknown,
+            false
+        ));
+        assert!(!dspic_voltage_command_allowed(DspicFirmware::Unknown, true));
+        assert!(!dspic_voltage_command_allowed(
+            DspicFirmware::Other(0x88),
+            false
+        ));
+        assert!(!dspic_voltage_command_allowed(
+            DspicFirmware::Other(0x88),
+            true
+        ));
+    }
+
+    #[test]
+    fn runtime_protocol_requires_an_explicitly_modeled_firmware() {
+        for known in [
+            DspicFirmware::Fw82,
+            DspicFirmware::Fw86,
+            DspicFirmware::Fw89,
+            DspicFirmware::Fw8A,
+            DspicFirmware::FwB9,
+            DspicFirmware::FwFE,
+        ] {
+            assert!(
+                dspic_runtime_protocol_is_proven(known),
+                "known firmware {known:?} must retain its proven route"
+            );
+        }
+        assert!(!dspic_runtime_protocol_is_proven(DspicFirmware::Unknown));
+        assert!(!dspic_runtime_protocol_is_proven(DspicFirmware::Other(
+            0x88
+        )));
+        let missing =
+            ensure_dspic_runtime_protocol_is_proven(0x21, DspicFirmware::Unknown, "heartbeat")
+                .expect_err("heartbeat must fail closed without firmware evidence");
+        assert!(missing.to_string().contains("no firmware identity"));
+        let unsupported =
+            ensure_dspic_runtime_protocol_is_proven(0x21, DspicFirmware::Other(0x88), "heartbeat")
+                .expect_err("heartbeat must fail closed for unsupported firmware");
+        assert!(unsupported.to_string().contains("0x88"));
     }
 
     #[test]
@@ -5759,6 +6133,8 @@ mod pic0x89_tests {
         let from_ver = DspicFirmware::from_version(0x86);
         // observed-fw-byte (pic0x89) path: fw=0x86 stays Fw86 (NOT Fw89).
         let from_observed = pic0x89_firmware_from_observed_fw_byte(Some(0x86));
+        // Missing evidence must not be upgraded by an encoding experiment.
+        let from_missing = pic0x89_firmware_from_observed_fw_byte(None);
 
         // Restore env before any assertion can unwind and leak the override.
         unsafe {
@@ -5779,6 +6155,11 @@ mod pic0x89_tests {
             DspicFirmware::Fw86,
             "SAFETY: pic0x89_firmware_from_observed_fw_byte remapped fw=0x86 to {from_observed:?} \
              under FORCE_FW89_ENCODING — fw=0x86 must stay Fw86 so it remains voltage-refused"
+        );
+        assert_eq!(
+            from_missing,
+            DspicFirmware::Unknown,
+            "SAFETY: FORCE_FW89_ENCODING manufactured fw=0x89 from missing evidence"
         );
 
         // The whole point of refusing the remap: the resulting firmware is still

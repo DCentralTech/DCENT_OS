@@ -1,0 +1,176 @@
+{
+  "schema_version": 1,
+  "algorithm": {
+    "id": "bm13xx-asic-response-crc5",
+    "width": 5,
+    "description": "Braiins crc5_resp_serial modified response CRC state machine",
+    "polynomial_hex": "0d",
+    "transition": "modified response transition from crc5_resp_serial; do not substitute a generic polynomial helper",
+    "initial_value_by_response_kind": {
+      "command_or_register": "03",
+      "job": "1b"
+    },
+    "reflect_input": false,
+    "reflect_output": false,
+    "xor_output_hex": "00",
+    "bit_order": "msb-first",
+    "coverage": "response payload only; exclude aa55 preamble and final CRC/flags byte",
+    "trailer": "bit 7 selects job response; bits 4:0 carry response CRC; bits 6:5 are outside this contract",
+    "reference": {
+      "path": "",
+      "lines": "24-30,93-100,111-113"
+    },
+    "integration_reference": {
+      "path": "",
+      "lines": "963-972,976-995,1066-1076"
+    }
+  },
+  "positive_vectors": [
+    {
+      "id": "sniff-bm1397-get-address-response",
+      "chip_id_hex": "1397",
+      "response_kind": "command_or_register",
+      "payload_hex": "139718000000",
+      "trailer_hex": "06",
+      "full_frame_hex": "aa5513971800000006",
+      "evidence": [
+        {
+          "kind": "independent-sniff",
+          "path": "",
+          "lines": "2,7"
+        }
+      ]
+    },
+    {
+      "id": "am3-bb-live-bm1362-unassigned-get-address-response",
+      "chip_id_hex": "1362",
+      "response_kind": "command_or_register",
+      "payload_hex": "136203000000",
+      "trailer_hex": "0d",
+      "full_frame_hex": "aa551362030000000d",
+      "evidence": [
+        {
+          "kind": "dcent-live-am3-bb-capture",
+          "path": "",
+          "lines": "72,80,88"
+        },
+        {
+          "kind": "dcent-live-am3-bb-accepted-share-capture",
+          "path": "",
+          "lines": "107,379"
+        }
+      ]
+    },
+    {
+      "id": "xil-live-bm1362-assigned-address-ca-report",
+      "chip_id_hex": "1362",
+      "response_kind": "command_or_register",
+      "payload_hex": "136203caca000000",
+      "trailer_hex": "08",
+      "full_frame_hex": "aa55136203caca00000008",
+      "evidence": [
+        {
+          "kind": "dcent-live-xil-capture",
+          "path": "",
+          "lines": "171"
+        }
+      ]
+    },
+    {
+      "id": "xil-live-bm1362-assigned-address-cc-report",
+      "chip_id_hex": "1362",
+      "response_kind": "command_or_register",
+      "payload_hex": "136203cccc000000",
+      "trailer_hex": "12",
+      "full_frame_hex": "aa55136203cccc00000012",
+      "evidence": [
+        {
+          "kind": "dcent-live-xil-capture",
+          "path": "",
+          "lines": "173"
+        }
+      ]
+    },
+    {
+      "id": "xil-live-bm1362-assigned-address-f4-report",
+      "chip_id_hex": "1362",
+      "response_kind": "command_or_register",
+      "payload_hex": "136203f4f4000000",
+      "trailer_hex": "02",
+      "full_frame_hex": "aa55136203f4f400000002",
+      "evidence": [
+        {
+          "kind": "dcent-live-xil-capture",
+          "path": "",
+          "lines": "176"
+        }
+      ]
+    },
+    {
+      "id": "xil-live-bm1362-assigned-address-f6-report",
+      "chip_id_hex": "1362",
+      "response_kind": "command_or_register",
+      "payload_hex": "136203f6f6000000",
+      "trailer_hex": "17",
+      "full_frame_hex": "aa55136203f6f600000017",
+      "evidence": [
+        {
+          "kind": "dcent-live-xil-capture",
+          "path": "",
+          "lines": "177"
+        }
+      ]
+    },
+    {
+      "id": "xil-live-bm1362-assigned-address-f8-report",
+      "chip_id_hex": "1362",
+      "response_kind": "command_or_register",
+      "payload_hex": "136203f8f8000000",
+      "trailer_hex": "13",
+      "full_frame_hex": "aa55136203f8f800000013",
+      "evidence": [
+        {
+          "kind": "dcent-live-xil-capture",
+          "path": "",
+          "lines": "178"
+        }
+      ]
+    },
+    {
+      "id": "xil-live-bm1362-assigned-address-fa-report",
+      "chip_id_hex": "1362",
+      "response_kind": "command_or_register",
+      "payload_hex": "136203fafa000000",
+      "trailer_hex": "06",
+      "full_frame_hex": "aa55136203fafa00000006",
+      "evidence": [
+        {
+          "kind": "dcent-live-xil-capture",
+          "path": "",
+          "lines": "179"
+        }
+      ]
+    }
+  ],
+  "corpus_assessment": {
+    "bm1362_distinct_payload_vectors": 7,
+    "am3_bb_distinct_payload_vectors": 1,
+    "independent_evidence_surfaces": [
+      "Braiins response-specific FPGA RTL",
+      "independent BM1397 UART sniff",
+      "DCENT_OS AM3-BB BM1362 captures",
+      "DCENT_OS Xilinx BM1362 capture"
+    ],
+    "supports": [
+      "response-specific CRC validation for the recorded command/register reply shapes",
+      "classification of AM3-BB trailer 0x0d as a non-job response with valid lower-five-bit CRC"
+    ],
+    "does_not_support": [
+      "host-command CRC reuse",
+      "meaning for trailer bits 6:5",
+      "unique-chip identity or chip-count proof from repeated unassigned AM3-BB replies",
+      "Measured hardware identity",
+      "job-response CRC validation without an independently retained job vector"
+    ]
+  }
+}

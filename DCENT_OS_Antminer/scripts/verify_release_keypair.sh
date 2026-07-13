@@ -35,12 +35,15 @@ command -v od >/dev/null 2>&1 || { echo "od is required" >&2; exit 2; }
 
 fail() { echo "CEREMONY FAIL: $*" >&2; exit 1; }
 
-# Raw 32-byte Ed25519 key from a PEM public key: the SubjectPublicKeyInfo DER is a
-# fixed 12-byte prefix + the 32-byte key, so the last 32 bytes are the raw key.
-raw_pub_hex() {
+# Canonical Ed25519 SubjectPublicKeyInfo DER is exactly the 12-byte algorithm/
+# BIT STRING prefix below plus 32 raw public-key bytes. Checking the complete
+# shape is essential: taking the last 32 bytes accepts RSA/ECDSA keys and can
+# print a dangerously false firmware pin.
+public_der_hex() {
     openssl pkey -pubin -in "$1" -outform DER 2>/dev/null \
-        | tail -c 32 | od -An -v -tx1 | tr -d ' \n'
+        | od -An -v -tx1 | tr -d ' \n'
 }
+ED25519_SPKI_PREFIX=302a300506032b6570032100
 
 [ -f "$PRIV" ] || fail "private key file not found: $PRIV"
 [ -f "$PUB" ] || fail "public key file not found: $PUB"
@@ -51,10 +54,21 @@ openssl pkey -pubin -in "$PUB" -noout 2>/dev/null || fail "public key does not p
 
 # 2. The supplied public key MATCHES the private key (derive pub from priv, compare
 #    the raw 32 bytes). Catches a mismatched pair before it ships.
-DERIVED=$(openssl pkey -in "$PRIV" -pubout 2>/dev/null \
-    | openssl pkey -pubin -outform DER 2>/dev/null | tail -c 32 | od -An -v -tx1 | tr -d ' \n')
-GIVEN=$(raw_pub_hex "$PUB")
-[ -n "$GIVEN" ] || fail "could not extract the raw public key from $PUB"
+DERIVED_DER=$(openssl pkey -in "$PRIV" -pubout 2>/dev/null \
+    | openssl pkey -pubin -outform DER 2>/dev/null | od -An -v -tx1 | tr -d ' \n')
+GIVEN_DER=$(public_der_hex "$PUB")
+[ "${#DERIVED_DER}" -eq 88 ] || fail "private key is not Ed25519"
+[ "${#GIVEN_DER}" -eq 88 ] || fail "public key is not Ed25519"
+case "$DERIVED_DER" in
+    "$ED25519_SPKI_PREFIX"*) ;;
+    *) fail "private key is not Ed25519" ;;
+esac
+case "$GIVEN_DER" in
+    "$ED25519_SPKI_PREFIX"*) ;;
+    *) fail "public key is not Ed25519" ;;
+esac
+DERIVED=${DERIVED_DER#"$ED25519_SPKI_PREFIX"}
+GIVEN=${GIVEN_DER#"$ED25519_SPKI_PREFIX"}
 [ "$DERIVED" = "$GIVEN" ] || fail "public key does NOT match the private key"
 
 # 3. Exactly 32 bytes (64 hex chars) — the firmware-baked form.

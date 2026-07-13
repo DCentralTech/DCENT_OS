@@ -32,6 +32,9 @@
 
 #![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items)]
 
+#[cfg(all(feature = "sim-hal", target_os = "linux", target_arch = "arm"))]
+compile_error!("sim-hal is host-only and must never be compiled into ARM Linux firmware artifacts");
+
 pub mod adc;
 pub mod board_control;
 pub mod chain_backend;
@@ -82,6 +85,26 @@ pub mod xadc;
 
 use thiserror::Error;
 
+/// Observed result of the one rollback attempt attached to a partial boot.
+///
+/// `Failed` deliberately retains the typed HAL error. In particular, an
+/// accepted SafeOff receipt timeout remains `I2cSafeOffOutcomeUnknown`; it is
+/// never flattened into a string or retried behind a still-pending plan.
+#[derive(Debug)]
+pub enum PowerRollbackOutcome {
+    Completed,
+    Failed(Box<HalError>),
+}
+
+impl std::fmt::Display for PowerRollbackOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Completed => f.write_str("completed"),
+            Self::Failed(error) => write!(f, "failed: {error}"),
+        }
+    }
+}
+
 /// HAL error type.
 #[derive(Debug, Error)]
 pub enum HalError {
@@ -107,6 +130,19 @@ pub enum HalError {
     /// I2C transaction failed.
     #[error("I2C error on bus {bus} addr 0x{addr:02X}: {detail}")]
     I2c { bus: u8, addr: u8, detail: String },
+
+    /// A controller-stage authorization was intentionally revoked by a newer
+    /// safe-off generation. This is not a transport fault and must not trigger
+    /// bus reset/reopen recovery ahead of the pending SafeOff operation.
+    #[error("I2C request superseded on bus {bus} addr 0x{addr:02X}: {detail}")]
+    I2cSafetySuperseded { bus: u8, addr: u8, detail: String },
+
+    /// A reserved SafeOff command was accepted by the worker-owned mailbox,
+    /// but the caller could not observe its completion. This is deliberately
+    /// distinct from an I2C transport fault: retrying can enqueue work behind
+    /// a still-pending shutdown plan and invalidate its compensation policy.
+    #[error("I2C SafeOff outcome unknown on bus {bus} addr 0x{addr:02X}: {detail}")]
+    I2cSafeOffOutcomeUnknown { bus: u8, addr: u8, detail: String },
 
     /// GPIO operation failed.
     #[error("GPIO error: {0}")]
@@ -143,6 +179,17 @@ pub enum HalError {
     /// PSU framed-I2C protocol error with runtime context.
     #[error("PSU protocol error: {0}")]
     PsuProtocolOwned(String),
+
+    /// A boot failed after power could have been enabled and exactly one
+    /// worker-owned rollback was attempted. Both outcomes stay structured so
+    /// callers never lose the initiating failure when rollback also fails.
+    #[error("partial boot failed during {context}: {primary}; power rollback {rollback}")]
+    PartialBootRollback {
+        context: &'static str,
+        #[source]
+        primary: Box<HalError>,
+        rollback: PowerRollbackOutcome,
+    },
 
     /// PSU telemetry is not yet characterized for this FW byte.
     ///

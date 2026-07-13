@@ -73,9 +73,10 @@ case "$target" in
     am2-s19)               stem="DCENTOS_XIL3_S19" ;;
     am2-s19pro)            stem="DCENTOS_XIL3_S19Pro" ;;   # BM1398. GEN=3 (S19-era); operator to confirm 2 vs 3.
     am2-s19j)              stem="DCENTOS_XIL3_S19j" ;;
-    am2-s19jpro|am2-s19jpro-zynq) stem="DCENTOS_XIL3_S19jPro" ;;
+    am2-s19jpro|am2-s19jpro-zynq|am2-s19jpro-sd) stem="DCENTOS_XIL3_S19jPro" ;;
     am2-t19)               stem="DCENTOS_XIL3_T19" ;;
-    am3-bb|am3-bb-s19jpro) stem="DCENTOS_BB3_S19jPro" ;;
+    am3-bb|am3-bb-s19jpro|am3-bb-s19jpro-vnish) stem="DCENTOS_BB3_S19jPro" ;;
+    cv1835-s19jpro)        stem="DCENTOS_CV3_S19jPro" ;;
     am3-s21)               stem="DCENTOS_AML3_S21" ;;
     am3-s19k|am3-s19kpro)  stem="DCENTOS_AML3_S19kPro" ;;
     am3-s19xp)             stem="DCENTOS_AML3_S19XP" ;;

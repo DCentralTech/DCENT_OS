@@ -262,24 +262,10 @@ impl TuningProfile {
 
     /// Save the profile as JSON to disk.
     ///
-    /// Uses atomic write (write to .tmp, then rename) to prevent corruption
-    /// from power loss during write.
+    /// Uses the common bounded crash-durable JSON publication contract.
     pub fn save(&self, dir: &str) -> crate::Result<()> {
         let path = format!("{}/autotune-chain{}.json", dir, self.chain_id);
-        let tmp_path = format!("{}.tmp", path);
-
-        // Ensure directory exists
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            tracing::warn!(error = %e, dir, "Failed to create profile directory");
-        }
-
-        let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&tmp_path, &json)?;
-        // fsync: commit data to NAND before rename to prevent power-loss corruption
-        if let Ok(f) = std::fs::File::open(&tmp_path) {
-            let _ = f.sync_all();
-        }
-        std::fs::rename(&tmp_path, &path)?;
+        crate::durable_json::write_pretty(&path, self)?;
         tracing::info!(
             chain_id = self.chain_id,
             path = %path,
@@ -453,18 +439,7 @@ impl TuningProfile {
     /// automatically revert if the new settings are worse.
     pub fn save_backup(&self, dir: &str) -> crate::Result<()> {
         let path = format!("{}/autotune-chain{}.backup.json", dir, self.chain_id);
-        let tmp_path = format!("{}.tmp", path);
-
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            tracing::warn!(error = %e, dir, "Failed to create backup directory");
-        }
-
-        let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&tmp_path, &json)?;
-        if let Ok(f) = std::fs::File::open(&tmp_path) {
-            let _ = f.sync_all();
-        }
-        std::fs::rename(&tmp_path, &path)?;
+        crate::durable_json::write_pretty(&path, self)?;
         tracing::info!(
             chain_id = self.chain_id,
             path = %path,

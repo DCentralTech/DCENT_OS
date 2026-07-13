@@ -11,6 +11,7 @@
 //!   4. Check for uart_trans kernel module -> CVitek
 //!   5. Check for /dev/ttyS1 + Amlogic DTS -> Amlogic
 
+pub mod am2_controller;
 pub mod amlogic;
 pub mod beaglebone;
 pub mod beaglebone_cold_boot;
@@ -18,14 +19,28 @@ pub mod config;
 pub mod cvitek;
 pub mod cvitek_cold_boot;
 pub mod cvitek_pinmux;
+#[cfg(feature = "sim-hal")]
+pub mod sim;
 pub mod stm32mp15;
 pub mod subtype;
 pub mod zynq;
 
 use crate::i2c::I2cBus;
 use crate::{HalError, Result};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
+pub use am2_controller::{
+    bind_am2_controller_endpoint_from_observation, bind_am2_hashboard_presence,
+    discover_am2_controller_endpoint, discover_system_am2_controller_plan,
+    observe_am2_hashboard_presence, try_discover_system_am2_controller_plan, Am2ControllerContext,
+    Am2ControllerPlan, Am2HashboardPresence,
+};
 pub use config::VoltageControllerKind;
+pub use subtype::{
+    discover_system_pic16_endpoint_with_heartbeat, discover_system_voltage_controller_endpoint,
+    VoltageControllerEndpoint, VoltageControllerEndpointError,
+};
 
 /// Control board type identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,10 +82,54 @@ pub trait ChainAccess: Send + Sync {
     fn wait_for_nonce(&self) -> Result<()>;
 }
 
+/// Checked fan-command evidence. This proves only that the platform command
+/// path completed and its available PWM readback matched; it does not prove
+/// airflow or physical fan rotation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FanCommandReceipt {
+    pub(crate) requested_pwm: u8,
+    pub(crate) observed_pwm: u8,
+}
+
+impl FanCommandReceipt {
+    /// Build command evidence after a platform implementation has read its
+    /// applied PWM back. External platform crates can implement [`FanAccess`]
+    /// without gaining a constructor that accepts a mismatch.
+    pub fn from_matching_readback(requested_pwm: u8, observed_pwm: u8) -> Result<Self> {
+        if requested_pwm != observed_pwm {
+            return Err(HalError::Fan(format!(
+                "fan PWM readback mismatch: requested {requested_pwm}, observed {observed_pwm}"
+            )));
+        }
+        Ok(Self {
+            requested_pwm,
+            observed_pwm,
+        })
+    }
+
+    pub fn requested_pwm(&self) -> u8 {
+        self.requested_pwm
+    }
+
+    pub fn observed_pwm(&self) -> u8 {
+        self.observed_pwm
+    }
+}
+
 /// Abstract fan access interface.
 pub trait FanAccess: Send + Sync {
     /// Set fan speed (PWM value, platform-specific range).
     fn set_speed(&self, pwm: u8);
+
+    /// Set fan speed through a platform-specific fallible command path and
+    /// require its available readback. The default is deliberately unavailable:
+    /// calling an infallible compatibility setter and then observing an old,
+    /// already-equal value cannot prove that the new write completed.
+    fn set_speed_checked(&self, _pwm: u8) -> Result<FanCommandReceipt> {
+        Err(HalError::Fan(
+            "checked fan commands are not implemented for this platform".to_string(),
+        ))
+    }
 
     /// Get current fan RPM.
     fn get_rpm(&self) -> u32;
@@ -90,11 +149,333 @@ pub trait FanAccess: Send + Sync {
     }
 
     /// Whether hardware fan tachometer readings are available.
-    /// When false, get_rpm() returns synthesized estimates and the thermal
-    /// controller should NOT use RPM for fan-failure detection — it must
-    /// rely solely on temperature thresholds for safety.
+    /// When false, RPM accessors provide no safety evidence: they may return
+    /// zero for compatibility, but the thermal controller must not interpret
+    /// that zero as a measured stopped fan. It must rely on temperature
+    /// thresholds until fresh tach evidence becomes available.
     fn tach_available(&self) -> bool {
         true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HardwareMutationGatePhase {
+    Pending,
+    Open,
+    Closed,
+}
+
+#[derive(Debug)]
+struct HardwareMutationGateState {
+    phase: HardwareMutationGatePhase,
+    in_flight: usize,
+}
+
+#[derive(Debug)]
+struct HardwareMutationGateInner {
+    state: Mutex<HardwareMutationGateState>,
+    drained: Condvar,
+}
+
+/// Shared admission barrier for hardware mutations that can race teardown.
+///
+/// Every external control-plane mutator holds a lease for the full blocking
+/// hardware call. Teardown closes admission and waits for all leases to drain
+/// before it observes software safe-off. This makes a checked LOW readback a
+/// stable ordering fact instead of a value that an in-flight API handler can
+/// immediately invalidate.
+#[derive(Clone, Debug)]
+pub struct HardwareMutationGate {
+    inner: Arc<HardwareMutationGateInner>,
+}
+
+impl HardwareMutationGate {
+    pub fn new_open() -> Self {
+        Self::new(HardwareMutationGatePhase::Open)
+    }
+
+    /// Construct a terminally closed gate for management surfaces that must
+    /// never admit hardware mutations in this process lifetime.
+    ///
+    /// Closed admission is irreversible. Because no lease can have been
+    /// admitted before construction, [`Self::close_and_drain`] succeeds
+    /// immediately and returns the same opaque barrier evidence as a drained
+    /// open gate.
+    pub fn new_closed() -> Self {
+        Self::new(HardwareMutationGatePhase::Closed)
+    }
+
+    fn new(phase: HardwareMutationGatePhase) -> Self {
+        Self {
+            inner: Arc::new(HardwareMutationGateInner {
+                state: Mutex::new(HardwareMutationGateState {
+                    phase,
+                    in_flight: 0,
+                }),
+                drained: Condvar::new(),
+            }),
+        }
+    }
+
+    pub fn try_acquire(&self) -> Result<HardwareMutationLease> {
+        let mut state =
+            self.inner.state.lock().map_err(|_| {
+                HalError::Platform("hardware mutation gate mutex poisoned".to_string())
+            })?;
+        match state.phase {
+            HardwareMutationGatePhase::Open => {}
+            HardwareMutationGatePhase::Pending => {
+                return Err(HalError::Platform(
+                    "hardware mutation admission is pending mining readiness".to_string(),
+                ));
+            }
+            HardwareMutationGatePhase::Closed => {
+                return Err(HalError::Platform(
+                    "hardware mutation admission is closed for teardown".to_string(),
+                ));
+            }
+        }
+        state.in_flight = state.in_flight.saturating_add(1);
+        drop(state);
+        Ok(HardwareMutationLease {
+            inner: Arc::clone(&self.inner),
+        })
+    }
+
+    pub fn close_and_drain(&self, timeout: Duration) -> Result<HardwareMutationBarrierReceipt> {
+        let started_at = Instant::now();
+        let mut state =
+            self.inner.state.lock().map_err(|_| {
+                HalError::Platform("hardware mutation gate mutex poisoned".to_string())
+            })?;
+        state.phase = HardwareMutationGatePhase::Closed;
+
+        while state.in_flight != 0 {
+            let remaining = timeout.saturating_sub(started_at.elapsed());
+            if remaining.is_zero() {
+                return Err(HalError::Platform(format!(
+                    "timed out draining {} in-flight hardware mutation(s)",
+                    state.in_flight
+                )));
+            }
+            let (next_state, wait) =
+                self.inner
+                    .drained
+                    .wait_timeout(state, remaining)
+                    .map_err(|_| {
+                        HalError::Platform("hardware mutation gate mutex poisoned".to_string())
+                    })?;
+            state = next_state;
+            if wait.timed_out() && state.in_flight != 0 {
+                return Err(HalError::Platform(format!(
+                    "timed out draining {} in-flight hardware mutation(s)",
+                    state.in_flight
+                )));
+            }
+        }
+
+        Ok(HardwareMutationBarrierReceipt {
+            closed_and_drained_at: Instant::now(),
+        })
+    }
+}
+
+/// Sole capability that can transition a shared hardware-mutation gate from
+/// pending to open. API state receives only [`HardwareMutationGate`], so it can
+/// acquire leases after admission or close admission, but cannot authorize its
+/// own hardware access during engine bring-up.
+#[derive(Debug)]
+pub struct HardwareMutationGateOwner {
+    gate: HardwareMutationGate,
+}
+
+impl HardwareMutationGateOwner {
+    pub fn new_pending() -> Self {
+        let gate = HardwareMutationGate::new(HardwareMutationGatePhase::Pending);
+        Self { gate }
+    }
+
+    pub fn gate(&self) -> HardwareMutationGate {
+        self.gate.clone()
+    }
+
+    pub fn open(&self) -> Result<HardwareMutationAdmissionReceipt> {
+        let mut state =
+            self.gate.inner.state.lock().map_err(|_| {
+                HalError::Platform("hardware mutation gate mutex poisoned".to_string())
+            })?;
+        match state.phase {
+            HardwareMutationGatePhase::Pending => {
+                state.phase = HardwareMutationGatePhase::Open;
+                Ok(HardwareMutationAdmissionReceipt {
+                    opened_at: Instant::now(),
+                })
+            }
+            HardwareMutationGatePhase::Open => Err(HalError::Platform(
+                "hardware mutation admission was already opened".to_string(),
+            )),
+            HardwareMutationGatePhase::Closed => Err(HalError::Platform(
+                "hardware mutation admission is terminally closed".to_string(),
+            )),
+        }
+    }
+
+    pub fn close_and_drain(&self, timeout: Duration) -> Result<HardwareMutationBarrierReceipt> {
+        self.gate.close_and_drain(timeout)
+    }
+}
+
+impl Drop for HardwareMutationGateOwner {
+    fn drop(&mut self) {
+        // Drop is fail-closed and non-blocking. A failed zero-time drain still
+        // leaves admission terminally closed; it simply cannot mint evidence.
+        let _ = self.gate.close_and_drain(Duration::ZERO);
+    }
+}
+
+/// Opaque evidence that the hardware owner transitioned pending admission to
+/// open exactly once.
+#[derive(Debug)]
+pub struct HardwareMutationAdmissionReceipt {
+    opened_at: Instant,
+}
+
+impl HardwareMutationAdmissionReceipt {
+    pub fn opened_at(&self) -> Instant {
+        self.opened_at
+    }
+}
+
+/// RAII proof that one admitted hardware mutation is still in flight.
+#[derive(Debug)]
+pub struct HardwareMutationLease {
+    inner: Arc<HardwareMutationGateInner>,
+}
+
+impl Drop for HardwareMutationLease {
+    fn drop(&mut self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.in_flight = state.in_flight.saturating_sub(1);
+        if state.in_flight == 0 {
+            self.inner.drained.notify_all();
+        }
+    }
+}
+
+/// Opaque evidence that mutation admission is closed and every admitted
+/// control-plane mutation has completed.
+#[derive(Debug)]
+pub struct HardwareMutationBarrierReceipt {
+    closed_and_drained_at: Instant,
+}
+
+impl HardwareMutationBarrierReceipt {
+    pub fn closed_and_drained_at(&self) -> Instant {
+        self.closed_and_drained_at
+    }
+}
+
+#[cfg(test)]
+mod hardware_mutation_gate_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+
+    struct InfallibleCompatibilityFan;
+
+    impl FanAccess for InfallibleCompatibilityFan {
+        fn set_speed(&self, _pwm: u8) {}
+
+        fn get_rpm(&self) -> u32 {
+            0
+        }
+
+        fn get_speed_pwm(&self) -> u8 {
+            30
+        }
+    }
+
+    #[test]
+    fn default_checked_fan_path_never_mints_receipt_from_stale_equal_readback() {
+        let fan = InfallibleCompatibilityFan;
+        assert!(fan.set_speed_checked(30).is_err());
+    }
+
+    #[test]
+    fn close_rejects_new_mutations_and_waits_for_admitted_lease() {
+        let gate = HardwareMutationGate::new_open();
+        let lease = gate.try_acquire().unwrap();
+        let closer = gate.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            closer.close_and_drain(Duration::from_secs(1))
+        });
+        started_rx.recv().unwrap();
+
+        while gate.try_acquire().is_ok() {
+            thread::yield_now();
+        }
+        assert!(!handle.is_finished());
+        drop(lease);
+        assert!(handle.join().unwrap().is_ok());
+        assert!(gate.try_acquire().is_err());
+    }
+
+    #[test]
+    fn drain_timeout_keeps_admission_closed() {
+        let gate = HardwareMutationGate::new_open();
+        let _lease = gate.try_acquire().unwrap();
+        assert!(gate.close_and_drain(Duration::from_millis(1)).is_err());
+        assert!(gate.try_acquire().is_err());
+    }
+
+    #[test]
+    fn initially_closed_gate_rejects_leases_and_is_already_drained() {
+        let gate = HardwareMutationGate::new_closed();
+
+        assert!(gate.try_acquire().is_err());
+        let receipt = gate.close_and_drain(Duration::ZERO).unwrap();
+        assert!(receipt.closed_and_drained_at() <= Instant::now());
+        assert!(gate.try_acquire().is_err());
+    }
+
+    #[test]
+    fn pending_gate_can_only_be_opened_once_by_its_owner() {
+        let owner = HardwareMutationGateOwner::new_pending();
+        let gate = owner.gate();
+        assert!(gate
+            .try_acquire()
+            .unwrap_err()
+            .to_string()
+            .contains("pending mining readiness"));
+
+        let receipt = owner.open().unwrap();
+        assert!(receipt.opened_at() <= Instant::now());
+        let lease = gate.try_acquire().unwrap();
+        assert!(owner.open().is_err());
+        drop(lease);
+
+        owner.close_and_drain(Duration::ZERO).unwrap();
+        assert!(gate.try_acquire().is_err());
+        assert!(owner.open().is_err());
+    }
+
+    #[test]
+    fn dropping_pending_gate_owner_terminally_closes_api_admission() {
+        let gate = {
+            let owner = HardwareMutationGateOwner::new_pending();
+            let gate = owner.gate();
+            owner.open().unwrap();
+            assert!(gate.try_acquire().is_ok());
+            gate
+        };
+
+        assert!(gate.try_acquire().is_err());
     }
 }
 
@@ -130,37 +511,31 @@ pub trait Platform: Send + Sync {
     /// Open the GPIO controller.
     fn open_gpio(&self) -> Result<Box<dyn GpioAccess>>;
 
-    /// Voltage controller kind in use on this platform.
+    /// Informational voltage-controller kind in use on this platform.
     ///
-    /// Default impl returns `Dspic33Ep` so existing platforms (S9, S19 Pro,
-    /// S21, S19k Pro) keep their behavior unchanged. CV1835, BeagleBone,
-    /// and Amlogic override this with the `crate::platform::subtype`
-    /// classification result so the daemon can construct a `Pic1704Service`
-    /// when the subtype + 0x20 probe both pass at runtime.
+    /// The default is deliberately `NoPic`: implementations without exact
+    /// hashboard identity must not silently select dsPIC wire bytes. This enum
+    /// is compatibility/telemetry data, not service-construction authority.
     ///
     /// W2A.2 (2026-05-09): introduced as part of the PIC1704 wire-up.
     fn voltage_controller(&self) -> VoltageControllerKind {
-        VoltageControllerKind::Dspic33Ep
+        VoltageControllerKind::NoPic
     }
 }
 
 impl BoardType {
-    /// Voltage-controller default for a control-board family, used when
-    /// no `Platform` instance is constructed (CV1835 stub today, more in
-    /// future). Live runtime classification happens in
-    /// `crate::platform::subtype::classify_with_probe`; this helper is
-    /// only the *static* hint for diagnostic / preflight code.
+    /// Fail-closed hint for callers without a live `Platform` instance.
+    /// Control-board family alone does not identify the attached hashboard or
+    /// its controller protocol, so every unproven static default is `NoPic`.
     pub fn voltage_controller_default(&self) -> VoltageControllerKind {
         match self {
-            // CV1835 carriers ship BHB42XXX hashboards in the dev kit
-            // (`/etc/subtype = CVCtrl_BHB42XXX`). PIC1704 is the static
-            // expectation; runtime probe still gates real construction.
-            BoardType::CVitek => VoltageControllerKind::Pic1704,
-            // Existing platforms — keep current behavior.
-            BoardType::Zynq => VoltageControllerKind::Dspic33Ep,
-            BoardType::BeagleBone => VoltageControllerKind::Dspic33Ep,
-            BoardType::Amlogic => VoltageControllerKind::Dspic33Ep,
-            BoardType::Stm32Mp15 => VoltageControllerKind::Dspic33Ep,
+            // Even a CV1835 carrier can host different hashboard families.
+            BoardType::CVitek => VoltageControllerKind::NoPic,
+            // No carrier family alone grants a controller protocol.
+            BoardType::Zynq => VoltageControllerKind::NoPic,
+            BoardType::BeagleBone => VoltageControllerKind::NoPic,
+            BoardType::Amlogic => VoltageControllerKind::NoPic,
+            BoardType::Stm32Mp15 => VoltageControllerKind::NoPic,
         }
     }
 }
@@ -177,6 +552,16 @@ impl BoardType {
 /// ttyOX devices). The AM33XX CPU string is the BB tiebreaker over CVitek
 /// (different SoC entirely).
 pub fn detect_platform() -> Result<Box<dyn Platform>> {
+    // Simulation is considered before hardware auto-detection only when at
+    // least one simulation variable is explicitly present. A partial or
+    // malformed request fails closed instead of falling through to a real
+    // platform. `SimPlatform::from_env` also refuses every known miner
+    // hardware signature, even in a binary accidentally built with sim-hal.
+    #[cfg(feature = "sim-hal")]
+    if sim::sim_environment_is_mentioned() {
+        return Ok(Box::new(sim::SimPlatform::from_env()?));
+    }
+
     // 1. Zynq — UIO devices (covers both S9 and S19/am2-s17)
     if std::path::Path::new("/dev/uio0").exists() {
         return Ok(Box::new(zynq::ZynqPlatform::new()?));

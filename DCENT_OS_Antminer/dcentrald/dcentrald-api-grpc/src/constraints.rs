@@ -126,8 +126,16 @@ fn build_family_freq_only_constraints(
     home_mode: bool,
 ) -> TunerConstraints {
     let freqs: Vec<u32> = table.profiles.iter().map(|p| p.freq_mhz).collect();
-    let min = freqs.iter().copied().min().unwrap_or(DEFAULT_BM1362_FREQ_MIN_MHZ);
-    let max = freqs.iter().copied().max().unwrap_or(DEFAULT_BM1362_FREQ_MAX_MHZ);
+    let min = freqs
+        .iter()
+        .copied()
+        .min()
+        .unwrap_or(DEFAULT_BM1362_FREQ_MIN_MHZ);
+    let max = freqs
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(DEFAULT_BM1362_FREQ_MAX_MHZ);
     let step = freq_step_from_freqs(&freqs);
     let mode = if home_mode {
         OperatingMode::ModeHome
@@ -339,7 +347,10 @@ mod tests {
     #[test]
     fn unknown_or_empty_family_is_byte_identical_bm1362_default() {
         for h in [true, false] {
-            assert_eq!(build_constraints_for_chip("", h), build_bm1362_constraints(h));
+            assert_eq!(
+                build_constraints_for_chip("", h),
+                build_bm1362_constraints(h)
+            );
             assert_eq!(
                 build_constraints_for_chip("bm9999", h),
                 build_bm1362_constraints(h)

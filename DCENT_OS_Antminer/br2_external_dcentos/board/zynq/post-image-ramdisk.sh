@@ -38,6 +38,14 @@ if [ -f "${BINARIES_DIR}/rootfs.squashfs" ]; then
         HEADROOM=$(( (MAX_UBI_SIZE - SQFS_SIZE) * 100 / MAX_UBI_SIZE ))
         echo "  UBI fit: OK (${HEADROOM}% headroom within live S9 rootfs volume)"
     fi
+
+    . "${BR2_EXTERNAL_DCENTOS_PATH}/../scripts/lib/rootfs_ownership_ledger.sh"
+    dcent_emit_rootfs_ownership_ledger \
+        "${BINARIES_DIR}/rootfs.squashfs" \
+        "${BINARIES_DIR}/rootfs-ownership.json" \
+        --post-build-script "board=${BR2_EXTERNAL_DCENTOS_PATH}/board/zynq/post-build.sh" \
+        --post-build-script "common-prune=${BR2_EXTERNAL_DCENTOS_PATH}/board/common/prune-runtime-research-tools.sh" \
+        --overlay-root "zynq-base=${BR2_EXTERNAL_DCENTOS_PATH}/board/zynq/rootfs-overlay"
 else
     echo "  WARNING: rootfs.squashfs not found (squashfs not enabled in defconfig?)"
 fi

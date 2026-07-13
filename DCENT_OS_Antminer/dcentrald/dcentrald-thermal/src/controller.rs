@@ -222,7 +222,7 @@ pub struct ThermalController {
     /// Timestamp of last valid temperature reading.
     last_temp_update: std::time::Instant,
     /// Whether hardware fan tachometer is available.
-    /// When false, fan_rpm is synthesized and fan-failure detection is disabled.
+    /// When false, fan RPM is not safety evidence and fan-failure detection is disabled.
     /// Temperature-based protection still operates (stalled fan → temp rise → throttle → shutdown).
     tach_available: bool,
     /// Immersion / hydro cooling mode. **Default-OFF** (`ImmersionConfig::default()`
@@ -747,16 +747,24 @@ impl ThermalController {
         self.immersion_active
     }
 
-    /// Set whether hardware fan tach is available.
-    /// Call this after platform detection. When false, fan-failure detection
-    /// is disabled and the controller relies on temperature thresholds only.
+    /// Set whether current hardware fan-tach evidence is available.
+    ///
+    /// Callers may update this dynamically while a sampler warms up or after
+    /// an I/O failure. Losing availability resets the consecutive-zero debounce
+    /// because observations separated by an evidence gap are not consecutive.
     pub fn set_tach_available(&mut self, available: bool) {
+        if self.tach_available == available {
+            return;
+        }
         self.tach_available = available;
         if !available {
+            self.fan_zero_count = 0;
             tracing::info!(
                 "Thermal: fan tach unavailable — fan-failure detection disabled, \
                             relying on temperature thresholds for safety"
             );
+        } else {
+            tracing::info!("Thermal: fan tach evidence available");
         }
     }
 
@@ -950,6 +958,24 @@ mod tests {
         assert!(matches!(action, ThermalAction::SetFanPwm(30)));
         assert_eq!(controller.current_pwm(), 30);
         assert!(matches!(controller.state(), ThermalState::ColdStart));
+    }
+
+    #[test]
+    fn dynamic_tach_evidence_loss_resets_zero_debounce_and_can_recover() {
+        let mut controller = ThermalController::new(test_profile());
+        controller.fan_zero_count = 2;
+
+        controller.set_tach_available(false);
+        assert!(!controller.tach_available);
+        assert_eq!(controller.fan_zero_count, 0);
+
+        // An idempotent unavailable update must not manufacture state.
+        controller.set_tach_available(false);
+        assert_eq!(controller.fan_zero_count, 0);
+
+        controller.set_tach_available(true);
+        assert!(controller.tach_available);
+        assert_eq!(controller.fan_zero_count, 0);
     }
 
     // -- THERMAL-3: sleep-state PWM is owned by the safety cap, not a raw 25 --

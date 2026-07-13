@@ -1,11 +1,11 @@
-//! PIC1704 bootloader programmer ops — **recovery-tool only**.
+//! PIC1704 bootloader programmer protocol research — **not shipped**.
 //!
-//! This module is compiled out of the production `dcentrald` binary by the
-//! `#[cfg(feature = "recovery-tool")]` gate in `super::mod`. Only the
-//! `pic-recovery` crate enables that feature, so accidental linkage from
-//! the daemon is a **compile error**, not a runtime guard. This mirrors
-//! the `dspic_flash` lockdown pattern ( root §"Corruption-
-//! prevention guarantees" #2).
+//! This module is available only when an explicit research/test build enables
+//! `recovery-tool`. No shipped package enables that feature: production
+//! `dcentrald` and the diagnostic-only `pic-recovery` package cannot link
+//! these symbols. Preserving the protocol code does not authorize an executor;
+//! any future mutation path requires a separate controller-recovery authority
+//! architecture ( root §"Corruption-prevention guarantees" #2).
 //!
 //! # Source of truth
 //!
@@ -22,8 +22,8 @@
 //! RE2's dev-kit `SOURCE_HAL/pic1704.{c,h}` does **not** expose programmer
 //! ops — only runtime ops (heartbeat, dc-dc, voltage/current/temp). The
 //! programmer opcode wire-format below is therefore an inferred mapping
-//! that mirrors the BraiinsOS PIC16F1704 bootloader ABI as documented in
-//! `dcentrald-asic::dspic_flash` §"Protocol revision history":
+//! that mirrors the BraiinsOS PIC16F1704 bootloader ABI captured by the
+//! historical controller-recovery protocol research:
 //!
 //! - `0x01` SEEK / SET_FLASH_POINTER
 //! - `0x05` WRITE_DATA_INTO_PIC (chunked)
@@ -37,7 +37,7 @@
 //! that evidence; that's why every helper is host-testable and every
 //! Service method goes through the I2C service queue (no raw `/dev/i2c-N`).
 //!
-//! # Why direct I²C is allowed here (vs )
+//! # Transport context (not runtime authority)
 //!
 //!  says NEVER flash PICs via AXI IIC. That
 //! rule applies to **am2 Zynq dsPIC** on S19j Pro Zynq variants where the
@@ -46,20 +46,24 @@
 //! NO FPGA IIC — it hangs off a plain `/dev/i2c-0` exposed by the host
 //! SoC's I2C controller (CV1835: pinmux'd CV1835 i2c block; BB: AM335x
 //! i2c0; Amlogic: standard kernel i2c-meson). There is no AXI bus to
-//! corrupt, so direct I²C from the recovery binary is the correct path.
-//! The single-I²C-owner rule still applies on am2 — but the PIC1704
-//! platforms (CV/BB/AML) are not am2.
+//! corrupt. That topology explains the protocol's original transport model,
+//! but this module has no shipped transport consumer. A future executor must
+//! still obtain typed target authority, exclusive bus ownership, and the
+//! remaining controller-recovery safety guarantees before performing I²C
+//! mutation. The single-I²C-owner rule remains mandatory wherever applicable.
 //!
-//! # Gates layered on every op
+//! # Preserved research invariants
 //!
-//! Every programmer op in this module enforces TWO gates:
+//! Every programmer op preserves two defensive invariants:
 //!
 //! 1. **Compile-time gate**: `#[cfg(feature = "recovery-tool")]` on the
 //!    module itself + `Pic1704Authorized` sealed trait on construction.
-//! 2. **Runtime gate**: `ConfirmedBrickedToken` argument that can only be
-//!    minted by the recovery binary's `--confirm-bricked` flow + a
-//!    `version == VER_BOOTLOADER (0x86)` precondition. Programmer ops
-//!    refuse if the chip is in application mode (`0x88`/`0x89`/`0x8A`).
+//! 2. **Call-site invariant**: `ConfirmedBrickedToken` plus a
+//!    `version == VER_BOOTLOADER (0x86)` precondition. Programmer ops refuse
+//!    if the chip is in application mode (`0x88`/`0x89`/`0x8A`).
+//!
+//! These checks are useful host-testable protocol defenses, but they are not
+//! a complete authority model and no shipped caller can reach them.
 //!
 //!:
 //! `start_app` is destructive in App mode. `seek` / `erase` / `write` are
@@ -68,7 +72,7 @@
 
 #![cfg(feature = "recovery-tool")]
 
-use dcentrald_hal::i2c::I2cTransactionStep;
+use dcentrald_hal::i2c::{I2cMutationLabel, I2cTransactionStep};
 use tracing::{info, warn};
 
 use super::protocol::{classify_version, Pic1704State, REG_CONTROL, VER_BOOTLOADER};
@@ -98,23 +102,22 @@ pub const WRITE_CHUNK_BYTES: usize = 64;
 //  ConfirmedBrickedToken — runtime confirmation gate
 // ===========================================================================
 
-/// Proof-of-operator-confirmation token, required for every destructive
-/// programmer op in this module.
+/// Legacy confirmation token retained to pin the research API's destructive
+/// call boundary.
 ///
 /// Construction is gated by [`ConfirmedBrickedToken::new_with_confirmation`],
-/// which only accepts the literal string `"--confirm-bricked"`. The
-/// recovery binary's CLI flow is the only caller that has any reason to
-/// know that string — it's the same `--confirm-bricked` flag operators
-/// type into the `pic-recovery` shell command.
+/// which only accepts the literal string `"--confirm-bricked"`. This string
+/// check is retained for compatibility with host tests; it is not sufficient
+/// authorization for a future executor.
 ///
 /// The token is intentionally `!Clone` and `!Copy`: each programmer op
-/// consumes a fresh one. This forces the recovery binary to re-mint the
-/// token at each op boundary, and prevents accidental "save the token
-/// once, reuse forever" anti-patterns from the daemon side.
+/// consumes a fresh one. This preserves per-operation acknowledgement if a
+/// future authority layer wraps the research API, and prevents accidental
+/// "save the token once, reuse forever" call patterns.
 ///
 /// In tests (also `#[cfg(feature = "recovery-tool")]`), [`Self::for_tests`]
 /// produces a token without the runtime confirmation string. That helper
-/// is `cfg(test)` so it never compiles into a release artifact.
+/// is `cfg(test)` and no shipped package enables this module.
 #[derive(Debug)]
 pub struct ConfirmedBrickedToken {
     // Private field with private type so the token cannot be constructed
@@ -126,7 +129,7 @@ pub struct ConfirmedBrickedToken {
 struct ConfirmedBrickedSeal;
 
 impl ConfirmedBrickedToken {
-    /// Mint a token from the recovery binary's `--confirm-bricked` flag.
+    /// Mint the legacy research token from its confirmation literal.
     ///
     /// `flag` MUST be exactly `"--confirm-bricked"`. Any other value
     /// returns [`AsicError::Pic`] with a clear "operator did not confirm"
@@ -147,7 +150,7 @@ impl ConfirmedBrickedToken {
     }
 
     /// Test-only constructor. Compiles only with `#[cfg(test)]` so it
-    /// cannot leak into the recovery binary or any release artifact.
+    /// cannot leak into a non-test build.
     #[cfg(test)]
     pub(crate) fn for_tests() -> Self {
         Self {
@@ -336,9 +339,9 @@ pub fn pic_write_1704(
 ///
 /// 1. It **re-reads** `REG_VERSION` first to refuse if the PIC is already
 ///    in application mode (no silent no-op fallthrough). The runtime
-///    helper treats App-mode as a no-op success, which is correct for
-///    daemon use; for the recovery flow, the operator wants a hard
-///    failure so they know the PIC didn't actually need recovery.
+///    helper treats App-mode as a no-op success, which is correct for daemon
+///    use; the research helper returns a hard failure so host tests can prove
+///    that no transition was required.
 /// 2. It **consumes** a `ConfirmedBrickedToken`, matching the rest of
 ///    the programmer ops.
 ///
@@ -379,8 +382,8 @@ impl Pic1704Service {
     /// Run a programmer-op transaction through the service handle.
     ///
     /// `op_label` is used only for error messages — keep it short.
-    /// This method is `#[cfg(feature = "recovery-tool")]` and so does not
-    /// exist in production builds.
+    /// This method is `#[cfg(feature = "recovery-tool")]`; no shipped package
+    /// enables that feature.
     #[cfg(feature = "recovery-tool")]
     pub(super) fn run_programmer_steps(
         &mut self,
@@ -388,7 +391,7 @@ impl Pic1704Service {
         op_label: &str,
     ) -> Result<()> {
         self.i2c_handle()
-            .transaction(self.address(), steps)
+            .transaction_mutating(I2cMutationLabel::Recovery, self.address(), steps)
             .map(|_| ())
             .map_err(|e| AsicError::Pic {
                 addr: self.address(),
@@ -574,8 +577,8 @@ mod tests {
     #[test]
     fn opcodes_are_canonical() {
         // BraiinsOS bmminer ABI — these are load-bearing across PIC
-        // families; if any of them changes, dspic_flash::OP_* and
-        // pic-recovery's CMD_* must change in lockstep.
+        // families. If any changes, all retained protocol fixtures must be
+        // re-adjudicated against the same source evidence.
         assert_eq!(OP_SEEK, 0x01);
         assert_eq!(OP_WRITE, 0x05);
         assert_eq!(OP_ERASE, 0x09);

@@ -8,20 +8,17 @@
 //!
 //! The canonical fix is tempfile + fsync + atomic `rename(2)`:
 //!
-//!   1. Write the new contents to `<path>.tmp` in the same directory.
+//!   1. Write the new contents to a unique sibling in the same directory.
 //!   2. `fsync` the tempfile so its bytes are durable on disk.
 //!   3. `rename` the tempfile onto the target — a POSIX atomic operation
 //!      within the same filesystem.
 //!   4. `fsync` the parent directory so the rename itself is durable.
 //!
-//! Same filesystem is important: on ubifs (the /data and /etc backing on
-//! our BraiinsOS-sourced kernel), rename across a mount boundary falls back
-//! to copy-then-unlink which is NOT atomic. Caller must pass a path on the
-//! same filesystem as its parent directory (the default for /data/* and
-//! /etc/* on our rootfs).
+//! Same filesystem is important: `rename(2)` across a mount boundary fails and
+//! must never be replaced with copy-then-unlink. The common primitive always
+//! stages beside the target, which keeps publication on one filesystem.
 
-use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -41,19 +38,15 @@ pub const CONFIG_FILE_NAME: &str = "dcentrald.toml";
 /// resolution.
 static CONFIG_WRITE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// Shared API persistence ceiling. Configuration, onboarding state, and
+/// imported profile JSON are all small control-plane artifacts; none may turn
+/// the generic atomic helper into an unbounded storage sink.
+pub const MAX_ATOMIC_WRITE_BYTES: usize = 8 * 1024 * 1024;
+
 /// Current config-write generation. See [`CONFIG_WRITE_GENERATION`].
 pub fn config_write_generation() -> u64 {
     CONFIG_WRITE_GENERATION.load(Ordering::Acquire)
 }
-
-/// Process-monotonic counter that makes [`atomic_write_bytes`] staging-file
-/// names unique (RELIAB-2a). Two concurrent writers in the SAME process share
-/// `std::process::id()`, so the PID alone is NOT enough: without a per-write
-/// discriminator both would `open(.., truncate(true))` the identical
-/// `<file>.tmp.<pid>` and clobber each other's bytes, and the racing renames
-/// could publish a torn or empty file. `fetch_add` hands each in-flight write a
-/// distinct suffix.
-static TMP_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Storage-class write failures that should be surfaced to API clients with a
 /// stable code instead of an opaque "write failed" string.
@@ -137,6 +130,10 @@ fn is_config_file(path: &Path) -> bool {
     path.file_name().and_then(|n| n.to_str()) == Some(CONFIG_FILE_NAME)
 }
 
+fn published_write_invalidates_config(path: &Path, target_published: bool) -> bool {
+    target_published && is_config_file(path)
+}
+
 /// Drop-in replacement for `std::fs::write`: writes `contents` to `path`
 /// atomically via tempfile + fsync + rename.
 ///
@@ -144,8 +141,10 @@ fn is_config_file(path: &Path) -> bool {
 /// so callers can swap `std::fs::write(p, s)` for `atomic_write(p, s)` with
 /// no other changes.
 ///
-/// If any step fails, the tempfile is best-effort removed and the error is
-/// returned. The target file is NEVER left truncated or half-written.
+/// Payloads larger than [`MAX_ATOMIC_WRITE_BYTES`] are rejected before staging.
+/// If any step fails, the sibling is best-effort removed and the error is
+/// returned. A post-rename directory-sync error reports failure while still
+/// invalidating the config cache because complete new bytes were published.
 pub fn atomic_write<P, B>(path: P, contents: B) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -161,82 +160,27 @@ where
 /// If any step fails, the tempfile is best-effort removed and the error
 /// is returned. The target file is NEVER left truncated or half-written.
 pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "atomic_write_bytes: path has no parent directory",
-        )
-    })?;
+    let result = dcentrald_common::atomic_file::atomic_write(
+        path,
+        bytes,
+        dcentrald_common::atomic_file::AtomicWriteOptions::state_file(MAX_ATOMIC_WRITE_BYTES),
+    );
 
-    let file_name = path.file_name().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "atomic_write_bytes: path has no file name",
-        )
-    })?;
-
-    // Staging file alongside the target. The name MUST be unique per in-flight
-    // write so two concurrent writers (even within THIS process, same PID) never
-    // stage to the same path and clobber each other — which would publish a torn
-    // or empty file (RELIAB-2a). We combine the PID, a process-monotonic
-    // sequence counter (the actual uniqueness guarantee — see `TMP_WRITE_SEQ`),
-    // and the current nanosecond (extra entropy across process restarts). Kept
-    // short — ubifs has a 255-byte filename limit.
-    let seq = TMP_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let mut tmp_name = std::ffi::OsString::from(file_name);
-    tmp_name.push(format!(".tmp.{}.{}.{}", std::process::id(), seq, nanos));
-    let tmp_path = parent.join(&tmp_name);
-
-    // Explicit create-and-truncate, 0600 on unix (config may contain secrets).
-    let mut tmp = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp_path)?;
-
-    let write_result = (|| -> io::Result<()> {
-        tmp.write_all(bytes)?;
-        tmp.flush()?;
-        tmp.sync_all()?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e);
-    }
-
-    // Drop the tempfile handle before rename (Windows friendliness; on Linux
-    // it doesn't matter but costs nothing).
-    drop(tmp);
-
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e);
-    }
-
-    // P3-2: the new contents are now in place (rename succeeded), so a
-    // successful rewrite of the daemon config file invalidates the in-memory
-    // config cache. Bump AFTER the rename so any reader that observes the new
-    // generation is guaranteed to read the new file. Filename-gated so
-    // profile/onboarding writes that also use `atomic_write` do not invalidate
-    // the config cache.
-    if is_config_file(path) {
+    // Rename can publish a complete new config before parent-directory fsync
+    // fails. The caller must receive that durability error, but the in-memory
+    // cache generation must still advance so subsequent reads cannot serve the
+    // old configuration after the new bytes became visible.
+    let target_published = match &result {
+        Ok(_) => true,
+        Err(error) => error.target_published(),
+    };
+    if published_write_invalidates_config(path, target_published) {
         CONFIG_WRITE_GENERATION.fetch_add(1, Ordering::AcqRel);
     }
 
-    // Best-effort parent dir fsync so the rename is crash-safe. If we can't
-    // open the dir for fsync (e.g. Windows dev), swallow — the rename itself
-    // is already atomic and the data was fsynced.
-    if let Ok(dir) = File::open(parent) {
-        let _ = dir.sync_all();
-    }
-
-    Ok(())
+    result
+        .map(|_| ())
+        .map_err(dcentrald_common::atomic_file::AtomicWriteError::into_io_error)
 }
 
 #[cfg(test)]
@@ -252,9 +196,61 @@ mod tests {
         atomic_write_bytes(&target, b"key = 1\n").unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "key = 1\n");
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
         atomic_write_bytes(&target, b"key = 2\n").unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "key = 2\n");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn oversize_payload_is_rejected_before_target_replacement() {
+        let dir = std::env::temp_dir().join(format!(
+            "dcent_atomic_bound_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("config.toml");
+        std::fs::write(&target, b"original\n").unwrap();
+
+        let error = atomic_write_bytes(&target, &vec![b'x'; MAX_ATOMIC_WRITE_BYTES + 1])
+            .expect_err("oversize API state must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read(&target).unwrap(), b"original\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_target_is_rejected_without_mutating_referent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "dcent_atomic_symlink_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let referent = dir.join("referent.toml");
+        let target = dir.join("config.toml");
+        std::fs::write(&referent, b"original\n").unwrap();
+        symlink(&referent, &target).unwrap();
+
+        atomic_write_bytes(&target, b"replacement\n").expect_err("symlink target must fail closed");
+        assert_eq!(std::fs::read(&referent).unwrap(), b"original\n");
+        assert!(std::fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -281,6 +277,17 @@ mod tests {
         assert!(!is_config_file(Path::new("/data/onboarding.json")));
         // The staging tempfile must NOT count as a config write.
         assert!(!is_config_file(Path::new("/data/dcentrald.toml.tmp.123")));
+    }
+
+    #[test]
+    fn published_config_invalidates_cache_even_when_durability_later_fails() {
+        let config = Path::new("/data/dcentrald.toml");
+        assert!(!published_write_invalidates_config(config, false));
+        assert!(published_write_invalidates_config(config, true));
+        assert!(!published_write_invalidates_config(
+            Path::new("/data/profile.json"),
+            true
+        ));
     }
 
     #[test]

@@ -437,217 +437,111 @@ def uio_names():
     return names
 
 
-def uio_fan_control_present():
-    """Return True when the FPGA fan-control block is UIO-bound."""
-    return "fan-control" in uio_names()
 
 
-def am2_target_without_fan_uio():
-    names = uio_names()
-    if "board-control" in names:
-        return "fan-control" not in names
-    platform = get_platform_key().lower()
-    return platform.startswith("am2-") and "fan-control" not in names
 
 
-def dcentrald_fan_cmd(args):
-    """Run dcentrald fan one-shots and return (ok, combined_output)."""
-    for candidate in [
-        "/usr/local/bin/dcentrald",
-        "/usr/bin/dcentrald",
-        "/tmp/dcentrald_runtime",
-        "/tmp/dcentrald_fixed",
-    ]:
-        if os.path.exists(candidate) and os.access(candidate, os.X_OK):
-            try:
-                argv = [candidate] + (args if isinstance(args, list) else args.split())
-                result = subprocess.run(
-                    argv,
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                return result.returncode == 0, (result.stdout + result.stderr).strip()
-            except Exception as exc:
-                return False, str(exc)
-    return False, "no executable dcentrald fan helper found"
 
 
-def parse_dcentrald_fan_output(out):
-    """Parse key=value fields from dcentrald fan one-shots."""
-    parsed = {}
-    for key in (
-        "commanded_pwm",
-        "commanded_readback",
-        "commanded_pwm0",
-        "commanded_pwm1",
-        "max_rpm",
-    ):
-        match = re.search(r"{}=([0-9]+)".format(key), out)
-        if match:
-            parsed[key] = int(match.group(1))
-    if "commanded_pwm" not in parsed and "commanded_readback" in parsed:
-        parsed["commanded_pwm"] = parsed["commanded_readback"]
-    match = re.search(r"per_fan_rpm=\[([^\]]*)\]", out)
-    if match:
-        values = []
-        for item in match.group(1).split(","):
-            item = item.strip()
-            if not item:
-                continue
-            if ":" in item:
-                item = item.split(":", 1)[1].strip()
-            try:
-                values.append(int(item))
-            except ValueError:
-                pass
-        parsed["per_fan_rpm"] = values
-    return parsed
 
 
 # =============================================================================
 # MCP Tool Implementations
 # =============================================================================
 
-def tool_get_system_status(params):
-    """Get comprehensive system health snapshot."""
-    status = {
-        "hostname": run_cmd("hostname"),
-        "kernel": run_cmd("uname -r"),
-        "arch": run_cmd("uname -m"),
-        "uptime": run_cmd("uptime"),
+def _raw_hardware_unavailable(interface, operation, params=None):
+    """Fail closed until a typed daemon-owned snapshot or broker exists."""
+    requested = params if isinstance(params, dict) else {}
+    return {
+        "status": "unavailable",
+        "interface": interface,
+        "operation": operation,
+        "requested": requested,
+        "hardware_access_attempted": False,
+        "reason": (
+            f"Direct {interface} access from the MCP process is retired. "
+            "dcentrald is the exclusive runtime hardware owner; add a serialized daemon snapshot "
+            "or command broker before restoring this operation."
+        ),
     }
 
-    meminfo = run_cmd("free -h 2>/dev/null | grep Mem")
-    if meminfo:
-        parts = meminfo.split()
-        status["memory"] = {
-            "total": parts[1] if len(parts) > 1 else "?",
-            "used": parts[2] if len(parts) > 2 else "?",
-            "free": parts[3] if len(parts) > 3 else "?",
-        }
 
-    loadavg = run_cmd("cat /proc/loadavg")
-    if loadavg:
-        parts = loadavg.split()
-        status["load"] = {"1m": parts[0], "5m": parts[1], "15m": parts[2]}
+def _raw_i2c_unavailable(operation, params=None):
+    """Preserve the I2C-specific compatibility helper."""
+    return _raw_hardware_unavailable("I2C", operation, params)
 
-    ip_info = run_cmd("ip addr show eth0 2>/dev/null | grep 'inet '")
-    if ip_info:
-        status["ip"] = ip_info.strip().split()[1]
 
-    uio_count = len(list(
-        f for f in os.listdir("/sys/class/uio") if f.startswith("uio")
-    )) if os.path.exists("/sys/class/uio") else 0
-    status["platform"] = get_platform_key()
-    status["uio_devices"] = uio_count
-
-    if is_zynq_platform():
-        fpga_ver = run_cmd("devmem 0x43C00000 32 2>/dev/null")
-        status["fpga_version"] = fpga_ver or "N/A"
-    else:
-        status["fpga_version"] = "N/A"
-
-    return status
+def tool_get_system_status(params):
+    """Return the daemon-owned runtime status snapshot."""
+    return tool_live_stats(params)
 
 
 def tool_get_temperatures(params):
-    """Read all temperature sensors (TMP75 on I2C, ASIC internal)."""
-    temps = {}
-    for bus in [0, 1, 2]:
-        for addr in ["0x48", "0x49", "0x4a", "0x4b", "0x4c", "0x4d", "0x4e", "0x4f"]:
-            raw = run_cmd(f"i2cget -y {bus} {addr} 0x00 w 2>/dev/null")
-            if raw and raw != "0x0000":
-                try:
-                    val = int(raw, 16)
-                    msb = val & 0xFF
-                    lsb = (val >> 8) & 0xFF
-                    temp_raw = (msb << 4) | (lsb >> 4)
-                    if temp_raw & 0x800:
-                        temp_raw -= 4096
-                    temp_c = round(temp_raw * 0.0625, 1)
-                    temps[f"bus{bus}_{addr}"] = {"celsius": temp_c, "bus": bus, "address": addr}
-                except Exception:
-                    pass
-    return {"sensors": temps, "count": len(temps)}
+    """Return daemon-owned per-chain temperature snapshots.
+
+    The MCP process is an API adapter, not a second hardware owner. Direct
+    sensor polling would bypass dcentrald's serialized bus service and can
+    consume a controller reply intended for the mining runtime.
+    """
+    status = tool_live_stats({})
+    if "error" in status:
+        return {
+            "status": "unavailable",
+            "source": "dcentrald /api/status",
+            "sensors": {},
+            "count": 0,
+            "error": status["error"],
+        }
+
+    sensors = {}
+    chains = status.get("chains", [])
+    if isinstance(chains, list):
+        for chain in chains:
+            if not isinstance(chain, dict):
+                continue
+            temp_c = chain.get("temp_c")
+            if not isinstance(temp_c, (int, float)) or temp_c <= 0:
+                continue
+            chain_id = chain.get("id", "unknown")
+            sensors[f"chain_{chain_id}"] = {
+                "celsius": temp_c,
+                "source": chain.get("temp_source") or "dcentrald snapshot",
+                "chain_id": chain_id,
+            }
+    return {
+        "status": "ok" if sensors else "unavailable",
+        "source": "dcentrald /api/status",
+        "sensors": sensors,
+        "count": len(sensors),
+    }
 
 
 def tool_get_chain_status(params):
-    """Get hash board chain detection status via FPGA GPIO.
-    GPIOs 902-904 on gpiochip897 (FPGA 0x41200000, bits 5-7).
-    Active HIGH: 1 = board plugged, 0 = not plugged."""
-    if not is_zynq_platform():
-        return platform_refused("FPGA GPIO chain status")
-    chains = {}
-    for chain_id, gpio in [("6", "902"), ("7", "903"), ("8", "904")]:
-        gpio_path = f"/sys/class/gpio/gpio{gpio}/value"
-        if not os.path.exists(gpio_path):
-            # Auto-export GPIO if not already exported
-            try:
-                with open("/sys/class/gpio/export", "w") as f:
-                    f.write(gpio)
-                with open(f"/sys/class/gpio/gpio{gpio}/direction", "w") as f:
-                    f.write("in")
-            except Exception:
-                pass
-        if os.path.exists(gpio_path):
-            try:
-                val = open(gpio_path).read().strip()
-                chains[f"chain_{chain_id}"] = {
-                    "plugged": val == "1",  # Active HIGH: 1 = connected
-                    "gpio_pin": gpio,
-                    "gpio_value": val,
-                }
-            except Exception:
-                chains[f"chain_{chain_id}"] = {"error": "cannot read GPIO"}
-        else:
-            chains[f"chain_{chain_id}"] = {"gpio_exported": False}
-    return {"chains": chains}
+    """Return daemon-owned chain state without touching GPIO."""
+    status = tool_live_stats(params)
+    if "error" in status:
+        return status
+    return {
+        "status": "ok",
+        "source": "dcentrald /api/status",
+        "chains": status.get("chains", []),
+        "hardware_access_attempted": False,
+    }
 
 
 def tool_get_fpga_registers(params):
-    """Read FPGA registers. Args: base_addr (hex), count (int, default 6)."""
-    if not is_zynq_platform():
-        return platform_refused("FPGA register reads")
-    base = int(params.get("base_addr", "0x43C00000"), 16)
-    count = min(int(params.get("count", 6)), 32)
-    regs = {}
-    for i in range(count):
-        addr = base + (i * 4)
-        val = run_cmd(f"devmem 0x{addr:08X} 32 2>/dev/null")
-        regs[f"0x{addr:08X}"] = val or "ERROR"
-    return {"base": f"0x{base:08X}", "registers": regs}
+    """Preserve the legacy tool name without opening physical memory."""
+    return _raw_hardware_unavailable("FPGA register", "read", params)
 
 
 def tool_get_i2c_scan(params):
-    """Scan I2C bus for connected devices. Args: bus (int, default 0)."""
-    bus = int(params.get("bus", 0))
-    output = run_cmd(f"i2cdetect -y {bus} 2>/dev/null")
-    devices = []
-    for line in output.split("\n")[1:]:
-        parts = line.split(":")
-        if len(parts) == 2:
-            row_base = int(parts[0].strip(), 16)
-            cols = parts[1].split()
-            for j, col in enumerate(cols):
-                if col != "--" and col != "UU" and col != "":
-                    try:
-                        addr = int(col, 16)
-                        devices.append({"address": f"0x{addr:02x}", "status": "active"})
-                    except ValueError:
-                        if col == "UU":
-                            devices.append({"address": f"0x{row_base + j:02x}", "status": "in-use"})
-    return {"bus": bus, "devices": devices, "count": len(devices)}
+    """Preserve the legacy tool name without bypassing daemon ownership."""
+    return _raw_i2c_unavailable("scan", params)
 
 
 def tool_read_i2c_register(params):
-    """Read I2C register. Args: bus, address, register."""
-    bus = int(params.get("bus", 0))
-    addr = params.get("address", "0x48")
-    reg = params.get("register", "0x00")
-    mode = params.get("mode", "b")  # b=byte, w=word
-    val = run_cmd(f"i2cget -y {bus} {addr} {reg} {mode} 2>/dev/null")
-    return {"bus": bus, "address": addr, "register": reg, "value": val or "ERROR"}
+    """Preserve the legacy tool name without bypassing daemon ownership."""
+    return _raw_i2c_unavailable("read", params)
 
 
 def tool_get_nand_info(params):
@@ -694,171 +588,41 @@ def tool_get_uio_devices(params):
 
 
 def tool_run_diagnostic(params):
-    """Run full hardware diagnostic suite."""
-    results = {
-        "platform": get_platform_key(),
-        "system": tool_get_system_status({}),
+    """Compose diagnostics from daemon snapshots and OS metadata."""
+    status = tool_live_stats({})
+    return {
+        "status": "ok" if "error" not in status else "unavailable",
+        "source": "dcentrald snapshots",
+        "system": status,
         "temperatures": tool_get_temperatures({}),
         "chains": tool_get_chain_status({}),
         "uio": tool_get_uio_devices({}),
+        "hardware_access_attempted": False,
     }
-
-    # Quick health assessment
-    issues = []
-    if is_zynq_platform() and results["uio"]["count"] == 0:
-        issues.append("No UIO devices found — FPGA bitstream may not be loaded")
-    if results["temperatures"]["count"] == 0:
-        issues.append("No temperature sensors detected — boards may need power")
-    if "chains" in results["chains"]:
-        for cid in ["6", "7", "8"]:
-            chain = results["chains"]["chains"].get(f"chain_{cid}", {})
-            if chain.get("plugged") is False:
-                issues.append(f"Chain {cid} not plugged in")
-
-    results["health"] = "OK" if not issues else "ISSUES"
-    results["issues"] = issues
-    return results
 
 
 def tool_get_fan_speed(params):
-    """Read current fan command and physical RPM."""
-    if uio_fan_control_present():
-        ok, out = dcentrald_fan_cmd(["--get-fan"])
-        parsed = parse_dcentrald_fan_output(out)
-        commanded = parsed.get("commanded_pwm")
-        result = {
-            "backend": "dcentrald_uio",
-            "ok": ok,
-            "raw": out,
-            "commanded_pwm": commanded,
-            "commanded_pwm0": parsed.get("commanded_pwm0"),
-            "commanded_pwm1": parsed.get("commanded_pwm1"),
-            "max_rpm": parsed.get("max_rpm"),
-            "per_fan_rpm": parsed.get("per_fan_rpm", []),
-            "pwm": commanded,
-            "pwm_percent": commanded,
-            "rpm": parsed.get("max_rpm"),
-            "note": "fan-control is UIO-bound; devmem is not fan proof",
-        }
-        if not ok:
-            result["error"] = out or "dcentrald fan helper failed"
-        return result
-
-    if am2_target_without_fan_uio():
-        return {
-            "ok": False,
-            "status": "fan_uio_missing",
-            "platform": get_platform_key(),
-            "error": "AM2/XIL fan-control UIO is missing; devmem fan reads are not valid fan evidence",
-        }
-
-    if not is_zynq_platform():
-        return platform_refused("Zynq FPGA fan register reads")
-    fan0_rps = run_cmd("devmem 0x42800000 32 2>/dev/null")
-    fan1_rps = run_cmd("devmem 0x42800004 32 2>/dev/null")
-    fan_pwm0 = run_cmd("devmem 0x42800010 32 2>/dev/null")
-    fan_pwm1 = run_cmd("devmem 0x42800014 32 2>/dev/null")
-    result = {"fan0": {}, "fan1": {}}
-    try:
-        rps0 = int(fan0_rps, 0) & 0xFF if fan0_rps else 0
-        result["fan0"]["rps"] = rps0
-        result["fan0"]["rpm"] = rps0 * 60
-    except ValueError:
-        result["fan0"]["rpm"] = 0
-    try:
-        rps1 = int(fan1_rps, 0) & 0xFF if fan1_rps else 0
-        result["fan1"]["rps"] = rps1
-        result["fan1"]["rpm"] = rps1 * 60
-    except ValueError:
-        result["fan1"]["rpm"] = 0
-    try:
-        pwm = int(fan_pwm0, 0) & 0x7F if fan_pwm0 else 0
-        result["pwm"] = pwm
-        result["pwm_percent"] = min(round(pwm / 1.27), 100)
-    except ValueError:
-        result["pwm"] = 0
-    # Primary RPM = whichever fan has a reading (fan0 preferred, fallback to fan1)
-    rpm0 = result["fan0"].get("rpm", 0)
-    rpm1 = result["fan1"].get("rpm", 0)
-    result["rpm"] = rpm0 if rpm0 > 0 else rpm1
-    return result
+    """Return daemon-published fan telemetry."""
+    status = tool_live_stats({})
+    if "error" in status:
+        return status
+    fans = status.get("fans", {})
+    return {
+        "status": "ok" if isinstance(fans, dict) else "unavailable",
+        "source": "dcentrald /api/status",
+        "fans": fans if isinstance(fans, dict) else {},
+        "hardware_access_attempted": False,
+    }
 
 
 def tool_set_fan_speed(params):
-    """Set fan PWM command. Args: pwm (0-30 UIO/home) or percent."""
-    if "pwm" not in params and "percent" not in params:
-        return {
-            "ok": False,
-            "error": "missing required pwm or percent; refusing to change fan speed by default",
-        }
-    if uio_fan_control_present():
-        # MCP-4: `percent` (0-100) and `pwm` (raw 0-127 PWM scale) are DISTINCT
-        # units. dcentrald --set-fan expects a RAW PWM value, so a `percent`
-        # request is first converted to PWM (percent * 1.27, the same factor the
-        # legacy devmem path uses) — previously a `percent` value was applied
-        # verbatim as raw PWM. Either unit is then hard-clamped to the PWM-30
-        # home cap so this control can never command a louder-than-home fan.
-        if "pwm" in params:
-            requested_unit = "pwm"
-            requested_pwm = max(0, int(params["pwm"]))
-        else:
-            requested_unit = "percent"
-            requested_percent = max(0, min(100, int(params["percent"])))
-            requested_pwm = int(round(requested_percent * 1.27))
-        pwm_val = max(0, min(30, requested_pwm))
-        ok, out = dcentrald_fan_cmd(["--set-fan", str(pwm_val)])
-        parsed = parse_dcentrald_fan_output(out)
-        result = {
-            "backend": "dcentrald_uio",
-            "ok": ok,
-            "requested_unit": requested_unit,
-            "requested_pwm_raw": requested_pwm,
-            "requested_pwm": pwm_val,
-            "home_cap_pwm": 30,
-            "pwm_scale_max": 127,
-            "clamped": pwm_val != requested_pwm,
-            "commanded_pwm": parsed.get("commanded_pwm"),
-            "commanded_pwm0": parsed.get("commanded_pwm0"),
-            "commanded_pwm1": parsed.get("commanded_pwm1"),
-            "max_rpm": parsed.get("max_rpm"),
-            "per_fan_rpm": parsed.get("per_fan_rpm", []),
-            "raw": out,
-            "note": "commanded PWM is not acoustic proof; check max_rpm/operator hearing",
-        }
-        if not ok:
-            result["error"] = out or "dcentrald fan helper failed"
-        return result
-
-    if am2_target_without_fan_uio():
-        return {
-            "ok": False,
-            "status": "fan_uio_missing",
-            "platform": get_platform_key(),
-            "error": "AM2/XIL fan-control UIO is missing; refusing stale devmem fan write",
-        }
-
-    if not is_zynq_platform():
-        return platform_refused("Zynq FPGA fan register writes")
-    if "pwm" in params:
-        pwm_val = max(0, min(127, int(params["pwm"])))
-    elif "percent" in params:
-        pct = max(0, min(100, int(params["percent"])))
-        pwm_val = int(pct * 1.27)
-    run_cmd(f"devmem 0x42800010 32 {pwm_val} 2>/dev/null")
-    run_cmd(f"devmem 0x42800014 32 {pwm_val} 2>/dev/null")
-    return {"set_pwm": pwm_val, "set_percent": min(round(pwm_val / 1.27), 100)}
+    """Preserve the legacy mutation tool until an authenticated broker exists."""
+    return _raw_hardware_unavailable("fan controller", "write", params)
 
 
 def tool_read_devmem(params):
-    """Read memory-mapped register. Args: address (hex string)."""
-    if not is_zynq_platform():
-        return platform_refused("raw devmem reads")
-    addr = params.get("address", "0x43C00000")
-    # Sanitize address to prevent command injection
-    if not re.match(r'^0x[0-9a-fA-F]{1,8}$', addr):
-        return {"address": addr, "value": "ERROR", "error": "Invalid address format (use 0x hex)"}
-    val = run_cmd(f"devmem {addr} 32 2>/dev/null")
-    return {"address": addr, "value": val or "ERROR"}
+    """Preserve the legacy tool name without opening physical memory."""
+    return _raw_hardware_unavailable("physical memory", "read", params)
 
 
 def _validate_hex(value, name="value"):
@@ -869,160 +633,52 @@ def _validate_hex(value, name="value"):
 
 
 def tool_write_fpga_register(params):
-    """Write 32-bit FPGA register via devmem. Args: address (hex), value (hex)."""
-    if not is_zynq_platform():
-        return platform_refused("FPGA register writes")
-    addr = params.get("address", "")
-    value = params.get("value", "")
-    err = _validate_hex(addr, "address")
-    if err:
-        return err
-    err = _validate_hex(value, "value")
-    if err:
-        return err
-    run_cmd(f"devmem {addr} 32 {value} 2>/dev/null")
-    # Read back to confirm
-    readback = run_cmd(f"devmem {addr} 32 2>/dev/null")
-    return {"address": addr, "written": value, "readback": readback or "ERROR"}
+    """Preserve the legacy tool name without mutating FPGA registers."""
+    return _raw_hardware_unavailable("FPGA register", "write", params)
 
 
 def tool_write_devmem(params):
-    """Write arbitrary physical address via devmem. Args: address (hex), value (hex)."""
-    if not is_zynq_platform():
-        return platform_refused("raw devmem writes")
-    addr = params.get("address", "")
-    value = params.get("value", "")
-    err = _validate_hex(addr, "address")
-    if err:
-        return err
-    err = _validate_hex(value, "value")
-    if err:
-        return err
-    run_cmd(f"devmem {addr} 32 {value} 2>/dev/null")
-    readback = run_cmd(f"devmem {addr} 32 2>/dev/null")
-    return {"address": addr, "written": value, "readback": readback or "ERROR"}
+    """Preserve the legacy tool name without mutating physical memory."""
+    return _raw_hardware_unavailable("physical memory", "write", params)
 
 
 def tool_write_i2c_register(params):
-    """Write I2C device register via i2cset. Args: bus, address, register, value, mode."""
-    bus = int(params.get("bus", 0))
-    addr = params.get("address", "0x48")
-    reg = params.get("register", "0x00")
-    value = params.get("value", "0x00")
-    mode = params.get("mode", "b")
-    if get_platform_key().startswith("am3-aml") and os.environ.get("DCENT_MCP_ALLOW_UNSAFE_I2C_WRITE") != "1":
-        return {
-            "error": "I2C writes are disabled on am3-aml MCP by default",
-            "platform": get_platform_key(),
-            "status": "refused",
-        }
-    # Validate hex args
-    for name, val in [("address", addr), ("register", reg), ("value", value)]:
-        if not re.match(r'^0x[0-9a-fA-F]{1,4}$', val):
-            return {"error": f"Invalid {name} format (use 0x hex)"}
-    if mode not in ("b", "w"):
-        return {"error": "mode must be 'b' (byte) or 'w' (word)"}
-    result = run_cmd(f"i2cset -y {bus} {addr} {reg} {value} {mode} 2>/dev/null")
-    # Read back
-    readback = run_cmd(f"i2cget -y {bus} {addr} {reg} {mode} 2>/dev/null")
-    return {
-        "bus": bus, "address": addr, "register": reg,
-        "written": value, "readback": readback or "ERROR",
-    }
+    """Refuse the legacy parallel write path."""
+    return _raw_i2c_unavailable("write", params)
 
 
 def tool_pic_status(params):
-    """Read all 3 PICs at I2C addresses 0x55, 0x56, 0x57 on bus 1."""
-    pics = {}
-    status_map = {0xCC: "bootloader", 0x60: "app_mode"}
-    for addr_int, label in [(0x55, "chain_6"), (0x56, "chain_7"), (0x57, "chain_8")]:
-        addr_hex = f"0x{addr_int:02x}"
-        raw = run_cmd(f"i2cget -y 1 {addr_hex} 2>/dev/null")
-        if raw:
-            try:
-                val = int(raw, 16)
-                state = status_map.get(val, "unknown")
-                pics[label] = {
-                    "address": addr_hex,
-                    "raw_byte": f"0x{val:02x}",
-                    "state": state,
-                }
-            except ValueError:
-                pics[label] = {"address": addr_hex, "raw": raw, "state": "parse_error"}
-        else:
-            pics[label] = {"address": addr_hex, "state": "no_response"}
-    return {"pics": pics}
+    """Return the daemon-owned PIC catalog/live-snapshot surface."""
+    raw = run_cmd("curl -s http://127.0.0.1:8080/api/hardware/pic_info", timeout=3)
+    if not raw:
+        return {
+            "status": "unavailable",
+            "source": "dcentrald /api/hardware/pic_info",
+            "error": "dcentrald PIC snapshot endpoint not responding",
+        }
+    try:
+        return sanitize_obj(json.loads(raw))
+    except json.JSONDecodeError:
+        return {
+            "status": "unavailable",
+            "source": "dcentrald /api/hardware/pic_info",
+            "error": "invalid JSON from daemon PIC snapshot endpoint",
+        }
 
 
 def tool_gpio_read(params):
-    """Read any GPIO pin. Args: pin (int)."""
-    pin = int(params.get("pin", 0))
-    gpio_path = f"/sys/class/gpio/gpio{pin}/value"
-    if not os.path.exists(gpio_path):
-        try:
-            with open("/sys/class/gpio/export", "w") as f:
-                f.write(str(pin))
-            with open(f"/sys/class/gpio/gpio{pin}/direction", "w") as f:
-                f.write("in")
-        except Exception as e:
-            return {"pin": pin, "error": f"Cannot export GPIO: {e}"}
-    try:
-        val = open(gpio_path).read().strip()
-        return {"pin": pin, "value": int(val)}
-    except Exception as e:
-        return {"pin": pin, "error": str(e)}
+    """Preserve the legacy tool name without exporting or reading GPIO."""
+    return _raw_hardware_unavailable("GPIO", "read", params)
 
 
 def tool_gpio_write(params):
-    """Write GPIO pin with safety check. Args: pin (int), value (0/1).
-    REFUSES if pin < 890 to prevent accidental writes to critical system GPIOs."""
-    pin = int(params.get("pin", 0))
-    value = int(params.get("value", 0))
-    if pin < 890:
-        return {"pin": pin, "error": "REFUSED: pin < 890 — writing to low GPIO pins risks damaging system hardware"}
-    if value not in (0, 1):
-        return {"pin": pin, "error": "value must be 0 or 1"}
-    gpio_path = f"/sys/class/gpio/gpio{pin}"
-    if not os.path.exists(gpio_path):
-        try:
-            with open("/sys/class/gpio/export", "w") as f:
-                f.write(str(pin))
-        except Exception as e:
-            return {"pin": pin, "error": f"Cannot export GPIO: {e}"}
-    try:
-        with open(f"{gpio_path}/direction", "w") as f:
-            f.write("out")
-        with open(f"{gpio_path}/value", "w") as f:
-            f.write(str(value))
-        return {"pin": pin, "value": value, "status": "ok"}
-    except Exception as e:
-        return {"pin": pin, "error": str(e)}
+    """Preserve the legacy tool name without mutating GPIO."""
+    return _raw_hardware_unavailable("GPIO", "write", params)
 
 
 def tool_board_control(params):
-    """Enable/disable/reset hash board by chain ID (6/7/8).
-    Uses devmem on FPGA CTRL_REG at chain base address."""
-    if not is_zynq_platform():
-        return platform_refused("FPGA board control")
-    chain_id = int(params.get("chain_id", 6))
-    action = params.get("action", "enable")
-    chain_bases = {6: 0x43C00000, 7: 0x43C10000, 8: 0x43C20000}
-    if chain_id not in chain_bases:
-        return {"error": "chain_id must be 6, 7, or 8"}
-    if action not in ("enable", "disable", "reset"):
-        return {"error": "action must be enable, disable, or reset"}
-    base = chain_bases[chain_id]
-    ctrl_addr = f"0x{base:08X}"
-    if action == "enable":
-        run_cmd(f"devmem {ctrl_addr} 32 0x0C 2>/dev/null")
-    elif action == "disable":
-        run_cmd(f"devmem {ctrl_addr} 32 0x00 2>/dev/null")
-    elif action == "reset":
-        run_cmd(f"devmem {ctrl_addr} 32 0x00 2>/dev/null")
-        time.sleep(0.1)
-        run_cmd(f"devmem {ctrl_addr} 32 0x0C 2>/dev/null")
-    readback = run_cmd(f"devmem {ctrl_addr} 32 2>/dev/null")
-    return {"chain_id": chain_id, "action": action, "ctrl_reg": readback or "ERROR"}
+    """Preserve the legacy tool name without mutating board control."""
+    return _raw_hardware_unavailable("FPGA board control", "mutate", params)
 
 
 def tool_get_hashrate(params):
@@ -1380,22 +1036,22 @@ TOOLS = {
         "handler": tool_set_pool,
     },
     "get_system_status": {
-        "description": "Get comprehensive system health snapshot including kernel, memory, load, network, FPGA version, and UIO device count.",
+        "description": "Return the daemon-owned runtime status snapshot.",
         "inputSchema": {"type": "object", "properties": {}},
         "handler": tool_get_system_status,
     },
     "get_temperatures": {
-        "description": "Read all temperature sensors (TMP75/NCT218 on I2C buses). Returns celsius readings for each detected sensor.",
+        "description": "Return daemon-owned per-chain temperature snapshots without opening hardware buses.",
         "inputSchema": {"type": "object", "properties": {}},
         "handler": tool_get_temperatures,
     },
     "get_chain_status": {
-        "description": "Get hash board chain detection status for chains 6, 7, 8. Shows GPIO plug-detect state for each chain slot.",
+        "description": "Return daemon-owned chain state without exporting or reading GPIOs.",
         "inputSchema": {"type": "object", "properties": {}},
         "handler": tool_get_chain_status,
     },
     "get_fpga_registers": {
-        "description": "Read FPGA registers starting from a base address. Useful for inspecting UART FIFO status, baud rate config, and chain control registers.",
+        "description": "Compatibility stub: raw FPGA register reads are unavailable outside the daemon owner.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1406,7 +1062,7 @@ TOOLS = {
         "handler": tool_get_fpga_registers,
     },
     "get_i2c_scan": {
-        "description": "Scan an I2C bus to discover connected devices (PIC voltage controllers, temperature sensors, EEPROM, PSU).",
+        "description": "Compatibility stub: unavailable until dcentrald exposes a serialized topology snapshot.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1416,7 +1072,7 @@ TOOLS = {
         "handler": tool_get_i2c_scan,
     },
     "read_i2c_register": {
-        "description": "Read a specific register from an I2C device.",
+        "description": "Compatibility stub: direct register access is unavailable outside the dcentrald hardware owner.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1440,12 +1096,12 @@ TOOLS = {
         "handler": tool_get_uio_devices,
     },
     "run_diagnostic": {
-        "description": "Run a comprehensive hardware diagnostic. Checks system health, temperatures, chain detection, and UIO devices. Returns issues list if any problems found.",
+        "description": "Compose a diagnostic view from daemon snapshots and read-only OS metadata.",
         "inputSchema": {"type": "object", "properties": {}},
         "handler": tool_run_diagnostic,
     },
     "get_fan_speed": {
-        "description": "Read current fan command and physical RPM. UIO fan-control uses the dcentrald one-shot; devmem is not fan proof.",
+        "description": "Return daemon-published fan command and RPM telemetry.",
         "inputSchema": {"type": "object", "properties": {}},
         "handler": tool_get_fan_speed,
     },
@@ -1455,12 +1111,13 @@ TOOLS = {
     # superset extensions are axe-only by design (keep-unique fence,
     # mcp-auth-contract §2.2/§6) — OS reaches frequency/voltage EFFECTS through
     # its OWN low-level tools (set_config / write_i2c_register), which are NOT
-    # superset aliases and stay OS-private. As a CONTROL tool, set_fan_speed is
-    # a WRITE_TOOLS member and routes through _write_tool_authorized()
-    # (open-on-dev / locked-on-release, fail-CLOSED). Drift-pinned by
+    # superset aliases and stay OS-private. The compatibility name remains a
+    # WRITE_TOOLS member and routes through _write_tool_authorized(), but fails
+    # closed until dcentrald exposes an authenticated serialized fan broker.
+    # Drift-pinned by
     # dcent-schema/tests/python_overlay_drift.rs::python_overlays_match_the_tuning_superset.
     "set_fan_speed": {
-        "description": "Set fan PWM command. WARNING: low PWM may still have a loud physical RPM floor; verify max_rpm.",
+        "description": "Compatibility stub: fan mutation is unavailable until dcentrald exposes an authenticated serialized broker.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1471,7 +1128,7 @@ TOOLS = {
         "handler": tool_set_fan_speed,
     },
     "read_devmem": {
-        "description": "Read a 32-bit value from a memory-mapped register address. Used for FPGA register inspection.",
+        "description": "Compatibility stub: raw physical-memory reads are unavailable in the runtime image.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1482,7 +1139,7 @@ TOOLS = {
         "handler": tool_read_devmem,
     },
     "write_fpga_register": {
-        "description": "Write a 32-bit value to an FPGA register via devmem. Reads back to confirm.",
+        "description": "Compatibility stub: raw FPGA register writes are unavailable in the runtime image.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1494,7 +1151,7 @@ TOOLS = {
         "handler": tool_write_fpga_register,
     },
     "write_devmem": {
-        "description": "Write a 32-bit value to any physical memory address via devmem. Reads back to confirm.",
+        "description": "Compatibility stub: raw physical-memory writes are unavailable in the runtime image.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1506,7 +1163,7 @@ TOOLS = {
         "handler": tool_write_devmem,
     },
     "write_i2c_register": {
-        "description": "Write a value to an I2C device register via i2cset. Reads back to confirm.",
+        "description": "Retired compatibility stub: parallel I2C mutation is always refused.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1521,12 +1178,12 @@ TOOLS = {
         "handler": tool_write_i2c_register,
     },
     "pic_status": {
-        "description": "Read all 3 PIC voltage controllers (0x55, 0x56, 0x57 on I2C bus 1). Returns state: bootloader (0xCC), app_mode (0x60), or unknown/dead.",
+        "description": "Return the daemon-owned PIC catalog and live-snapshot status; never probe controllers directly.",
         "inputSchema": {"type": "object", "properties": {}},
         "handler": tool_pic_status,
     },
     "gpio_read": {
-        "description": "Read a GPIO pin value. Auto-exports the pin if needed.",
+        "description": "Compatibility stub: raw GPIO reads are unavailable outside the daemon owner.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1537,7 +1194,7 @@ TOOLS = {
         "handler": tool_gpio_read,
     },
     "gpio_write": {
-        "description": "Write a GPIO pin (0 or 1). REFUSES pins below 890 to protect critical system GPIOs.",
+        "description": "Compatibility stub: raw GPIO writes are unavailable outside the daemon owner.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1549,7 +1206,7 @@ TOOLS = {
         "handler": tool_gpio_write,
     },
     "board_control": {
-        "description": "Enable, disable, or reset a hash board by chain ID. Writes FPGA CTRL_REG. WARNING: disable can break FPGA UART state if traffic is flowing.",
+        "description": "Compatibility stub: direct FPGA board-control mutations are unavailable.",
         "inputSchema": {
             "type": "object",
             "properties": {

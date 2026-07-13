@@ -7,8 +7,9 @@
 //!
 //! Per memory rule , RESET (0x07) is BANNED on
 //! fw=0x89 (it permanently downgrades the firmware to fw=0x86). The
-//! `dspic_flash` module is gated behind the `recovery-tool` Cargo feature
-//! so destructive symbols cannot link into `dcentrald`.
+//! Recovery research is gated behind the `recovery-tool` Cargo feature, which
+//! no shipped binary enables, so destructive symbols cannot link into
+//! `dcentrald` or the diagnostic-only controller tools.
 //!
 //! Wire format:
 //!   * `set_voltage`:  `[55 AA 04 10 DAC SUM]` — framed DAC encoding.

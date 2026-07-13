@@ -1,4 +1,4 @@
-# DCENTos Hacker Shell - bash configuration
+# DCENT_OS operator shell configuration
 
 # Colored prompt (red for root)
 if [ "$(id -u)" -eq 0 ]; then
@@ -11,23 +11,16 @@ fi
 alias ll='ls -la'
 alias la='ls -A'
 alias l='ls -CF'
-alias tools='ls /root/tools/*.py'
 alias dmesg='dmesg --color=always'
 
-# Quick hardware access aliases
-alias fpga='devmem 0x43C00000 32'
-alias i2c-scan='for b in 0 1 2 3 4 5 6 7; do echo "=== Bus $b ==="; i2cdetect -y $b 2>/dev/null; done'
-alias uart-cfg='stty -F /dev/ttyPS1 115200 cs8 -cstopb -parenb raw'
+# Read-only daemon snapshot aliases. Standalone hardware access is excluded
+# from runtime images so dcentrald remains the sole I2C/UART/UIO owner.
+alias miner-status='curl -fsS http://127.0.0.1:8080/api/status'
+alias device-info='curl -fsS http://127.0.0.1:8080/api/system/info'
+alias pic-info='curl -fsS http://127.0.0.1:8080/api/hardware/pic_info'
+alias psu-info='curl -fsS http://127.0.0.1:8080/api/diagnostics/troubleshoot/psu'
 alias mtd-info='cat /proc/mtd'
 alias mod-info='lsmod'
-
-# Tool shortcuts
-alias scan-regs='python3 /root/tools/register_scanner.py'
-alias enum-chain='python3 /root/tools/asic_enumerator.py'
-alias probe-psu='python3 /root/tools/psu_probe.py'
-alias find-temp='python3 /root/tools/temp_finder.py'
-alias verify='python3 /root/tools/assumption_verifier.py'
-alias test-all='/root/tools/test_suite.sh'
 
 # History
 HISTSIZE=1000
@@ -37,26 +30,18 @@ HISTCONTROL=ignoredups:ignorespace
 # Help function
 help-tools() {
     echo ""
-    echo "=== DCENTos Hacker Shell Tools ==="
+    echo "=== DCENT_OS Operator Tools ==="
     echo ""
-    echo "Hardware Probing:"
-    echo "  scan-regs      - Scan all ASIC registers (BM1387)"
-    echo "  enum-chain     - Enumerate ASIC chain (discover chips)"
-    echo "  probe-psu      - Probe PSU via I2C/PMBus"
-    echo "  find-temp      - Discover temperature registers"
-    echo "  fpga           - Read FPGA base register"
-    echo "  i2c-scan       - Scan all I2C buses"
-    echo ""
-    echo "Testing:"
-    echo "  verify         - Run assumption verifier"
-    echo "  test-all       - Run full test suite"
+    echo "Daemon snapshots:"
+    echo "  miner-status   - Live miner and per-chain telemetry"
+    echo "  device-info    - Platform and ASIC identity"
+    echo "  pic-info       - PIC catalog and daemon-owned observations"
+    echo "  psu-info       - PSU/power snapshot without a live bus probe"
     echo ""
     echo "System:"
-    echo "  uart-cfg       - Configure UART for hash board"
     echo "  mtd-info       - Show NAND partition table"
     echo "  mod-info       - Show loaded kernel modules"
     echo ""
-    echo "Interactive:"
-    echo "  dcent-shell    - Launch interactive research toolkit"
-    echo ""
+    echo "Raw research tools require a future exclusive-owner repair image."
+    echo "They are intentionally absent from the normal runtime rootfs."
 }

@@ -1,0 +1,19 @@
+{"schema":"dcent-init-trace-v1","model":"s19jpro","strictness":"structural","provenance":["",""," Sniffing Techniques LIVE Capture from 20231213 - Antminer S19j Pro - Capture 3 - 545mhz.sal"]}
+{"event":"baud_changed","chain_id":0,"baud":114678}
+{"event":"command","chain_id":0,"bytes":[81,9,0,164]}
+{"event":"command","chain_id":0,"bytes":[144,0,255,255]}
+{"event":"command","chain_id":0,"bytes":[81,9,0,20]}
+{"event":"command","chain_id":0,"bytes":[0,0,0,255]}
+{"event":"command","chain_id":0,"bytes":[81,9,0,88]}
+{"event":"command","chain_id":0,"bytes":[0,1,17,17]}
+{"event":"command","chain_id":0,"bytes":[81,9,0,84]}
+{"event":"command","chain_id":0,"bytes":[0,0,0,3]}
+{"event":"command","chain_id":0,"bytes":[81,9,0,40]}
+{"event":"command","chain_id":0,"bytes":[0,0,48,17]}
+{"event":"command","chain_id":0,"bytes":[81,9,0,24]}
+{"event":"command","chain_id":0,"bytes":[0,193,0,176]}
+{"event":"baud_changed","chain_id":0,"baud":3125000}
+{"event":"command","chain_id":0,"bytes":[81,9,0,16]}
+{"event":"command","chain_id":0,"bytes":[0,0,19,129]}
+{"event":"command","chain_id":0,"bytes":[81,9,0,8]}
+{"event":"command","chain_id":0,"bytes":[80,218,1,65]}

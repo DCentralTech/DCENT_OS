@@ -1026,6 +1026,34 @@ mod tests {
         }
     }
 
+    /// BoardDesc public-beta targets must never be TD-003 management-only blocked.
+    #[test]
+    fn board_desc_public_beta_targets_are_not_td003_blocked() {
+        for desc in dcentrald_common::BoardDesc::all_registered() {
+            if !desc.public_beta_install {
+                continue;
+            }
+            assert_eq!(
+                td003_management_only_board_target(desc.board_target),
+                None,
+                "BoardDesc public_beta_install target {} must not be TD-003 blocked",
+                desc.board_target
+            );
+            assert!(
+                dcentrald_common::BoardDesc::is_public_beta_install_target(desc.board_target),
+                "{}",
+                desc.board_target
+            );
+        }
+        // Sanity: only the two XIL beta packages.
+        let beta: Vec<_> = dcentrald_common::BoardDesc::all_registered()
+            .iter()
+            .filter(|d| d.public_beta_install)
+            .map(|d| d.board_target)
+            .collect();
+        assert_eq!(beta, vec!["am1-s9", "am2-s19j"]);
+    }
+
     #[test]
     fn td003_board_target_gate_does_not_block_promoted_or_other_known_markers() {
         for marker in [

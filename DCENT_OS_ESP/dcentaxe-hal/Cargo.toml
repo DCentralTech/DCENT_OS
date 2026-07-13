@@ -22,7 +22,8 @@ pins-nerd = []         # I2C SDA=43, SCL=44
 # Additive + orthogonal to the pins-bitaxe/pins-nerd family selector: enabling it
 # only compiles in the `lora_pins` GPIO map + the esp-idf `open_lora_bus` builder.
 # Selected transitively by the `dcentaxe` binary's default-OFF `lora` feature so a
-# non-LoRa SKU pays zero bytes. ⚠️ PROVISIONAL pins — NEEDS-NETLIST-LOCK (doc 05 §1.3).
+# non-LoRa SKU pays zero bytes. Pins LOCKED — netlist-confirmed 9/9
+# (dcent-axe-BM1397 FULL_PREFAB_REVIEW_2026-07-11).
 pins-lora = []
 # Display hardware
 display-ssd1306 = []   # 128x32 I2C OLED (BitAxe)

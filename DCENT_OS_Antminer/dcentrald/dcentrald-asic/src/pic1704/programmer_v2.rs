@@ -16,14 +16,17 @@
 //!
 //! W11.7 `programmer.rs` uses BraiinsOS-shared register-style opcodes
 //! (`[0x09, 0x01, ...]` etc — REG_CONTROL prefix). W14.C uses framed
-//! ordinals (no register prefix). Both ship; carrier picks per evidence.
+//! ordinals (no register prefix). Both are retained as compile-gated protocol
+//! research; neither has a shipped transport consumer.
 //!
-//! ## Recovery-tool feature gate (TRIPLE)
+//! ## Research-only boundary
 //!
 //! 1. Module wrapped in `#![cfg(feature = "recovery-tool")]`.
-//! 2. Production `dcentrald` Cargo.toml does NOT enable `recovery-tool`.
-//! 3. CLI subcommand requires `--confirm-bricked` token + `--manifest`
-//!    + `--i-acknowledge-pic1704-framed-inferred` (NOT `--i-acknowledge-90-percent`).
+//! 2. No shipped package enables `recovery-tool`; the diagnostic-only
+//!    `pic-recovery` package is not a consumer.
+//! 3. Historical CLI confirmation flags are not deployment authority. A
+//!    future executor requires the separate controller-recovery authority
+//!    architecture and must preserve the uncertainty labels below.
 //!
 //! ## REG_VOLTAGE_L collision guard (MANDATORY)
 //!
@@ -167,9 +170,9 @@ pub const PIC1704_CRC_S11_TV1: u16 = 0xCAED;
 
 /// Errors emitted by host-side wire-format helpers in this module.
 ///
-/// Note: I²C transport errors are surfaced via `crate::AsicError` at the
-/// CLI layer; this enum is for pre-wire validation that catches malformed
-/// inputs before any byte hits the bus.
+/// This enum is for pre-wire validation that catches malformed inputs before
+/// any byte could reach a bus. A future authorized transport must surface I²C
+/// errors separately and fail closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FpError {
     /// Refuses any seek/erase below 0x000200 (bootloader region sacred).
@@ -193,10 +196,10 @@ pub enum FpError {
     StartAppTimeout,
     /// Word in WRITE_WORDS payload exceeds 24-bit width.
     InvalidWordWidth,
-    /// CLI invocation refused: `--manifest <path>` missing.
+    /// A future authorized invocation is missing its signed target manifest.
     NoManifest,
-    /// CLI invocation refused: `--serial` provided but doesn't match
-    /// the manifest's `target_serial` field.
+    /// The confirmed target serial does not match the manifest's
+    /// `target_serial` field.
     SerialMismatch,
 }
 
@@ -495,9 +498,9 @@ mod tests {
 
     #[test]
     fn ordinals_are_canonical() {
-        // W4 handoff `pic1704_v2.h` ordinals — load-bearing across the
-        // CLI + executor. If any of these flips, the framed protocol
-        // wire format breaks silently.
+        // W4 handoff `pic1704_v2.h` ordinals — load-bearing protocol
+        // fixtures. If any flips, a future executor's wire format would break
+        // silently.
         assert_eq!(FP_SEEK, 0x10);
         assert_eq!(FP_ERASE_PAGE, 0x11);
         assert_eq!(FP_WRITE_WORDS, 0x12);

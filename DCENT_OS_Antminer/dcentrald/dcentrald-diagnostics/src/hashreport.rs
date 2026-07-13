@@ -14,6 +14,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::evidence::DiagnosticEvidence;
+
 /// HashReport test phases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HashReportPhase {
@@ -155,10 +157,16 @@ pub struct BoardResult {
     pub hashrate_ghs: f32,
     /// Board voltage in volts.
     pub voltage_v: f32,
+    /// Provenance for `voltage_v`.
+    #[serde(default)]
+    pub voltage_evidence: DiagnosticEvidence<f32>,
     /// Board temperature in celsius.
     pub temp_c: f32,
     /// Total CRC errors.
     pub crc_errors: u32,
+    /// Provenance for the CRC observation/window.
+    #[serde(default)]
+    pub crc_evidence: DiagnosticEvidence<u32>,
     /// Board grade: A, B, C, D, or F.
     pub grade: char,
     /// Per-chip health scores.
@@ -177,8 +185,10 @@ mod unit_grade_tests {
             chips_dead,
             hashrate_ghs: 0.0,
             voltage_v: 13.7,
+            voltage_evidence: DiagnosticEvidence::measured(13.7, "rail_adc", Some(1)),
             temp_c: 60.0,
             crc_errors: 0,
+            crc_evidence: DiagnosticEvidence::measured(0, "crc_window", Some(1)),
             grade,
             chips: Vec::new(),
         }
@@ -232,6 +242,24 @@ mod unit_grade_tests {
         assert_eq!(calculate_unit_grade(&[board(0, 'A')]), 'A');
         assert_eq!(calculate_unit_grade(&[board(1, 'A')]), 'B'); // 1 dead > 0 → B
     }
+    #[test]
+    fn commanded_or_inferred_board_evidence_cannot_produce_unit_pass() {
+        let mut commanded = board(0, 'A');
+        commanded.voltage_evidence = DiagnosticEvidence::commanded(13.7, "runtime_setpoint", None);
+        assert_eq!(calculate_unit_grade(&[commanded]), 'C');
+
+        let mut inferred = board(0, 'A');
+        inferred.crc_evidence = DiagnosticEvidence::inferred(0, "cumulative_counter", None);
+        assert_eq!(calculate_unit_grade(&[inferred]), 'C');
+    }
+
+    #[test]
+    fn unavailable_legacy_evidence_is_not_silently_accepted() {
+        let mut legacy = board(0, 'A');
+        legacy.voltage_evidence = DiagnosticEvidence::default();
+        legacy.crc_evidence = DiagnosticEvidence::default();
+        assert_eq!(calculate_unit_grade(&[legacy]), 'C');
+    }
 }
 
 /// Assign a health grade based on score.
@@ -263,7 +291,7 @@ pub fn calculate_unit_grade(boards: &[BoardResult]) -> char {
     let total_dead: u32 = boards.iter().map(|b| b.chips_dead as u32).sum();
     let worst_grade = boards.iter().map(|b| b.grade).max().unwrap_or('F');
 
-    if worst_grade == 'F' || total_dead > boards.len() as u32 * 6 {
+    let health_grade = if worst_grade == 'F' || total_dead > boards.len() as u32 * 6 {
         'F'
     } else if worst_grade == 'D' || total_dead > 5 {
         'D'
@@ -273,5 +301,16 @@ pub fn calculate_unit_grade(boards: &[BoardResult]) -> char {
         'B'
     } else {
         'A'
+    };
+
+    let required_evidence_measured = boards.iter().all(|board| {
+        board.voltage_v.is_finite()
+            && board.voltage_evidence.is_measured_for(&board.voltage_v)
+            && board.crc_evidence.is_measured_for(&board.crc_errors)
+    });
+    if !required_evidence_measured && matches!(health_grade, 'A' | 'B') {
+        'C'
+    } else {
+        health_grade
     }
 }

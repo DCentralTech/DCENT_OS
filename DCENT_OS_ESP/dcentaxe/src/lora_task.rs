@@ -7,6 +7,19 @@
 //! natively. Compiled ONLY under the default-OFF `lora` feature — a non-LoRa SKU
 //! never sees this module (byte-identical image; "no lying UI").
 //!
+//! ## Two radio modes (one at a time)
+//! A single SX1262 sits on ONE sync word + modulation at a time, so the radio runs
+//! in exactly one of two modes, selected by config:
+//!   * **`$DCM` native** (default) — the D-Central mesh grammar + managed flood.
+//!   * **Meshtastic Router** (`--features meshtastic` + `MeshConfig.meshtastic_mode`) —
+//!     the radio is programmed for the Meshtastic PHY (sync word 0x24B4) and the
+//!     node is a genuine Router on an existing Meshtastic mesh: it relays with the
+//!     managed [`MeshtasticRouter`], announces itself as NodeInfo, and beacons
+//!     miner status as text every node can read. The Meshtastic path is
+//!     `#[cfg(feature = "meshtastic")]`; runtime is further gated by
+//!     `MeshConfig.meshtastic_mode` (default-OFF, dormant until provisioned — the
+//!     same posture as the `$DCM` owner-key gate).
+//!
 //! ## Invariants (mirrored from `mqtt.rs` — do NOT regress)
 //! - **Own task.** The radio runs on its own thread and NEVER blocks the mining or
 //!   safety loops. Every SX1262 SPI op (blocking) happens here, not on a hot path.
@@ -34,6 +47,7 @@ use log::{error, info, warn};
 use serde_json::{json, Value};
 
 use dcentaxe_hal::lora_pins::LoraBus;
+use dcentaxe_lora::bitcoin::{self, BitcoinTracker};
 use dcentaxe_lora::config::MeshConfig;
 use dcentaxe_lora::duty::{DutyCycle, ModulationParams};
 use dcentaxe_lora::esp_hal::{EspInputPin, EspOutputPin, EspSpiBus};
@@ -41,10 +55,19 @@ use dcentaxe_lora::flood::{RebroadcastPlanner, RxAction};
 use dcentaxe_lora::gate::{CommandGate, ControlLimits, GateOutcome, MeshControl};
 use dcentaxe_lora::mcp::{LoraStatusResponse, MeshPeerInfo, MeshPeersResponse, SendBeaconResponse};
 use dcentaxe_lora::mesh::{
-    BlockFound, Identify, MeshFrame, MeshKind, NodeId, PeerTable, Telemetry,
+    BlockFound, Identify, MeshFrame, MeshKind, NetInfo, NodeId, PeerTable, Telemetry, Tip,
 };
 use dcentaxe_lora::relay::TxQueue;
 use dcentaxe_lora::sx1262::{Region, Sx1262};
+
+use crate::mesh_solo_runtime;
+
+#[cfg(feature = "meshtastic")]
+use dcentaxe_lora::meshtastic::{
+    self, Channel, MeshtasticNode, MeshtasticPhyConfig, MeshtasticRouter, PacketHeader,
+};
+#[cfg(feature = "meshtastic")]
+use std::collections::VecDeque;
 
 use crate::shared::SharedState;
 
@@ -72,6 +95,44 @@ const TX_DONE_POLL_BUDGET: u32 = 250; // ~250 × RX_POLL_MS/… bounded, never i
 /// deferred a cycle — collision avoidance for a dense always-on swarm. Chosen a
 /// few dB above a typical sub-GHz noise floor; tune per deployment.
 const LBT_RSSI_THRESHOLD_DBM: i16 = -90;
+
+/// Hop budget for Meshtastic packets this node originates.
+#[cfg(feature = "meshtastic")]
+const MT_HOP_LIMIT: u8 = 3;
+/// Bound on the Meshtastic outbound-packet queue (each entry is a full packet, so
+/// keep it small on the 300 KB entry board).
+#[cfg(feature = "meshtastic")]
+const MT_TX_CAP: usize = 16;
+/// Bound on the discovered-Meshtastic-node list.
+#[cfg(feature = "meshtastic")]
+const MT_NODES_CAP: usize = 32;
+
+/// Runtime state for a node operating in **Meshtastic Router** mode. Held in
+/// [`LoraShared::mt`] ONLY when the operator selected `meshtastic_mode`; its
+/// presence IS the mode flag. A single SX1262 cannot be on both the `$DCM` and
+/// Meshtastic PHYs at once, so when this is `Some` the `$DCM` planner/gate/peer
+/// path is dormant and the radio speaks Meshtastic exclusively.
+#[cfg(feature = "meshtastic")]
+struct MeshtasticStack {
+    /// Managed rebroadcast router: `(from,id)` dedup + hop-aware SNR-delay flood.
+    router: MeshtasticRouter,
+    /// The one channel we hold the key for (encrypt/decrypt + channel hash).
+    channel: Channel,
+    /// Programmed PHY (SF/BW/CR + sync word 0x24B4 + centre frequency).
+    phy: MeshtasticPhyConfig,
+    /// Our own originated-packet id counter (also the AES-CTR nonce input).
+    packet_id: u32,
+    /// Raw ready-to-send packets (16-byte header + encrypted payload) — self
+    /// beacons + due rebroadcasts. Bounded; drained by the radio task, LBT-gated.
+    tx: VecDeque<Vec<u8>>,
+    /// Meshtastic peers learned off the air (from NodeInfo), bounded LRU.
+    nodes: Vec<MeshtasticNode>,
+    /// Our NodeInfo long/short display names.
+    long_name: String,
+    short_name: String,
+    /// Hop budget for packets we originate.
+    hop_limit: u8,
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Shared snapshot (read by the MCP tools + /api/system/info; written by the task)
@@ -110,6 +171,16 @@ struct LoraShared {
     gate: CommandGate,
     /// Rising-edge tracker for the block-found proxy (nonces_found delta).
     last_nonces_found: u64,
+    /// Freshest Bitcoin network snapshot heard over the mesh (Phase-3 "Bitcoin on
+    /// mesh" ticker); updated on a `NetInfo` RX, surfaced to the dashboard/MCP.
+    bitcoin: BitcoinTracker,
+    /// This node has internet and originates the `NetInfo` tip beacon from its
+    /// own stratum feed (no HTTP). From `MeshConfig.is_gateway`.
+    is_gateway: bool,
+    /// Meshtastic Router state — `Some` ⇒ the radio runs in Meshtastic mode and
+    /// the `$DCM` planner/gate above are dormant. `None` ⇒ native `$DCM`.
+    #[cfg(feature = "meshtastic")]
+    mt: Option<MeshtasticStack>,
 }
 
 static LORA: Mutex<Option<LoraShared>> = Mutex::new(None);
@@ -119,6 +190,13 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Wall-clock unix SECONDS (Bitcoin-data freshness is coarse). `0` if the clock
+/// is unset (pre-NTP); the tracker measures freshness from local receive time so
+/// a wrong-but-advancing clock still ages data sensibly.
+fn now_unix_s() -> u64 {
+    now_ms() / 1000
 }
 
 fn region_str(r: Region) -> &'static str {
@@ -141,6 +219,18 @@ fn format_diff(d: f64) -> String {
         }
     }
     format!("{d:.0}")
+}
+
+/// The peer count to report on the read surfaces — the Meshtastic node list when
+/// the radio is in Meshtastic mode, otherwise the native `$DCM` [`PeerTable`]. So
+/// the dashboard/MCP count never shows a stale-empty `$DCM` table while the node
+/// is actually a Meshtastic Router with peers.
+fn mesh_peer_count(s: &LoraShared) -> u32 {
+    #[cfg(feature = "meshtastic")]
+    if let Some(mt) = s.mt.as_ref() {
+        return mt.nodes.len() as u32;
+    }
+    s.peers.len() as u32
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -167,7 +257,7 @@ pub fn status_json() -> Value {
             last_beacon_unix_ms: s.last_beacon_unix_ms,
             last_rx_rssi_dbm: s.last_rx_rssi_dbm,
             last_rx_snr_db: s.last_rx_snr_db,
-            mesh_peer_count: s.peers.len() as u32,
+            mesh_peer_count: mesh_peer_count(s),
         },
         None => LoraStatusResponse {
             region: region_str(LORA_REGION).to_string(),
@@ -315,9 +405,10 @@ pub fn system_info_view() -> Option<crate::api_system_info::LoraInfoView> {
         present: s.present,
         region: region_str(s.region),
         radio_state: s.radio_state,
-        peer_count: s.peers.len() as u32,
+        peer_count: mesh_peer_count(s),
         last_beacon_unix_ms: s.last_beacon_unix_ms,
         last_rx_rssi_dbm: s.last_rx_rssi_dbm,
+        bitcoin: Some(s.bitcoin.view(now_unix_s())),
     })
 }
 
@@ -349,7 +440,14 @@ pub fn spawn(state: SharedState, bus: LoraBus<'static>) {
     // default is FAIL-CLOSED (no owner key ⇒ the gate refuses all air control)
     // and role=Router (a mains-powered axe is a backbone relay), which is the
     // correct safe starting posture until the operator provisions a key.
-    let cfg = MeshConfig::default();
+    // Mesh runtime config: prefer NVS-backed config.mesh when present; else
+    // fail-closed defaults (solo mesh OFF).
+    let cfg = {
+        let g = state.config.lock().unwrap_or_else(|e| e.into_inner());
+        g.mesh.clone()
+    };
+    // Solo mesh empty-block controller (pure crates); no-op when not fully opted in.
+    mesh_solo_runtime::configure(&cfg, node_id);
     // Publish the pre-init snapshot immediately so the MCP tools / dashboard can
     // truthfully report "uninitialized" before the cold boot completes.
     {
@@ -369,6 +467,12 @@ pub fn spawn(state: SharedState, bus: LoraBus<'static>) {
             planner: RebroadcastPlanner::new(node_id, cfg.role()),
             gate: CommandGate::new(cfg.owner_key(), ControlLimits::DEFAULT),
             last_nonces_found: 0,
+            bitcoin: BitcoinTracker::new(),
+            is_gateway: cfg.is_gateway,
+            // Meshtastic Router mode is opt-in (config + `meshtastic` feature).
+            // With the default MeshConfig this resolves to `None` ⇒ native `$DCM`.
+            #[cfg(feature = "meshtastic")]
+            mt: build_meshtastic_stack(&cfg, node_id, &state),
         });
     }
     info!(
@@ -386,12 +490,20 @@ pub fn spawn(state: SharedState, bus: LoraBus<'static>) {
 /// Radio task body. Owns the `Sx1262` exclusively. Cold-boots the radio; on
 /// failure logs ONCE + sets `radio_state=fault` and returns (mining continues).
 fn run(state: SharedState, bus: LoraBus<'static>) {
+    // R-24: attach the host-driven E22 RF-switch enables (TXEN=GPIO2 /
+    // RXEN=GPIO9 on DCENT_axe BM1397). With the pins attached the driver routes
+    // the switch on every TX/RX/standby transition and skips DIO2-switch mode;
+    // a pinless map keeps the DIO2 posture.
     let mut radio = Sx1262::new(
         EspSpiBus::new(bus.spi),
         EspInputPin::new(bus.busy),
         EspInputPin::new(bus.dio1),
         EspOutputPin::new(bus.nreset),
         LORA_REGION,
+    )
+    .with_rf_switch(
+        bus.txen.map(EspOutputPin::new),
+        bus.rxen.map(EspOutputPin::new),
     );
 
     // Cold boot (reset → standby → DC-DC → TCXO → calibrate → LoRa config). A real
@@ -404,8 +516,15 @@ fn run(state: SharedState, bus: LoraBus<'static>) {
     set_state("standby", true);
     info!("LoRa: radio up (present=true)");
 
-    // Announce ourselves once so peers learn our model immediately.
-    enqueue_self_beacon(MeshKind::Identify(build_identify(&state)));
+    // If configured as a Meshtastic Router, re-program the radio for the
+    // Meshtastic PHY (sync word 0x24B4 + preset modulation), overriding the `$DCM`
+    // LoRa config `begin()` applied. A failure clears the mode and we run `$DCM`.
+    #[cfg(feature = "meshtastic")]
+    mt_apply_phy(&mut radio);
+
+    // Announce ourselves once so peers learn us immediately — a Meshtastic
+    // NodeInfo in Router mode, an `$DCM` Identify beacon in native mode.
+    beacon_self_announce(&state);
 
     // Backbone-relay radio setup: run boosted (max-sensitivity) RX so this
     // always-on node hears the whole mesh, pre-load CAD params for LBT, and arm
@@ -423,6 +542,7 @@ fn run(state: SharedState, bus: LoraBus<'static>) {
     }
 
     let mut last_tlm = now_ms();
+    let mut last_netinfo = 0u64; // 0 ⇒ a gateway beacons the tip on the first loop
     loop {
         // 1) Drain outbound queue (MCP beacons, self beacons, relays) — TX first.
         drain_tx(&mut radio);
@@ -431,7 +551,15 @@ fn run(state: SharedState, bus: LoraBus<'static>) {
         let now = now_ms();
         if now.saturating_sub(last_tlm) >= TLM_BEACON_INTERVAL_S * 1000 {
             last_tlm = now;
-            enqueue_beacon_if_duty(MeshKind::Telemetry(build_telemetry(&state)));
+            beacon_periodic_telemetry(&state);
+        }
+
+        // 2b) Gateway: beacon the Bitcoin tip — the block height comes from THIS
+        //     node's own stratum feed (no internet), so off-grid nodes learn the
+        //     chain tip over LoRa (Bitcoin on mesh). No-op unless is_gateway.
+        if now.saturating_sub(last_netinfo) >= bitcoin::GATEWAY_BEACON_INTERVAL_S * 1000 {
+            last_netinfo = now;
+            beacon_netinfo_if_gateway(&state);
         }
 
         // 3) Block-found proxy: a rising nonces_found edge → high-priority BLK.
@@ -521,7 +649,105 @@ fn maybe_beacon_block_found(state: &SharedState) {
         }
     }
     if fire {
-        enqueue_beacon_if_duty(MeshKind::BlockFound(build_block_found(state)));
+        beacon_block_found(state);
+    }
+}
+
+/// Announce this node once at startup — a Meshtastic NodeInfo in Router mode, an
+/// `$DCM` Identify beacon in native mode.
+fn beacon_self_announce(state: &SharedState) {
+    #[cfg(feature = "meshtastic")]
+    if mt_active() {
+        mt_enqueue_nodeinfo(state);
+        return;
+    }
+    enqueue_self_beacon(MeshKind::Identify(build_identify(state)));
+}
+
+/// Periodic status beacon — a human-readable Meshtastic text line in Router mode,
+/// an `$DCM` Telemetry frame in native mode. Duty-bounded either way.
+fn beacon_periodic_telemetry(state: &SharedState) {
+    #[cfg(feature = "meshtastic")]
+    if mt_active() {
+        mt_enqueue_status(state);
+        return;
+    }
+    enqueue_beacon_if_duty(MeshKind::Telemetry(build_telemetry(state)));
+}
+
+/// Block-found announcement — a Meshtastic text broadcast in Router mode, an
+/// `$DCM` BlockFound frame in native mode.
+fn beacon_block_found(state: &SharedState) {
+    #[cfg(feature = "meshtastic")]
+    if mt_active() {
+        mt_enqueue_block_found(state);
+        return;
+    }
+    enqueue_beacon_if_duty(MeshKind::BlockFound(build_block_found(state)));
+}
+
+/// Gateway origination for "Bitcoin on mesh": beacon the Bitcoin tip (block height
+/// from THIS node's own stratum feed — no internet) so off-grid nodes get a
+/// no-Wi-Fi chain-tip ticker over LoRa. No-op unless this node is a gateway AND
+/// has a real tip (mining is up).
+///
+/// Network difficulty from stratum job nBits via pure `netinfo_from_stratum_nbits`
+/// (no HTTP). Price/fee stay 0 until an HTTPS client supplies them (operator).
+fn beacon_netinfo_if_gateway(state: &SharedState) {
+    let is_gw = {
+        let g = LORA.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().map(|s| s.is_gateway).unwrap_or(false)
+    };
+    if !is_gw {
+        return;
+    }
+    let height = state
+        .stats
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .snapshot()
+        .block_height;
+    if height == 0 {
+        return; // no chain tip yet (mining not up) — don't beacon a zero height
+    }
+    // Difficulty from compact nBits (no HTTP). Use diff-1 placeholder until a
+    // live job nBits field is plumbed through StratumStatus (operator follow-up).
+    let nbits: u32 = 0x1d00_ffff;
+    let info = bitcoin::netinfo_from_stratum_nbits(
+        height as i64,
+        nbits,
+        0.0,
+        0,
+        now_unix_s(),
+    );
+    // A Meshtastic gateway pushes the ticker as a human-readable text broadcast
+    // (any client renders it); native `$DCM` originates the structured NetInfo.
+    #[cfg(feature = "meshtastic")]
+    if mt_active() {
+        mt_enqueue_ticker_text(&info);
+        return;
+    }
+    enqueue_beacon_if_duty(MeshKind::NetInfo(info));
+
+    // Origin a mining Tip only when solo-mesh runtime is configured (not every
+    // gateway NetInfo tick with a zero prev_hash). Real prev_hash plumbing is
+    // operator follow-up before any mainnet tip origin.
+    if state
+        .config
+        .lock()
+        .map(|c| c.mesh.solo_mesh_empty_active() && c.mesh.is_gateway)
+        .unwrap_or(false)
+    {
+        let mut g = LORA.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = g.as_mut() {
+            mesh_solo_runtime::maybe_origin_tip(
+                [0u8; 32],
+                nbits,
+                now_unix_s() as u32,
+                height as i64,
+                &mut s.tx_queue,
+            );
+        }
     }
 }
 
@@ -542,6 +768,19 @@ where
     // read failure falls through to transmit rather than stalling the mesh.
     if let Ok(false) = radio.channel_clear_rssi(LBT_RSSI_THRESHOLD_DBM) {
         return;
+    }
+    // Meshtastic mode drains its own raw-packet queue (LBT already checked above).
+    #[cfg(feature = "meshtastic")]
+    if mt_active() {
+        mt_drain_tx(radio);
+        return;
+    }
+    // Pull solo-mesh BFG frames produced by the share hook into the TX queue.
+    {
+        let mut g = LORA.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = g.as_mut() {
+            mesh_solo_runtime::drain_outbound_bfg(&mut s.tx_queue);
+        }
     }
     loop {
         let frame = {
@@ -601,6 +840,12 @@ where
     D: dcentaxe_lora::GpioPin,
     N: dcentaxe_lora::GpioPin,
 {
+    // In Meshtastic mode the RX path decodes/routes Meshtastic packets instead.
+    #[cfg(feature = "meshtastic")]
+    if mt_active() {
+        mt_service_rx(radio, state);
+        return;
+    }
     if !matches!(radio.irq_pending(), Ok(true)) {
         return;
     }
@@ -638,6 +883,13 @@ where
         // drain_due_rebroadcasts), or cancels/suppresses it — it is deliberately
         // NOT transmitted immediately, which is what stops correlated collisions.
         let action = s.planner.on_receive(&frame, snr as f32, now_ms());
+        // Bitcoin on mesh: a received tip snapshot updates the local ticker (a
+        // relayed OLD copy is rejected by the tracker's newer-timestamp gate).
+        if let MeshKind::NetInfo(n) = &frame.kind {
+            s.bitcoin.observe(n, now_unix_s());
+        }
+        // Solo mesh tip / BFG gateway path (pure controllers in mesh_solo_runtime).
+        mesh_solo_runtime::on_rx_frame(&frame, now_ms(), &mut s.tx_queue);
         // Owner control: an inbound Command must clear HMAC auth + anti-replay +
         // the safe setpoint clamp before it can touch hardware. Every other kind
         // is observe/relay only.
@@ -677,6 +929,11 @@ where
 /// the planner's SNR + jitter schedule) into the priority TX queue, duty-bounded.
 /// The next `drain_tx` transmits them, listen-before-talk-gated.
 fn drain_due_rebroadcasts() {
+    #[cfg(feature = "meshtastic")]
+    if mt_active() {
+        mt_drain_due();
+        return;
+    }
     let mut g = LORA.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = g.as_mut() {
         let now = now_ms();
@@ -709,6 +966,381 @@ fn apply_mesh_control(_state: &SharedState, ctrl: &MeshControl) {
         MeshControl::SetTargetWatts(_)
         | MeshControl::SetTargetTempC(_)
         | MeshControl::SetAutotunerMode(_) => { /* apply the clamped autotuner setpoint (wiring pending) */
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Meshtastic Router mode (feature = "meshtastic"; esp-idf integration seam)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Build the Meshtastic runtime state from config, or `None` to run native
+/// `$DCM`. Returns `None` unless `enabled && meshtastic_mode` AND a valid channel
+/// resolves — so a bad PSK cleanly falls back to `$DCM` rather than half-meshing.
+#[cfg(feature = "meshtastic")]
+fn build_meshtastic_stack(
+    cfg: &MeshConfig,
+    node_id: NodeId,
+    state: &SharedState,
+) -> Option<MeshtasticStack> {
+    if !(cfg.enabled && cfg.meshtastic_mode) {
+        return None;
+    }
+    let channel = match cfg.meshtastic_channel() {
+        Some(c) => c,
+        None => {
+            warn!("LoRa: meshtastic_mode set but channel PSK invalid — running $DCM");
+            return None;
+        }
+    };
+    let phy = cfg.meshtastic_phy(meshtastic_default_freq(LORA_REGION));
+    let (long_name, short_name) = {
+        let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
+        let board = config.board_config();
+        let long = board.device_model.clone();
+        let short = if cfg.meshtastic_short_name.is_empty() {
+            derive_short_name(&board.device_model)
+        } else {
+            cfg.meshtastic_short_name.chars().take(4).collect()
+        };
+        (long, short)
+    };
+    info!(
+        "LoRa: Meshtastic Router mode — channel '{}' (hash 0x{:02x}), preset {}, {} Hz",
+        channel.name,
+        channel.hash(),
+        cfg.meshtastic_preset,
+        phy.freq_hz
+    );
+    Some(MeshtasticStack {
+        router: MeshtasticRouter::new(node_id.0, cfg.role()),
+        channel,
+        phy,
+        packet_id: 0,
+        tx: VecDeque::new(),
+        nodes: Vec::new(),
+        long_name,
+        short_name,
+        hop_limit: MT_HOP_LIMIT,
+    })
+}
+
+/// The region LongFast default centre frequency (used when the operator leaves
+/// `meshtastic_freq_hz` at 0). Confirm against your Meshtastic app for a
+/// non-LongFast channel (see `dcentaxe_lora::meshtastic::phy`).
+#[cfg(feature = "meshtastic")]
+fn meshtastic_default_freq(region: Region) -> u32 {
+    match region {
+        Region::Eu868 => meshtastic::phy::EU868_LONGFAST_HZ,
+        Region::Na915 => meshtastic::phy::US_LONGFAST_HZ,
+    }
+}
+
+/// Derive a ≤4-char Meshtastic short name from the board model (uppercased
+/// alphanumerics), falling back to `"DCAX"`.
+#[cfg(feature = "meshtastic")]
+fn derive_short_name(model: &str) -> String {
+    let s: String = model
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(4)
+        .collect();
+    if s.is_empty() {
+        "DCAX".to_string()
+    } else {
+        s.to_ascii_uppercase()
+    }
+}
+
+/// `true` when the radio is operating in Meshtastic Router mode.
+#[cfg(feature = "meshtastic")]
+fn mt_active() -> bool {
+    let g = LORA.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref().map(|s| s.mt.is_some()).unwrap_or(false)
+}
+
+/// Program the SX1262 for the configured Meshtastic PHY. On failure, clear the
+/// mode so the task reverts to `$DCM` (fail-soft — a PHY fault is a hardware
+/// problem `begin()` would usually have caught first).
+#[cfg(feature = "meshtastic")]
+fn mt_apply_phy<SPI, B, D, N>(radio: &mut Sx1262<SPI, B, D, N>)
+where
+    SPI: dcentaxe_lora::SpiBus,
+    B: dcentaxe_lora::GpioPin,
+    D: dcentaxe_lora::GpioPin,
+    N: dcentaxe_lora::GpioPin,
+{
+    let phy = {
+        let g = LORA.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().and_then(|s| s.mt.as_ref().map(|mt| mt.phy))
+    };
+    let Some(phy) = phy else {
+        return;
+    };
+    match radio.apply_meshtastic_phy(&phy) {
+        Ok(()) => info!(
+            "LoRa: Meshtastic PHY applied (sync 0x{:04x}, {} Hz, SF{})",
+            phy.sync_word, phy.freq_hz, phy.sf
+        ),
+        Err(e) => {
+            warn!("LoRa: apply_meshtastic_phy failed ({e}) — reverting to $DCM mode");
+            let mut g = LORA.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(s) = g.as_mut() {
+                s.mt = None;
+            }
+        }
+    }
+}
+
+/// A [`ModulationParams`] matching a Meshtastic preset, for an HONEST duty-cycle
+/// airtime estimate (LongFast SF11 is far slower than the crate default — the
+/// governor must not under-count it).
+#[cfg(feature = "meshtastic")]
+fn mt_modulation(phy: MeshtasticPhyConfig) -> ModulationParams {
+    ModulationParams {
+        spreading_factor: phy.preset.sf(),
+        bandwidth_hz: phy.preset.bandwidth_khz() * 1000,
+        coding_rate_denom: phy.preset.coding_rate_denom(),
+        explicit_header: true,
+        crc_on: phy.crc_on,
+        preamble_syms: phy.preamble_len,
+    }
+}
+
+/// Build a broadcast packet carrying `data` from our node, duty-gate it, and
+/// enqueue the raw bytes. Allocates the next originator packet id.
+#[cfg(feature = "meshtastic")]
+fn mt_push_broadcast(s: &mut LoraShared, data: &meshtastic::Data) {
+    let node = s.node_id.0;
+    let (bytes, airtime) = {
+        let Some(mt) = s.mt.as_mut() else {
+            return;
+        };
+        mt.packet_id = mt.packet_id.wrapping_add(1);
+        if mt.packet_id == 0 {
+            mt.packet_id = 1;
+        }
+        let pid = mt.packet_id;
+        let Ok(bytes) = meshtastic::build_broadcast(&mt.channel, node, pid, mt.hop_limit, data)
+        else {
+            return;
+        };
+        let airtime = mt_modulation(mt.phy).airtime_ms(bytes.len());
+        (bytes, airtime)
+    };
+    if s.duty.try_acquire(airtime, now_ms()) {
+        if let Some(mt) = s.mt.as_mut() {
+            if mt.tx.len() >= MT_TX_CAP {
+                mt.tx.pop_front();
+            }
+            mt.tx.push_back(bytes);
+        }
+    }
+}
+
+/// Announce this node as Meshtastic NodeInfo (so it appears by name in every
+/// stock client's node list).
+#[cfg(feature = "meshtastic")]
+fn mt_enqueue_nodeinfo(_state: &SharedState) {
+    let mut g = LORA.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(s) = g.as_mut() else {
+        return;
+    };
+    let Some((node, long, short)) =
+        s.mt.as_ref()
+            .map(|mt| (s.node_id.0, mt.long_name.clone(), mt.short_name.clone()))
+    else {
+        return;
+    };
+    let user = meshtastic::build_user(node, &long, &short);
+    let data = meshtastic::nodeinfo_data(&user);
+    mt_push_broadcast(s, &data);
+}
+
+/// Beacon a human-readable miner-status text line (any Meshtastic client renders
+/// it).
+#[cfg(feature = "meshtastic")]
+fn mt_enqueue_status(state: &SharedState) {
+    let t = build_telemetry(state);
+    let msg = format!(
+        "DCENT_axe {:.0}GH {:.0}C {:.1}W acc:{}",
+        t.hashrate_ghs, t.chip_temp_c, t.power_w, t.shares_accepted
+    );
+    let data = meshtastic::text_data(&msg);
+    let mut g = LORA.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = g.as_mut() {
+        mt_push_broadcast(s, &data);
+    }
+}
+
+/// Beacon a block-found text broadcast.
+#[cfg(feature = "meshtastic")]
+fn mt_enqueue_block_found(state: &SharedState) {
+    let b = build_block_found(state);
+    let msg = format!("DCENT_axe found a block! best diff {}", b.best_diff);
+    let data = meshtastic::text_data(&msg);
+    let mut g = LORA.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = g.as_mut() {
+        mt_push_broadcast(s, &data);
+    }
+}
+
+/// Beacon the Bitcoin ticker as a Meshtastic text broadcast — Bitcoin on a stock
+/// Meshtastic mesh (Phase-2 bridge × Phase-3 ticker).
+#[cfg(feature = "meshtastic")]
+fn mt_enqueue_ticker_text(info: &NetInfo) {
+    let data = meshtastic::text_data(&bitcoin::ticker_line(info));
+    let mut g = LORA.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = g.as_mut() {
+        mt_push_broadcast(s, &data);
+    }
+}
+
+/// Transmit every queued Meshtastic packet (self beacons + due rebroadcasts).
+/// LBT was already checked by the caller (`drain_tx`).
+#[cfg(feature = "meshtastic")]
+fn mt_drain_tx<SPI, B, D, N>(radio: &mut Sx1262<SPI, B, D, N>)
+where
+    SPI: dcentaxe_lora::SpiBus,
+    B: dcentaxe_lora::GpioPin,
+    D: dcentaxe_lora::GpioPin,
+    N: dcentaxe_lora::GpioPin,
+{
+    loop {
+        let bytes = {
+            let mut g = LORA.lock().unwrap_or_else(|e| e.into_inner());
+            g.as_mut()
+                .and_then(|s| s.mt.as_mut())
+                .and_then(|mt| mt.tx.pop_front())
+        };
+        let Some(bytes) = bytes else {
+            break;
+        };
+        set_state_str("tx");
+        if let Err(e) = radio.transmit(&bytes) {
+            warn!("LoRa: meshtastic transmit failed: {e}");
+            continue;
+        }
+        wait_tx_done(radio);
+        let mut g = LORA.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = g.as_mut() {
+            s.last_beacon_unix_ms = Some(now_ms());
+        }
+    }
+}
+
+/// Service one Meshtastic RX opportunity: decode the header, schedule a managed
+/// rebroadcast via the router, and learn a peer's identity from a decodable
+/// NodeInfo on our channel. Owner control over the mesh is intentionally NOT on
+/// this path — it stays on the HMAC-authenticated `$DCM` command grammar.
+#[cfg(feature = "meshtastic")]
+fn mt_service_rx<SPI, B, D, N>(radio: &mut Sx1262<SPI, B, D, N>, _state: &SharedState)
+where
+    SPI: dcentaxe_lora::SpiBus,
+    B: dcentaxe_lora::GpioPin,
+    D: dcentaxe_lora::GpioPin,
+    N: dcentaxe_lora::GpioPin,
+{
+    if !matches!(radio.irq_pending(), Ok(true)) {
+        return;
+    }
+    let irq = match radio.process_irq() {
+        Ok(i) => i,
+        Err(e) => {
+            warn!("LoRa: irq read failed: {e}");
+            return;
+        }
+    };
+    if !irq.rx_done || irq.crc_err {
+        return;
+    }
+    let (payload, rssi, snr) = match radio.receive() {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("LoRa: rx read failed: {e}");
+            return;
+        }
+    };
+    let Some(header) = PacketHeader::decode(&payload) else {
+        return;
+    };
+    // Safe: PacketHeader::decode returned Some ⇒ payload.len() >= HEADER_LEN.
+    let body = payload[meshtastic::HEADER_LEN..].to_vec();
+
+    let mut g = LORA.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(s) = g.as_mut() else {
+        return;
+    };
+    s.last_rx_rssi_dbm = Some(rssi);
+    s.last_rx_snr_db = Some(snr as f32);
+    let Some(mt) = s.mt.as_mut() else {
+        return;
+    };
+    let decision = mt.router.on_receive(&header, &body, snr as f32, now_ms());
+    // Learn peer identity from a decodable NodeInfo on a channel we hold.
+    if let Some(dec) = meshtastic::decode_packet(std::slice::from_ref(&mt.channel), &payload) {
+        if let Some(data) = dec.data {
+            if data.portnum == meshtastic::portnum::NODEINFO_APP {
+                if let Ok(user) = meshtastic::User::decode(&data.payload) {
+                    let node = MeshtasticNode::from_nodeinfo(&header, &user, rssi, snr);
+                    mt_upsert_node(&mut mt.nodes, node);
+                }
+            }
+        }
+    }
+    match decision {
+        meshtastic::RelayDecision::Scheduled { .. } => {
+            info!("LoRa[mt]: scheduled relay of {:08x}", header.from)
+        }
+        meshtastic::RelayDecision::Canceled => {
+            info!(
+                "LoRa[mt]: relay canceled — neighbor covered {:08x}",
+                header.from
+            )
+        }
+        meshtastic::RelayDecision::Suppressed(_) => {}
+    }
+}
+
+/// Insert-or-refresh a discovered Meshtastic node (bounded LRU by node id).
+#[cfg(feature = "meshtastic")]
+fn mt_upsert_node(nodes: &mut Vec<MeshtasticNode>, node: MeshtasticNode) {
+    if let Some(existing) = nodes.iter_mut().find(|n| n.node == node.node) {
+        *existing = node;
+    } else {
+        if nodes.len() >= MT_NODES_CAP {
+            nodes.remove(0);
+        }
+        nodes.push(node);
+    }
+}
+
+/// Move every Meshtastic rebroadcast whose contention slot has arrived into the
+/// outbound queue, duty-bounded. The next `drain_tx` sends them (LBT-gated).
+#[cfg(feature = "meshtastic")]
+fn mt_drain_due() {
+    let mut g = LORA.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(s) = g.as_mut() else {
+        return;
+    };
+    let now = now_ms();
+    let due = match s.mt.as_mut() {
+        Some(mt) => mt.router.due(now),
+        None => return,
+    };
+    for pkt in due {
+        let bytes = pkt.to_bytes();
+        let airtime = match s.mt.as_ref() {
+            Some(mt) => mt_modulation(mt.phy).airtime_ms(bytes.len()),
+            None => return,
+        };
+        if s.duty.try_acquire(airtime, now) {
+            if let Some(mt) = s.mt.as_mut() {
+                if mt.tx.len() >= MT_TX_CAP {
+                    mt.tx.pop_front();
+                }
+                mt.tx.push_back(bytes);
+            }
         }
     }
 }
@@ -748,7 +1380,13 @@ pub const LORA_DASHBOARD_PANEL_HTML: &str = r##"<script>
       +'<div>Region: <b>'+(l.region||'-')+'</b></div>'
       +'<div>State: <b>'+(l.radioState||'-')+'</b></div>'
       +'<div>Last beacon: <b>'+fmtAgo(l.lastBeaconUnixMs)+'</b></div>'
-      +'<div>Last RX RSSI: <b>'+(l.lastRxRssiDbm!=null?l.lastRxRssiDbm+' dBm':'-')+'</b></div>';
+      +'<div>Last RX RSSI: <b>'+(l.lastRxRssiDbm!=null?l.lastRxRssiDbm+' dBm':'-')+'</b></div>'
+      +(l.bitcoin&&l.bitcoin.present
+        ?'<div style="margin-top:4px;border-top:1px solid rgba(250,165,0,0.22);padding-top:4px">'
+          +'₿ <b>#'+l.bitcoin.blockHeight+'</b>'
+          +(l.bitcoin.priceUsd>0?' | $'+Math.round(l.bitcoin.priceUsd).toLocaleString():'')
+          +(l.bitcoin.fresh?'':' <span style="color:#6b7a8d">(stale)</span>')+'</div>'
+        :'');
   }
   function poll(){
     fetch('/api/system/info').then(function(r){return r.json();}).then(function(d){

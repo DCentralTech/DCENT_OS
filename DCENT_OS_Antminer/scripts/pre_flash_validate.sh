@@ -557,7 +557,7 @@ else
     if [ "$AGE_HR" -lt 6 ]; then
         echo "PASS 7/8: tarball mtime ${AGE_HR}h old (<6h)"
     else
-        fail "7/8 tarball is ${AGE_HR}h old - rebuild via scripts/build_in_docker.sh first"
+        fail "7/8 tarball is ${AGE_HR}h old - obtain a fresh capsule-built or independently approved signed artifact"
     fi
 fi
 

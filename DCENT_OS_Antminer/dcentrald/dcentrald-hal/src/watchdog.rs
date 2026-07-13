@@ -50,12 +50,16 @@ mod tests {
 
     #[test]
     fn close_magic_is_the_only_magic_close_path() {
-        let close_body = source_after("pub fn close_magic(self)");
+        let close_body = source_after("pub fn close_magic(mut self)");
         let drop_body = source_after("impl Drop for Watchdog");
 
         assert!(
             close_body.contains("nix::unistd::write(&self.file, &[WATCHDOG_MAGIC_CLOSE])"),
             "close_magic must write WATCHDOG_MAGIC_CLOSE before dropping the fd"
+        );
+        assert!(
+            close_body.contains("if written != 1"),
+            "close_magic must require one complete magic-close byte before issuing a receipt"
         );
         assert!(
             !drop_body.contains("WATCHDOG_MAGIC_CLOSE")
@@ -68,6 +72,18 @@ mod tests {
             drop_body.contains("WITHOUT magic close"),
             "Watchdog::Drop must keep an explicit warning that the watchdog remains armed"
         );
+        assert!(
+            close_body.contains("self.magic_close_completed = true")
+                && drop_body.contains("if self.magic_close_completed")
+                && drop_body.contains("return;"),
+            "a successful explicit magic close must not emit the fail-closed Drop warning"
+        );
+    }
+
+    #[test]
+    fn set_timeout_returns_kernel_effective_value_to_policy() {
+        assert!(SOURCE.contains("pub fn set_timeout(&self, seconds: u32) -> Result<u32>"));
+        assert!(SOURCE.contains("Ok(secs as u32)"));
     }
 }
 
@@ -75,6 +91,7 @@ mod tests {
 pub struct Watchdog {
     /// Owned file handle for /dev/watchdog.
     file: fs::File,
+    magic_close_completed: bool,
 }
 
 impl Watchdog {
@@ -92,7 +109,10 @@ impl Watchdog {
 
         tracing::info!("Watchdog opened — countdown started");
 
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            magic_close_completed: false,
+        })
     }
 
     /// Kick (pet) the watchdog to reset the countdown timer.
@@ -111,7 +131,7 @@ impl Watchdog {
     /// the watchdog waits before rebooting if not kicked.
     /// BUG FIX (2026-04-11): timeout_s was parsed from config but never applied.
     #[cfg(unix)]
-    pub fn set_timeout(&self, seconds: u32) -> Result<()> {
+    pub fn set_timeout(&self, seconds: u32) -> Result<u32> {
         use std::os::fd::AsRawFd;
         // WDIOC_SETTIMEOUT = _IOWR('W', 6, int) = 0xC0045706
         const WDIOC_SETTIMEOUT: libc::c_ulong = 0xC004_5706u32 as libc::c_ulong;
@@ -136,17 +156,25 @@ impl Watchdog {
             "Watchdog timeout set to {}s",
             secs
         );
-        Ok(())
+        Ok(secs as u32)
     }
 
     /// Close the watchdog with the magic close character.
     ///
     /// Writing "V" before closing tells the watchdog driver to disable
     /// the timer (only works when CONFIG_WATCHDOG_NOWAYOUT is not set).
-    pub fn close_magic(self) -> Result<()> {
-        nix::unistd::write(&self.file, &[WATCHDOG_MAGIC_CLOSE])
+    pub fn close_magic(mut self) -> Result<()> {
+        let written = nix::unistd::write(&self.file, &[WATCHDOG_MAGIC_CLOSE])
             .map_err(|e| HalError::Watchdog(format!("magic close failed: {}", e)))?;
-        tracing::info!("Watchdog disabled via magic close");
+        if written != 1 {
+            return Err(HalError::Watchdog(format!(
+                "magic close short write: expected 1 byte, wrote {written}"
+            )));
+        }
+        self.magic_close_completed = true;
+        tracing::info!(
+            "Watchdog magic-close byte write completed; kernel timer state remains unmeasured"
+        );
         // File is closed when `self.file` is dropped
         Ok(())
     }
@@ -154,6 +182,9 @@ impl Watchdog {
 
 impl Drop for Watchdog {
     fn drop(&mut self) {
+        if self.magic_close_completed {
+            return;
+        }
         // WARNING: Dropping without writing "V" leaves the watchdog running.
         // The system will reboot if nothing else opens /dev/watchdog.
         // This is intentional -- if dcentrald crashes, we WANT the reboot.

@@ -120,6 +120,51 @@ pub struct ChipMapCell {
     /// Provenance: RE-010 handoff §3 LOW-3 (2026-05-21).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub die_temp_c: Option<f32>,
+
+    /// Laplacian hot-spot gradient vs neighbors (°C above mean); from
+    /// `dcentrald-chip-analysis`. `None` until per-chip temps exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anomaly_gradient: Option<f32>,
+
+    /// Cross-slot hot z-score; `None` until multi-slot temps exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anomaly_cross_slot_zscore: Option<f32>,
+
+    /// Nonce deficit % below slot average; may be filled from live counters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anomaly_nonce_deficit: Option<f32>,
+}
+
+impl ChipMapCell {
+    /// Attach pure anomaly scores (hot-spot-only ≥ 0) without changing grade.
+    pub fn with_anomalies(
+        mut self,
+        scores: crate::chip_analysis_bridge::ChipAnomalyScores,
+    ) -> Self {
+        self.anomaly_gradient = Some(scores.gradient);
+        self.anomaly_cross_slot_zscore = Some(scores.cross_slot_zscore);
+        self.anomaly_nonce_deficit = Some(scores.nonce_deficit);
+        self
+    }
+}
+
+impl ChipMap {
+    /// Fill `anomaly_nonce_deficit` from cell `nonce_count` vs map average.
+    ///
+    /// Safe offline path when die temps are absent (gradient/z-score stay None).
+    pub fn enrich_nonce_deficits(&mut self) {
+        if self.cells.is_empty() {
+            return;
+        }
+        let nonces: Vec<i64> = self.cells.iter().map(|c| c.nonce_count as i64).collect();
+        let slot_avg = crate::chip_analysis_bridge::compute_slot_avg_nonce(&nonces);
+        for cell in &mut self.cells {
+            cell.anomaly_nonce_deficit = Some(crate::chip_analysis_bridge::compute_nonce_deficit(
+                cell.nonce_count as i64,
+                slot_avg,
+            ));
+        }
+    }
 }
 
 /// Color coding for ChipMap cells.
@@ -241,7 +286,7 @@ mod chip_map_cell_re010_tests {
     //!
     //! Provenance: RE-010 handoff §3 LOW-1 / LOW-2 / LOW-3 + the closure
     //! follow-up directive ("ship the shape now, populate as data lands").
-    use super::{ChipColor, ChipMapCell};
+    use super::{ChipColor, ChipMap, ChipMapCell};
 
     #[test]
     fn chip_color_from_score_fails_safe_on_non_finite_and_maps_thresholds() {
@@ -276,6 +321,9 @@ mod chip_map_cell_re010_tests {
             expected_nonce_rate_hz: None,
             health_ts: None,
             die_temp_c: None,
+            anomaly_gradient: None,
+            anomaly_cross_slot_zscore: None,
+            anomaly_nonce_deficit: None,
         }
     }
 
@@ -295,6 +343,57 @@ mod chip_map_cell_re010_tests {
             !json.contains("die_temp_c"),
             "None die_temp_c must not appear on the wire: {json}"
         );
+        assert!(
+            !json.contains("anomaly_"),
+            "None anomaly_* fields must not appear on the wire: {json}"
+        );
+    }
+
+    #[test]
+    fn enrich_nonce_deficits_marks_weak_chips() {
+        let mut map = ChipMap {
+            chain_id: 0,
+            chip_count: 2,
+            columns: 2,
+            rows: 1,
+            cells: vec![
+                ChipMapCell {
+                    index: 0,
+                    address: 0,
+                    health_score: 1.0,
+                    grade: 'A',
+                    color: ChipColor::Green,
+                    frequency_mhz: 500,
+                    nonce_count: 100,
+                    crc_errors: 0,
+                    expected_nonce_rate_hz: None,
+                    health_ts: None,
+                    die_temp_c: None,
+                    anomaly_gradient: None,
+                    anomaly_cross_slot_zscore: None,
+                    anomaly_nonce_deficit: None,
+                },
+                ChipMapCell {
+                    index: 1,
+                    address: 4,
+                    health_score: 0.5,
+                    grade: 'D',
+                    color: ChipColor::Orange,
+                    frequency_mhz: 500,
+                    nonce_count: 10,
+                    crc_errors: 0,
+                    expected_nonce_rate_hz: None,
+                    health_ts: None,
+                    die_temp_c: None,
+                    anomaly_gradient: None,
+                    anomaly_cross_slot_zscore: None,
+                    anomaly_nonce_deficit: None,
+                },
+            ],
+        };
+        map.enrich_nonce_deficits();
+        assert_eq!(map.cells[0].anomaly_nonce_deficit, Some(0.0));
+        assert!(map.cells[1].anomaly_nonce_deficit.unwrap_or(0.0) > 0.0);
     }
 
     #[test]

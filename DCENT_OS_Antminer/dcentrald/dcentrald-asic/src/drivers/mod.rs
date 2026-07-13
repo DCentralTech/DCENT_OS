@@ -733,6 +733,21 @@ pub struct PllConfig {
 ///
 /// Each BM13xx chip family implements this trait with its specific
 /// initialization sequence, register values, job format, and nonce decoding.
+///
+/// # Architecture note (ADR-0010, 2026-07-11)
+///
+/// **Long-term spine:** pure `AsicProtocol` / init programs over a
+/// `ChainTransport` (see `dcentrald_hal::chain_backend::Bm1397PlusChainBackend`
+/// and `docs/architecture/COMPOSITION_MODEL.md`). Methods that take
+/// [`FpgaChain`] are the historical Zynq-Braiins-FIFO shape. Production
+/// AM2/AML/BB paths often use serial transports and do **not** all go
+/// through this trait today — that is technical debt under the mining
+/// strangler (ADR-0009), not a license to add more `FpgaChain`-only APIs.
+///
+/// Prefer: new protocol work as pure byte-level helpers + transport-agnostic
+/// ops. Prefer: voltage via a future `VoltageRail`, not `PicController`-only
+/// `set_voltage`. Do not silently fall back unknown chip IDs to BM1387 PLL
+/// tables when adding PLL plumbing.
 pub trait ChipDriver: Send + Sync {
     /// Chip identifier (e.g., 0x1387, 0x1397, 0x1366, 0x1368, 0x1370, 0x1362).
     fn chip_id(&self) -> u16;

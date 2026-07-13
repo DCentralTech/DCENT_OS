@@ -130,20 +130,20 @@ make_release_verify_gate_check() {
     fi
 
     if awk '
-        BEGIN { in_release = 0; verify_line = 0; build_line = 0; skip_line = 0 }
+        BEGIN { in_release = 0; verify_line = 0; capsule_line = 0; skip_line = 0 }
         /^release:/ { in_release = 1; next }
         in_release && /^[A-Za-z0-9_.-]+:/ { in_release = 0 }
         in_release && /\$\(MAKE\) verify/ { verify_line = NR }
-        in_release && /DCENT_RELEASE_IMAGE=1/ { build_line = NR }
+        in_release && /scripts\/build_s9_release_capsule\.sh/ { capsule_line = NR }
         in_release && /DCENT_SKIP_VERIFY/ { skip_line = NR }
         END {
-            ok = verify_line > 0 && build_line > 0 && verify_line < build_line && skip_line == 0
+            ok = verify_line > 0 && capsule_line > 0 && verify_line < capsule_line && skip_line == 0
             exit ok ? 0 : 1
         }
     ' Makefile; then
         pass "make release runs make verify before building release artifacts"
     else
-        fail "make release must run make verify before DCENT_RELEASE_IMAGE build and must not honor DCENT_SKIP_VERIFY"
+        fail "make release must run make verify before the S9 capsule driver and must not honor DCENT_SKIP_VERIFY"
     fi
 }
 
@@ -327,11 +327,11 @@ pre_flash_package_only_selftest() {
   "board": "$board",
   "board_target": "$board",
   "status": "$status",
-  "payloads": [
-    { "path": "sysupgrade-$board/kernel", "size": $kernel_size, "sha256": "$kernel_sha" },
-    { "path": "sysupgrade-$board/root", "size": $root_size, "sha256": "$root_sha" },
-    { "path": "sysupgrade-$board/METADATA", "size": $metadata_size, "sha256": "$metadata_sha" }
-  ]
+  "payloads": {
+    "kernel": { "path": "sysupgrade-$board/kernel", "size": $kernel_size, "sha256": "$kernel_sha" },
+    "rootfs": { "path": "sysupgrade-$board/root", "size": $root_size, "sha256": "$root_sha" },
+    "metadata": { "path": "sysupgrade-$board/METADATA", "size": $metadata_size, "sha256": "$metadata_sha" }
+  }
 }
 EOF
         (cd "$pkgdir" && sha256sum kernel root METADATA > SHA256SUMS) || return 1
@@ -455,12 +455,12 @@ PY
   "board": "am3-s19k",
   "board_target": "am3-s19k",
   "version": "test",
-  "payloads": [
-    { "path": "sysupgrade-am3-s19k/kernel", "size": $kernel_size, "sha256": "$kernel_sha" },
-    { "path": "sysupgrade-am3-s19k/root", "size": $root_size, "sha256": "$root_sha" },
-    { "path": "sysupgrade-am3-s19k/METADATA", "size": $metadata_size, "sha256": "$metadata_sha" },
-    { "path": "sysupgrade-am3-s19k/release_ed25519.pub", "size": $pub_size, "sha256": "$pub_sha" }
-  ]
+  "payloads": {
+    "kernel": { "path": "sysupgrade-am3-s19k/kernel", "size": $kernel_size, "sha256": "$kernel_sha" },
+    "rootfs": { "path": "sysupgrade-am3-s19k/root", "size": $root_size, "sha256": "$root_sha" },
+    "metadata": { "path": "sysupgrade-am3-s19k/METADATA", "size": $metadata_size, "sha256": "$metadata_sha" },
+    "verification_key": { "path": "sysupgrade-am3-s19k/release_ed25519.pub", "size": $pub_size, "sha256": "$pub_sha" }
+  }
 }
 EOF
         (cd "$signed_dir" && sha256sum kernel root METADATA release_ed25519.pub > SHA256SUMS) || return 1
@@ -754,6 +754,42 @@ if bash scripts/test_stage_am2_sd_artifacts_static.sh >/dev/null 2>&1; then
 else
     fail "AM2 SD artifact staging selftest failed"
 fi
+# Install-path honesty + aggregate GO guard (cannot claim public install GO
+# without CAPSTONE_EVIDENCE; never run silent).
+require_file 'scripts/check_install_path_honesty.py'
+require_file 'scripts/check_install_path_go_guard.py'
+require_file 'scripts/test_sd_common_mbr_static.sh'
+if command -v python3 >/dev/null 2>&1; then
+    if python3 scripts/check_install_path_honesty.py >/dev/null 2>&1; then
+        pass "install-path honesty check"
+    else
+        fail "install-path honesty check failed"
+    fi
+    if python3 scripts/check_install_path_go_guard.py >/dev/null 2>&1; then
+        pass "install-path GO guard (aggregate GO stays NO without CAPSTONE)"
+    else
+        fail "install-path GO guard failed"
+    fi
+elif command -v py >/dev/null 2>&1; then
+    if py -3 scripts/check_install_path_honesty.py >/dev/null 2>&1; then
+        pass "install-path honesty check"
+    else
+        fail "install-path honesty check failed"
+    fi
+    if py -3 scripts/check_install_path_go_guard.py >/dev/null 2>&1; then
+        pass "install-path GO guard"
+    else
+        fail "install-path GO guard failed"
+    fi
+else
+    fail "python3/py required for install-path honesty/GO guards"
+fi
+if bash scripts/test_sd_common_mbr_static.sh >/dev/null 2>&1; then
+    pass "sd_common pure-Python three-part MBR write selftest"
+else
+    fail "sd_common MBR selftest failed"
+fi
+require_pattern 'scripts/sign_sd_image.sh' 'dcent_sd_require_complete_manifest_for_signing' 'sign_sd_image enforces CE-410 completeness before openssl'
 require_pattern 'scripts/build_am2_s19jpro_sd_disk_image.sh' 'boot_artifacts_complete' 'am2 SD builder emits boot artifact completeness manifest'
 require_pattern 'scripts/build_am2_s19jpro_sd_disk_image.sh' '"BOOT.bin"' 'am2 SD manifest records BOOT.bin presence'
 require_pattern 'scripts/build_am2_s19jpro_sd_disk_image.sh' '"uEnv.txt"' 'am2 SD manifest records uEnv presence'
@@ -780,7 +816,7 @@ require_pattern 'br2_external_dcentos/board/zynq/rootfs-overlay/etc/init.d/S99up
 # inactive-slot write armed stays effective). Brick-safe: stricter only.
 require_pattern 'br2_external_dcentos/board/zynq/rootfs-overlay/etc/init.d/S99upgrade' '/api/system/health' 'A/B commit gate checks the real health endpoint, not just socket bind'
 require_pattern 'br2_external_dcentos/board/zynq/rootfs-overlay/etc/init.d/S99upgrade' 'MIN_HEALTHY_UPTIME_S' 'A/B commit gate enforces a sustained boot-success window'
-require_pattern 'br2_external_dcentos/board/zynq/rootfs-overlay/etc/init.d/S99verify' 'DEFER to S99upgrade' 'S99verify defers to the S99upgrade boot-success commit decision'
+require_pattern 'br2_external_dcentos/board/zynq/rootfs-overlay/etc/init.d/S99verify' 'report-only proof consumer' 'S99verify remains a non-mutating consumer of the S99upgrade boot-success decision'
 require_pattern 'scripts/pre_flash_validate.sh' 'inactive NAND slot' 'pre-flash gate still validates inactive NAND slot'
 require_pattern 'scripts/pre_flash_validate.sh' '--package-only' 'pre-flash validator keeps local package-only mode'
 require_pattern 'scripts/pre_flash_validate.sh' 'tar entry paths are relative and traversal-free' 'pre-flash package-only mode rejects unsafe tar paths'
@@ -845,6 +881,21 @@ require_pattern 'dcentrald/dcentrald-thermal/src/offgrid.rs' 'non_finite_power_a
 require_pattern 'dcentrald/dcentrald-thermal/src/curtailment.rs' 'sleep_controller_has_no_float_sensor_surface' 'curtailment sleep controller has no float sensor surface'
 require_pattern 'dcentrald/dcentrald-hal/src/xadc.rs' 'iio_float_parser_rejects_non_finite_values' 'XADC parser rejects non-finite sysfs values'
 require_file 'scripts/check_safety_clamp_manifest.py'
+# BoardDesc install matrix (ADR-0011) — living product/lab/A/B SSOT for packaging.
+require_file 'docs/architecture/install_matrix.tsv'
+require_file 'scripts/export_install_matrix.ps1'
+require_file 'scripts/check_install_matrix_drift.ps1'
+if grep -q $'^am1-s9\t' docs/architecture/install_matrix.tsv \
+    && grep -q $'^am2-s19j\t' docs/architecture/install_matrix.tsv; then
+    pass 'install_matrix.tsv lists public-beta runtime board targets am1-s9 and am2-s19j'
+else
+    fail 'install_matrix.tsv missing public-beta runtime rows am1-s9 / am2-s19j'
+fi
+if awk -F'\t' 'NR>1 && $3=="1" {c++} END{exit !(c==2)}' docs/architecture/install_matrix.tsv; then
+    pass 'install_matrix.tsv has exactly two public_beta=1 rows'
+else
+    fail 'install_matrix.tsv public_beta=1 row count is not exactly 2'
+fi
 if run_python_script scripts/check_safety_clamp_manifest.py --self-test; then
     pass "safety clamp manifest: classified thermal/voltage/frequency/PWM clamp set is pinned with negative control"
 else
@@ -873,6 +924,113 @@ require_pattern 'dcentrald/fuzz/Cargo.toml' 'v1_pool_message_parser' 'cargo-fuzz
 require_pattern '../../.github/workflows/dcentos-fuzz-smoke.yml' 'cargo fuzz run ota_sysupgrade_tar -- -runs=256' 'scheduled fuzz smoke runs OTA tar parser'
 require_pattern '../../.github/workflows/dcentos-fuzz-smoke.yml' 'cargo fuzz run sv2_frame_decoder -- -runs=256' 'scheduled fuzz smoke runs SV2 frame decoder'
 require_pattern '../../.github/workflows/dcentos-fuzz-smoke.yml' 'cargo fuzz run v1_pool_message_parser -- -runs=256' 'scheduled fuzz smoke runs V1 pool-message parser'
+
+# Release-workflow admission anti-orphan. `build_in_docker.sh` and
+# `build-dcentrald.sh` are capsule-internal drivers: a workflow calling either
+# one directly can no longer satisfy receipt-v4 invocation ownership. S9 CI
+# must consume the atomic public directory and verify it after private cleanup.
+# AM2 has no capsule yet, so its former package/nandsim claims stay explicit and
+# fail closed instead of falling back to the mutable inner driver.
+release_workflow_capsule_admission_check() {
+    workflow_dir='../../.github/workflows'
+    image_workflow="$workflow_dir/dcentos-image-smoke.yml"
+    nandsim_workflow="$workflow_dir/dcentos-offline-nandsim.yml"
+
+    require_file "$image_workflow"
+    require_file "$nandsim_workflow"
+
+    direct_call_pattern='(^|[[:space:]])(bash|sh)[[:space:]]+(\./)?scripts/(build_in_docker|build-dcentrald)\.sh([[:space:]\\]|$)'
+    direct_calls=$(grep -REn -- "$direct_call_pattern" "$workflow_dir" 2>/dev/null || true)
+    if [ -n "$direct_calls" ]; then
+        fail "release workflows must not invoke capsule-internal build drivers directly: $direct_calls"
+    else
+        pass 'release workflows cannot orphan the outer capsule by invoking inner build drivers'
+    fi
+
+    for workflow in "$image_workflow" "$nandsim_workflow"; do
+        require_pattern "$workflow" \
+            'bash scripts/build_s9_release_capsule.sh' \
+            "$workflow uses the admitted S9 outer capsule"
+        require_pattern "$workflow" \
+            'python3 scripts/portable_release_evidence.py verify' \
+            "$workflow verifies the exact published directory after cleanup"
+        require_pattern "$workflow" \
+            'vars.DCENT_RUST_BUILDER_BASE' \
+            "$workflow obtains the builder digest from repository/dispatch authority"
+        require_pattern "$workflow" \
+            "grep -Eq '^.+@sha256:[0-9a-f]{64}$'" \
+            "$workflow rejects missing or mutable builder references"
+        require_pattern "$workflow" \
+            "DCENT_TOOLCHAIN_SHA256_VERIFIED: '1'" \
+            "$workflow explicitly admits the ratified S9 toolchain checksum"
+        require_pattern "$workflow" \
+            'vars.DCENT_BUILD_INPUTS_DIR' \
+            "$workflow obtains an explicit restricted-input channel authority"
+        require_pattern "$workflow" \
+            'runs-on: [self-hosted, linux, x64, dcentos-restricted-inputs' \
+            "$workflow reserves capsule execution for an operator-managed restricted-input runner"
+        require_pattern "$workflow" \
+            'sh scripts/provision_build_inputs.sh --source "$INPUT_ROOT"' \
+            "$workflow provisions restricted bytes only from the external authority"
+        require_pattern "$workflow" \
+            'sh scripts/provision_build_inputs.sh --check' \
+            "$workflow hash-verifies every restricted input before build"
+        require_pattern "$workflow" \
+            'DCENT_BUILD_INPUTS_DIR must be outside the Actions checkout.' \
+            "$workflow rejects a checkout-local pseudo-provisioning channel"
+        require_pattern "$workflow" \
+            'DCENT_AM2_CAPSULE_STATUS: unavailable-fail-closed' \
+            "$workflow exposes the missing AM2 capsule as a coverage disposition"
+        require_pattern "$workflow" \
+            '[ -e scripts/build_am2_release_capsule.sh ]' \
+            "$workflow forces review when an AM2 capsule becomes available"
+        reject_pattern "$workflow" \
+            'bash scripts/build_am2_release_capsule.sh' \
+            "$workflow does not claim an unimplemented AM2 capsule"
+        reject_pattern "$workflow" \
+            '  push:' \
+            "$workflow does not schedule an always-blocked hosted push build"
+        reject_pattern "$workflow" \
+            '  pull_request:' \
+            "$workflow does not schedule an always-blocked hosted pull-request build"
+    done
+
+    require_pattern "$image_workflow" \
+        '--test release_artifact_contract' \
+        'image-smoke executes the public OTA artifact verifier on the capsule artifact'
+    require_pattern "$image_workflow" \
+        'built_release_artifact_passes_public_ota_contract' \
+        'image-smoke invokes the ignored real-artifact contract test explicitly'
+    reject_pattern "$image_workflow" \
+        'target: am2-s19jpro' \
+        'image-smoke does not claim AM2 package coverage without an admitted capsule'
+    reject_pattern "$image_workflow" \
+        'target: cv1835-s19jpro' \
+        'image-smoke does not advertise the unpinned CV1835 release lane'
+    require_pattern "$nandsim_workflow" \
+        '--target am1-s9' \
+        'nandsim runs only the capsule-backed S9 target'
+    reject_pattern "$nandsim_workflow" \
+        '--target both' \
+        'nandsim does not claim AM2 coverage without an admitted package producer'
+}
+release_workflow_capsule_admission_check
+
+require_pattern 'scripts/build_in_docker.sh' 'dcent_prepare_git_release_provenance' 'container build validates provenance against the source worktree'
+require_pattern 'scripts/build_in_docker.sh' '-e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH"' 'container build passes the canonical epoch into image packaging'
+require_pattern 'scripts/package_sysupgrade.sh' 'dcent_create_deterministic_tar' 'S9 sysupgrade uses the deterministic envelope archiver'
+require_pattern 'br2_external_dcentos/board/zynq/am2-s19jpro/post-image.sh' 'dcent_create_deterministic_tar' 'AM2 sysupgrade uses the deterministic envelope archiver'
+require_pattern 'br2_external_dcentos/board/cvitek/cv1835-s19jpro/post-image.sh' 'dcent_create_deterministic_tar' 'CV1835 sysupgrade uses the deterministic envelope archiver'
+if awk '
+    /dcent_write_sysupgrade_manifest/ { rewrite = NR }
+    /dcent_create_deterministic_tar/ { archive = NR }
+    END { exit !(rewrite > 0 && archive > rewrite) }
+' 'br2_external_dcentos/board/zynq/am2-s19jpro/post-image.sh'; then
+    pass 'AM2 shared final-manifest rewrite occurs before deterministic packaging'
+else
+    fail 'AM2 must rewrite/sign the canonical shared manifest before deterministic packaging'
+fi
+require_pattern 'dcentrald/dcentrald-api/tests/release_artifact_contract.rs' 'verify_sysupgrade_bundle(&artifact, false, Some(&public_key))' 'real-artifact test calls the public fail-closed OTA verifier'
 require_pattern 'dcentrald/dcentrald-stratum/src/v1/messages.rs' 'parse_pool_message_never_panics_on_arbitrary_or_malformed_input' 'V1 pool-message parser has malformed-input panic coverage'
 require_pattern 'dcentrald/dcentrald-api/src/cgminer.rs' 'cgminer_shared_toolbox_contract_fixture_matches_dispatcher' 'cgminer dispatcher is pinned to shared toolbox contract fixture'
 require_pattern '../dcent-toolbox/tests/test_cgminer_shape.py' 'test_dcentos_shared_cgminer_contract_fixture_parses_like_toolbox_expects' 'toolbox parses the shared dcentos cgminer contract fixture'
@@ -2613,28 +2771,83 @@ scaffold_driver_fail_closed_check() {
 scaffold_driver_fail_closed_check
 
 #
-# CI-GATE-STALE-BINARY: the build_in_docker.sh dcentrald freshness guard must
-# stay wired + fail-closed. build_in_docker STAGES the prebuilt host binary; it
-# does NOT recompile. The .25 dashboard-frequency fix (b1e9e8ca) was committed
-# but never compiled, so every image for hours shipped the pre-fix binary and
-# the dashboard reported the wrong frequency. The Phase-0 guard refuses a binary
-# older than its source. A refactor must not silently drop it. See
-# .
+# CI-GATE-STALE-BINARY: build_in_docker.sh stages prebuilt Rust binaries and
+# does not recompile them. Snapshot-consistency receipts, rather than mutable
+# mtimes, detect local binary/source/context drift without claiming that the
+# receipt attests a compiler execution. Phase 0 exports one detached private
+# generation and Phase 5 must never reopen the mutable host target tree.
 #
 stale_binary_guard_check() {
     f='scripts/build_in_docker.sh'
     require_file "$f"
     require_pattern "$f" 'dcent_required_prebuilt_binaries' \
         'CI-GATE-STALE-BINARY: build_in_docker enumerates all required staged binaries'
-    require_pattern "$f" 'dcentos-init binary is STALE' \
-        'CI-GATE-STALE-BINARY: build_in_docker selftest covers stale dcentos-init'
-    require_pattern "$f" 'dcentos-discovery' \
-        'CI-GATE-STALE-BINARY: build_in_docker can refuse stale BB discovery binary'
-    require_pattern "$f" 'binary is STALE' \
-        'CI-GATE-STALE-BINARY: build_in_docker refuses stale staged binaries (source newer than built binary)'
-    # Fail-closed: the refusal must hard-exit unless the explicit override is set.
-    require_pattern "$f" 'DCENT_ALLOW_STALE_DCENTRALD:-0' \
-        'CI-GATE-STALE-BINARY: stale-binary guard fails closed (rejects unless DCENT_ALLOW_STALE_DCENTRALD=1)'
+    require_pattern "$f" 'export-snapshot-set' \
+        'CI-GATE-STALE-BINARY: Phase 0 captures a private snapshot-consistent binary set'
+    require_pattern "$f" 'query-export-snapshot-path' \
+        'CI-GATE-STALE-BINARY: host resolves helper-verified canonical export paths'
+    require_pattern "$f" '--field path-sha256' \
+        'CI-GATE-STALE-BINARY: host atomically queries verified paths and digests for Phase 5'
+    require_pattern "$f" 'destination digest mismatch' \
+        'CI-GATE-STALE-BINARY: Phase 5 proves destination bytes equal the verified export'
+    reject_pattern "$f" 'RECEIPT_HELPER=/build/dcentos/scripts/binary_build_receipt.py' \
+        'CI-GATE-STALE-BINARY: Phase 5 does not trust the mutable recopied helper'
+    require_pattern "$f" 'export-snapshot-capability-path' \
+        'CI-GATE-STALE-BINARY: packaging retains the out-of-stage destruction capability'
+    require_pattern "$f" 'destroy-export-snapshot-set' \
+        'CI-GATE-STALE-BINARY: cleanup destroys the detached binary set'
+    require_pattern "$f" '--capability "$BINARY_EXPORT_CAPABILITY"' \
+        'CI-GATE-STALE-BINARY: detached-set cleanup is capability-authorized'
+    require_pattern "$f" '-v "${DOCKER_BINARY_EXPORT_STAGE}:/dcent-binaries:ro"' \
+        'CI-GATE-STALE-BINARY: Phase 5 receives the private export through a comma-safe read-only mount'
+    require_pattern "$f" 'ALL_PREBUILT_BINARIES="dcentrald dcentos-init dcentos-discovery pic-recovery dspic-flash"' \
+        'CI-GATE-STALE-BINARY: warm volume purges shipped and historical recovery binary generations'
+    require_pattern "$f" 'unsafe persistent binary staging component' \
+        'CI-GATE-STALE-BINARY: persistent release path rejects symlink components'
+    require_pattern "$f" '"$BUILD_CONTAINER_ID" bash -c' \
+        'CI-GATE-STALE-BINARY: post-inspection Docker work runs the immutable image ID'
+    reject_pattern "$f" '${POSIX_PROJECT_DIR}/dcentrald/target:/target:ro' \
+        'CI-GATE-STALE-BINARY: mutable host Rust target tree is not mounted for packaging'
+    require_pattern "$f" 'check-override-policy' \
+        'CI-GATE-STALE-BINARY: release-context stale override policy stays enforced'
+    require_pattern 'scripts/build-dcentrald.sh' 'emit_build_receipts' \
+        'CI-GATE-STALE-BINARY: Rust build emits receipts for staged binaries'
+    require_pattern 'scripts/build-dcentrald.sh' '--binary "$receipt_release_dir/dcentrald"' \
+        'CI-GATE-STALE-BINARY: dcentrald receipt is emitted'
+    require_pattern 'scripts/build-dcentrald.sh' '--binary "$receipt_release_dir/dcentos-init"' \
+        'CI-GATE-STALE-BINARY: dcentos-init receipt is emitted'
+    require_pattern 'scripts/build-dcentrald.sh' '--binary "$receipt_release_dir/dcentos-discovery"' \
+        'CI-GATE-STALE-BINARY: dcentos-discovery receipt is emitted'
+    require_pattern "$f" 'am3-bb-s19jpro-vnish|cv1835-s19jpro' \
+        'CI-GATE-STALE-BINARY: CV1835 discovery is part of the exact required set'
+    require_pattern 'br2_external_dcentos/board/cvitek/cv1835-s19jpro/post-build.sh' \
+        'ERROR: dcentos-discovery not found' \
+        'CI-GATE-STALE-BINARY: CV1835 refuses an unstaged discovery binary'
+    require_pattern "$f" '--source-workspace DCENT_OS_Antminer/dcentrald' \
+        'CI-GATE-STALE-BINARY: receipt inventory is rooted in the authenticated snapshot workspace'
+    require_pattern 'scripts/binary_build_receipt.py' 'exact-git-object-snapshot' \
+        'CI-GATE-STALE-BINARY: v4 receipts distinguish immutable source from live worktree state'
+    if python3 - <<'PY'
+import runpy
+
+namespace = runpy.run_path("scripts/binary_build_receipt.py", run_name="ci_receipt_constants")
+expected = (
+    "declared-release-capsule-and-post-build-snapshot-consistency-"
+    "not-build-causality-or-reproducibility-proof"
+)
+raise SystemExit(0 if namespace.get("RECEIPT_CLAIM_V4") == expected else 1)
+PY
+    then
+        pass 'CI-GATE-STALE-BINARY: v4 capsule receipt claims neither build causality nor reproducibility proof'
+    else
+        fail 'CI-GATE-STALE-BINARY: v4 capsule receipt semantic claim regressed'
+    fi
+    require_pattern 'scripts/binary_build_receipt.py' 'is forbidden in release provenance/status/image mode' \
+        'CI-GATE-STALE-BINARY: receipt bypass is categorically rejected for releases'
+    require_pattern 'scripts/binary_build_receipt.py' 'it does not bypass snapshot/export validation' \
+        'CI-GATE-STALE-BINARY: deprecated lab signal grants no immutable-boundary bypass'
+    require_file 'scripts/test_binary_build_receipt.sh'
+    require_file 'scripts/test_binary_export_phase5.sh'
     require_pattern 'br2_external_dcentos/board/zynq/post-build.sh' 'ERROR: dcentos-init not found' \
         'CI-GATE-STALE-BINARY: zynq post-build fails when dcentos-init is absent'
     require_pattern 'br2_external_dcentos/board/zynq/am2-s19jpro/post-build.sh' 'ERROR: dcentos-init not found' \
@@ -2643,10 +2856,15 @@ stale_binary_guard_check() {
         'CI-GATE-STALE-BINARY: zynq image stamps dcentos-init sha256'
     require_pattern 'br2_external_dcentos/board/zynq/am2-s19jpro/post-build.sh' 'dcentos-init.sha256' \
         'CI-GATE-STALE-BINARY: am2-s19jpro image stamps dcentos-init sha256'
-    if DCENT_STALE_BINARY_GUARD_SELFTEST=1 bash scripts/build_in_docker.sh --target s9 >/dev/null 2>&1; then
-        pass "CI-GATE-STALE-BINARY: build_in_docker stale-binary selftest trips on dcentos-init source drift"
+    if sh scripts/test_binary_build_receipt.sh >/dev/null 2>&1; then
+        pass "CI-GATE-STALE-BINARY: receipt suite rejects binary, source, context, and release-bypass drift"
     else
-        fail "CI-GATE-STALE-BINARY: build_in_docker stale-binary selftest failed"
+        fail "CI-GATE-STALE-BINARY: binary receipt adversarial suite failed"
+    fi
+    if bash scripts/test_binary_export_phase5.sh >/dev/null 2>&1; then
+        pass "CI-GATE-STALE-BINARY: immutable Phase 0 to Phase 5 route and source pin hold"
+    else
+        fail "CI-GATE-STALE-BINARY: immutable Phase 5 binary export boundary failed"
     fi
 }
 stale_binary_guard_check
@@ -3146,10 +3364,9 @@ commit_authority_normalization_check
 #   1. CORE-INVARIANT MARKERS: all 4 copies carry the shared V1..V14
 #      proof-matrix contract (run_verify/emit_check/the V1..V14 banner/schema
 #      version=2). Catches an accidentally gutted or truncated copy.
-#   2. ZYNQ-ONLY W8 DELTA: only the zynq copy carries the W8 brick-safety
-#      "DEFER to S99upgrade" boot-success block. The 3 non-zynq copies MUST NOT
-#      carry it. Documents + enforces the one intentional zynq-only divergence
-#      (do NOT add the W8 block to platforms we cannot live-test — out of scope).
+#   2. REPORT-ONLY COMMIT AUTHORITY: all copies are non-mutating proof
+#      consumers. They must not contain command-position durable boot-state
+#      mutation, while the Zynq copy observes S99upgrade's decision marker.
 #   3. NON-ZYNQ EQUIVALENCE MODULO ARCH-FALLBACK: the 3 non-zynq copies are NOT
 #      byte-identical as-is — each legitimately customises the `uname -m`
 #      last-resort BOARD_FAMILY arch fallback (the two `armv7l|arm)` /
@@ -3201,21 +3418,28 @@ s99verify_drift_check() {
         pass "CI-GATE-S99VERIFY-DRIFT: all 4 S99verify copies carry the shared V1..V14 proof-matrix markers"
     fi
 
-    # 2. Zynq-only W8 "DEFER to S99upgrade" brick-safety delta.
-    if grep -F -- 'DEFER to S99upgrade' "$zynq" >/dev/null 2>&1; then
-        pass "CI-GATE-S99VERIFY-DRIFT: zynq S99verify keeps the W8 'DEFER to S99upgrade' brick-safety block"
-    else
-        fail "CI-GATE-S99VERIFY-DRIFT: zynq S99verify lost the W8 'DEFER to S99upgrade' block (brick-safety regression)"
-    fi
-    w8_leak=0
-    for f in $nonzynq; do
-        if grep -F -- 'DEFER to S99upgrade' "$f" >/dev/null 2>&1; then
-            fail "CI-GATE-S99VERIFY-DRIFT: non-zynq copy $f gained the zynq-only W8 'DEFER to S99upgrade' block (boot-behavior change on a non-live-tested platform)"
-            w8_leak=1
+    # 2. Every verifier is report-only. Ignore prose and reject only actual
+    #    command-position durable mutation. Zynq additionally observes the
+    #    marker written by its sole commit authority, S99upgrade.
+    authority_ok=1
+    for f in $all; do
+        if ! grep -F -- 'report-only proof consumer' "$f" >/dev/null 2>&1; then
+            fail "CI-GATE-S99VERIFY-DRIFT: $f lost the report-only ownership marker"
+            authority_ok=0
+        fi
+        mutation_hits=$(grep -nE '^[[:space:]]*(fw_setenv|nandwrite|flash_erase)([[:space:]]|$)' "$f" 2>/dev/null || true)
+        if [ -n "$mutation_hits" ]; then
+            fail "CI-GATE-S99VERIFY-DRIFT: $f contains a durable boot-state mutation command"
+            printf '%s\n' "$mutation_hits" >&2
+            authority_ok=0
         fi
     done
-    if [ "$w8_leak" -eq 0 ]; then
-        pass "CI-GATE-S99VERIFY-DRIFT: the W8 'DEFER to S99upgrade' block stays zynq-only (absent from amlogic/cvitek/beaglebone)"
+    if ! grep -F -- 'UPGRADE_COMMIT_MARKER' "$zynq" >/dev/null 2>&1; then
+        fail "CI-GATE-S99VERIFY-DRIFT: zynq S99verify lost the S99upgrade decision-marker observation"
+        authority_ok=0
+    fi
+    if [ "$authority_ok" -eq 1 ]; then
+        pass "CI-GATE-S99VERIFY-DRIFT: all S99verify copies are report-only and Zynq observes the sole commit authority's marker"
     fi
 
     # 3. Non-zynq copies byte-identical modulo the sanctioned `uname -m` arch
@@ -3374,6 +3598,30 @@ hardware_identification_confidence_check() {
     fi
 }
 hardware_identification_confidence_check
+
+nonstandard_mining_identity_provenance_check() {
+    require_file 'scripts/test_nonstandard_mining_identity_provenance.sh'
+    if [ -f 'scripts/test_nonstandard_mining_identity_provenance.sh' ]; then
+        if sh 'scripts/test_nonstandard_mining_identity_provenance.sh' >/dev/null 2>&1; then
+            pass "non-standard mining engines remain non-Measured without retained enumeration receipts"
+        else
+            fail "non-standard mining identity provenance audit regressed"
+        fi
+    fi
+}
+nonstandard_mining_identity_provenance_check
+
+asic_wire_crc5_check() {
+    require_file 'scripts/test_asic_wire_crc5.sh'
+    if [ -f 'scripts/test_asic_wire_crc5.sh' ]; then
+        if sh 'scripts/test_asic_wire_crc5.sh' >/dev/null 2>&1; then
+            pass "ASIC wire CRC5: captured command vectors, generated Python copies, and unverified response semantics are pinned"
+        else
+            fail "ASIC wire CRC5: command checksum or response-integrity boundary regressed"
+        fi
+    fi
+}
+asic_wire_crc5_check
 
 offline_soak_harness_check() {
     require_file 'scripts/test_offline_soak_harness.sh'
@@ -3669,6 +3917,371 @@ sysupgrade_packaging_static_check() {
 }
 sysupgrade_packaging_static_check
 
+# The signed sysupgrade envelope must be byte-identical when the same staged
+# payloads are packaged in unrelated directories with different host mtimes,
+# creation order and modes. The test also proves invalid/missing/dirty source
+# provenance fails closed before signing.
+release_envelope_reproducibility_check() {
+    require_file 'scripts/test_release_envelope_reproducibility.sh'
+    if [ -f 'scripts/test_release_envelope_reproducibility.sh' ]; then
+        if bash 'scripts/test_release_envelope_reproducibility.sh' >/dev/null 2>&1; then
+            pass "release envelope is reproducible and provenance rejects invalid inputs"
+        else
+            fail "release envelope reproducibility/provenance contract regressed"
+        fi
+    fi
+}
+release_envelope_reproducibility_check
+
+release_publication_check() {
+    require_file 'scripts/release_publication.py'
+    require_file 'scripts/test_release_publication.py'
+    require_file 'scripts/test_release_publication.sh'
+    if sh 'scripts/test_release_publication.sh' >/dev/null 2>&1; then
+        pass "each flat release compatibility file publishes atomically without replacement"
+    else
+        fail "release publication path/identity boundary regressed"
+    fi
+}
+release_publication_check
+
+# A release invocation is an identity/capability boundary, not cleanup authority
+# over arbitrary Docker or output state. Source materialization and authoritative
+# publication have separate exact-tree capabilities so each can fail closed.
+release_capsule_primitives_check() {
+    require_file 'scripts/release_invocation.py'
+    require_file 'scripts/release_signing_authority.py'
+    require_file 'scripts/test_release_signing_authority.py'
+    require_file 'scripts/test_release_signing_authority.sh'
+    require_file 'scripts/release_capsule_lineage.py'
+    require_file 'scripts/test_release_invocation.py'
+    require_file 'scripts/test_release_invocation.sh'
+    require_file 'scripts/release_result_stage.py'
+    require_file 'scripts/test_release_result_stage.py'
+    require_file 'scripts/test_release_result_stage.sh'
+    require_file 'scripts/release_docker_resources.py'
+    require_file 'scripts/test_release_docker_resources.py'
+    require_file 'scripts/test_release_docker_resources.sh'
+    require_file 'scripts/build_s9_release_capsule.sh'
+    require_file 'scripts/test_cargo_capsule_driver.sh'
+    require_file 'scripts/test_s9_release_capsule_driver.sh'
+    require_file 'scripts/release_capsule_target_policy.py'
+    require_file 'scripts/test_release_capsule_target_policy.py'
+    require_file 'scripts/test_release_capsule_target_policy.sh'
+    require_file 'scripts/portable_release_evidence.py'
+    require_file 'scripts/test_portable_release_evidence.py'
+    require_file 'scripts/test_portable_release_evidence.sh'
+    require_file 'scripts/source_snapshot.py'
+    require_file 'scripts/test_source_snapshot.py'
+    require_file 'scripts/test_source_snapshot.sh'
+    require_file 'scripts/release_set_publication.py'
+    require_file 'scripts/test_release_set_publication.py'
+    require_file 'scripts/test_release_set_publication.sh'
+
+    if sh 'scripts/test_release_invocation.sh' >/dev/null 2>&1; then
+        pass "release invocation identities are unique, capability-owned, and explicitly GC-gated"
+    else
+        fail "release invocation identity/capability boundary regressed"
+    fi
+    if sh 'scripts/test_release_signing_authority.sh' >/dev/null 2>&1; then
+        pass "release signing keys are stable, private, invocation-bound capabilities"
+    else
+        fail "release signing-authority snapshot/integrity boundary regressed"
+    fi
+    # The wrapper declares Bash and uses `set -o pipefail`; invoking it through
+    # Ubuntu's `/bin/sh` (dash) exits before any result-stage test runs.
+    if bash 'scripts/test_release_result_stage.sh' >/dev/null 2>&1; then
+        pass "Cargo result handoff is invocation-bound, exact, and outside the live source tree"
+    else
+        fail "release result-stage isolation/integrity boundary regressed"
+    fi
+    if sh 'scripts/test_release_docker_resources.sh' >/dev/null 2>&1; then
+        pass "Docker volume operations require exact invocation labels and cleanup authority"
+    else
+        fail "release Docker resource authority boundary regressed"
+    fi
+    if bash 'scripts/test_cargo_capsule_driver.sh' >/dev/null 2>&1; then
+        pass "Cargo capsule consumes read-only snapshot source and isolated invocation results"
+    else
+        fail "Cargo capsule driver isolation/cleanup boundary regressed"
+    fi
+    if bash 'scripts/test_s9_release_capsule_driver.sh' >/dev/null 2>&1; then
+        pass "S9 capsule preserves immutable source, private invocation state, cleanup, and no-replace publication"
+    else
+        fail "S9 release-capsule orchestration boundary regressed"
+    fi
+    if bash 'scripts/test_release_capsule_target_policy.sh' >/dev/null 2>&1; then
+        pass "release-capsule targets use one exact fail-closed identity policy"
+    else
+        fail "release-capsule target admission policy regressed"
+    fi
+    if sh 'scripts/test_source_snapshot.sh' >/dev/null 2>&1; then
+        pass "source snapshots materialize exact Git-object bytes outside the live worktree"
+    else
+        fail "Git-object source snapshot integrity/cleanup boundary regressed"
+    fi
+    if bash 'scripts/test_portable_release_evidence.sh' >/dev/null 2>&1; then
+        pass "published release sets remain target-bound and independently auditable after private-stage cleanup"
+    else
+        fail "portable signed release-evidence target boundary regressed"
+    fi
+    if sh 'scripts/test_release_set_publication.sh' >/dev/null 2>&1; then
+        pass "authoritative release directories publish as one exact no-replace set"
+    else
+        fail "authoritative release-set sealing/publication boundary regressed"
+    fi
+}
+release_capsule_primitives_check
+
+# Partial source closure is a separate, deliberately narrower claim than
+# envelope reproducibility. Bind immutable build definitions and actual output
+# member digests while keeping unresolved Buildroot/container inputs explicit.
+source_closure_check() {
+    require_file 'scripts/source_closure.py'
+    require_file 'scripts/test_source_closure.sh'
+    require_file 'scripts/test_build_input_preflight.sh'
+    require_file 'scripts/build_input_snapshot.py'
+    require_file 'scripts/test_build_input_snapshot.py'
+    require_file 'scripts/test_build_input_snapshot.sh'
+    if [ -f 'scripts/test_source_closure.sh' ]; then
+        if bash 'scripts/test_source_closure.sh' >/dev/null 2>&1; then
+            pass "partial source closure is deterministic and rejects missing/mutable inputs"
+        else
+            fail "partial source-closure generation/verification regressed"
+        fi
+    fi
+    if [ -f 'scripts/test_build_input_preflight.sh' ]; then
+        if bash 'scripts/test_build_input_preflight.sh' >/dev/null 2>&1; then
+            pass "target-scoped out-of-band inputs fail closed before Cargo/Docker consumers"
+        else
+            fail "target-scoped build-input preflight regressed"
+        fi
+    fi
+    if [ -f 'scripts/test_build_input_snapshot.sh' ]; then
+        if sh 'scripts/test_build_input_snapshot.sh' >/dev/null 2>&1; then
+            pass "manifest-pinned external bytes use exact-tree snapshots and consumer-side digest checks"
+        else
+            fail "build-input snapshot integrity/cleanup/consumption gate regressed"
+        fi
+    fi
+    require_pattern 'scripts/source_closure.py' \
+        'org.dcentral.dcentos.source-closure.v4' \
+        'source closure v4 binds one authenticated invocation and Git-object snapshot'
+    require_pattern 'scripts/source_closure.py' \
+        'org.dcentral.dcentos.source-closure.v3' \
+        'historical source closure v3 remains verification-only during migration'
+    require_pattern 'scripts/source_closure.py' \
+        'legacy source-closure v1 receipts lack required out-of-band input binding' \
+        'source closure rejects unbound legacy v1 receipts by default'
+    require_pattern 'scripts/source_closure.py' \
+        'legacy source-closure v2 receipts lack retained prebuilt Rust input binding' \
+        'source closure rejects v2 receipts that omit retained prebuilt Rust inputs'
+    require_pattern 'scripts/source_closure.py' \
+        'retained-packaging-input-snapshots-not-build-execution-attestation' \
+        'retained prebuilt Rust evidence keeps its build-execution boundary explicit'
+    require_pattern 'scripts/build_inputs.manifest' \
+        'knowledge-base/extractions/s9/s9_devicetree.dtb' \
+        'S9 FIT device tree is pinned as a consumed out-of-band build input'
+    require_pattern 'scripts/build-dcentrald.sh' \
+        '--target cargo-workspace' \
+        'Cargo workspace snapshots its ignored embedded input before compilation'
+    require_pattern 'scripts/build_in_docker.sh' \
+        'build_input_snapshot.py" create' \
+        'firmware packaging snapshots target inputs before Docker consumption'
+    reject_pattern 'scripts/build_in_docker.sh' \
+        ':/kb:ro' \
+        'supported packaging lanes cannot bypass snapshots through a live knowledge-base mount'
+    reject_pattern 'scripts/build_in_docker.sh' \
+        '/kb/extractions/' \
+        'packaging contains no dormant live-extraction fallback path'
+    if [ ! -e 'dcentrald/pic-recovery/build.rs' ]; then
+        pass 'Cargo diagnostics contain no recovery-artifact build script'
+    else
+        fail 'Cargo diagnostics unexpectedly contain dcentrald/pic-recovery/build.rs'
+    fi
+    reject_pattern 'dcentrald/pic-recovery/src/main.rs' \
+        'include_bytes!' \
+        'controller diagnostics cannot embed a proprietary recovery artifact'
+    reject_pattern 'dcentrald/pic-recovery/src/main.rs' \
+        'include_str!' \
+        'controller diagnostics cannot embed a textual recovery artifact'
+    reject_pattern 'dcentrald/pic-recovery/src/dspic_flash_main.rs' \
+        'include_bytes!' \
+        'dsPIC status command cannot embed a proprietary recovery artifact'
+    reject_pattern 'dcentrald/pic-recovery/src/dspic_flash_main.rs' \
+        'include_str!' \
+        'dsPIC status command cannot embed a textual recovery artifact'
+    reject_pattern 'scripts/build-dcentrald.sh' \
+        'DCENT_STOCK_FPGA' \
+        'normal Cargo builds cannot carry retired stock-FPGA environment authority'
+    reject_pattern 'scripts/build-dcentrald.sh' \
+        'STAGED_STOCK_FPGA' \
+        'normal Cargo builds cannot stage the retired stock-FPGA recovery input'
+    reject_pattern 'scripts/build-dcentrald.sh' \
+        '/dcent-inputs/stock_fpga' \
+        'normal Cargo builds cannot mount the retired stock-FPGA recovery input'
+    reject_pattern 'scripts/build_inputs.manifest' \
+        'pic-recovery/firmware/stock_fpga_s9.bin' \
+        'release input policy cannot retain the unconsumed stock FPGA blob'
+    reject_pattern 'scripts/build_inputs.manifest' \
+        'pic-recovery/firmware/stock_fpga_extracted.bin' \
+        'release input policy cannot retain the unconsumed comparison blob'
+    require_pattern 'scripts/source_closure.py' \
+        'COMMON_CARGO_BUILD_INPUTS = ()' \
+        'Cargo external-input evidence truthfully selects an empty file set'
+    require_pattern 'scripts/build_in_docker.sh' \
+        '--token "$BUILD_INPUT_DESTROY_TOKEN"' \
+        'firmware packaging cleanup requires the out-of-band snapshot destruction capability'
+    reject_pattern 'scripts/build-dcentrald.sh' \
+        '$KNOWLEDGE_BASE_DIR":/knowledge-base:ro' \
+        'cross Cargo cannot inspect the full live knowledge-base tree'
+    require_pattern 'scripts/build-dcentrald.sh' \
+        ':/knowledge-base/firmware-archive/stock-bitmain-manifest.json:ro' \
+        'cross Cargo receives only the exact tracked stock manifest input'
+    require_pattern 'scripts/build_in_docker.sh' \
+        'git -C buildroot status --porcelain --untracked-files=normal' \
+        'source closure rejects modified, staged, and untracked warm-volume Buildroot source'
+    require_pattern 'scripts/build_in_docker.sh' \
+        'source_closure.py" generate' \
+        'all Docker image producers emit a source-closure receipt'
+    require_pattern '../../.github/workflows/dcentos-image-smoke.yml' \
+        'portable_release_evidence.py verify' \
+        'S9 image smoke reauthenticates closure, receipts, inputs, and artifacts after capsule cleanup'
+    require_pattern '../../.github/workflows/dcentos-image-smoke.yml' \
+        'portable-release-evidence.json.sig' \
+        'S9 image smoke requires the signed portable exact-set index'
+    require_pattern '../../.github/workflows/dcentos-image-smoke.yml' \
+        '.dcent-release-set.json' \
+        'S9 image smoke requires the final sealed release-set descriptor'
+    require_pattern '../../.github/workflows/dcentos-image-smoke.yml' \
+        '${{ runner.temp }}/dcentos-image-smoke-${{ github.run_id }}-${{ github.run_attempt }}/releases/' \
+        'S9 image smoke uploads the atomic published directory instead of a hand-picked flat sidecar subset'
+    require_pattern '../../.github/workflows/dcentos-image-smoke.yml' \
+        'AM2 package smoke: intentionally unavailable' \
+        'AM2 image-smoke source-closure coverage remains explicitly blocked until an AM2 capsule exists'
+}
+source_closure_check
+
+# Buildroot package file lists are path claims, not final-content ownership.
+# Keep the bounded final-rootfs ledger's deterministic classifier and negative
+# controls live in CI without pretending that a fixture proves production image
+# attribution or a complete SPDX/CycloneDX SBOM.
+rootfs_ownership_ledger_check() {
+    require_file 'scripts/rootfs_ownership_ledger.py'
+    require_file 'scripts/test_rootfs_ownership_ledger.sh'
+    if [ -f 'scripts/test_rootfs_ownership_ledger.sh' ]; then
+        if bash 'scripts/test_rootfs_ownership_ledger.sh' >/dev/null 2>&1; then
+            pass "final-rootfs ownership ledger is deterministic and keeps ambiguous/unattributed evidence explicit"
+        else
+            fail "final-rootfs ownership ledger fixture or negative controls regressed"
+        fi
+    fi
+    require_pattern 'scripts/rootfs_ownership_ledger.py' \
+        '"is_sbom": False' \
+        'rootfs ownership ledger does not overclaim complete SBOM coverage'
+    require_pattern 'scripts/rootfs_ownership_ledger.py' \
+        'single-buildroot-path-claim;final-content-origin-not-proven' \
+        'unique Buildroot package attribution remains explicitly path-claim-only'
+}
+rootfs_ownership_ledger_check
+
+# Buildroot's own legal-info output is hash-enumerated as a bounded release
+# evidence slice. It is artifact-bound and source/license aware, but remains a
+# custom partial inventory rather than an SBOM or a license-compliance claim.
+buildroot_legal_inventory_check() {
+    require_file 'scripts/buildroot_legal_inventory.py'
+    require_file 'scripts/test_buildroot_legal_inventory.sh'
+    if [ -f 'scripts/test_buildroot_legal_inventory.sh' ]; then
+        if bash 'scripts/test_buildroot_legal_inventory.sh' >/dev/null 2>&1; then
+            pass "artifact-bound Buildroot legal-info inventory is deterministic and fail-closed"
+        else
+            fail "Buildroot legal-info inventory fixture or negative controls regressed"
+        fi
+    fi
+    require_pattern 'scripts/buildroot_legal_inventory.py' \
+        '"is_sbom": False' \
+        'Buildroot legal inventory does not overclaim complete SBOM coverage'
+    require_pattern 'scripts/buildroot_legal_inventory.py' \
+        '"license_compliance": "not_assessed"' \
+        'Buildroot legal inventory does not overclaim license compliance'
+    require_pattern 'scripts/buildroot_legal_inventory.py' \
+        '"vulnerability_analysis": "not_performed"' \
+        'Buildroot legal inventory keeps advisory analysis explicitly unresolved'
+    require_pattern 'scripts/build_in_docker.sh' \
+        'buildroot_legal_inventory.py generate' \
+        'release image producers emit the Buildroot legal-info inventory'
+    require_pattern 'scripts/build_in_docker.sh' \
+        '--artifact "$BUILDROOT_LEGAL_INVENTORY_PATH"' \
+        'signed source-closure receipts bind the Buildroot legal-info inventory'
+}
+buildroot_legal_inventory_check
+
+# Rust packages are the first dependency-inventory vertical slice. Keep the
+# custom schema honest: it is artifact-bound and locked/offline, but does not
+# pretend to be a complete SPDX/CycloneDX SBOM for Buildroot firmware.
+rust_dependency_inventory_check() {
+    require_file 'scripts/rust_dependency_inventory.py'
+    require_file 'scripts/test_rust_dependency_inventory.sh'
+    if [ -f 'scripts/test_rust_dependency_inventory.sh' ]; then
+        if bash 'scripts/test_rust_dependency_inventory.sh' >/dev/null 2>&1; then
+            pass "artifact-bound Rust dependency inventory is deterministic and locked offline"
+        else
+            fail "Rust dependency inventory generation/verification regressed"
+        fi
+    fi
+    require_pattern 'scripts/rust_dependency_inventory.py' \
+        '"spdx_conformance": "not_claimed"' \
+        'Rust inventory does not overclaim SPDX conformance'
+    require_pattern 'scripts/rust_dependency_inventory.py' \
+        '"cyclonedx_conformance": "not_claimed"' \
+        'Rust inventory does not overclaim CycloneDX conformance'
+    require_pattern 'scripts/build_in_docker.sh' \
+        'rust_dependency_inventory.py" generate' \
+        'release image producers emit the Rust dependency inventory'
+    require_pattern 'scripts/build-dcentrald.sh' \
+        'cargo metadata --locked --offline --filter-platform' \
+        'Rust inventory metadata is emitted locked/offline for the release target'
+    require_pattern 'scripts/build-dcentrald.sh' \
+        'FROM ${RUST_BUILDER_BASE}' \
+        'Rust inventory metadata shares the selected builder base'
+    require_pattern 'scripts/build-dcentrald.sh' \
+        'builder_image_id=$DCENT_BUILDER_IMAGE_ID' \
+        'Rust inventory receipt context binds the inspected builder image ID'
+    require_pattern 'scripts/build-dcentrald.sh' \
+        '"$DOCKER_IMAGE_ID" \' \
+        'Rust inventory build executes the inspected immutable builder image ID'
+    require_pattern 'scripts/build_in_docker.sh' \
+        '--artifact "$RUST_INVENTORY_PATH"' \
+        'source-closure receipt binds the Rust dependency inventory'
+    require_pattern '../../.github/workflows/dcentos-image-smoke.yml' \
+        'portable_release_evidence.py verify' \
+        'S9 image smoke verifies the closure-bound Rust inventory through portable capsule evidence'
+    require_pattern '../../.github/workflows/dcentos-image-smoke.yml' \
+        'AM2 package smoke: intentionally unavailable' \
+        'AM2 Rust-inventory workflow coverage is not claimed without an admitted capsule'
+}
+rust_dependency_inventory_check
+
+# Amlogic first boot uses /data/.firstboot-pending as a write-ahead marker
+# before the raw recovery-flag transition. Keep the crash-injection harness in
+# the aggregate gate so the marker cannot regress to unchecked truncate/sync or
+# a fail-open continuation into flash/env mutation.
+amlogic_firstboot_wal_durability_check() {
+    require_file 'scripts/test_amlogic_s99upgrade_wal_durability.sh'
+    if [ -f 'scripts/test_amlogic_s99upgrade_wal_durability.sh' ]; then
+        if bash 'scripts/test_amlogic_s99upgrade_wal_durability.sh' >/dev/null 2>&1; then
+            pass "Amlogic firstboot WAL is durable before recovery authority mutation"
+        else
+            fail "Amlogic firstboot WAL durability/fail-closed harness regressed"
+        fi
+    fi
+    require_pattern \
+        'br2_external_dcentos/board/amlogic/rootfs-overlay/etc/init.d/S99upgrade' \
+        'refusing recovery-flag commit' \
+        'Amlogic S99upgrade refuses recovery authority when WAL durability is unproven'
+}
+amlogic_firstboot_wal_durability_check
+
 # OTA downgrade-floor monotonicity gate. The signed-package shell path must
 # never treat an older release version as installable, even when the operator's
 # lab downgrade override is present. This host-only test extracts the comparator
@@ -3711,24 +4324,61 @@ overlay_board_target_recognized_check() {
 }
 overlay_board_target_recognized_check
 
-# EEPROM/PIC corruption-prevention gate (guarantee #2 from the .74/.139 incident).
-# The destructive dsPIC flash ops (RESET 0x07 / JUMP 0x06 / ERASE 0x09 /
-# SEND_DATA 0x14 / full reflash()) live behind the `recovery-tool` Cargo feature
-# in dcentrald-asic + dcentrald-hal. The load-bearing guarantee is that CALLING
-# them is a COMPILE ERROR in the dcentrald daemon — which holds ONLY while the
-# daemon crate never enables that feature on those deps. Nothing structurally
-# stopped a regression that added `features = ["recovery-tool"]` to the daemon's
-# Cargo.toml, which would link `dspic_flash` into the daemon and silently re-arm
-# the whole EEPROM/dsPIC corruption class. Only `pic-recovery` (a separate,
-# --confirm-bricked binary) may enable it; the daemon crate must NEVER mention it.
+# Controller mutation is not a shipped software capability. Keep this proof in
+# one executable semantic test so Cargo membership, dependencies, syscalls,
+# dashboard ownership, and stale-binary cleanup cannot drift independently.
+controller_diagnostic_boundary_check() {
+    require_file 'scripts/test_controller_diagnostic_boundary.py'
+    require_file 'dcentrald/dcentrald-api-types/src/dspic_frame.rs'
+    require_file 'dcentrald/dcentrald-hal/src/stock_fpga_iic.rs'
+    require_pattern 'dcentrald/dcentrald-api-types/src/dspic_frame.rs' \
+        'SET_HOST_MAC_ADDRESS_OPCODE: u8 = 0x14' \
+        'CONTROLLER-DIAGNOSTICS: canonical API catalog pins 0x14 as SET_HOST_MAC_ADDRESS'
+    require_pattern 'dcentrald/dcentrald-hal/src/stock_fpga_iic.rs' \
+        'SET_HOST_MAC_ADDRESS: u8 = 0x14' \
+        'CONTROLLER-DIAGNOSTICS: HAL catalog independently pins 0x14 as SET_HOST_MAC_ADDRESS'
+    if python3 'scripts/test_controller_diagnostic_boundary.py' >/dev/null 2>&1; then
+        pass 'CONTROLLER-DIAGNOSTICS: standalone tools are opt-in and structurally read-only'
+    else
+        fail 'CONTROLLER-DIAGNOSTICS: standalone diagnostic-only boundary regressed'
+    fi
+}
+controller_diagnostic_boundary_check
+
+# Normal-runtime hardware ownership is process-exclusive. Web adapters and
+# post-boot checks consume daemon snapshots; normal REST handlers never open a
+# second transport; raw research executors are pruned after every product
+# overlay. S99verify observes boot-commit state but never owns its mutation.
+runtime_hardware_ownership_check() {
+    require_file 'scripts/test_runtime_hardware_ownership.py'
+    require_file 'scripts/test_s99verify_commit_authority.sh'
+    require_file 'br2_external_dcentos/board/common/prune-runtime-research-tools.sh'
+    if python3 'scripts/test_runtime_hardware_ownership.py' >/dev/null 2>&1; then
+        pass 'HARDWARE-OWNERSHIP: runtime adapters are snapshot-only and research executors are absent from product rootfs images'
+    else
+        fail 'HARDWARE-OWNERSHIP: parallel runtime hardware access or release-composition pruning regressed'
+    fi
+    if sh 'scripts/test_s99verify_commit_authority.sh' >/dev/null 2>&1; then
+        pass 'HARDWARE-OWNERSHIP: S99verify observes committed/blocked boot state without durable mutation authority'
+    else
+        fail 'HARDWARE-OWNERSHIP: S99verify boot-commit authority contract regressed'
+    fi
+}
+runtime_hardware_ownership_check
+
+# Recovery-feature isolation gate (guarantee #2 from the .74/.139 incident).
+# Historical protocol research remains feature-gated inside library crates,
+# but no shipped daemon or standalone package may enable it.
 recovery_tool_not_in_daemon_check() {
     _dc='dcentrald/dcentrald/Cargo.toml'
+    _controller='dcentrald/pic-recovery/Cargo.toml'
     require_file "$_dc"
-    _hits=$(grep -nE 'recovery-tool' "$_dc" 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*#' || true)
+    require_file "$_controller"
+    _hits=$(grep -nE 'recovery-tool' "$_dc" "$_controller" 2>/dev/null | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)
     if [ -z "$_hits" ]; then
-        pass "EEPROM/PIC: dcentrald daemon crate does not enable the recovery-tool feature (destructive dsPIC ops stay a compile error)"
+        pass "EEPROM/PIC: no shipped daemon or controller package enables recovery-tool"
     else
-        fail "EEPROM/PIC: dcentrald/dcentrald/Cargo.toml references recovery-tool — the destructive dsPIC flash ops (.74/.139 corruption class) would link into the daemon and calling them would no longer be a compile error. Only pic-recovery may enable it. Offending line(s): $_hits"
+        fail "EEPROM/PIC: a shipped package enables recovery-tool. Offending line(s): $_hits"
     fi
 }
 recovery_tool_not_in_daemon_check
@@ -3776,13 +4426,11 @@ wallet_log_masking_check() {
 }
 wallet_log_masking_check
 
-# CI-GATE-CE026 (reverse A/B + AM2 first-install offline nandsim proof). The
-# DYNAMIC proof (nandsim + UBI/UBIFS as root) runs ONLY in the privileged Linux
-# CI job (.github/workflows/dcentos-offline-nandsim.yml); it CANNOT run on a
-# Windows/WSL host. This STATIC gate pins that the new reverse-direction A/B
-# path, the AM2 first-install path, and their CI wiring EXIST and stay
-# fail-closed, so a regression that guts them fails HERE instead of silently
-# dropping coverage. It does NOT assert that a dynamic run happened.
+# CI-GATE-CE026 (reverse A/B + AM2 first-install offline nandsim contracts).
+# The reusable runner and harness retain both S9 and AM2 static paths. Dynamic
+# CI currently runs only S9 because only S9 has an admitted package capsule;
+# AM2 remains an explicit workflow blocker, not an executed proof. This gate
+# keeps the AM2 harness ready without misreporting it as CI coverage.
 ce026_reverse_ab_and_am2_first_install_check() {
     tag='CI-GATE-CE026'
     harness='scripts/sysupgrade_offline_nandsim_harness.sh'
@@ -3849,9 +4497,9 @@ ce026_reverse_ab_and_am2_first_install_check() {
         fi
     fi
 
-    # (4) CI WIRING: the virtme runner invokes the reverse-direction + am2
-    #     first-install guest commands, and the workflow greps the new sentinels
-    #     fail-closed.
+    # (4) RUNNER COVERAGE + HONEST CI WIRING: the reusable runner retains both
+    #     targets, while the workflow asserts only capsule-backed S9 sentinels
+    #     and carries an explicit AM2 blocked disposition.
     require_pattern "$runner" '--current-fw 1 --target am1-s9' \
         "$tag CI-WIRING: runner invokes the am1-s9 reverse-direction guest proof"
     require_pattern "$runner" '--current-fw 1 --target am2-s19jpro' \
@@ -3860,10 +4508,16 @@ ce026_reverse_ab_and_am2_first_install_check() {
         "$tag CI-WIRING: runner invokes the am2-s19jpro first-install guest proof"
     require_pattern "$workflow" "grep -q 'OFFLINE_NANDSIM_PROOF_OK target=am1-s9 direction=reverse'" \
         "$tag CI-WIRING: workflow asserts the am1-s9 reverse sentinel"
-    require_pattern "$workflow" "grep -q 'OFFLINE_NANDSIM_PROOF_OK target=am2-s19jpro direction=reverse'" \
-        "$tag CI-WIRING: workflow asserts the am2-s19jpro reverse sentinel"
-    require_pattern "$workflow" "grep -q 'OFFLINE_FIRST_INSTALL_PROOF_OK target=am2-s19jpro'" \
-        "$tag CI-WIRING: workflow asserts the am2 first-install sentinel"
+    require_pattern "$workflow" "grep -q 'OFFLINE_FIRST_INSTALL_PROOF_OK target=am1-s9'" \
+        "$tag CI-WIRING: workflow asserts the am1-s9 first-install sentinel"
+    require_pattern "$workflow" 'AM2 nandsim: intentionally unavailable' \
+        "$tag CI-WIRING: workflow reports AM2 nandsim as unavailable without a capsule"
+    require_pattern "$workflow" 'No AM2 nandsim, first-install, OTA-parser, boot, or mining claim is made by this run.' \
+        "$tag CI-WIRING: workflow explicitly bounds the missing AM2 dynamic claims"
+    reject_pattern "$workflow" "grep -q 'OFFLINE_NANDSIM_PROOF_OK target=am2-s19jpro direction=reverse'" \
+        "$tag CI-WIRING: workflow does not assert an AM2 reverse proof it cannot build"
+    reject_pattern "$workflow" "grep -q 'OFFLINE_FIRST_INSTALL_PROOF_OK target=am2-s19jpro'" \
+        "$tag CI-WIRING: workflow does not assert an AM2 first-install proof it cannot build"
 }
 ce026_reverse_ab_and_am2_first_install_check
 
@@ -3902,6 +4556,243 @@ ce114_proxy_nonce_weak_entropy_check() {
     fi
 }
 ce114_proxy_nonce_weak_entropy_check
+
+# SIM-HAL: host simulator must remain impossible to reference from a default
+# build and absent from every firmware/Buildroot profile. The compile probe is
+# a real downstream crate (not a source grep): it imports SimPlatform without
+# enabling the feature and MUST fail to compile.
+sim_hal_nonshipping_gate() {
+    hal_manifest='dcentrald/dcentrald-hal/Cargo.toml'
+    platform_mod='dcentrald/dcentrald-hal/src/platform/mod.rs'
+    require_pattern "$hal_manifest" 'sim-hal = [' \
+        'SIM-HAL: opt-in Cargo feature exists'
+    require_pattern 'dcentrald/dcentrald-hal/src/lib.rs' \
+        'sim-hal is host-only and must never be compiled into ARM Linux firmware artifacts' \
+        'SIM-HAL: ARM Linux firmware compile guard is present'
+    require_pattern "$platform_mod" '#[cfg(feature = "sim-hal")]' \
+        'SIM-HAL: module export is compile-time gated'
+
+    if grep -R -n --include='*defconfig' --include='*.mk' --include='Config.in' \
+        'sim-hal' br2_external_dcentos >/dev/null 2>&1; then
+        fail 'SIM-HAL: a Buildroot/release profile enables the host simulator feature'
+    else
+        pass 'SIM-HAL: no Buildroot/release profile enables the host simulator feature'
+    fi
+
+    [ "$STATIC_ONLY" -eq 0 ] || return 0
+    sim_rust_toolchain="${DCENT_RUST_TOOLCHAIN:-1.90.0}"
+    sim_rustup="$(command -v rustup 2>/dev/null || true)"
+    if [ -z "$sim_rustup" ] && [ -x "${HOME:-}/.cargo/bin/rustup" ]; then
+        sim_rustup="${HOME}/.cargo/bin/rustup"
+    fi
+    if [ -z "$sim_rustup" ]; then
+        fail 'SIM-HAL compile-fail probe: rustup is unavailable for the pinned toolchain'
+        return
+    fi
+    if ! "$sim_rustup" run "$sim_rust_toolchain" cargo --version >/dev/null 2>&1; then
+        fail "SIM-HAL compile-fail probe: pinned Rust toolchain is unavailable: $sim_rust_toolchain"
+        return
+    fi
+
+    sim_probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/dcent-sim-hal-negative.XXXXXX")
+    mkdir -p "$sim_probe_dir/src"
+    cat >"$sim_probe_dir/Cargo.toml" <<EOF
+[package]
+name = "dcent-sim-hal-negative-probe"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+dcentrald-hal = { path = "$PROJECT_DIR/dcentrald/dcentrald-hal" }
+EOF
+    cat >"$sim_probe_dir/src/main.rs" <<'EOF'
+use dcentrald_hal::platform::sim::SimPlatform;
+
+fn main() {
+    let _ = std::mem::size_of::<SimPlatform>();
+}
+EOF
+    if "$sim_rustup" run "$sim_rust_toolchain" cargo check --quiet \
+        --manifest-path "$sim_probe_dir/Cargo.toml" \
+        >"$sim_probe_dir/stdout" 2>"$sim_probe_dir/stderr"; then
+        fail 'SIM-HAL compile-fail probe: SimPlatform was linkable without --features sim-hal'
+    elif grep -E 'could not find `sim`|unresolved import.*platform::sim' \
+        "$sim_probe_dir/stderr" >/dev/null 2>&1; then
+        pass 'SIM-HAL compile-fail probe: default dependency cannot reference SimPlatform'
+    else
+        fail 'SIM-HAL compile-fail probe failed for an unexpected reason (not the feature gate)'
+        sed -n '1,80p' "$sim_probe_dir/stderr" >&2
+    fi
+    rm -rf -- "$sim_probe_dir"
+}
+sim_hal_nonshipping_gate
+
+# SIM-HAL evidence/contract meta-gates. These are static and host-safe: they
+# neither contact a pool nor touch a device. The full VM/nandsim proof remains
+# a separate, artifact-bearing CI job because it needs a compatible kernel.
+sim_hal_evidence_contract_gates() {
+    for script in \
+        scripts/sim/bringup_ladder.sh \
+        scripts/sim/full_offline_model_proof.sh \
+        scripts/sim/virtme_sim_hal_runner.sh \
+        scripts/sim/wsl_namespace_sim_hal_runner.sh \
+        scripts/sim/wsl_all_model_proof.sh; do
+        if bash -n "$script"; then
+            pass "SIM-HAL: shell syntax valid for $script"
+        else
+            fail "SIM-HAL: shell syntax invalid for $script"
+        fi
+    done
+    if python3 scripts/sim/check_sim_tier_honesty.py; then
+        pass 'SIM-HAL: S9-S23 declared tiers do not exceed checked evidence'
+    else
+        fail 'SIM-HAL: tier-honesty matrix failed'
+    fi
+    if python3 scripts/sim/check_esp_contract_parity.py; then
+        pass 'ESP convergence: donation/onboarding contract parity gate passed'
+    else
+        fail 'ESP convergence: donation/onboarding contract parity gate failed'
+    fi
+
+    # A simulator that only runs on a developer workstation is not a release
+    # gate.  Pin the executable model proofs to the workflow so they cannot
+    # become another orphaned safety suite during CI refactors.
+    sim_workflow='../../.github/workflows/dcentos-offline-gates.yml'
+    require_pattern "$sim_workflow" 'sim-hal-contract:' \
+        'SIM-HAL CI: independent executable contract job is present'
+    require_pattern "$sim_workflow" \
+        'cargo test -p dcentrald-asic --features sim-hal --test golden_init_trace' \
+        'SIM-HAL CI: provenance-backed golden initialization traces execute'
+    require_pattern "$sim_workflow" \
+        'cargo test -p dcentrald --features sim-hal --test sim_s19pro_t2' \
+        'SIM-HAL CI: ten-model T2 enumeration/init/share proof executes'
+    require_pattern "$sim_workflow" \
+        'i2c_service_deadline_tests' \
+        'SIM-HAL CI: deadline-aware serialized I2C regression executes'
+    require_pattern "$sim_workflow" \
+        'caller_supplied_privileged_intent_surface_stays_crate_private' \
+        'SIM-HAL CI: I2C privileged-intent visibility regression executes'
+    require_pattern "$sim_workflow" \
+        'cargo test -p dcentrald-hal --doc' \
+        'SIM-HAL CI: I2C privileged-intent compile-fail contract executes'
+    require_pattern "$sim_workflow" \
+        'init_heartbeat_ownership_tests' \
+        'SIM-HAL CI: initialization-heartbeat ownership regression executes'
+    require_pattern "$sim_workflow" \
+        'cargo test -p dcentrald --features sim-hal --bin dcentrald voltage_mailbox::tests' \
+        'SIM-HAL CI: prioritized voltage mailbox lifecycle regressions execute'
+    require_pattern "$sim_workflow" \
+        'psu_apw12_smbus::tests::power_off' \
+        'SIM-HAL CI: PSU safe-off failure and compensation regression executes'
+    require_pattern "$sim_workflow" \
+        'psu_apw12_smbus::tests::cold_boot' \
+        'SIM-HAL CI: partial cold-boot rollback regression executes'
+    require_pattern "$sim_workflow" \
+        'runtime::thread_guard::tests' \
+        'SIM-HAL CI: bounded runtime-thread ownership regression executes'
+    require_pattern "$sim_workflow" \
+        'am2_power_shutdown_evidence_tests' \
+        'SIM-HAL CI: AM2 shutdown evidence regression executes'
+}
+sim_hal_evidence_contract_gates
+
+# Native NoPic safety-watchdog evidence must remain executable in hosted CI.
+# Source invariants complement (not replace) the fake-device behavioral tests:
+# every API PSU mutator is admitted through the shared gate, serial teardown
+# drains that gate before safe-off, and fan liveness uses checked actuation.
+nopic_watchdog_evidence_contract_gates() {
+    workflow='../../.github/workflows/dcentos-offline-gates.yml'
+    require_pattern "$workflow" \
+        'cargo test -p dcentrald --bin dcentrald runtime::safety_watchdog::tests' \
+        'NoPic watchdog CI: fail-closed worker state-machine tests execute'
+    require_pattern "$workflow" \
+        'cargo test -p dcentrald --bin dcentrald nopic_watchdog_and_safeoff_order_is_fail_closed' \
+        'NoPic watchdog CI: engine teardown source-order contract executes'
+    require_pattern "$workflow" \
+        'cargo test -p dcentrald --bin dcentrald watchdog_armed_on_all_mining_entry_paths' \
+        'NoPic watchdog CI: mining entry-path admission contract executes'
+    require_pattern "$workflow" \
+        'cargo test -p dcentrald-hal --lib hardware_mutation_gate_tests' \
+        'NoPic watchdog CI: control-plane mutation drain contract executes'
+    require_pattern "$workflow" \
+        'checked_fan_command_surfaces_partial_two_channel_write' \
+        'NoPic watchdog CI: partial two-channel fan failure executes'
+    require_pattern "$workflow" \
+        'checked_psu_gpio_parser_never_converts_unknown_data_to_off' \
+        'NoPic watchdog CI: unknown GPIO readback remains fail-closed'
+    require_pattern 'dcentrald/dcentrald-api/src/rest/late.rs' \
+        'state.hardware_mutation_gate.try_acquire()' \
+        'NoPic watchdog: API PSU mutations acquire teardown-drain admission'
+    require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' \
+        '.close_and_drain(RUNTIME_THREAD_STOP_TIMEOUT)' \
+        'NoPic watchdog: serial teardown closes and drains API mutations'
+    require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' \
+        'fan.set_speed_checked' \
+        'NoPic watchdog: thermal safety liveness uses checked fan actuation'
+}
+nopic_watchdog_evidence_contract_gates
+
+# A watchdog-disarm followed by a voltage-minimum command removes the PSU's
+# independent cutoff before the safe-direction command is known to have
+# completed. Runtime code must use Apw121215a::safe_shutdown_to_min(), whose
+# ordering is minimum first and disarm second.
+if grep -R -n --include='*.rs' '\.watchdog(false)' dcentrald/dcentrald/src >/tmp/dcentos-naked-psu-disarm.$$ 2>/dev/null; then
+    fail 'PSU safe-off ordering: naked watchdog(false) remains in daemon runtime code'
+    cat /tmp/dcentos-naked-psu-disarm.$$ >&2
+else
+    pass 'PSU safe-off ordering: daemon runtime uses the minimum-then-disarm coordinator'
+fi
+rm -f /tmp/dcentos-naked-psu-disarm.$$
+require_pattern 'dcentrald/dcentrald-hal/src/psu.rs' \
+    'pub fn safe_shutdown_to_min' \
+    'PSU safe-off ordering: typed minimum-then-disarm coordinator exists'
+
+# Raw public I2C operations are conservatively terminal-fenced mutations;
+# privileged intent is HAL-internal. Production protocol modules use typed
+# plans or audit-only mutation labels instead of the compatibility transaction.
+if grep -R -n --include='*.rs' --exclude='i2c.rs' '\.transaction(' \
+    dcentrald/dcentrald-hal/src \
+    dcentrald/dcentrald-asic/src \
+    dcentrald/dcentrald/src \
+    >/tmp/dcentos-untyped-i2c-transaction.$$ 2>/dev/null; then
+    fail 'I2C mutation labeling: compatibility transaction call remains in production modules'
+    cat /tmp/dcentos-untyped-i2c-transaction.$$ >&2
+else
+    pass 'I2C mutation labeling: raw public operations are conservatively fenced; production compound transactions use typed plans or audit labels'
+fi
+rm -f /tmp/dcentos-untyped-i2c-transaction.$$
+
+# Application crates must never regain the ability to select the HAL's
+# authorizing intent or invoke an intent-bearing executor. Keep the scan on
+# production source roots so compile-fail documentation and HAL unit tests do
+# not become false positives.
+if grep -R -n --include='*.rs' -E 'I2cOperationIntent|_with_intent' \
+    dcentrald/dcentrald-asic/src \
+    dcentrald/dcentrald/src \
+    >/tmp/dcentos-external-i2c-intent.$$ 2>/dev/null; then
+    fail 'I2C privilege boundary: application crate references HAL-internal intent authority'
+    cat /tmp/dcentos-external-i2c-intent.$$ >&2
+else
+    pass 'I2C privilege boundary: privileged intent and intent-bearing executors remain HAL-internal'
+fi
+rm -f /tmp/dcentos-external-i2c-intent.$$
+
+# AM3-BB carrier contract: keep the active `a lab unit` board-target, HAL constants,
+# safe boot/shutdown GPIO directions, UART topology, DTB admission gates, and
+# the quarantined legacy BBCtrl/S70 DTS from silently converging into one
+# misleading product definition.  Both commands are host-only Python checks.
+if run_python_script scripts/test_am3_bb_hardware_contract.py; then
+    pass 'AM3-BB hardware contract: negative fixtures reject unsafe drift'
+else
+    fail 'AM3-BB hardware contract: negative-fixture suite failed'
+fi
+if run_python_script scripts/check_am3_bb_hardware_contract.py --root "$PROJECT_DIR"; then
+    pass 'AM3-BB hardware contract: catalog and all offline consumers agree'
+else
+    fail 'AM3-BB hardware contract: board/DTS/build consistency gate failed'
+fi
 
 # Anti-orphan meta-gate (structural fix for the recurring orphaned-safety-test
 # class — ESP ban-gates, dcent-schema, and packaging-static all once ran NOWHERE,

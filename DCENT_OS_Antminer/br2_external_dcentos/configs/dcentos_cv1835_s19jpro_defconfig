@@ -112,7 +112,7 @@ BR2_TARGET_GENERIC_ISSUE="DCENTos for S19j Pro Cvitek CV1835 (cv1835-s19jpro) - 
 # CV1835 identity on top.
 # =============================================================================
 BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/cvitek/cv1835-s19jpro/rootfs-overlay"
-BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/cvitek/cv1835-s19jpro/post-build.sh"
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/cvitek/cv1835-s19jpro/post-build.sh $(BR2_EXTERNAL_DCENTOS_PATH)/board/common/prune-runtime-research-tools.sh"
 BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/cvitek/cv1835-s19jpro/post-image.sh"
 
 # =============================================================================
@@ -145,9 +145,9 @@ BR2_PACKAGE_DROPBEAR=y
 # inspection during sysupgrade preflight.
 BR2_PACKAGE_MMC_UTILS=y
 
-# i2c-tools: i2cdetect / i2cget for runtime PIC1704 + APW12 + LM75A
+# Raw I2C utilities are excluded; dcentrald owns PIC1704/APW12/LM75A buses.
 # probing (parity with am2 / am3-bb / amlogic).
-BR2_PACKAGE_I2C_TOOLS=y
+# BR2_PACKAGE_I2C_TOOLS is not set
 
 # =============================================================================
 # Kernel build (W11.11 — FORWARD-LOOKING, NOT WIRED).

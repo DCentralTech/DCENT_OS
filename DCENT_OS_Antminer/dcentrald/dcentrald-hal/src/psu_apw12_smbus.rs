@@ -66,7 +66,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::i2c::{I2cServiceHandle, I2cTransactionStep};
+use crate::i2c::{I2cOperationIntent, I2cServiceHandle, I2cTransactionStep};
 use crate::HalError;
 use crate::Result;
 
@@ -360,6 +360,18 @@ impl Apw12Telemetry {
 //  Apw12SmbusBackend — the runtime controller
 // ===========================================================================
 
+/// Best locally known result of APW12 output-control commands.
+///
+/// This is command-completion evidence, not an independent rail measurement.
+/// `Unknown` is used on attach and whenever a submitted command's outcome is
+/// not known. Callers must not treat `On` or `Off` as physical telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PsuOutputState {
+    Unknown,
+    On,
+    Off,
+}
+
 /// Service-thread-backed APW12 SMBus PSU controller.
 ///
 /// All I/O goes through a shared [`I2cServiceHandle`] — never raw
@@ -370,11 +382,102 @@ pub struct Apw12SmbusBackend {
     address: u8,
     /// Cached firmware version word (0 until [`Self::get_fw_version`] runs).
     fw_version: u16,
-    /// Cached `output_on` flag mirroring RE2's `apw12_t::output_on`.
-    output_on: bool,
+    /// Best locally known power-command outcome. This deliberately starts and
+    /// returns to `Unknown` when transport completion is not observable.
+    output_state: PsuOutputState,
     /// Cached watchdog-armed flag — APW12 has no readable watchdog state,
     /// so we track it locally.
     watchdog_armed: bool,
+    /// Last accepted watchdog timeout, retained for shutdown compensation.
+    watchdog_timeout_ms: Option<u16>,
+}
+
+/// Arms one APW12 power rollback for the lifetime of a boot attempt.
+///
+/// Ordinary errors are handled explicitly by [`run_with_power_rollback`] so
+/// both the primary and rollback results can be returned. In unwind-enabled
+/// builds, `Drop` is a best-effort panic fallback. Release firmware uses
+/// `panic = "abort"`, so its process-wide platform panic hook is the only
+/// software panic cutoff; this guard's `Drop` does not run there.
+/// `rollback_attempted` is set before submitting the worker-owned plan so an
+/// unwind cannot enqueue a duplicate plan after an unknown receipt outcome.
+struct Apw12PowerRollbackGuard<'a> {
+    psu: &'a mut Apw12SmbusBackend,
+    context: &'static str,
+    committed: bool,
+    rollback_attempted: bool,
+}
+
+impl Apw12PowerRollbackGuard<'_> {
+    fn attempt_rollback(&mut self) -> crate::PowerRollbackOutcome {
+        debug_assert!(!self.rollback_attempted);
+        self.rollback_attempted = true;
+        match self.psu.power_off_with_disarm() {
+            Ok(()) => crate::PowerRollbackOutcome::Completed,
+            Err(error) => crate::PowerRollbackOutcome::Failed(Box::new(error)),
+        }
+    }
+}
+
+impl Drop for Apw12PowerRollbackGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed || self.rollback_attempted {
+            return;
+        }
+        self.rollback_attempted = true;
+        let rollback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.psu.power_off_with_disarm()
+        }));
+        match rollback {
+            Ok(Ok(())) => tracing::warn!(
+                context = self.context,
+                "APW12 unwind-only rollback completed (release panic=abort uses the platform panic hook instead)"
+            ),
+            Ok(Err(error)) => tracing::error!(
+                context = self.context,
+                %error,
+                "APW12 unwind-only rollback failed; no duplicate plan will be submitted"
+            ),
+            Err(_) => tracing::error!(
+                context = self.context,
+                "APW12 unwind-only rollback panicked; no duplicate plan will be submitted"
+            ),
+        }
+    }
+}
+
+/// Execute work while APW12 output may be energized.
+///
+/// On ordinary failure, exactly one worker-owned disarm + POWER_OFF plan is
+/// attempted and its typed result is attached without replacing `primary`.
+/// The guard is armed before `body` begins, covering even a POWER_ON request
+/// whose transport result is unknown after the hardware may have accepted it.
+pub(crate) fn run_with_power_rollback<T>(
+    psu: &mut Apw12SmbusBackend,
+    context: &'static str,
+    body: impl FnOnce(&mut Apw12SmbusBackend) -> Result<T>,
+) -> Result<T> {
+    let mut guard = Apw12PowerRollbackGuard {
+        psu,
+        context,
+        committed: false,
+        rollback_attempted: false,
+    };
+    match body(&mut *guard.psu) {
+        Ok(value) => {
+            guard.committed = true;
+            Ok(value)
+        }
+        Err(primary) => {
+            let rollback = guard.attempt_rollback();
+            guard.committed = true;
+            Err(HalError::PartialBootRollback {
+                context,
+                primary: Box::new(primary),
+                rollback,
+            })
+        }
+    }
 }
 
 impl Apw12SmbusBackend {
@@ -398,8 +501,9 @@ impl Apw12SmbusBackend {
             i2c: handle,
             address,
             fw_version: 0,
-            output_on: false,
+            output_state: PsuOutputState::Unknown,
             watchdog_armed: false,
+            watchdog_timeout_ms: None,
         }
     }
 
@@ -414,10 +518,13 @@ impl Apw12SmbusBackend {
         self.fw_version
     }
 
-    /// Whether the PSU is currently powered ON, by our cached state. The
-    /// cache is updated by [`Self::power_on`] / [`Self::power_off_with_disarm`].
-    pub fn is_output_on(&self) -> bool {
-        self.output_on
+    /// Best locally known output-command state.
+    ///
+    /// This is never physical rail telemetry. It is `Unknown` until a command
+    /// completes and returns to `Unknown` before any mutation whose outcome
+    /// may become unobservable.
+    pub fn output_state(&self) -> PsuOutputState {
+        self.output_state
     }
 
     /// Whether the watchdog is currently armed, by our cached state.
@@ -435,9 +542,10 @@ impl Apw12SmbusBackend {
     /// after `apw12_power_on`. We bake the sleep into this method so callers
     /// don't have to remember it.
     pub fn power_on(&mut self) -> Result<()> {
-        self.run(power_on_steps())?;
+        self.output_state = PsuOutputState::Unknown;
+        self.run_with_intent(I2cOperationIntent::Energize, power_on_steps())?;
         std::thread::sleep(Duration::from_millis(POWER_ON_SETTLE_MS));
-        self.output_on = true;
+        self.output_state = PsuOutputState::On;
         tracing::info!(
             addr = format_args!("0x{:02X}", self.address),
             settle_ms = POWER_ON_SETTLE_MS,
@@ -455,8 +563,9 @@ impl Apw12SmbusBackend {
     /// [`Self::power_off_with_disarm`] instead.
     #[doc(hidden)]
     pub fn power_off_raw(&mut self) -> Result<()> {
-        self.run(power_off_steps())?;
-        self.output_on = false;
+        self.output_state = PsuOutputState::Unknown;
+        self.run_with_intent(I2cOperationIntent::SafeOff, power_off_steps())?;
+        self.output_state = PsuOutputState::Off;
         Ok(())
     }
 
@@ -466,30 +575,57 @@ impl Apw12SmbusBackend {
     /// armed watchdog this still issues both opcodes — APW12 hardware
     /// accepts a redundant disarm gracefully.
     ///
-    /// # Failure semantics
-    ///
-    /// - Watchdog disarm error: logged and ignored. POWER_OFF still fires.
-    /// - POWER_OFF error: returned.
+    /// If POWER_OFF fails after watchdog disarm may have succeeded, the driver
+    /// makes one bounded compensating watchdog-arm attempt. Cache changes and
+    /// return values describe completed transport commands only; APW12 exposes
+    /// no independent physical rail-off observation here.
     pub fn power_off_with_disarm(&mut self) -> Result<()> {
-        // Step 1: disarm watchdog. Errors logged, not propagated, per RE2.
-        if let Err(e) = self.run(disable_watchdog_steps()) {
-            tracing::warn!(
-                addr = format_args!("0x{:02X}", self.address),
-                error = %e,
-                "APW12 disarm-watchdog failed during shutdown — continuing to POWER_OFF",
-            );
-        } else {
-            self.watchdog_armed = false;
+        let (compensation_timeout, compensation_policy) = match self.watchdog_timeout_ms {
+            Some(timeout) => (timeout, "restore-known-prior-timeout"),
+            None => (
+                WDOG_MIN_MS,
+                "emergency-minimum-timeout-prior-configuration-unknown",
+            ),
+        };
+        self.output_state = PsuOutputState::Unknown;
+        let outcome = self.i2c.conditional_safe_off_plan(
+            self.address,
+            disable_watchdog_steps(),
+            power_off_steps(),
+            enable_watchdog_steps(compensation_timeout),
+        )?;
+
+        if outcome.primary.completed() {
+            self.output_state = PsuOutputState::Off;
+            if outcome.prelude.completed() || outcome.prelude_retry.completed() {
+                self.watchdog_armed = false;
+                tracing::info!(
+                    addr = format_args!("0x{:02X}", self.address),
+                    retried_disarm = !outcome.prelude.completed(),
+                    "APW12 worker-owned POWER_OFF plan completed in a safe final command state; physical rail-off was not independently observed"
+                );
+                return Ok(());
+            }
+            return Err(HalError::PsuProtocolOwned(format!(
+                "APW12 POWER_OFF completed, but watchdog disarm and post-off re-disarm failed (initial={:?}, retry={:?}); physical watchdog state is unknown",
+                outcome.prelude, outcome.prelude_retry
+            )));
         }
 
-        // Step 2: POWER_OFF.
-        self.run(power_off_steps())?;
-        self.output_on = false;
-        tracing::info!(
-            addr = format_args!("0x{:02X}", self.address),
-            "APW12 POWER_OFF (with watchdog disarm)"
-        );
-        Ok(())
+        if outcome.compensation.completed() {
+            self.watchdog_armed = true;
+            self.watchdog_timeout_ms = Some(compensation_timeout);
+        } else if outcome.prelude.completed() {
+            self.watchdog_armed = false;
+        }
+        Err(HalError::PsuProtocolOwned(format!(
+            "APW12 POWER_OFF failed ({:?}); initial watchdog disarm={:?}; compensating watchdog arm={:?} at {} ms (policy={}); output state is unknown",
+            outcome.primary,
+            outcome.prelude,
+            outcome.compensation,
+            compensation_timeout,
+            compensation_policy
+        )))
     }
 
     // -----------------------------------------------------------------------
@@ -505,7 +641,7 @@ impl Apw12SmbusBackend {
                 mv, VOLTAGE_MIN_MV, VOLTAGE_MAX_MV
             )));
         }
-        self.run(set_voltage_steps(mv))?;
+        self.run_with_intent(I2cOperationIntent::Energize, set_voltage_steps(mv))?;
         tracing::info!(
             addr = format_args!("0x{:02X}", self.address),
             mv,
@@ -618,8 +754,12 @@ impl Apw12SmbusBackend {
                 timeout_ms, WDOG_MIN_MS, WDOG_MAX_MS
             )));
         }
-        self.run(enable_watchdog_steps(timeout_ms))?;
+        self.run_with_intent(
+            I2cOperationIntent::NeutralControl,
+            enable_watchdog_steps(timeout_ms),
+        )?;
         self.watchdog_armed = true;
+        self.watchdog_timeout_ms = Some(timeout_ms);
         tracing::info!(
             addr = format_args!("0x{:02X}", self.address),
             timeout_ms,
@@ -630,7 +770,10 @@ impl Apw12SmbusBackend {
 
     /// DISABLE_WDOG (RE2 `apw12_disable_watchdog`).
     pub fn disable_watchdog(&mut self) -> Result<()> {
-        self.run(disable_watchdog_steps())?;
+        // Disarm alone removes a hardware cutoff and is neutral control, not
+        // privileged SafeOff. The coordinated power-off plan owns the
+        // reserved disarm phase.
+        self.run_with_intent(I2cOperationIntent::NeutralControl, disable_watchdog_steps())?;
         self.watchdog_armed = false;
         tracing::info!(
             addr = format_args!("0x{:02X}", self.address),
@@ -694,10 +837,38 @@ impl Apw12SmbusBackend {
     /// 4. SET_VOLTAGE to `target_mv`
     /// 5. READ_TELEMETRY confirm (DC volt non-zero), then ENABLE_WDOG
     ///
-    /// This method honors RE2's ordering exactly. Any step that fails
-    /// returns `Err(...)` immediately — callers must NOT proceed to mining
-    /// when this returns an error.
+    /// This method honors RE2's ordering exactly. Deterministic parameter
+    /// errors are rejected before POWER_ON. Any later failure triggers one
+    /// worker-owned watchdog-disarm + POWER_OFF plan and returns
+    /// [`HalError::PartialBootRollback`] containing both typed outcomes;
+    /// callers must not proceed to mining.
     pub fn cold_boot_sequence_5_step(&mut self, target_mv: u16, wdog_ms: u16) -> Result<()> {
+        // Reject deterministic configuration errors before POWER_ON. These
+        // bounds are also enforced by the individual commands, but checking
+        // here prevents an invalid final-stage watchdog value or voltage from
+        // leaving an otherwise healthy PSU energized.
+        if !(VOLTAGE_MIN_MV..=VOLTAGE_MAX_MV).contains(&target_mv) {
+            return Err(HalError::PsuProtocolOwned(format!(
+                "cold_boot target voltage {} outside [{}, {}]",
+                target_mv, VOLTAGE_MIN_MV, VOLTAGE_MAX_MV
+            )));
+        }
+        if !(WDOG_MIN_MS..=WDOG_MAX_MS).contains(&wdog_ms) {
+            return Err(HalError::PsuProtocolOwned(format!(
+                "cold_boot watchdog {} ms outside [{}, {}]",
+                wdog_ms, WDOG_MIN_MS, WDOG_MAX_MS
+            )));
+        }
+
+        run_with_power_rollback(self, "APW12 five-step cold boot", |psu| {
+            psu.cold_boot_sequence_5_step_energized(target_mv, wdog_ms)
+        })
+    }
+
+    /// Five-step body with no local rollback wrapper. Platform orchestrators
+    /// use the public method and then immediately arm their own continuation
+    /// guard through the final platform phase.
+    fn cold_boot_sequence_5_step_energized(&mut self, target_mv: u16, wdog_ms: u16) -> Result<()> {
         tracing::info!(
             addr = format_args!("0x{:02X}", self.address),
             target_mv,
@@ -801,7 +972,10 @@ impl Apw12SmbusBackend {
 
     /// CLEAR_FAULTS (RE2 0x0F). Write byte; no payload.
     pub fn clear_faults(&mut self) -> Result<()> {
-        self.run(write_steps(Apw12Cmd::ClearFaults.as_u8(), &[]))?;
+        self.run_with_intent(
+            I2cOperationIntent::Recovery,
+            write_steps(Apw12Cmd::ClearFaults.as_u8(), &[]),
+        )?;
         Ok(())
     }
 
@@ -815,17 +989,29 @@ impl Apw12SmbusBackend {
     //  Internal: dispatch a write/read transaction through the I2C service
     // -----------------------------------------------------------------------
 
-    /// Run a write-only transaction (returns nothing). Fails if the
-    /// transaction returned any read results.
-    fn run(&self, steps: Vec<I2cTransactionStep>) -> Result<()> {
-        let _ = self.i2c.transaction(self.address, steps)?;
+    /// Run a typed write-only transaction (returns nothing).
+    fn run_with_intent(
+        &self,
+        intent: I2cOperationIntent,
+        steps: Vec<I2cTransactionStep>,
+    ) -> Result<()> {
+        if intent == I2cOperationIntent::SafeOff && self.i2c.has_reserved_safe_off_lane() {
+            if let [I2cTransactionStep::Write(data)] = steps.as_slice() {
+                return self.i2c.write_bytes_with_intent(intent, self.address, data);
+            }
+        }
+        let _ = self
+            .i2c
+            .transaction_with_intent(intent, self.address, steps)?;
         Ok(())
     }
 
     /// Run a transaction that contains exactly one read step and return
     /// the resulting bytes. Fails if zero reads are returned.
     fn run_read(&self, steps: Vec<I2cTransactionStep>) -> Result<Vec<u8>> {
-        let mut reads = self.i2c.transaction(self.address, steps)?;
+        let mut reads =
+            self.i2c
+                .transaction_with_intent(I2cOperationIntent::ReadOnly, self.address, steps)?;
         reads
             .pop()
             .ok_or_else(|| HalError::PsuProtocolOwned("transaction returned no read result".into()))
@@ -1067,18 +1253,293 @@ mod tests {
         })
     }
 
+    fn spawn_conditional_worker(
+        rx: Receiver<I2cRequest>,
+        outcome: crate::i2c::I2cConditionalSafeOffOutcome,
+    ) -> thread::JoinHandle<(
+        Vec<I2cTransactionStep>,
+        Vec<I2cTransactionStep>,
+        Vec<I2cTransactionStep>,
+    )> {
+        thread::spawn(move || match rx.recv().expect("conditional plan request") {
+            I2cRequest::ConditionalSafeOffPlan {
+                prelude,
+                primary,
+                compensation,
+                reply_tx,
+                ..
+            } => {
+                let _ = reply_tx.send(Ok(outcome));
+                (prelude, primary, compensation)
+            }
+            other => panic!("unexpected non-conditional request: {:?}", other),
+        })
+    }
+
+    #[derive(Debug)]
+    struct BootWorkerLog {
+        transactions: Vec<Vec<I2cTransactionStep>>,
+        rollback_plans: usize,
+    }
+
+    /// Script normal boot transactions and one worker-owned rollback plan on
+    /// the same raw service seam. A second plan is a test failure: dropping
+    /// its reply sender also prevents a duplicate caller from hanging.
+    fn spawn_boot_rollback_worker(
+        rx: Receiver<I2cRequest>,
+        replies: Vec<Result<Vec<Vec<u8>>>>,
+        rollback_reply: Result<crate::i2c::I2cConditionalSafeOffOutcome>,
+    ) -> thread::JoinHandle<BootWorkerLog> {
+        thread::spawn(move || {
+            let mut transactions = Vec::new();
+            let mut replies = replies.into_iter();
+            let mut rollback_reply = Some(rollback_reply);
+            let mut rollback_plans = 0;
+            while let Ok(request) = rx.recv() {
+                match request {
+                    I2cRequest::Transaction {
+                        steps, reply_tx, ..
+                    } => {
+                        transactions.push(steps);
+                        let reply = replies
+                            .next()
+                            .unwrap_or_else(|| panic!("unexpected boot transaction"));
+                        let _ = reply_tx.send(reply);
+                    }
+                    I2cRequest::ConditionalSafeOffPlan { reply_tx, .. } => {
+                        rollback_plans += 1;
+                        let Some(reply) = rollback_reply.take() else {
+                            drop(reply_tx);
+                            panic!("duplicate rollback plan");
+                        };
+                        let _ = reply_tx.send(reply);
+                    }
+                    other => panic!("unexpected boot request: {other:?}"),
+                }
+            }
+            BootWorkerLog {
+                transactions,
+                rollback_plans,
+            }
+        })
+    }
+
+    fn phase_completed() -> crate::i2c::I2cSafeOffPhaseOutcome {
+        crate::i2c::I2cSafeOffPhaseOutcome::Completed
+    }
+
+    fn phase_not_attempted() -> crate::i2c::I2cSafeOffPhaseOutcome {
+        crate::i2c::I2cSafeOffPhaseOutcome::NotAttempted
+    }
+
+    fn phase_failed(detail: &str) -> crate::i2c::I2cSafeOffPhaseOutcome {
+        crate::i2c::I2cSafeOffPhaseOutcome::Failed(detail.into())
+    }
+
+    fn successful_rollback_outcome() -> crate::i2c::I2cConditionalSafeOffOutcome {
+        crate::i2c::I2cConditionalSafeOffOutcome {
+            prelude: phase_completed(),
+            primary: phase_completed(),
+            compensation: phase_not_attempted(),
+            prelude_retry: phase_not_attempted(),
+        }
+    }
+
+    #[test]
+    fn output_command_state_starts_unknown() {
+        let (handle, _rx) = I2cServiceHandle::for_unit_tests();
+        let psu = Apw12SmbusBackend::new(handle, Cv1835S19jPro);
+        assert_eq!(psu.output_state(), PsuOutputState::Unknown);
+    }
+
+    #[test]
+    fn failed_power_on_cannot_leave_a_false_off_cache() {
+        let (handle, rx) = I2cServiceHandle::for_unit_tests();
+        let worker = spawn_mock_worker(
+            rx,
+            vec![Err(HalError::I2c {
+                bus: 0,
+                addr: APW12_I2C_ADDR,
+                detail: "injected unobserved POWER_ON outcome".into(),
+            })],
+        );
+        let mut psu = Apw12SmbusBackend::new(handle, Cv1835S19jPro);
+
+        assert!(psu.power_on().is_err());
+        assert_eq!(psu.output_state(), PsuOutputState::Unknown);
+
+        drop(psu);
+        assert_eq!(worker.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cold_boot_prevalidates_voltage_and_watchdog_before_power_on() {
+        for (target_mv, watchdog_ms) in [(VOLTAGE_MIN_MV - 1, WDOG_MIN_MS), (1420, 0)] {
+            let (handle, rx) = I2cServiceHandle::for_unit_tests();
+            let mut psu = Apw12SmbusBackend::new(handle, Cv1835S19jPro);
+            assert!(psu
+                .cold_boot_sequence_5_step(target_mv, watchdog_ms)
+                .is_err());
+            assert!(
+                rx.try_recv().is_err(),
+                "invalid boot parameters must issue no POWER_ON or rollback I/O"
+            );
+        }
+    }
+
+    #[test]
+    fn cold_boot_preserves_primary_fw_failure_and_completed_rollback() {
+        let (handle, rx) = I2cServiceHandle::for_unit_tests();
+        let worker = spawn_boot_rollback_worker(
+            rx,
+            vec![
+                Ok(Vec::new()),
+                Ok(vec![vec![0x02, 0x01]]), // unsupported FW 0x0102
+            ],
+            Ok(successful_rollback_outcome()),
+        );
+        let mut psu = Apw12SmbusBackend::new(handle, Cv1835S19jPro);
+
+        let error = psu.cold_boot_sequence_5_step(1420, 100).unwrap_err();
+        let source = std::error::Error::source(&error)
+            .expect("PartialBootRollback must expose its initiating failure");
+        assert!(source.to_string().contains("PSU unsupported"));
+        match error {
+            HalError::PartialBootRollback {
+                context,
+                primary,
+                rollback: crate::PowerRollbackOutcome::Completed,
+            } => {
+                assert_eq!(context, "APW12 five-step cold boot");
+                assert!(matches!(*primary, HalError::PsuUnsupported(_)));
+            }
+            other => panic!("unexpected structured boot error: {other:?}"),
+        }
+        assert_eq!(psu.output_state(), PsuOutputState::Off);
+
+        drop(psu);
+        let log = worker.join().unwrap();
+        assert_eq!(log.rollback_plans, 1);
+        assert_eq!(log.transactions.len(), 2);
+    }
+
+    #[test]
+    fn cold_boot_rollback_outcome_unknown_is_structured_and_not_duplicated() {
+        let (handle, rx) = I2cServiceHandle::for_unit_tests();
+        let worker = spawn_boot_rollback_worker(
+            rx,
+            vec![Err(HalError::I2c {
+                bus: 0,
+                addr: APW12_I2C_ADDR,
+                detail: "injected POWER_ON outcome unknown".into(),
+            })],
+            Err(HalError::I2cSafeOffOutcomeUnknown {
+                bus: 0,
+                addr: APW12_I2C_ADDR,
+                detail: "accepted rollback receipt timed out".into(),
+            }),
+        );
+        let mut psu = Apw12SmbusBackend::new(handle, Cv1835S19jPro);
+
+        let error = psu.cold_boot_sequence_5_step(1420, 100).unwrap_err();
+        match error {
+            HalError::PartialBootRollback {
+                primary,
+                rollback: crate::PowerRollbackOutcome::Failed(rollback),
+                ..
+            } => {
+                assert!(matches!(*primary, HalError::I2c { .. }));
+                assert!(matches!(
+                    *rollback,
+                    HalError::I2cSafeOffOutcomeUnknown { .. }
+                ));
+            }
+            other => panic!("unexpected structured boot error: {other:?}"),
+        }
+        assert_eq!(psu.output_state(), PsuOutputState::Unknown);
+
+        drop(psu);
+        let log = worker.join().unwrap();
+        assert_eq!(log.rollback_plans, 1);
+        assert_eq!(log.transactions.len(), 1);
+    }
+
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn unwind_profile_fallback_submits_exactly_one_rollback() {
+        let (handle, rx) = I2cServiceHandle::for_unit_tests();
+        let worker = spawn_boot_rollback_worker(rx, Vec::new(), Ok(successful_rollback_outcome()));
+        let mut psu = Apw12SmbusBackend::new(handle, Cv1835S19jPro);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<()> = run_with_power_rollback(&mut psu, "panic test", |_psu| {
+                panic!("injected boot panic")
+            });
+        }));
+        assert!(panic.is_err());
+
+        drop(psu);
+        let log = worker.join().unwrap();
+        assert_eq!(log.rollback_plans, 1);
+        assert!(log.transactions.is_empty());
+    }
+
+    #[test]
+    fn post_power_scope_preserves_platform_failure_structurally() {
+        let (handle, rx) = I2cServiceHandle::for_unit_tests();
+        let worker = spawn_boot_rollback_worker(rx, Vec::new(), Ok(successful_rollback_outcome()));
+        let mut psu = Apw12SmbusBackend::new(handle, Cv1835S19jPro);
+
+        let error = run_with_power_rollback(&mut psu, "injected platform phase", |_psu| {
+            Err::<(), _>(HalError::Gpio("injected reset failure".into()))
+        })
+        .unwrap_err();
+        match error {
+            HalError::PartialBootRollback {
+                context,
+                primary,
+                rollback: crate::PowerRollbackOutcome::Completed,
+            } => {
+                assert_eq!(context, "injected platform phase");
+                assert!(matches!(*primary, HalError::Gpio(_)));
+            }
+            other => panic!("unexpected structured platform error: {other:?}"),
+        }
+
+        drop(psu);
+        let log = worker.join().unwrap();
+        assert_eq!(log.rollback_plans, 1);
+        assert!(log.transactions.is_empty());
+    }
+
+    #[test]
+    fn successful_post_power_scope_commits_without_rollback() {
+        let (handle, rx) = I2cServiceHandle::for_unit_tests();
+        let worker = spawn_boot_rollback_worker(rx, Vec::new(), Ok(successful_rollback_outcome()));
+        let mut psu = Apw12SmbusBackend::new(handle, Cv1835S19jPro);
+
+        run_with_power_rollback(&mut psu, "successful platform phase", |_psu| Ok(())).unwrap();
+
+        drop(psu);
+        let log = worker.join().unwrap();
+        assert_eq!(log.rollback_plans, 0);
+        assert!(log.transactions.is_empty());
+    }
+
     /// power_off_with_disarm sends DISABLE_WDOG (0x07) BEFORE POWER_OFF (0x00).
     #[test]
     fn power_off_disarms_watchdog_first() {
         let (handle, rx) = I2cServiceHandle::for_unit_tests();
         // Need an unbounded staging channel — the for_unit_tests channel is
         // sync_channel(1), so rotate by spawning the worker first.
-        let worker = spawn_mock_worker(
+        let worker = spawn_conditional_worker(
             rx,
-            vec![
-                Ok(Vec::new()), // disable_watchdog
-                Ok(Vec::new()), // power_off
-            ],
+            crate::i2c::I2cConditionalSafeOffOutcome {
+                prelude: phase_completed(),
+                primary: phase_completed(),
+                compensation: phase_not_attempted(),
+                prelude_retry: phase_not_attempted(),
+            },
         );
 
         let mut psu = Apw12SmbusBackend::new(handle, Am335xBbS19jPro);
@@ -1089,20 +1550,84 @@ mod tests {
         drop(psu);
         let log = worker.join().expect("worker thread");
 
-        assert_eq!(log.len(), 2, "exactly two transactions");
+        let (prelude, primary, compensation) = log;
         // First call: DISABLE_WDOG (opcode 0x07, payload 0x00 0x00)
-        match &log[0].1[0] {
+        match &prelude[0] {
             I2cTransactionStep::Write(b) => {
                 assert_eq!(b[0], 0x07, "first opcode must be DISABLE_WDOG (0x07)");
             }
             _ => panic!("expected Write step"),
         }
         // Second call: POWER_OFF (opcode 0x00, no payload)
-        match &log[1].1[0] {
+        match &primary[0] {
             I2cTransactionStep::Write(b) => {
                 assert_eq!(b, &[0x00], "second opcode must be POWER_OFF (0x00)");
             }
             _ => panic!("expected Write step"),
+        }
+        assert_eq!(
+            compensation[0],
+            I2cTransactionStep::Write(vec![0x06, 0x64, 0x00])
+        );
+    }
+
+    #[test]
+    fn power_off_success_does_not_hide_watchdog_disarm_failure() {
+        let (handle, rx) = I2cServiceHandle::for_unit_tests();
+        let worker = spawn_conditional_worker(
+            rx,
+            crate::i2c::I2cConditionalSafeOffOutcome {
+                prelude: phase_failed("injected disarm failure"),
+                primary: phase_completed(),
+                compensation: phase_not_attempted(),
+                prelude_retry: phase_failed("injected retry failure"),
+            },
+        );
+        let mut psu = Apw12SmbusBackend::new(handle, Am335xBbS19jPro);
+        psu.output_state = PsuOutputState::On;
+
+        let rendered = psu.power_off_with_disarm().unwrap_err().to_string();
+        assert!(rendered.contains("POWER_OFF completed"), "{rendered}");
+        assert_eq!(psu.output_state(), PsuOutputState::Off);
+        drop(psu);
+        let _ = worker.join().unwrap();
+    }
+
+    #[test]
+    fn power_off_failure_after_disarm_attempts_watchdog_compensation() {
+        let (handle, rx) = I2cServiceHandle::for_unit_tests();
+        let worker = spawn_conditional_worker(
+            rx,
+            crate::i2c::I2cConditionalSafeOffOutcome {
+                prelude: phase_completed(),
+                primary: phase_failed("injected power-off failure"),
+                compensation: phase_completed(),
+                prelude_retry: phase_not_attempted(),
+            },
+        );
+        let mut psu = Apw12SmbusBackend::new(handle, Am335xBbS19jPro);
+        psu.output_state = PsuOutputState::On;
+        psu.watchdog_armed = true;
+        psu.watchdog_timeout_ms = Some(5_000);
+
+        let rendered = psu.power_off_with_disarm().unwrap_err().to_string();
+        assert!(
+            rendered.contains("compensating watchdog arm=Completed"),
+            "{rendered}"
+        );
+        assert!(
+            matches!(psu.output_state(), PsuOutputState::Unknown),
+            "failed POWER_OFF must invalidate the command-history cache"
+        );
+        assert!(psu.watchdog_armed);
+        drop(psu);
+
+        let (_, _, compensation) = worker.join().unwrap();
+        match &compensation[0] {
+            I2cTransactionStep::Write(bytes) => {
+                assert_eq!(bytes[0], 0x06, "compensation must re-arm watchdog");
+            }
+            _ => panic!("expected compensation Write step"),
         }
     }
 

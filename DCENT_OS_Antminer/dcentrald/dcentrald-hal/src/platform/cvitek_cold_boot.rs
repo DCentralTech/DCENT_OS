@@ -133,7 +133,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::psu_apw12_smbus::Apw12SmbusBackend;
+use crate::psu_apw12_smbus::{run_with_power_rollback, Apw12SmbusBackend};
 use crate::serial::DevmemUart;
 use crate::stock_fpga_axi_mmap::BitmainAxiMmapBackend;
 use crate::{HalError, Result};
@@ -465,10 +465,16 @@ fn fpga_chain_offset(chain: u8, per_chain_offset: u32) -> u32 {
 
 /// Run the CV1835 cold-boot sequence end-to-end.
 ///
-/// All six phases run sequentially. On any error the function bails fast —
-/// the caller is responsible for unwinding (drop the returned [`HalError`]
-/// + drop the `Apw12SmbusBackend` and `Pic1704ColdBoot` adapter, both of
-/// which clean up via Drop). We never re-engage a half-failed phase here.
+/// All six phases run sequentially. The APW12 five-step method rolls back its
+/// own partial POWER_ON failures. Once that succeeds, this orchestrator keeps
+/// a rollback scope armed through the final platform phase. Any later error
+/// returns both the initiating error and the worker-owned disarm/POWER_OFF
+/// result as [`HalError::PartialBootRollback`]. PIC and UART adapters have no
+/// destructive Drop guarantee.
+///
+/// This scope does not provide release-panic cleanup: firmware is built with
+/// `panic = "abort"`, which skips `Drop`. A production caller must arm a
+/// platform panic-hook cutoff before invoking this energizing sequence.
 ///
 /// # Arguments
 ///
@@ -571,202 +577,208 @@ pub fn cv1835_cold_boot<P: Pic1704ColdBoot>(
     // See memory rule .
     let p1 = Instant::now();
     psu.cold_boot_sequence_5_step(opts.target_voltage_mv, opts.watchdog_ms)?;
-    tracing::info!(
-        elapsed_ms = p1.elapsed().as_millis() as u64,
-        total_ms = t0.elapsed().as_millis() as u64,
-        "CV1835 cold-boot phase 1 done — APW12 5-step (R4-CONFIRMED §2)"
-    );
 
-    // ── Phase 2 — PIC1704 DC-DC enable per chain (t = 7.0 s) ──────────────
-    // R4-CONFIRMED — `bmminer_init_trace_cv1835.md` §2 step
-    // `_bitmain_pic_enable_dc_dc_common`: REG_VERSION read → if 0x86
-    // write 0x5A → REG_CONTROL=0x01 (jump to app) → poll until 0x89 →
-    // REG_CONTROL=0x01 (DC-DC ON) → poll REG_STATUS PGOOD bit. PIC1704
-    // register map confirmed via pic1704.h (REG_VERSION=0x00,
-    // REG_CONTROL=0x09). See memory rule
-    //  (bootloader-jump
-    // is destructive in app mode; classify version before start_app).
-    let p2 = Instant::now();
-    for chain in 0..chain_count {
-        let v = pic.read_version(chain)?;
-        tracing::debug!(
-            chain,
-            fw = format_args!("0x{:02X}", v),
-            "CV1835 cold-boot phase 2: PIC version read (R4-CONFIRMED §2)"
+    // Phase 1 committed its internal rollback scope. Arm a continuation
+    // scope immediately so every remaining ordinary error converges through
+    // the worker-owned APW12 shutdown plan. Release panic=abort requires a
+    // separately armed platform hard-cut hook.
+    run_with_power_rollback(psu, "CV1835 cold boot after APW12 init", |_psu| {
+        tracing::info!(
+            elapsed_ms = p1.elapsed().as_millis() as u64,
+            total_ms = t0.elapsed().as_millis() as u64,
+            "CV1835 cold-boot phase 1 done — APW12 5-step (R4-CONFIRMED §2)"
         );
-        // start_app() is a no-op when already in app mode — matches
-        // pic1704.c lines 207-209. Our orchestrator always calls
-        // read_version first per the trait contract, so the impl can
-        // make a safe classification before issuing the bootloader jump.
-        pic.start_app(chain)?;
-        pic.wait_for_app(chain, Duration::from_millis(5_000))?;
-        pic.enable_dc_dc(chain)?;
-    }
-    tracing::info!(
-        elapsed_ms = p2.elapsed().as_millis() as u64,
-        total_ms = t0.elapsed().as_millis() as u64,
-        "CV1835 cold-boot phase 2 done — PIC1704 DC-DC ON on {} chains \
-         (R4-CONFIRMED §2)",
-        chain_count
-    );
-
-    // ── Phase 3 — GPIO ASIC reset de-assert with 10 ms stagger (t = 7.0 s) ─
-    // R4-CONFIRMED — `bmminer_init_trace_cv1835.md` §1 (S37bitmainer_setup
-    // rows 2g-2j export GPIOs 427/429/431/433 as MIPIRX1_PAD0N..PAD3N →
-    // ASIC_RST0..3) and §2 timing table:
-    //   gpio_write(427,1) → +10 ms → 429 → +10 ms → 431 → +10 ms → 433.
-    // `s19j_init.c::s19j_asic_deassert_reset` is the canonical sequence.
-    // sysfs export numbers locked in [`ASIC_RESET_GPIOS_R4`].
-    let p3 = Instant::now();
-    let reset_gpios = CViTekPlatform::chain_reset_gpios();
-    for (idx, gpio) in reset_gpios.iter().take(chain_count as usize).enumerate() {
-        // s19j_init.c convention: 1 = running (de-assert reset), 0 = held.
-        write_sysfs_gpio_value(*gpio, true)?;
-        tracing::debug!(
-            chain = idx as u8,
-            gpio = *gpio,
-            "CV1835 cold-boot phase 3: ASIC reset de-asserted (R4-CONFIRMED §1+§2)"
-        );
-        if idx + 1 < chain_count as usize {
-            std::thread::sleep(ASIC_RESET_STAGGER);
-        }
-    }
-    tracing::info!(
-        elapsed_ms = p3.elapsed().as_millis() as u64,
-        total_ms = t0.elapsed().as_millis() as u64,
-        "CV1835 cold-boot phase 3 done — GPIO reset de-assert ({} chains, \
-         10 ms stagger, R4-CONFIRMED §1+§2)",
-        chain_count
-    );
-
-    // ── Phase 4 — UART init (937500) + soft-reset broadcast (t = 7.5 s) ──
-    // R4-CONFIRMED — `bmminer_init_trace_cv1835.md` §2.5 step
-    // `chain_write_enable`: open `/dev/uart_trans` → ioctl SET_BAUD
-    // 937500 → flush TX/RX FIFOs → broadcast CMD_SOFT_RESET
-    // [0x55, 0x01, 0x00, CRC]. DLF=0xAB yields exact 937500 baud at
-    // 25 MHz xtal; MCR=0x03 + FCR=0x07 are required prior to baud
-    // divisor write per memory rule .
-    let p4 = Instant::now();
-    let soft_reset = bm1362_soft_reset_frame();
-    for (idx, uart) in uarts.iter_mut().enumerate() {
-        uart.set_baud(CHAIN_UART_BAUD_HZ)?;
-        uart.flush_io();
-        uart.write_bytes(&soft_reset)?;
-        tracing::debug!(
-            chain = idx as u8,
-            baud = CHAIN_UART_BAUD_HZ,
-            "CV1835 cold-boot phase 4: UART set + CMD_SOFT_RESET broadcast \
-             (R4-CONFIRMED §2.5)"
-        );
-    }
-    tracing::info!(
-        elapsed_ms = p4.elapsed().as_millis() as u64,
-        total_ms = t0.elapsed().as_millis() as u64,
-        "CV1835 cold-boot phase 4 done — UARTs at 937500 + soft-reset \
-         (R4-CONFIRMED §2.5)"
-    );
-
-    // ── Phase 5 — MiscCtrl 0x00C100B0 triple-write × 5 ms (t = 8.5 s) ────
-    // R4-CONFIRMED — `bmminer_init_trace_cv1835.md` §2.6 + dev-kit HAL
-    // `s19j_init.c::s19j_misctrl_triple_write`: BM1362 ignores single
-    // writes to MiscCtrl. Three consecutive writes at 5 ms spacing are
-    // required for the register to take effect. Per memory rule
-    // .
-    let p5 = Instant::now();
-    let misc_frame = bm1362_broadcast_write_frame(
-        // BM1362 register address byte for MiscCtrl. The wire frame uses an
-        // 8-bit register byte; the absolute MMIO address 0x00C100B0 is the
-        // ASIC-side decoded address. R4 §2.6 + memory rule
-        // .
-        0x18,
-        MISCCTRL_VALUE,
-    );
-    for (idx, uart) in uarts.iter_mut().enumerate() {
-        for round in 0..3u8 {
-            uart.write_bytes(&misc_frame)?;
-            if round < 2 {
-                std::thread::sleep(MISCCTRL_SPACING);
-            }
-        }
-        tracing::debug!(
-            chain = idx as u8,
-            value = format_args!("0x{:08X}", MISCCTRL_VALUE),
-            "CV1835 cold-boot phase 5: MiscCtrl triple-write done (R4-CONFIRMED §2.6)"
-        );
-    }
-    tracing::info!(
-        elapsed_ms = p5.elapsed().as_millis() as u64,
-        total_ms = t0.elapsed().as_millis() as u64,
-        "CV1835 cold-boot phase 5 done — MiscCtrl triple-write × {} chains \
-         (R4-CONFIRMED §2.6)",
-        chain_count
-    );
-
-    // ── Phase 6 — First WORK_TX dispatch readiness (t = 9.0 s) ───────────
-    // Phase 6 STAYS INFERRED. R4 §7 confidence row marks FPGA register
-    // offsets at 0x43C00xxx as PARTIAL — inferred from S17/T9 patterns,
-    // not yet live-probed on a CV1835 bitstream. R4-1 (bench CV1835 unit
-    // FPGA live probe) is the carry-forward blocker.
-    if opts.run_fpga_dispatch_prep {
-        let p6 = Instant::now();
-        let fpga = fpga.expect("checked above when run_fpga_dispatch_prep=true");
+        // ── Phase 2 — PIC1704 DC-DC enable per chain (t = 7.0 s) ──────────────
+        // R4-CONFIRMED — `bmminer_init_trace_cv1835.md` §2 step
+        // `_bitmain_pic_enable_dc_dc_common`: REG_VERSION read → if 0x86
+        // write 0x5A → REG_CONTROL=0x01 (jump to app) → poll until 0x89 →
+        // REG_CONTROL=0x01 (DC-DC ON) → poll REG_STATUS PGOOD bit. PIC1704
+        // register map confirmed via pic1704.h (REG_VERSION=0x00,
+        // REG_CONTROL=0x09). See memory rule
+        //  (bootloader-jump
+        // is destructive in app mode; classify version before start_app).
+        let p2 = Instant::now();
         for chain in 0..chain_count {
-            // XXX: INFERRED — RE3 §6 / R4-1 carry-forward, requires live
-            // verify on bench CV1835 unit. Per-chain CHAIN_CONTROL =
-            // 0x00000001 enables the chain's work engine. The exact bit
-            // layout of CHAIN_CONTROL is not yet probed; we use 0x1 as
-            // the canonical "enable" value matching the Zynq stock-FPGA
-            // convention. See memory rule
-            // .
-            let ctrl_offset = fpga_chain_offset(chain, INFERRED_FPGA_CHAIN_CONTROL_OFFSET);
-            fpga.write_reg(chain, ctrl_offset, 0x0000_0001);
+            let v = pic.read_version(chain)?;
             tracing::debug!(
                 chain,
-                offset = format_args!("0x{:04X}", ctrl_offset),
-                "CV1835 cold-boot phase 6: CHAIN_CONTROL=1 (XXX: INFERRED — R4-1)"
+                fw = format_args!("0x{:02X}", v),
+                "CV1835 cold-boot phase 2: PIC version read (R4-CONFIRMED §2)"
             );
+            // start_app() is a no-op when already in app mode — matches
+            // pic1704.c lines 207-209. Our orchestrator always calls
+            // read_version first per the trait contract, so the impl can
+            // make a safe classification before issuing the bootloader jump.
+            pic.start_app(chain)?;
+            pic.wait_for_app(chain, Duration::from_millis(5_000))?;
+            pic.enable_dc_dc(chain)?;
+        }
+        tracing::info!(
+            elapsed_ms = p2.elapsed().as_millis() as u64,
+            total_ms = t0.elapsed().as_millis() as u64,
+            "CV1835 cold-boot phase 2 done — PIC1704 DC-DC ON on {} chains \
+         (R4-CONFIRMED §2)",
+            chain_count
+        );
 
-            // XXX: INFERRED — RE3 §6 / R4-1 carry-forward, requires live
-            // verify on bench CV1835 unit. Read-back the WORK_RX register
-            // so the FPGA's internal state machine clears any residual
-            // nonce-buffer bits before mining work flows. We discard the
-            // value — this is a register-poke for state, not data.
-            let rx_offset = fpga_chain_offset(chain, INFERRED_FPGA_WORK_RX_OFFSET);
-            let _scratch = fpga.read_reg(chain, rx_offset);
-
-            // XXX: INFERRED — RE3 §6 / R4-1 carry-forward, requires live
-            // verify on bench CV1835 unit. Confirm WORK_TX offset is
-            // in-bounds for the mmap window. We do NOT submit actual
-            // work — the orchestrator only validates the address
-            // arithmetic ahead of the daemon's first work dispatch.
-            let tx_offset = fpga_chain_offset(chain, INFERRED_FPGA_WORK_TX_OFFSET);
-            if (tx_offset as usize) >= fpga.region_size() {
-                return Err(HalError::Other(format!(
-                    "CV1835 cold-boot phase 6: WORK_TX offset 0x{:04X} for chain {} \
-                     exceeds mmap region 0x{:X} (XXX: INFERRED layout — R4-1)",
-                    tx_offset,
-                    chain,
-                    fpga.region_size(),
-                )));
+        // ── Phase 3 — GPIO ASIC reset de-assert with 10 ms stagger (t = 7.0 s) ─
+        // R4-CONFIRMED — `bmminer_init_trace_cv1835.md` §1 (S37bitmainer_setup
+        // rows 2g-2j export GPIOs 427/429/431/433 as MIPIRX1_PAD0N..PAD3N →
+        // ASIC_RST0..3) and §2 timing table:
+        //   gpio_write(427,1) → +10 ms → 429 → +10 ms → 431 → +10 ms → 433.
+        // `s19j_init.c::s19j_asic_deassert_reset` is the canonical sequence.
+        // sysfs export numbers locked in [`ASIC_RESET_GPIOS_R4`].
+        let p3 = Instant::now();
+        let reset_gpios = CViTekPlatform::chain_reset_gpios();
+        for (idx, gpio) in reset_gpios.iter().take(chain_count as usize).enumerate() {
+            // s19j_init.c convention: 1 = running (de-assert reset), 0 = held.
+            write_sysfs_gpio_value(*gpio, true)?;
+            tracing::debug!(
+                chain = idx as u8,
+                gpio = *gpio,
+                "CV1835 cold-boot phase 3: ASIC reset de-asserted (R4-CONFIRMED §1+§2)"
+            );
+            if idx + 1 < chain_count as usize {
+                std::thread::sleep(ASIC_RESET_STAGGER);
             }
         }
         tracing::info!(
-            elapsed_ms = p6.elapsed().as_millis() as u64,
+            elapsed_ms = p3.elapsed().as_millis() as u64,
             total_ms = t0.elapsed().as_millis() as u64,
-            "CV1835 cold-boot phase 6 done — FPGA dispatch prep on {} chains \
-             (XXX: INFERRED registers — RE3 §6 / R4-1 carry-forward)",
+            "CV1835 cold-boot phase 3 done — GPIO reset de-assert ({} chains, \
+         10 ms stagger, R4-CONFIRMED §1+§2)",
             chain_count
         );
-    } else {
-        tracing::info!("CV1835 cold-boot: phase 6 skipped (opts.run_fpga_dispatch_prep=false)");
-    }
 
-    tracing::info!(
-        total_ms = t0.elapsed().as_millis() as u64,
-        chains = chain_count,
-        "CV1835 cold-boot: complete"
-    );
-    Ok(())
+        // ── Phase 4 — UART init (937500) + soft-reset broadcast (t = 7.5 s) ──
+        // R4-CONFIRMED — `bmminer_init_trace_cv1835.md` §2.5 step
+        // `chain_write_enable`: open `/dev/uart_trans` → ioctl SET_BAUD
+        // 937500 → flush TX/RX FIFOs → broadcast CMD_SOFT_RESET
+        // [0x55, 0x01, 0x00, CRC]. DLF=0xAB yields exact 937500 baud at
+        // 25 MHz xtal; MCR=0x03 + FCR=0x07 are required prior to baud
+        // divisor write per memory rule .
+        let p4 = Instant::now();
+        let soft_reset = bm1362_soft_reset_frame();
+        for (idx, uart) in uarts.iter_mut().enumerate() {
+            uart.set_baud(CHAIN_UART_BAUD_HZ)?;
+            uart.flush_io();
+            uart.write_bytes(&soft_reset)?;
+            tracing::debug!(
+                chain = idx as u8,
+                baud = CHAIN_UART_BAUD_HZ,
+                "CV1835 cold-boot phase 4: UART set + CMD_SOFT_RESET broadcast \
+             (R4-CONFIRMED §2.5)"
+            );
+        }
+        tracing::info!(
+            elapsed_ms = p4.elapsed().as_millis() as u64,
+            total_ms = t0.elapsed().as_millis() as u64,
+            "CV1835 cold-boot phase 4 done — UARTs at 937500 + soft-reset \
+         (R4-CONFIRMED §2.5)"
+        );
+
+        // ── Phase 5 — MiscCtrl 0x00C100B0 triple-write × 5 ms (t = 8.5 s) ────
+        // R4-CONFIRMED — `bmminer_init_trace_cv1835.md` §2.6 + dev-kit HAL
+        // `s19j_init.c::s19j_misctrl_triple_write`: BM1362 ignores single
+        // writes to MiscCtrl. Three consecutive writes at 5 ms spacing are
+        // required for the register to take effect. Per memory rule
+        // .
+        let p5 = Instant::now();
+        let misc_frame = bm1362_broadcast_write_frame(
+            // BM1362 register address byte for MiscCtrl. The wire frame uses an
+            // 8-bit register byte; the absolute MMIO address 0x00C100B0 is the
+            // ASIC-side decoded address. R4 §2.6 + memory rule
+            // .
+            0x18,
+            MISCCTRL_VALUE,
+        );
+        for (idx, uart) in uarts.iter_mut().enumerate() {
+            for round in 0..3u8 {
+                uart.write_bytes(&misc_frame)?;
+                if round < 2 {
+                    std::thread::sleep(MISCCTRL_SPACING);
+                }
+            }
+            tracing::debug!(
+                chain = idx as u8,
+                value = format_args!("0x{:08X}", MISCCTRL_VALUE),
+                "CV1835 cold-boot phase 5: MiscCtrl triple-write done (R4-CONFIRMED §2.6)"
+            );
+        }
+        tracing::info!(
+            elapsed_ms = p5.elapsed().as_millis() as u64,
+            total_ms = t0.elapsed().as_millis() as u64,
+            "CV1835 cold-boot phase 5 done — MiscCtrl triple-write × {} chains \
+         (R4-CONFIRMED §2.6)",
+            chain_count
+        );
+
+        // ── Phase 6 — First WORK_TX dispatch readiness (t = 9.0 s) ───────────
+        // Phase 6 STAYS INFERRED. R4 §7 confidence row marks FPGA register
+        // offsets at 0x43C00xxx as PARTIAL — inferred from S17/T9 patterns,
+        // not yet live-probed on a CV1835 bitstream. R4-1 (bench CV1835 unit
+        // FPGA live probe) is the carry-forward blocker.
+        if opts.run_fpga_dispatch_prep {
+            let p6 = Instant::now();
+            let fpga = fpga.expect("checked above when run_fpga_dispatch_prep=true");
+            for chain in 0..chain_count {
+                // XXX: INFERRED — RE3 §6 / R4-1 carry-forward, requires live
+                // verify on bench CV1835 unit. Per-chain CHAIN_CONTROL =
+                // 0x00000001 enables the chain's work engine. The exact bit
+                // layout of CHAIN_CONTROL is not yet probed; we use 0x1 as
+                // the canonical "enable" value matching the Zynq stock-FPGA
+                // convention. See memory rule
+                // .
+                let ctrl_offset = fpga_chain_offset(chain, INFERRED_FPGA_CHAIN_CONTROL_OFFSET);
+                fpga.write_reg(chain, ctrl_offset, 0x0000_0001);
+                tracing::debug!(
+                    chain,
+                    offset = format_args!("0x{:04X}", ctrl_offset),
+                    "CV1835 cold-boot phase 6: CHAIN_CONTROL=1 (XXX: INFERRED — R4-1)"
+                );
+
+                // XXX: INFERRED — RE3 §6 / R4-1 carry-forward, requires live
+                // verify on bench CV1835 unit. Read-back the WORK_RX register
+                // so the FPGA's internal state machine clears any residual
+                // nonce-buffer bits before mining work flows. We discard the
+                // value — this is a register-poke for state, not data.
+                let rx_offset = fpga_chain_offset(chain, INFERRED_FPGA_WORK_RX_OFFSET);
+                let _scratch = fpga.read_reg(chain, rx_offset);
+
+                // XXX: INFERRED — RE3 §6 / R4-1 carry-forward, requires live
+                // verify on bench CV1835 unit. Confirm WORK_TX offset is
+                // in-bounds for the mmap window. We do NOT submit actual
+                // work — the orchestrator only validates the address
+                // arithmetic ahead of the daemon's first work dispatch.
+                let tx_offset = fpga_chain_offset(chain, INFERRED_FPGA_WORK_TX_OFFSET);
+                if (tx_offset as usize) >= fpga.region_size() {
+                    return Err(HalError::Other(format!(
+                        "CV1835 cold-boot phase 6: WORK_TX offset 0x{:04X} for chain {} \
+                     exceeds mmap region 0x{:X} (XXX: INFERRED layout — R4-1)",
+                        tx_offset,
+                        chain,
+                        fpga.region_size(),
+                    )));
+                }
+            }
+            tracing::info!(
+                elapsed_ms = p6.elapsed().as_millis() as u64,
+                total_ms = t0.elapsed().as_millis() as u64,
+                "CV1835 cold-boot phase 6 done — FPGA dispatch prep on {} chains \
+             (XXX: INFERRED registers — RE3 §6 / R4-1 carry-forward)",
+                chain_count
+            );
+        } else {
+            tracing::info!("CV1835 cold-boot: phase 6 skipped (opts.run_fpga_dispatch_prep=false)");
+        }
+
+        tracing::info!(
+            total_ms = t0.elapsed().as_millis() as u64,
+            chains = chain_count,
+            "CV1835 cold-boot: complete"
+        );
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------

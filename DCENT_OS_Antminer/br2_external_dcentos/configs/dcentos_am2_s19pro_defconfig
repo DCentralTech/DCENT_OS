@@ -76,7 +76,7 @@ BR2_TARGET_GENERIC_ISSUE="DCENTos for S19 Pro (am2, BM1398) — D-Central Techno
 # Buildroot applies overlays left-to-right so per-board files win.
 # =============================================================================
 BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/am2-s19pro/rootfs-overlay"
-BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/am2-s19pro/post-build.sh"
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/am2-s19pro/post-build.sh $(BR2_EXTERNAL_DCENTOS_PATH)/board/common/prune-runtime-research-tools.sh"
 BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/am2-s19pro/post-image.sh"
 
 # =============================================================================

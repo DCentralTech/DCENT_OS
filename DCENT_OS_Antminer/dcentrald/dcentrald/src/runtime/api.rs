@@ -13,6 +13,8 @@
 use anyhow::Result;
 use tracing::{error, info, warn};
 
+use dcentrald_hal::platform::HardwareMutationGate;
+
 use crate::config::DcentraldConfig;
 
 /// Build a minimal AppState and spawn the dashboard / CGMiner API servers.
@@ -21,8 +23,8 @@ use crate::config::DcentraldConfig;
 /// `--serial-mining` (idle path), and `--stock-fpga`. All of these own
 /// their hardware state outside of `Daemon::run()`, but the dashboard and
 /// `pyasic`-style monitoring still need to bind `:8080` + `:4028`. Returns
-/// the CGMiner + HTTP `JoinHandle`s so the caller can keep them alive for
-/// the lifetime of the process — dropping them aborts the API tasks.
+/// the CGMiner + HTTP `JoinHandle`s so the caller can explicitly own their
+/// lifetime. Dropping a Tokio handle detaches its still-running task.
 ///
 /// Errors are fatal — the dashboard not coming up is a deploy-rollback
 /// condition for proxy / hybrid mode, since the operator's only
@@ -34,6 +36,31 @@ pub async fn spawn_proxy_mode_api(
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)> {
     spawn_proxy_mode_api_with_state(config, runtime_mode, runtime_health_rx, None, shutdown).await
+}
+
+/// Variant of [`spawn_proxy_mode_api`] that shares mutation admission with a
+/// hardware-owning mining runtime.
+///
+/// The supplied gate is installed into the API's [`dcentrald_api::AppState`]
+/// by identity. This lets the mining owner close and drain API hardware calls
+/// before safe-off. The legacy wrapper remains open-by-default for modes that
+/// do not supply an ownership domain.
+pub async fn spawn_proxy_mode_api_with_hardware_mutation_gate(
+    config: DcentraldConfig,
+    runtime_mode: dcentrald_api::RuntimeHealthMode,
+    runtime_health_rx: Option<tokio::sync::watch::Receiver<dcentrald_api::RuntimeHealthSnapshot>>,
+    hardware_mutation_gate: HardwareMutationGate,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)> {
+    spawn_proxy_mode_api_with_state_and_hardware_mutation_gate(
+        config,
+        runtime_mode,
+        runtime_health_rx,
+        None,
+        hardware_mutation_gate,
+        shutdown,
+    )
+    .await
 }
 
 /// Variant of [`spawn_proxy_mode_api`] that also accepts a live `MinerState`
@@ -53,6 +80,27 @@ pub async fn spawn_proxy_mode_api_with_state(
     runtime_mode: dcentrald_api::RuntimeHealthMode,
     runtime_health_rx: Option<tokio::sync::watch::Receiver<dcentrald_api::RuntimeHealthSnapshot>>,
     external_state_rx: Option<tokio::sync::watch::Receiver<dcentrald_api::MinerState>>,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)> {
+    spawn_proxy_mode_api_with_state_and_hardware_mutation_gate(
+        config,
+        runtime_mode,
+        runtime_health_rx,
+        external_state_rx,
+        HardwareMutationGate::new_open(),
+        shutdown,
+    )
+    .await
+}
+
+/// Fully owned proxy-mode API variant with live state and shared mutation
+/// admission supplied by the mining runtime.
+pub async fn spawn_proxy_mode_api_with_state_and_hardware_mutation_gate(
+    config: DcentraldConfig,
+    runtime_mode: dcentrald_api::RuntimeHealthMode,
+    runtime_health_rx: Option<tokio::sync::watch::Receiver<dcentrald_api::RuntimeHealthSnapshot>>,
+    external_state_rx: Option<tokio::sync::watch::Receiver<dcentrald_api::MinerState>>,
+    hardware_mutation_gate: HardwareMutationGate,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)> {
     let api_config = dcentrald_api::ApiConfig {
@@ -104,7 +152,10 @@ pub async fn spawn_proxy_mode_api_with_state(
             );
         }
     }
-    let app_state = dcentrald_api::build_minimal_app_state(inputs);
+    let app_state = dcentrald_api::build_minimal_app_state_with_hardware_mutation_gate(
+        inputs,
+        hardware_mutation_gate,
+    );
 
     // P1-4 (Omega): bring up the shared notification stack (MQTT publisher +
     // event-bus webhook dispatcher + mining-sync bridge) for EVERY non-`Daemon`

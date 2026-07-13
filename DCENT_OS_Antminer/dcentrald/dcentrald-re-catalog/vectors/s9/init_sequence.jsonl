@@ -1,0 +1,13 @@
+{"schema":"dcent-init-trace-v1","model":"s9","strictness":"exact","provenance":["","",""]}
+{"event":"baud_changed","chain_id":0,"baud":114678}
+{"event":"command","chain_id":0,"bytes":[88,9,0,12]}
+{"event":"command","chain_id":0,"bytes":[0,104,2,33]}
+{"event":"command","chain_id":0,"bytes":[68,5,0,12]}
+{"event":"command","chain_id":0,"bytes":[88,9,0,28]}
+{"event":"command","chain_id":0,"bytes":[0,32,129,128]}
+{"event":"baud_changed","chain_id":0,"baud":1562500}
+{"event":"command","chain_id":0,"bytes":[88,9,0,28]}
+{"event":"command","chain_id":0,"bytes":[64,32,129,128]}
+{"event":"command","chain_id":0,"bytes":[88,9,0,24]}
+{"event":"command","chain_id":0,"bytes":[0,0,0,255]}
+{"event":"command","chain_id":0,"bytes":[68,5,0,28]}

@@ -22,6 +22,11 @@ import time
 import json
 import collections
 
+from dcentos_asic_wire import (
+    crc5_bm13xx_command,
+    require_captured_bm1387_protocol_profile,
+)
+
 try:
     import fcntl
     import termios
@@ -70,41 +75,13 @@ PLL_FREQ_MAP = {
 
 
 # ============================================================================
-# CRC5 for BM1387
-# ============================================================================
-
-def crc5_bm1387(data, bit_length=None):
-    """CRC5 polynomial 0x05, init 0x1F, bit-by-bit."""
-    crc = 0x1F
-    poly = 0x05
-    if bit_length is None:
-        bit_length = len(data) * 8
-
-    bit_index = 0
-    for byte in data:
-        for i in range(7, -1, -1):
-            if bit_index >= bit_length:
-                break
-            bit = (byte >> i) & 1
-            top_bit = (crc >> 4) & 1
-            crc = ((crc << 1) | bit) & 0x3F
-            if top_bit ^ ((crc >> 5) & 1):
-                crc ^= poly
-            crc &= 0x1F
-            bit_index += 1
-            if bit_index >= bit_length:
-                break
-    return crc & 0x1F
-
-
-# ============================================================================
 # BM1387 Command Builders
 # ============================================================================
 
 def build_read_register_cmd(chip_addr, reg_addr):
     """Build read register command: [0x54, chip_addr, reg_addr, CRC5]."""
     cmd_data = bytes([CMD_READ_REGISTER, chip_addr, reg_addr])
-    crc = crc5_bm1387(cmd_data)
+    crc = crc5_bm13xx_command(cmd_data)
     return bytes([CMD_READ_REGISTER, chip_addr, reg_addr, crc & 0x1F])
 
 
@@ -118,7 +95,7 @@ def build_chain_inactive_cmd():
     # BM1387 chain_inactive: 5-byte command
     # [CMD=0x55, LEN=0x05, 0x00, 0x00, CRC5]
     cmd_data = bytes([CMD_CHAIN_INACTIVE, 0x05, 0x00, 0x00])
-    crc = crc5_bm1387(cmd_data)
+    crc = crc5_bm13xx_command(cmd_data)
     return cmd_data + bytes([crc & 0x1F])
 
 
@@ -129,7 +106,7 @@ def build_set_address_cmd(chip_addr):
     Each call addresses one chip; chips respond in chain order.
     """
     cmd_data = bytes([CMD_SET_ADDRESS, chip_addr])
-    crc = crc5_bm1387(cmd_data)
+    crc = crc5_bm13xx_command(cmd_data)
     return bytes([CMD_SET_ADDRESS, chip_addr, crc & 0x1F])
 
 
@@ -143,20 +120,22 @@ def build_write_register_cmd(chip_addr, reg_addr, value):
     v1 = (value >> 8) & 0xFF
     v0 = value & 0xFF
     cmd_data = bytes([CMD_WRITE_REGISTER, chip_addr, reg_addr, v3, v2, v1, v0])
-    crc = crc5_bm1387(cmd_data)
+    crc = crc5_bm13xx_command(cmd_data)
     return cmd_data + bytes([crc & 0x1F])
 
 
 def parse_read_response(response):
-    """Parse 7-byte response: [reg, D3, D2, D1, D0, CRC_hi, CRC_lo]."""
-    if len(response) < READ_RESPONSE_LEN:
+    """Structurally parse a 7-byte response without claiming CRC validity.
+
+    Response trailer semantics are not the host-command CRC5 algorithm.  Raw
+    bytes are returned so later capture-backed work can validate them without
+    losing evidence.
+    """
+    if len(response) != READ_RESPONSE_LEN:
         return None
     reg_addr = response[0]
     value = (response[1] << 24) | (response[2] << 16) | (response[3] << 8) | response[4]
-    resp_crc = response[5] & 0x1F
-    calc_crc = crc5_bm1387(response[:5])
-    crc_ok = (calc_crc == resp_crc)
-    return (reg_addr, value, crc_ok)
+    return (reg_addr, value, "unverified", bytes(response[:READ_RESPONSE_LEN]))
 
 
 def decode_pll_freq(pll_value):
@@ -200,6 +179,7 @@ class UARTInterface:
         self.timeout = timeout
         self.fd = None
         self.fobj = None
+        self.last_response_observation = None
 
     def open(self):
         self.fd = os.open(self.device, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
@@ -228,6 +208,7 @@ class UARTInterface:
             self.fd = None
 
     def write(self, data):
+        require_captured_bm1387_protocol_profile()
         if self.fobj:
             self.fobj.write(data)
             self.fobj.flush()
@@ -272,7 +253,7 @@ class UARTInterface:
         return b""
 
     def read_register(self, chip_addr, reg_addr, retries=2):
-        """Read a register. Returns (reg, value, crc_ok) or None."""
+        """Read a register. Returns (reg, value, integrity, raw) or None."""
         cmd = build_read_register_cmd(chip_addr, reg_addr)
         for attempt in range(retries + 1):
             self.flush_input()
@@ -282,7 +263,16 @@ class UARTInterface:
             if len(resp) == READ_RESPONSE_LEN:
                 parsed = parse_read_response(resp)
                 if parsed is not None:
-                    return parsed
+                    self.last_response_observation = {
+                        "requested_register": reg_addr,
+                        "returned_register": parsed[0],
+                        "register_matches": parsed[0] == reg_addr,
+                        "response_integrity": parsed[2],
+                        "raw_response_hex": parsed[3].hex(),
+                        "raw_response_bytes": list(parsed[3]),
+                    }
+                    if parsed[0] == reg_addr:
+                        return parsed
             if attempt < retries:
                 time.sleep(0.02)
         return None
@@ -352,7 +342,7 @@ class MockUART:
                 value = 0x00000000
             else:
                 return None
-        return (reg_addr, value, True)
+        return (reg_addr, value, "simulated", b"")
 
 
 # ============================================================================
@@ -402,21 +392,40 @@ def enumerate_chain_active(uart, max_chips=MAX_CHIPS, verbose=False):
                     chip_idx, chip_addr))
             break
 
-        reg_returned, value, crc_ok = result
-        if not crc_ok:
+        reg_returned, value, integrity, raw_response = result
+
+        if reg_returned != REG_CHIP_ADDRESS:
+            chips.append({
+                "index": chip_idx,
+                "address": chip_addr,
+                "address_hex": "0x{:02X}".format(chip_addr),
+                "requested_register": REG_CHIP_ADDRESS,
+                "returned_register": reg_returned,
+                "response_integrity": integrity,
+                "raw_response_hex": raw_response.hex(),
+                "raw_response_bytes": list(raw_response),
+                "verified": False,
+                "evidence_status": "register_mismatch",
+            })
             if verbose:
-                sys.stderr.write("  Chip #{}: CRC error at addr 0x{:02X}\n".format(
-                    chip_idx, chip_addr))
-            # Still count it but flag the error
-            pass
+                sys.stderr.write(
+                    "  Chip #{}: requested register 0x{:02X}, got 0x{:02X}; "
+                    "stopping active enumeration\n".format(
+                        chip_idx, REG_CHIP_ADDRESS, reg_returned))
+            break
 
         chip_info = {
             "index": chip_idx,
             "address": chip_addr,
             "address_hex": "0x{:02X}".format(chip_addr),
             "chip_addr_reg": value,
-            "address_verified": (value & 0xFF) == chip_addr if crc_ok else False,
-            "crc_ok": crc_ok,
+            "address_verified": False,
+            "address_observed_matches": (value & 0xFF) == chip_addr,
+            "response_integrity": integrity,
+            "raw_response_hex": raw_response.hex(),
+            "crc_ok": None,
+            "verified": False,
+            "evidence_status": "structural_candidate",
             "pll_raw": None,
             "pll_freq_mhz": None,
             "version_raw": None,
@@ -426,32 +435,35 @@ def enumerate_chain_active(uart, max_chips=MAX_CHIPS, verbose=False):
 
         # Step 4: Read PLL
         pll_result = uart.read_register(chip_addr, REG_PLL)
-        if pll_result:
-            _, pll_val, pll_crc = pll_result
+        if pll_result and pll_result[0] == REG_PLL:
+            _, pll_val, _, pll_raw = pll_result
             chip_info["pll_raw"] = pll_val
             chip_info["pll_raw_hex"] = "0x{:08X}".format(pll_val)
             chip_info["pll_freq_mhz"] = decode_pll_freq(pll_val)
+            chip_info["pll_response_hex"] = pll_raw.hex()
 
         # Step 5: Read version
         ver_result = uart.read_register(chip_addr, REG_VERSION)
-        if ver_result:
-            _, ver_val, ver_crc = ver_result
+        if ver_result and ver_result[0] == REG_VERSION:
+            _, ver_val, _, ver_raw = ver_result
             chip_info["version_raw"] = ver_val
             chip_info["version_raw_hex"] = "0x{:08X}".format(ver_val)
             chip_info["version_str"] = decode_version(ver_val)
+            chip_info["version_response_hex"] = ver_raw.hex()
 
         # Read status
         stat_result = uart.read_register(chip_addr, REG_CHIP_STATUS)
-        if stat_result:
-            _, stat_val, _ = stat_result
+        if stat_result and stat_result[0] == REG_CHIP_STATUS:
+            _, stat_val, _, stat_raw = stat_result
             chip_info["status"] = stat_val
             chip_info["status_hex"] = "0x{:08X}".format(stat_val)
+            chip_info["status_response_hex"] = stat_raw.hex()
 
         chips.append(chip_info)
 
         if verbose:
-            sys.stderr.write("  Chip #{}: addr=0x{:02X} verified={} pll={} version={}\n".format(
-                chip_idx, chip_addr, chip_info["address_verified"],
+            sys.stderr.write("  Chip #{}: addr=0x{:02X} observed_match={} integrity={} pll={} version={}\n".format(
+                chip_idx, chip_addr, chip_info["address_observed_matches"], integrity,
                 chip_info.get("pll_freq_mhz", "?"),
                 chip_info.get("version_str", "?")))
 
@@ -476,31 +488,52 @@ def enumerate_chain_passive(uart, max_chips=MAX_CHIPS, verbose=False):
         if result is None:
             continue
 
-        reg_returned, value, crc_ok = result
+        reg_returned, value, integrity, raw_response = result
+
+        if reg_returned != REG_CHIP_ADDRESS:
+            chips.append({
+                "index": chip_idx,
+                "address": chip_addr,
+                "address_hex": "0x{:02X}".format(chip_addr),
+                "requested_register": REG_CHIP_ADDRESS,
+                "returned_register": reg_returned,
+                "response_integrity": integrity,
+                "raw_response_hex": raw_response.hex(),
+                "raw_response_bytes": list(raw_response),
+                "verified": False,
+                "evidence_status": "register_mismatch",
+            })
+            continue
 
         chip_info = {
             "index": chip_idx,
             "address": chip_addr,
             "address_hex": "0x{:02X}".format(chip_addr),
             "chip_addr_reg": value,
-            "crc_ok": crc_ok,
+            "crc_ok": None,
+            "response_integrity": integrity,
+            "raw_response_hex": raw_response.hex(),
+            "verified": False,
+            "evidence_status": "structural_candidate",
         }
 
         # Read PLL
         pll_result = uart.read_register(chip_addr, REG_PLL)
-        if pll_result:
-            _, pll_val, _ = pll_result
+        if pll_result and pll_result[0] == REG_PLL:
+            _, pll_val, _, pll_raw = pll_result
             chip_info["pll_raw"] = pll_val
             chip_info["pll_raw_hex"] = "0x{:08X}".format(pll_val)
             chip_info["pll_freq_mhz"] = decode_pll_freq(pll_val)
+            chip_info["pll_response_hex"] = pll_raw.hex()
 
         # Read version
         ver_result = uart.read_register(chip_addr, REG_VERSION)
-        if ver_result:
-            _, ver_val, _ = ver_result
+        if ver_result and ver_result[0] == REG_VERSION:
+            _, ver_val, _, ver_raw = ver_result
             chip_info["version_raw"] = ver_val
             chip_info["version_raw_hex"] = "0x{:08X}".format(ver_val)
             chip_info["version_str"] = decode_version(ver_val)
+            chip_info["version_response_hex"] = ver_raw.hex()
 
         chips.append(chip_info)
 
@@ -516,8 +549,8 @@ def format_chain_report(chips, scan_type="active"):
     lines = []
     lines.append("BM1387 Chain Enumeration Report ({} scan)".format(scan_type))
     lines.append("=" * 75)
-    lines.append("Chips found: {}".format(len(chips)))
-    lines.append("Total cores: {} (@ {} per chip)".format(
+    lines.append("Structural response candidates: {}".format(len(chips)))
+    lines.append("Candidate-implied cores (not verified): {} (@ {} per candidate)".format(
         len(chips) * CORES_PER_CHIP, CORES_PER_CHIP))
     lines.append("")
 
@@ -527,25 +560,25 @@ def format_chain_report(chips, scan_type="active"):
 
     # Table header
     lines.append("{:<6} {:<8} {:<10} {:<10} {:<12} {:<10} {}".format(
-        "#", "ADDR", "VERIFIED", "PLL(MHz)", "VERSION", "STATUS", "NOTES"))
+        "#", "ADDR", "EVIDENCE", "PLL(MHz)", "VERSION", "STATUS", "NOTES"))
     lines.append("-" * 75)
 
     freq_counts = collections.Counter()
     version_counts = collections.Counter()
-    crc_errors = 0
+    unverified_responses = 0
 
     for chip in chips:
         idx = chip["index"]
         addr = chip["address_hex"]
-        verified = "Yes" if chip.get("address_verified") else ("N/A" if "address_verified" not in chip else "No")
+        verified = "candidate"
         pll = "{:.0f}".format(chip["pll_freq_mhz"]) if chip.get("pll_freq_mhz") else "?"
         version = chip.get("version_str", "?")
         status = chip.get("status_hex", "?")
         notes = ""
 
-        if not chip.get("crc_ok"):
-            notes += "CRC_ERR "
-            crc_errors += 1
+        if chip.get("response_integrity") == "unverified":
+            notes += "CRC_UNVERIFIED "
+            unverified_responses += 1
         if chip.get("address_verified") is False:
             notes += "ADDR_MISMATCH "
 
@@ -572,8 +605,8 @@ def format_chain_report(chips, scan_type="active"):
         ver_summary = ", ".join("{} x{}".format(v, c) for v, c in sorted(version_counts.items()))
         lines.append("Chip versions: {}".format(ver_summary))
 
-    if crc_errors:
-        lines.append("CRC errors: {} (communication issues)".format(crc_errors))
+    if unverified_responses:
+        lines.append("Responses with unverified integrity: {}".format(unverified_responses))
 
     # Hashrate estimate
     total_ghps = 0
@@ -611,12 +644,12 @@ def run_self_tests():
         tests.append({"name": name, "status": status, "detail": detail})
 
     # --- Test 1: CRC5 determinism ---
-    c1 = crc5_bm1387(bytes([0x54, 0x00, 0x00]))
-    c2 = crc5_bm1387(bytes([0x54, 0x00, 0x00]))
+    c1 = crc5_bm13xx_command(bytes([0x52, 0x05, 0x00, 0x00]))
+    c2 = crc5_bm13xx_command(bytes([0x52, 0x05, 0x00, 0x00]))
     test("CRC5: deterministic", c1 == c2, "c1=0x{:02X} c2=0x{:02X}".format(c1, c2))
 
     # --- Test 2: CRC5 range ---
-    all_ok = all(0 <= crc5_bm1387(bytes([0x54, i, 0])) <= 0x1F for i in range(256))
+    all_ok = all(0 <= crc5_bm13xx_command(bytes([0x54, i, 0])) <= 0x1F for i in range(256))
     test("CRC5: all outputs in 5-bit range", all_ok)
 
     # --- Test 3: Build chain_inactive command ---
@@ -669,11 +702,11 @@ def run_self_tests():
     val = 0x00680261
     resp_data = bytes([0x0C, (val >> 24) & 0xFF, (val >> 16) & 0xFF,
                        (val >> 8) & 0xFF, val & 0xFF])
-    resp_crc = crc5_bm1387(resp_data)
-    full_resp = resp_data + bytes([resp_crc, 0x00])
+    full_resp = resp_data + bytes([0xA5, 0x5A])
     parsed = parse_read_response(full_resp)
-    test("parse_response: valid PLL response",
-         parsed is not None and parsed[0] == 0x0C and parsed[1] == val,
+    test("parse_response: structural PLL response is unverified",
+         parsed is not None and parsed[0] == 0x0C and parsed[1] == val
+         and parsed[2] == "unverified" and parsed[3] == full_resp,
          "parsed={}".format(parsed))
 
     # --- Test 12: PLL decode ---

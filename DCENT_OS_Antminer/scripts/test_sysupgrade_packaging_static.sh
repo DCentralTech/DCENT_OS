@@ -89,11 +89,11 @@ make_test_sysupgrade_package() {
   "board_target": "am3-s19k",
   "version": "test",
   "status": "$status",
-  "payloads": [
-    { "path": "sysupgrade-am3-s19k/kernel", "size": $kernel_size, "sha256": "$kernel_sha" },
-    { "path": "sysupgrade-am3-s19k/root", "size": $root_size, "sha256": "$root_sha" },
-    { "path": "sysupgrade-am3-s19k/METADATA", "size": $metadata_size, "sha256": "$metadata_sha" }
-  ]
+  "payloads": {
+    "kernel": { "path": "sysupgrade-am3-s19k/kernel", "size": $kernel_size, "sha256": "$kernel_sha" },
+    "rootfs": { "path": "sysupgrade-am3-s19k/root", "size": $root_size, "sha256": "$root_sha" },
+    "metadata": { "path": "sysupgrade-am3-s19k/METADATA", "size": $metadata_size, "sha256": "$metadata_sha" }
+  }
 }
 EOF
     (cd "$pkgdir" && sha256sum kernel root METADATA > SHA256SUMS)
@@ -129,11 +129,11 @@ make_test_oversized_zynq_package() {
   "board_target": "$board",
   "version": "test",
   "status": "lab_unsigned",
-  "payloads": [
-    { "path": "sysupgrade-$board/kernel", "size": $kernel_size, "sha256": "$kernel_sha" },
-    { "path": "sysupgrade-$board/root", "size": $actual_root_size, "sha256": "$root_sha" },
-    { "path": "sysupgrade-$board/METADATA", "size": $metadata_size, "sha256": "$metadata_sha" }
-  ]
+  "payloads": {
+    "kernel": { "path": "sysupgrade-$board/kernel", "size": $kernel_size, "sha256": "$kernel_sha" },
+    "rootfs": { "path": "sysupgrade-$board/root", "size": $actual_root_size, "sha256": "$root_sha" },
+    "metadata": { "path": "sysupgrade-$board/METADATA", "size": $metadata_size, "sha256": "$metadata_sha" }
+  }
 }
 EOF
     (cd "$pkgdir" && sha256sum kernel root METADATA > SHA256SUMS)
@@ -783,11 +783,11 @@ require_pattern "$ZYNQ_S99UPGRADE" 'not blocking commit on its absence' 'zynq S9
 # The real-health gate must default-safe: window default present and tunable.
 require_pattern "$ZYNQ_S99UPGRADE" 'DCENTOS_BOOT_SUCCESS_WINDOW_S' 'zynq S99upgrade boot-success window is tunable with a safe default'
 
-# S99verify must DEFER to S99upgrade's decision (single commit authority) and
-# never re-commit a slot S99upgrade declared unhealthy.
+# S99verify is a report-only consumer of S99upgrade's decision (single commit
+# authority) and must never re-commit a slot the upgrader blocked.
 require_pattern "$ZYNQ_S99VERIFY" 'UPGRADE_COMMIT_MARKER' 'zynq S99verify observes the S99upgrade commit-decision marker'
-require_pattern "$ZYNQ_S99VERIFY" 'DEFER to S99upgrade' 'zynq S99verify defers to S99upgrade on the commit decision'
-require_pattern "$ZYNQ_S99VERIFY" 'S99upgrade declared the slot UNHEALTHY' 'zynq S99verify leaves upgrade_stage set when S99upgrade blocked the slot'
+require_pattern "$ZYNQ_S99VERIFY" 'report-only proof consumer' 'zynq S99verify documents its non-mutating proof role'
+require_pattern "$ZYNQ_S99VERIFY" 'S99upgrade blocked commit' 'zynq S99verify preserves upgrade_stage when S99upgrade blocked the slot'
 
 # Both init scripts must stay POSIX/BusyBox-ash safe (no bashisms).
 require_pattern "$ZYNQ_S99UPGRADE" '#!/bin/sh' 'zynq S99upgrade is POSIX/BusyBox shell'
@@ -841,6 +841,7 @@ require_pattern "$ZYNQ_FW_ENV" '/dev/mtd4   0x20000   0x20000   0x20000   1' 'zy
 CV1835_SAFE_SU='scripts/safe_sysupgrade_cv_emmc.sh'
 CV1835_POST_IMAGE='br2_external_dcentos/board/cvitek/cv1835-s19jpro/post-image.sh'
 CV1835_POST_BUILD='br2_external_dcentos/board/cvitek/cv1835-s19jpro/post-build.sh'
+OTA_SIGNATURE_RS='dcentrald/dcentrald-api/src/ota_signature.rs'
 
 # Pre-extraction validation (member traversal/type + package-size ceiling).
 require_pattern "$CV1835_SAFE_SU" 'validate_sysupgrade_tar_members "$UPGRADE_TAR"' 'cv1835 safe-sysupgrade validates tar members before extraction'
@@ -857,10 +858,20 @@ require_pattern "$CV1835_SAFE_SU" 'openssl pkeyutl -verify -rawin -pubin' 'cv183
 require_pattern "$CV1835_SAFE_SU" '/etc/dcentos/release_ed25519.pub' 'cv1835 safe-sysupgrade verifies against the pinned release key'
 require_pattern "$CV1835_SAFE_SU" 'refusing unsigned CV1835 eMMC sysupgrade' 'cv1835 safe-sysupgrade refuses an unsigned package fail-closed'
 require_pattern "$CV1835_SAFE_SU" '&& ! is_release_status "$MANIFEST_STATUS"' 'cv1835 safe-sysupgrade only accepts the unsigned lab override for a non-release status'
+require_pattern "$CV1835_SAFE_SU" 'verify_manifest_payload_sha "$NEW_KERNEL" "uImage"' 'cv1835 consumer binds uImage to the signed manifest digest'
+require_pattern "$CV1835_SAFE_SU" 'verify_manifest_payload_sha "$NEW_ROOTFS" "rootfs.gz"' 'cv1835 consumer binds rootfs.gz to the signed manifest digest'
 
 # Producer: signed package emission + rootfs pubkey staging.
 require_pattern "$CV1835_POST_IMAGE" 'dcent_stage_release_key' 'cv1835 post-image stages release_ed25519.pub via the shared signing helper'
 require_pattern "$CV1835_POST_IMAGE" 'dcent_sign_sysupgrade_manifest' 'cv1835 post-image signs MANIFEST.json (emits MANIFEST.sig)'
+require_pattern "$CV1835_POST_IMAGE" 'required deployable rootfs missing' 'cv1835 producer fails when consumer-required rootfs.gz is unavailable'
+require_pattern "$CV1835_POST_IMAGE" 'required deployable kernel missing' 'cv1835 producer fails when consumer-required uImage is unavailable'
+require_pattern "$CV1835_POST_IMAGE" '"path": "dcentos-${BOARD_NAME}-sysupgrade/uImage"' 'cv1835 producer declares the consumer-required uImage in the canonical payload registry'
+require_pattern "$CV1835_POST_IMAGE" '"path": "dcentos-${BOARD_NAME}-sysupgrade/rootfs.gz"' 'cv1835 producer declares the consumer-required rootfs.gz in the canonical payload registry'
+require_pattern "$OTA_SIGNATURE_RS" 'accepted_leaves: &["kernel", "uImage"]' 'public OTA registry maps the canonical kernel kind to CV uImage'
+require_pattern "$OTA_SIGNATURE_RS" 'accepted_leaves: &["root", "rootfs.gz"]' 'public OTA registry maps the canonical rootfs kind to CV rootfs.gz'
+reject_pattern "$CV1835_POST_IMAGE" 'rootfs.ext2' 'cv1835 producer does not advertise the unsupported ext2 fallback'
+reject_pattern "$CV1835_POST_IMAGE" 'sysupgrade will be rootfs-only' 'cv1835 producer does not emit an unusable rootfs-only package'
 require_pattern "$CV1835_POST_BUILD" 'etc/dcentos/release_ed25519.pub' 'cv1835 post-build stages the pinned release_ed25519.pub into the rootfs'
 # --- end CV1835 eMMC signed-sysupgrade coverage ------------------------------
 

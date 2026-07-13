@@ -536,17 +536,24 @@ PWM 127 -> ~5940 RPM
 
 ```
 struct Watchdog {
-    fd: RawFd,            // /dev/watchdog
+    file: fs::File,              // owned /dev/watchdog handle
+    magic_close_completed: bool,
 }
 
 impl Watchdog {
     fn open() -> Result<Self>;
-    fn kick(&self) -> Result<()>;     // Write "V" to fd
-    fn close(self);                    // Close fd, watchdog keeps running
+    fn set_timeout(&self, seconds: u32) -> Result<u32>;
+    fn kick(&self) -> Result<()>;     // Write one zero byte
+    fn close_magic(self) -> Result<()>; // Write exactly one "V", then drop
 }
 ```
 
-The Cadence WDT at 0xF8005000 supports configurable timeout. `CONFIG_WATCHDOG_NOWAYOUT` is NOT set, meaning the watchdog CAN be stopped (by closing the fd after writing "V").
+`set_timeout` returns the kernel-adjusted effective timeout. Ordinary Drop is
+deliberately fail-closed and never writes the magic-close byte. A successful
+`close_magic` proves the exact one-byte write completed; it does not independently
+measure kernel timer state. The retained S9 kernel configuration shows
+`CONFIG_WATCHDOG_NOWAYOUT` is not set. Other target kernels require their own
+build evidence before making the same claim.
 
 ---
 
@@ -1377,8 +1384,8 @@ To ensure dcentrald works with pyasic (and therefore hass-miner / Home Assistant
 |  +--------------------------------------------+                          |
 |                                                                           |
 |  +--------------------------------------------+                          |
-|  | Watchdog Kicker (Tokio task)  configurable   |                          |
-|  | - Write "1" to /dev/watchdog                 |                          |
+|  | Watchdog owner (dedicated blocking thread)    |                          |
+|  | - Phase/evidence-gated zero-byte kicks        |                          |
 |  +--------------------------------------------+                          |
 |                                                                           |
 |  +--------------------------------------------+                          |
@@ -1753,7 +1760,10 @@ Phase 1: System Initialization
   2.  Load config from /data/dcentrald.toml
         Falls back to /etc/dcentrald.toml if missing
   3.  Initialize logging (tracing subscriber)
-  4.  Open watchdog (/dev/watchdog), start kick thread (5s interval)
+  4.  Establish the path-specific watchdog admission boundary
+        Native BM1368/BM1370 NoPic: open/configure/initial-kick before GPIO437
+        Standard/AM3-BB/stock/hybrid/PIC-serial: migration status varies; see
+        Section 14 and do not infer pre-energization coverage from this outline
   5.  Log firmware version, chip type, MAC address
 
 Phase 2: GPIO and Fan Setup
@@ -1846,17 +1856,32 @@ Phase 9: Post-Start Stabilization
 
 ### Watchdog
 
-```
-Timeout:   30 seconds (configurable)
-Kick:      Every 5 seconds from dedicated Tokio task
-Behavior:  If dcentrald crashes, system reboots within 30 seconds
-Recovery:  On reboot, dcentrald restarts via init script, resumes mining
+The reference contract uses one dedicated blocking-FD owner and acknowledged,
+monotonic `Bringup -> Mining -> Teardown` phases. A disabled or unavailable
+watchdog cannot admit an explicitly owned native NoPic power path. Mining kicks
+depend on completed safety liveness, not UI or hashrate timers. Once progress
+stalls, feed suppression is terminal for that owner.
 
-The Cadence WDT at 0xF8005000 is hardware-based.
-Even if the kernel panics, the watchdog fires.
-CONFIG_WATCHDOG_NOWAYOUT is NOT set, so watchdog can be
-stopped for firmware updates (close fd after writing "V").
-```
+Operator cancellation, owner Drop, channel loss, worker panic, deadline expiry,
+and join failure are not clean-disarm authority. Magic close requires a typed
+permit assembled from a terminal hardware-mutation barrier, quiesced actor
+receipt, and checked safe-off receipt. The teardown deadline is the latest time
+to admit the irreversible close operation; write completion and worker exit are
+observed separately. These receipts do not prove physical rail-off or kernel
+timer state.
+
+Coverage is intentionally mixed while migration proceeds:
+
+- the standard daemon has an earlier fail-closed owner but still needs migration
+  to the reusable runtime owner and pre-energization admission;
+- native BM1368/BM1370 NoPic serial uses the reusable owner before GPIO437 enable;
+- AM3-BB, stock, hybrid, non-native serial, and passthrough paths still contain
+  legacy watchdog ownership and must not be described as evidence-gated;
+- BM1366 adopted-live and external-owner modes additionally need explicit
+  adopted-power or external-supervisor leases.
+
+The retained S9 kernel shows magic-close support. Equivalent behavior on other
+kernels remains target-specific build and runtime evidence.
 
 ### PIC Heartbeat
 
@@ -1879,14 +1904,17 @@ Failure:   If heartbeat I2C write fails 3 consecutive times,
 ```
 Trigger:   Any chain temperature >= dangerous_temp_c (default 75)
 Action:    1. Disable voltage on ALL chains (PIC ENABLE_VOLTAGE = 0)
-           2. Set fans to maximum (PWM = 127)
+           2. Command fans within min(profile fan_max_pwm, PWM_SAFETY_MAX)
            3. Log CRITICAL: "Thermal shutdown triggered"
            4. Set red LED ON, green LED OFF
-           5. Continue watchdog kicks and API serving
-           6. Monitor temperature until below (dangerous - hysteresis)
-           7. Wait additional 60 seconds after temp drops
-           8. Re-run full init sequence (Phase 4 onward)
+           5. Stop safety liveness unless the path has an explicit safe state
+           6. Preserve management access only after its owned shutdown proof
 ```
+
+For native NoPic, missing or dangerous temperature and checked fan-actuation
+failure immediately request checked GPIO437-low safe-off. PWM readback proves a
+command path, not airflow. Fan blast is not the home-mining emergency policy;
+hash power is cut first and the default safety cap remains PWM 30.
 
 ### Fan Failure
 
@@ -1904,19 +1932,18 @@ Action:    1. Disable voltage on ALL chains
 
 ```
 Trigger:   SIGTERM, SIGINT, or API quit command
-Sequence:  1. Cancel all Tokio tasks via CancellationToken
-           2. Stop submitting new work
-           3. Wait 500ms for in-flight nonces
-           4. Submit any remaining valid shares
-           5. Disable hash board voltages (PIC ENABLE_VOLTAGE = 0)
-           6. Wait 2 seconds for power discharge
-           7. Ramp fans to 50% (cool-down)
-           8. Wait 5 seconds
-           9. Set fans to minimum
-           10. Close watchdog (write "V" then close fd)
-           11. Log "dcentrald stopped cleanly"
-           12. Exit 0
+Reference: 1. Acknowledge watchdog Teardown with one absolute deadline
+           2. Close hardware-mutation admission and drain admitted calls
+           3. Stop work and bounded-join hardware-mutating actors/feeders
+           4. Obtain checked safe-off evidence for every owned rail/controller
+           5. Apply bounded discharge/cooldown and quiet-fan policy
+           6. Construct a disarm permit only from sealed evidence receipts
+           7. Request exact-byte magic close and observe owner-thread exit
+           8. Publish management-only recovery only after positive receipts
 ```
+
+Any missing receipt leaves the SoC watchdog armed. Legacy engines have not all
+converged on this sequence, so a generic clean-shutdown claim is not valid yet.
 
 ### Mode-Dependent Safety Limits
 
@@ -2879,7 +2906,7 @@ GPIO Output (0x41210000):
 ### Daemon Lifecycle (Implemented)
 
 **Init Phases (daemon.rs):**
-1. System ID: read version, open watchdog
+1. System ID: read version and determine the path-specific watchdog policy
 2. Fan setup: command the home fan cap (PWM 10 boot default); AM2/XIL acoustic proof requires tach/RPM readback
 3. Hash board detection: GPIO PLUGO pins 902-904, enable pins 893-895
 4. PIC initialization: I2C cold_boot_init (JUMP_FROM_LOADER_TO_APP, set voltage, enable)
@@ -2893,24 +2920,28 @@ GPIO Output (0x41210000):
 3. **Stratum V1 client** — pool connect/auth, job reception via `job_tx`, share submission via `share_rx`
 4. **Stratum status handler** — receives `StratumStatus` events, updates `MinerState` (pool status, difficulty, accepted/rejected counts)
 5. **Work dispatcher** — receives `JobTemplate`, builds midstates via `WorkBuilder`, dispatches to all chains via `ChipDriver::send_work`, polls `WORK_RX_FIFO` at 100Hz, decodes nonces via `ChipDriver::decode_nonce`, tracks hashrate (EMA, per-chain), submits shares via `share_tx`
-6. **Watchdog kicker** — configurable interval (default 5s), writes to `/dev/watchdog`
-7. **Thermal control loop** — 5s interval, reads XADC die temp (IIO sysfs), reads fan RPM (FPGA tach), PID → set fan PWM. Emergency actions: `EmergencyShutdown` → fans 100% + disable all PIC voltages. `FanFailure` → disable all PIC voltages.
+6. **Watchdog owner** — dedicated blocking owner on migrated paths, with
+   effective-timeout-aware cadence, phase acknowledgements, terminal liveness
+   suppression, and evidence-gated magic close. Legacy engine helpers remain.
+7. **Thermal control loop** — 5s interval, reads XADC die temp (IIO sysfs), reads fan RPM (FPGA tach), PID → set fan PWM. Emergency actions: `EmergencyShutdown` / `FanFailure` → **cut hash power first** (disable PIC/dsPIC/rail voltages), then command fans to `min(profile fan_max_pwm, PWM_SAFETY_MAX)` (home default safety max is PWM **30**, not 100%/127). Fan blast is not the home emergency primary response.
 8. **PIC heartbeat** — 1s interval, opens I2C bus 0, sends heartbeat to all active PICs (0x55/0x56/0x57). PIC hardware watchdog cuts voltage if heartbeat stops for ~10 seconds.
 9. **State publisher** — 1s interval, reads fan PWM/RPM from `Arc<FanController>`, updates uptime, broadcasts WebSocket stats message
 10. **Signal handler** — SIGINT/SIGTERM → `CancellationToken::cancel` → all tasks observe and exit
 
-**Shutdown Sequence (11 steps):**
-1. Cancel all tasks via CancellationToken
-2. Stop work submission
-3. Wait 500ms for in-flight nonces
-4. (Submit remaining shares)
-5. Disable hash board voltages via PIC
-6. Wait 2s for power discharge
-7. Ramp fans to 50% (cool-down)
-8. Wait 5s
-9. Set fans to quiet minimum
-10. Close watchdog (write "V" magic close)
-11. Log "dcentrald stopped cleanly"
+**Reference shutdown ordering on migrated owners:**
+1. Enter and acknowledge bounded watchdog Teardown.
+2. Close hardware-mutation admission and drain already-admitted calls.
+3. Stop work and bounded-join hardware-mutating actors and controller feeders.
+4. Obtain checked safe-off evidence for the complete owned resource set.
+5. Complete the bounded discharge/cooldown and quiet-fan policy.
+6. Mint a disarm permit only from sealed mutation, quiescence, and safe-off receipts.
+7. Admit the exact-byte magic close before the teardown deadline and observe
+   the owner thread exit.
+8. Leave the watchdog armed on any missing evidence; do not claim clean stop.
+
+This ordering is implemented for the standard owner and explicitly owned native
+BM1368/BM1370 NoPic path with path-specific receipts. The reusable owner has not
+yet replaced every legacy engine helper.
 
 ### API Endpoint Inventory
 

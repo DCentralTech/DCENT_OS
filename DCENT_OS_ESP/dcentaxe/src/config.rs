@@ -7,6 +7,9 @@ use dcentaxe_hal::board::{
     PowerControllerKind, TempSensorKind,
 };
 use dcentaxe_stratum::StratumConfig;
+
+#[cfg(feature = "lora")]
+use dcentaxe_lora::config::MeshConfig;
 use serde::{Deserialize, Serialize};
 
 fn default_true() -> bool {
@@ -444,6 +447,12 @@ pub struct DcentAxeConfig {
     /// `#[serde(default)]` ⇒ legacy NVS blobs round-trip with no schema bump.
     #[serde(default)]
     pub mqtt: MqttConfig,
+    /// On-board LoRa / mesh config (default-OFF solo mesh). Only meaningful when
+    /// the firmware is built with `--features lora`; still stored so NVS blobs
+    /// round-trip. Fail-closed: `solo_relay_enabled=false`, mining_source=off.
+    #[cfg(feature = "lora")]
+    #[serde(default)]
+    pub mesh: MeshConfig,
     /// Enable the daily power/autotune schedule.
     #[serde(default = "default_true")]
     pub schedule_enabled: bool,
@@ -964,6 +973,8 @@ impl Default for DcentAxeConfig {
             sv2_own_templates: Sv2OwnTemplateConfig::default(),
             sv2_authority_pubkey: None,
             mqtt: MqttConfig::default(),
+            #[cfg(feature = "lora")]
+            mesh: MeshConfig::default(),
             schedule_enabled: true,
             schedule_timezone_offset_minutes: 0,
             power_schedule: Vec::new(),

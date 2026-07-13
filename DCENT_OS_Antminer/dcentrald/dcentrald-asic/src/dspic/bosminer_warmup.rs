@@ -12,7 +12,7 @@
 //! The load-bearing memory rule [] is NARROWER
 //! than its name suggests. It bans the **bare 3-byte form** `[55 AA 07]` on
 //! fw=0x89 PRODUCTION-RUNTIME paths — the `a lab unit` 2026-04-24 corruption that
-//! motivated the rule was the historical `dspic_flash::reset_pic` path going
+//! motivated the rule was the now-removed historical raw reset path going
 //! straight to RESET without the canonical 16-byte parser flush prelude.
 //!
 //! This wrapper **always** emits the bosminer-canonical sequence:
@@ -52,9 +52,9 @@
 //!   per-byte variant so the bosminer wire semantics are byte-identical.
 //! - **No READ step** — this is a prelude, not a probe. GET_VERSION is the
 //!   caller's responsibility (`pic_read_fw_version_service`).
-//! - **`recovery-tool`-gated `dspic_flash::reset_pic` stays compile-error
-//!   for the daemon.** This wrapper is parallel + safer by construction;
-//!   the existing destructive-ops gate is unchanged.
+//! - **The historical raw `dspic_flash::reset_pic` API no longer exists.**
+//!   This wrapper is the typed production path and preserves the load-bearing
+//!   parser-flush ordering.
 //!
 //! ### Load-bearing invariant — call BEFORE spawning the PIC heartbeat thread
 //!
@@ -129,7 +129,7 @@
 //! }
 //! ```
 
-use dcentrald_hal::i2c::{I2cServiceHandle, I2cTransactionStep};
+use dcentrald_hal::i2c::{I2cMutationLabel, I2cServiceHandle, I2cTransactionStep};
 
 use crate::{AsicError, Result};
 
@@ -319,7 +319,7 @@ pub fn am2_eeprom_bus_warmup_read(i2c: &I2cServiceHandle, eeprom_addr: u8) -> Re
         I2cTransactionStep::Read(EEPROM_WARMUP_READ_LEN),
     ];
     let reads = i2c
-        .transaction(eeprom_addr, steps)
+        .transaction_mutating(I2cMutationLabel::QueryPrelude, eeprom_addr, steps)
         .map_err(|e| AsicError::Pic {
             addr: eeprom_addr,
             detail: format!(
@@ -692,7 +692,7 @@ pub fn am2_pic_reset_and_start_app_strace_derived(i2c: &I2cServiceHandle, addr: 
             I2cTransactionStep::SleepMs(STRACE_WRITE_TO_ACK_READ_DELAY_MS),
             I2cTransactionStep::Read(1),
         ];
-        if let Ok(reads) = i2c.transaction(addr, probe_steps) {
+        if let Ok(reads) = i2c.transaction_mutating(I2cMutationLabel::Recovery, addr, probe_steps) {
             if let Some(first_read) = reads.first().and_then(|r| r.first()) {
                 let fw = *first_read;
                 // Known valid fw bytes per `dspic::DspicFirmware` enum +
@@ -749,7 +749,7 @@ pub fn am2_pic_reset_and_start_app_strace_derived(i2c: &I2cServiceHandle, addr: 
                 attempt,
                 "Wave-28 strace-derived warmup: emitting prelude transaction"
             );
-            match i2c.transaction(addr, steps.clone()) {
+            match i2c.transaction_mutating(I2cMutationLabel::Recovery, addr, steps.clone()) {
                 Ok(reads) => {
                     // 2026-06-07 (RE-018 .25 cold-engage diagnostic): the warmup
                     // historically DISCARDED the reply bytes, so we never knew if a
@@ -878,7 +878,7 @@ pub fn am2_pic_reset_and_start_app_strace_derived_exclusive(
             I2cTransactionStep::SleepMs(STRACE_WRITE_TO_ACK_READ_DELAY_MS),
             I2cTransactionStep::Read(1),
         ];
-        if let Ok(reads) = i2c.transaction(addr, probe_steps) {
+        if let Ok(reads) = i2c.transaction_mutating(I2cMutationLabel::Recovery, addr, probe_steps) {
             if let Some(first_read) = reads.first().and_then(|r| r.first()) {
                 let fw = *first_read;
                 let is_alive_app = matches!(fw, 0x82 | 0x86 | 0x88 | 0x89 | 0x8A);
@@ -911,13 +911,13 @@ pub fn am2_pic_reset_and_start_app_strace_derived_exclusive(
         steps = total_steps,
         read_config_latch = read_config_latch_active,
         "COLD-BYTE-DIFF Fix B: emitting the ENTIRE strace-derived warmup as ONE atomic \
-         i2c.transaction() (no interleave point for foreign i2c-0 producers; wire bytes \
+         transaction_mutating() (no interleave point for foreign i2c-0 producers; wire bytes \
          + dwells identical to the N-transaction form)"
     );
 
     let mut last_err: Option<dcentrald_hal::HalError> = None;
     for attempt in 1..=PRELUDE_TRANSACTION_RETRY_BUDGET.max(1) {
-        match i2c.transaction(addr, steps.clone()) {
+        match i2c.transaction_mutating(I2cMutationLabel::Recovery, addr, steps.clone()) {
             Ok(reads) => {
                 let ack: Vec<u8> = reads.iter().flatten().copied().collect();
                 tracing::info!(
@@ -1108,7 +1108,7 @@ pub fn am2_pic_reset_and_start_app_bosminer_faithful(
                 attempt,
                 "bosminer warmup: emitting prelude transaction"
             );
-            match i2c.transaction(addr, steps.clone()) {
+            match i2c.transaction_mutating(I2cMutationLabel::Recovery, addr, steps.clone()) {
                 Ok(_reads) => {
                     succeeded = true;
                     break;
@@ -1213,7 +1213,7 @@ pub fn am2_pic_reset_only_bosminer_faithful(i2c: &I2cServiceHandle, addr: u8) ->
                 attempt,
                 "bosminer warmup (no-jump): emitting prelude transaction"
             );
-            match i2c.transaction(addr, steps.clone()) {
+            match i2c.transaction_mutating(I2cMutationLabel::Recovery, addr, steps.clone()) {
                 Ok(_reads) => {
                     succeeded = true;
                     break;
@@ -1364,7 +1364,7 @@ pub fn build_lm75_passthrough_frame(cmd: u8, sensor: u8, flag: u8) -> [u8; 8] {
 }
 
 /// Build the 17-transaction LM75A passthrough warmup sequence as a
-/// vector of `I2cTransactionStep` lists, one Vec per `i2c.transaction()`
+/// vector of `I2cTransactionStep` lists, one Vec per typed I2C transaction
 /// call.
 ///
 /// Order (matches `bosminer-i2c0-slave20.txt:33-203` byte-for-byte):
@@ -1819,7 +1819,7 @@ pub fn am2_dspic_lm75_passthrough_warmup(i2c: &I2cServiceHandle, addr: u8) -> Re
             idx + 1, total, cmd_byte, sensor_byte
         );
 
-        match i2c.transaction(addr, steps) {
+        match i2c.transaction_mutating(I2cMutationLabel::NeutralControl, addr, steps) {
             Ok(_reads) => {
                 ok_count += 1;
             }
@@ -2036,7 +2036,7 @@ pub fn am2_pic_jump_only_reverify(i2c: &I2cServiceHandle, addr: u8) -> Result<()
         let mut last_err: Option<dcentrald_hal::HalError> = None;
         let mut succeeded = false;
         for attempt in 1..=PRELUDE_TRANSACTION_RETRY_BUDGET.max(1) {
-            match i2c.transaction(addr, steps.clone()) {
+            match i2c.transaction_mutating(I2cMutationLabel::Recovery, addr, steps.clone()) {
                 Ok(reads) => {
                     let ack: Vec<u8> = reads.iter().flatten().copied().collect();
                     tracing::info!(
@@ -2333,7 +2333,7 @@ pub fn am2_pic_reset_jump_reverify(
         let mut last_err: Option<dcentrald_hal::HalError> = None;
         let mut succeeded = false;
         for attempt in 1..=PRELUDE_TRANSACTION_RETRY_BUDGET.max(1) {
-            match i2c.transaction(addr, steps.clone()) {
+            match i2c.transaction_mutating(I2cMutationLabel::Recovery, addr, steps.clone()) {
                 Ok(reads) => {
                     let ack: Vec<u8> = reads.iter().flatten().copied().collect();
                     tracing::info!(

@@ -865,7 +865,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_constraints_returns_real_envelope_with_clamps() {
-        let svc = TunerSvc { home_mode: true, ..Default::default() };
+        let svc = TunerSvc {
+            home_mode: true,
+            ..Default::default()
+        };
         let resp = svc
             .get_constraints(Request::new(Empty {}))
             .await
@@ -955,10 +958,13 @@ mod tests {
             .await
             .expect_err("write RPC stays unimplemented");
         assert_eq!(err.code(), tonic::Code::Unimplemented);
-        let err = (TunerSvc { home_mode: false, ..Default::default() })
-            .set_tuner_mode(Request::new(SetTunerModeRequest { mode: None }))
-            .await
-            .expect_err("write RPC stays unimplemented");
+        let err = (TunerSvc {
+            home_mode: false,
+            ..Default::default()
+        })
+        .set_tuner_mode(Request::new(SetTunerModeRequest { mode: None }))
+        .await
+        .expect_err("write RPC stays unimplemented");
         assert_eq!(err.code(), tonic::Code::Unimplemented);
         let err = LocateSvc
             .locate_device(Request::new(LocateRequest {
@@ -1069,16 +1075,19 @@ mod tests {
         assert_eq!(resp.led_state, "blinking");
 
         // SetTunerMode delegates → ack + reflects active mode.
-        let resp = (TunerSvc { home_mode: true, ..Default::default() })
-            .set_tuner_mode(Request::new(SetTunerModeRequest {
-                mode: Some(TunerMode {
-                    mode: "efficiency".into(),
-                    ..Default::default()
-                }),
-            }))
-            .await
-            .expect("set_tuner_mode delegates")
-            .into_inner();
+        let resp = (TunerSvc {
+            home_mode: true,
+            ..Default::default()
+        })
+        .set_tuner_mode(Request::new(SetTunerModeRequest {
+            mode: Some(TunerMode {
+                mode: "efficiency".into(),
+                ..Default::default()
+            }),
+        }))
+        .await
+        .expect("set_tuner_mode delegates")
+        .into_inner();
         assert!(resp.acknowledged);
         assert!(resp.active_mode.is_some());
     }
@@ -1167,11 +1176,14 @@ mod tests {
         assert_eq!(fan.fans.len(), 1);
         assert_eq!(fan.fans[0].pwm, 30);
 
-        let tuner = (TunerSvc { home_mode: true, ..Default::default() })
-            .get_tuner_mode(Request::new(Empty {}))
-            .await
-            .expect("tuner maps after install")
-            .into_inner();
+        let tuner = (TunerSvc {
+            home_mode: true,
+            ..Default::default()
+        })
+        .get_tuner_mode(Request::new(Empty {}))
+        .await
+        .expect("tuner maps after install")
+        .into_inner();
         assert_eq!(tuner.mode, "efficiency");
 
         // Keep the sender alive until all reads are done.

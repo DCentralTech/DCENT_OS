@@ -15,68 +15,27 @@ use dcentrald_stratum::types::{
 };
 use dcentrald_stratum::url_validator::{validate_sv2_pool_url, validate_v1_pool_url};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
 use std::path::Path;
 
 const AM1_S9_MAX_CHIP_RAIL_MV: u16 = 9_400;
+const MAX_PERSISTED_CONFIG_BYTES: usize = 1024 * 1024;
 
 use crate::model;
 
-/// Crash-safe, power-loss-safe file write: write `bytes` to a sibling temp
-/// file, `fsync` it, then atomically `rename` it over `dest`, and `fsync` the
-/// parent directory so the rename itself is durable.
-///
-/// WAVE 0 STABILIZE (2026-06-05). Used by [`DcentraldConfig::save`] so a
-/// mid-write power loss can never corrupt `/data/dcentrald.toml`. POSIX
-/// guarantees `rename(2)` over an existing path is atomic on the same
-/// filesystem — a concurrent reader sees either the whole old file or the
-/// whole new file. The temp file is created in the SAME directory as `dest`
-/// (not `/tmp`) so the rename stays within one filesystem (cross-fs rename is
-/// not atomic and would `EXDEV`).
-///
-/// On any failure the partial temp file is best-effort removed so a crashed
-/// write doesn't litter `*.tmp` siblings.
+/// Publish daemon configuration through the common bounded crash-durable
+/// state-file contract. Unique sibling staging, target type and symlink
+/// rejection, metadata preservation, file synchronization, atomic rename, and
+/// parent-directory synchronization are shared with the other daemon state
+/// writers. The one-mebibyte ceiling makes the accepted persistence envelope
+/// explicit before any target replacement.
 pub(crate) fn atomic_write(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
-    // Unique-ish temp name in the destination directory, keyed on the final
-    // file name + this process id so two daemons (or a daemon + a tool) writing
-    // different files never collide on the temp path.
-    let file_name = dest
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("dcentrald.toml");
-    let tmp_path = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
-
-    // Write + fsync the temp file, then rename. Scope the File so it's closed
-    // before the rename on platforms (Windows) that can't rename an open file.
-    let write_result = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp_path)?;
-        f.write_all(bytes)?;
-        f.flush()?;
-        // Durability: get the bytes onto the medium before the rename so a
-        // power loss can't leave the renamed file pointing at unwritten data.
-        f.sync_all()?;
-        Ok(())
-    })();
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e);
-    }
-
-    if let Err(e) = std::fs::rename(&tmp_path, dest) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e);
-    }
-
-    // fsync the directory so the rename (a directory-entry change) is itself
-    // durable across a power loss. Best-effort: opening a directory for fsync
-    // is a no-op / unsupported on some platforms (notably Windows), so a
-    // failure here is not fatal — the data file is already fsync'd and renamed.
-    if let Ok(dir_file) = std::fs::File::open(dir) {
-        let _ = dir_file.sync_all();
-    }
-
-    Ok(())
+    dcentrald_common::atomic_file::atomic_write(
+        dest,
+        bytes,
+        dcentrald_common::atomic_file::AtomicWriteOptions::state_file(MAX_PERSISTED_CONFIG_BYTES),
+    )
+    .map(|_| ())
+    .map_err(dcentrald_common::atomic_file::AtomicWriteError::into_io_error)
 }
 
 /// Convert daemon donation settings into the Stratum router contract.
@@ -2202,8 +2161,8 @@ fn default_psu_voltage() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_stratum_config, stratum_donation_config, CurtailmentScheduleConfig, DcentraldConfig,
-        MiningConfig, PowerConfig, WatchdogConfig,
+        atomic_write, build_stratum_config, stratum_donation_config, CurtailmentScheduleConfig,
+        DcentraldConfig, MiningConfig, PowerConfig, WatchdogConfig, MAX_PERSISTED_CONFIG_BYTES,
     };
     use dcentrald_api::NetworkBlockConfig;
     use proptest::prelude::*;
@@ -2518,6 +2477,20 @@ model = "s19jpro"
         let cfg = DcentraldConfig::management_only_default();
         cfg.save(path_str).expect("atomic save must succeed");
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("saved config metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "new configuration files must be private by default"
+            );
+        }
+
         // The file exists, is non-empty, and re-loads to a valid config.
         let reloaded = DcentraldConfig::load(path_str)
             .expect("the atomically-written config must re-load and validate");
@@ -2550,6 +2523,55 @@ model = "s19jpro"
             "config must remain valid after an in-place atomic overwrite"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_atomic_write_rejects_oversize_without_replacing_target() {
+        let dir = std::env::temp_dir().join(format!(
+            "dcentrald_config_bound_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("dcentrald.toml");
+        std::fs::write(&path, b"old = true\n").expect("seed old config");
+
+        let error = atomic_write(&path, &vec![b'x'; MAX_PERSISTED_CONFIG_BYTES + 1])
+            .expect_err("oversize config must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read(&path).unwrap(), b"old = true\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_atomic_write_refuses_symlink_without_mutating_referent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "dcentrald_config_symlink_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let referent = dir.join("referent.toml");
+        let target = dir.join("dcentrald.toml");
+        std::fs::write(&referent, b"old = true\n").expect("seed referent");
+        symlink(&referent, &target).expect("create config symlink");
+
+        atomic_write(&target, b"new = true\n").expect_err("symlink target must be rejected");
+        assert_eq!(std::fs::read(&referent).unwrap(), b"old = true\n");
+        assert!(std::fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

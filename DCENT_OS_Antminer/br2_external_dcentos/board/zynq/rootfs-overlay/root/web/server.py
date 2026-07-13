@@ -29,7 +29,6 @@ import os
 import re
 import subprocess
 import sys
-import threading
 import time
 import socket
 import argparse
@@ -217,21 +216,6 @@ DCENTRALD_LOG = "/tmp/dcentrald.log"
 DCENTRALD_PIDFILE = "/var/run/dcentrald.pid"
 DCENTRALD_CHILD_PIDFILE = "/var/run/dcentrald-child.pid"
 
-# Fan register addresses (Zynq FPGA fan-control block)
-FAN_BASE = 0x42800000
-FAN0_RPS_ADDR = FAN_BASE + 0x00
-FAN1_RPS_ADDR = FAN_BASE + 0x04
-FAN_PWM0_ADDR = FAN_BASE + 0x10
-FAN_PWM1_ADDR = FAN_BASE + 0x14
-
-# FPGA chain base addresses (Zynq per-chain work/register windows)
-CHAIN_BASES = {
-    "6": 0x43C00000,
-    "7": 0x43C10000,
-    "8": 0x43C20000,
-}
-
-
 def _dashboard_sidecar(path, suffix):
     return Path(str(path) + suffix)
 
@@ -272,24 +256,6 @@ def _etag_matches(header_value, etag):
             return True
     return False
 
-# FPGA common register offsets
-FPGA_VERSION_OFF = 0x00
-FPGA_BUILD_ID_OFF = 0x04
-FPGA_CTRL_REG_OFF = 0x08
-FPGA_BAUD_REG_OFF = 0x10
-FPGA_ERR_COUNTER_OFF = 0x18
-
-# GPIO pins
-PLUG_DETECT_GPIOS = {"6": "902", "7": "903", "8": "904"}
-BOARD_ENABLE_GPIOS = {"6": "893", "7": "894", "8": "895"}
-
-# Background cache for slow probes (I2C temperature)
-_cache_lock = threading.Lock()
-_cached_i2c_temps = {}
-_cached_i2c_time = 0
-I2C_CACHE_TTL = 30  # seconds between I2C scans
-
-
 def run_cmd(cmd, timeout=3):
     """Run a shell command and return stdout, or empty string on failure."""
     try:
@@ -301,113 +267,16 @@ def run_cmd(cmd, timeout=3):
         return ""
 
 
-def uio_names():
-    """Return UIO device names exposed by sysfs."""
-    names = []
-    uio_root = "/sys/class/uio"
-    try:
-        for entry in os.listdir(uio_root):
-            name_path = os.path.join(uio_root, entry, "name")
-            try:
-                with open(name_path, "r", encoding="utf-8") as fh:
-                    names.append(fh.read().strip())
-            except OSError:
-                pass
-    except OSError:
-        pass
-    return names
 
 
-def am2_uio_fan_control_present():
-    """Return True when the FPGA fan-control block is UIO-bound."""
-    names = uio_names()
-    return "fan-control" in names
 
 
-def am2_target_without_fan_uio():
-    """Return True for AM2/XIL targets where devmem fan fallback is invalid."""
-    names = uio_names()
-    if "board-control" in names:
-        return "fan-control" not in names
-    for path in ("/etc/dcentos/board_target", "/etc/dcentos-platform", "/etc/dcentos/model"):
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                value = fh.read().strip().lower()
-            if "am2" in value or "s19j" in value or "s19pro" in value or "s17pro" in value:
-                return "fan-control" not in names
-        except OSError:
-            pass
-    return False
 
 
-def dcentrald_fan_cmd(args, timeout=10):
-    """Run dcentrald fan one-shots and return (ok, combined_output)."""
-    for candidate in (
-        "/usr/local/bin/dcentrald",
-        "/usr/bin/dcentrald",
-        "/tmp/dcentrald_runtime",
-        "/tmp/dcentrald_fixed",
-    ):
-        if os.path.exists(candidate) and os.access(candidate, os.X_OK):
-            try:
-                result = subprocess.run(
-                    [candidate] + list(args),
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                )
-                return result.returncode == 0, (result.stdout + result.stderr).strip()
-            except Exception as exc:
-                return False, str(exc)
-    return False, "no executable dcentrald fan helper found"
 
 
-def parse_dcentrald_fan_output(out):
-    """Parse key=value fields from dcentrald --get-fan/--set-fan output."""
-    parsed = {}
-    for key in (
-        "commanded_pwm",
-        "commanded_readback",
-        "commanded_pwm0",
-        "commanded_pwm1",
-        "max_rpm",
-    ):
-        match = re.search(r"{}=([0-9]+)".format(key), out)
-        if match:
-            parsed[key] = int(match.group(1))
-    if "commanded_pwm" not in parsed and "commanded_readback" in parsed:
-        parsed["commanded_pwm"] = parsed["commanded_readback"]
-    match = re.search(r"per_fan_rpm=\[([^\]]*)\]", out)
-    if match:
-        values = []
-        for item in match.group(1).split(","):
-            item = item.strip()
-            if not item:
-                continue
-            if ":" in item:
-                item = item.split(":", 1)[1].strip()
-            try:
-                values.append(int(item))
-            except ValueError:
-                pass
-        parsed["per_fan_rpm"] = values
-    return parsed
 
 
-def devmem_read(addr):
-    """Read a 32-bit register via devmem. Returns int or None."""
-    raw = run_cmd(f"devmem 0x{addr:08X} 32 2>/dev/null", timeout=2)
-    if raw:
-        try:
-            return int(raw, 0)
-        except ValueError:
-            return None
-    return None
-
-
-def devmem_write(addr, value):
-    """Write a 32-bit value to a register via devmem."""
-    run_cmd(f"devmem 0x{addr:08X} 32 0x{value:08X} 2>/dev/null", timeout=2)
 
 
 def read_sysfs(path):
@@ -419,348 +288,16 @@ def read_sysfs(path):
         return ""
 
 
-def read_gpio(gpio_num):
-    """Read a GPIO value from sysfs. Auto-exports if needed. Returns '0', '1', or ''."""
-    gpio_path = f"/sys/class/gpio/gpio{gpio_num}"
-    if not os.path.exists(gpio_path):
-        try:
-            with open("/sys/class/gpio/export", "w") as f:
-                f.write(str(gpio_num))
-            with open(f"{gpio_path}/direction", "w") as f:
-                f.write("in")
-        except Exception:
-            pass
-    return read_sysfs(f"{gpio_path}/value")
 
 
-def get_xadc_values():
-    """Read XADC die temperature and voltage rails from IIO sysfs."""
-    iio_base = "/sys/bus/iio/devices/iio:device0"
-    result = {}
-
-    # Die temperature: (raw + offset) * scale / 1000
-    raw = read_sysfs(f"{iio_base}/in_temp0_raw")
-    offset = read_sysfs(f"{iio_base}/in_temp0_offset")
-    scale = read_sysfs(f"{iio_base}/in_temp0_scale")
-    if raw and offset and scale:
-        try:
-            temp_c = (float(raw) + float(offset)) * float(scale) / 1000.0
-            result["die_temp_c"] = round(temp_c, 1)
-        except ValueError:
-            pass
-
-    # Voltages: raw * scale / 1000
-    voltage_channels = {
-        "vccint": ("in_voltage0_vccint_raw", "in_voltage0_vccint_scale"),
-        "vccaux": ("in_voltage1_vccaux_raw", "in_voltage1_vccaux_scale"),
-        "vccbram": ("in_voltage2_vccbram_raw", "in_voltage2_vccbram_scale"),
-        "vccpint": ("in_voltage3_vccpint_raw", "in_voltage3_vccpint_scale"),
-        "vccpaux": ("in_voltage4_vccpaux_raw", "in_voltage4_vccpaux_scale"),
-        "vccoddr": ("in_voltage5_vccoddr_raw", "in_voltage5_vccoddr_scale"),
-    }
-    for name, (raw_file, scale_file) in voltage_channels.items():
-        raw = read_sysfs(f"{iio_base}/{raw_file}")
-        scale = read_sysfs(f"{iio_base}/{scale_file}")
-        if raw and scale:
-            try:
-                volts = float(raw) * float(scale) / 1000.0
-                result[name] = round(volts, 3)
-            except ValueError:
-                pass
-
-    return result
 
 
-def get_fan_status():
-    """Read fan PWM command and physical RPM."""
-    if am2_uio_fan_control_present():
-        ok, out = dcentrald_fan_cmd(["--get-fan"])
-        parsed = parse_dcentrald_fan_output(out)
-        commanded = parsed.get("commanded_pwm")
-        max_rpm = parsed.get("max_rpm")
-        return {
-            "backend": "dcentrald_uio",
-            "ok": ok,
-            "pwm0": commanded,
-            "pwm1": commanded,
-            "commanded_pwm": commanded,
-            "commanded_pwm0": parsed.get("commanded_pwm0"),
-            "commanded_pwm1": parsed.get("commanded_pwm1"),
-            "pwm_percent": commanded,
-            "rpm": max_rpm,
-            "max_rpm": max_rpm,
-            "per_fan_rpm": parsed.get("per_fan_rpm", []),
-            "raw": out,
-            "note": "AM2 fan control is UIO-bound; devmem is not used as fan proof",
-            "error": None if ok else (out or "dcentrald fan helper failed"),
-        }
-    if am2_target_without_fan_uio():
-        return {
-            "backend": "dcentrald_uio",
-            "ok": False,
-            "status": "fan_uio_missing",
-            "error": "AM2/XIL fan-control UIO is missing; devmem fan fallback is invalid on this platform",
-        }
-
-    fan = {}
-
-    pwm0 = devmem_read(FAN_PWM0_ADDR)
-    pwm1 = devmem_read(FAN_PWM1_ADDR)
-    fan0_rps = devmem_read(FAN0_RPS_ADDR)
-    fan1_rps = devmem_read(FAN1_RPS_ADDR)
-
-    fan["pwm0"] = (pwm0 & 0x7F) if pwm0 is not None else None
-    fan["pwm1"] = (pwm1 & 0x7F) if pwm1 is not None else None
-
-    rps0 = (fan0_rps & 0x7F) if fan0_rps is not None else 0
-    rps1 = (fan1_rps & 0x7F) if fan1_rps is not None else 0
-    fan["fan0_rpm"] = rps0 * 60
-    fan["fan1_rpm"] = rps1 * 60
-    # Use the fan that reports a reading (FAN1 is typically the one connected)
-    fan["rpm"] = max(rps0, rps1) * 60
-
-    # PWM percentage (effective range is 0-100, saturated above 100)
-    pwm_val = fan["pwm0"] if fan["pwm0"] is not None else 0
-    fan["pwm_percent"] = min(round(pwm_val / 1.27), 100)
-
-    return fan
 
 
-def set_fan_speed(pwm):
-    """Set fan speed. AM2 uses dcentrald UIO one-shot; S9 keeps devmem."""
-    if am2_uio_fan_control_present():
-        requested_pwm = int(pwm)
-        pwm = max(0, min(30, requested_pwm))
-        ok, out = dcentrald_fan_cmd(["--set-fan", str(pwm)])
-        parsed = parse_dcentrald_fan_output(out)
-        return {
-            "backend": "dcentrald_uio",
-            "ok": ok,
-            "requested_pwm_raw": requested_pwm,
-            "requested_pwm": pwm,
-            "home_cap_pwm": 30,
-            "clamped": pwm != requested_pwm,
-            "commanded_pwm": parsed.get("commanded_pwm"),
-            "commanded_pwm0": parsed.get("commanded_pwm0"),
-            "commanded_pwm1": parsed.get("commanded_pwm1"),
-            "max_rpm": parsed.get("max_rpm"),
-            "per_fan_rpm": parsed.get("per_fan_rpm", []),
-            "raw": out,
-            "note": "commanded PWM is not acoustic proof; check max_rpm/operator hearing",
-            "error": None if ok else (out or "dcentrald fan helper failed"),
-        }
-    if am2_target_without_fan_uio():
-        return {
-            "backend": "dcentrald_uio",
-            "ok": False,
-            "status": "fan_uio_missing",
-            "error": "AM2/XIL fan-control UIO is missing; refusing stale devmem fan write",
-        }
-
-    pwm = max(0, min(127, int(pwm)))
-    devmem_write(FAN_PWM0_ADDR, pwm)
-    devmem_write(FAN_PWM1_ADDR, pwm)
-    return pwm
 
 
-def get_fpga_chain_status():
-    """Read FPGA per-chain status registers."""
-    chains = {}
-    for chain_id, base in CHAIN_BASES.items():
-        chain = {}
-
-        ver = devmem_read(base + FPGA_VERSION_OFF)
-        if ver is not None:
-            chain["version"] = f"0x{ver:08X}"
-            chain["miner_type"] = (ver >> 28) & 0xF
-            chain["model"] = (ver >> 20) & 0xFF
-            chain["ver_major"] = (ver >> 12) & 0xF
-            chain["ver_minor"] = (ver >> 8) & 0xF
-            chain["ver_patch"] = ver & 0xFF
-        else:
-            chain["version"] = "N/A"
-
-        build_id = devmem_read(base + FPGA_BUILD_ID_OFF)
-        chain["build_id"] = f"0x{build_id:08X}" if build_id is not None else "N/A"
-
-        ctrl = devmem_read(base + FPGA_CTRL_REG_OFF)
-        if ctrl is not None:
-            chain["enabled"] = bool(ctrl & (1 << 3))
-            chain["bm139x_mode"] = bool(ctrl & (1 << 4))
-            midstate_cnt = (ctrl >> 1) & 0x3
-            chain["midstate_count"] = [1, 2, 4, 4][midstate_cnt]
-        else:
-            chain["enabled"] = False
-
-        baud_reg = devmem_read(base + FPGA_BAUD_REG_OFF)
-        if baud_reg is not None and baud_reg > 0:
-            chain["baud_rate"] = 200_000_000 // (16 * (baud_reg + 1))
-            chain["baud_reg"] = baud_reg
-        else:
-            chain["baud_rate"] = 0
-
-        err_cnt = devmem_read(base + FPGA_ERR_COUNTER_OFF)
-        chain["error_count"] = err_cnt if err_cnt is not None else 0
-
-        # GPIO plug detect
-        plug = read_gpio(PLUG_DETECT_GPIOS[chain_id])
-        # Active-high on this unit (from deep probe: HIGH = plugged)
-        chain["plugged"] = plug == "1"
-
-        # GPIO board enable
-        en = read_gpio(BOARD_ENABLE_GPIOS[chain_id])
-        chain["board_enabled"] = en == "1"
-
-        chains[chain_id] = chain
-
-    return chains
 
 
-def get_i2c_temps_cached():
-    """Return cached I2C temperature readings. Background thread refreshes."""
-    global _cached_i2c_temps, _cached_i2c_time
-    with _cache_lock:
-        return dict(_cached_i2c_temps)
-
-
-def _refresh_i2c_temps():
-    """Background thread to refresh I2C temperature sensors."""
-    global _cached_i2c_temps, _cached_i2c_time
-    while True:
-        temps = {}
-        for bus in [0]:
-            for addr_hex in ["0x48", "0x49", "0x4a", "0x4b"]:
-                raw = run_cmd(f"i2cget -y {bus} {addr_hex} 0x00 w 2>/dev/null", timeout=2)
-                if raw and raw != "0x0000" and raw.startswith("0x"):
-                    try:
-                        val = int(raw, 16)
-                        msb = val & 0xFF
-                        lsb = (val >> 8) & 0xFF
-                        temp_raw = (msb << 4) | (lsb >> 4)
-                        if temp_raw & 0x800:
-                            temp_raw -= 4096
-                        temp_c = temp_raw * 0.0625
-                        if -40 < temp_c < 125:
-                            temps[f"bus{bus}_{addr_hex}"] = round(temp_c, 1)
-                    except (ValueError, TypeError):
-                        pass
-        with _cache_lock:
-            _cached_i2c_temps = temps
-            _cached_i2c_time = time.time()
-        time.sleep(I2C_CACHE_TTL)
-
-
-def get_system_status():
-    """Gather full system status from hardware. Non-blocking."""
-    status = {
-        "version": VERSION,
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "uptime_seconds": int(time.time() - START_TIME),
-        "system": {},
-        "network": {},
-        "hardware": {},
-        "fpga": {},
-        "chains": {},
-        "fan": {},
-        "xadc": {},
-        "temperature": {},
-        "nand": {},
-    }
-
-    # Firmware slot (from kernel cmdline)
-    cmdline = run_cmd("cat /proc/cmdline")
-    mtd_match = re.search(r'ubi\.mtd=(\d+)', cmdline)
-    if mtd_match:
-        mtd_num = mtd_match.group(1)
-        fw_num = "2" if mtd_num == "8" else "1"
-        status["firmware_slot"] = {"mtd": int(mtd_num), "firmware": int(fw_num)}
-
-    # System info
-    status["system"]["hostname"] = run_cmd("hostname")
-    status["system"]["kernel"] = run_cmd("uname -r")
-    status["system"]["arch"] = run_cmd("uname -m")
-    status["system"]["uptime"] = run_cmd("uptime -p 2>/dev/null || uptime")
-
-    # Memory
-    meminfo = run_cmd("free -b 2>/dev/null | grep Mem")
-    if meminfo:
-        parts = meminfo.split()
-        if len(parts) >= 3:
-            status["system"]["mem_total"] = int(parts[1])
-            status["system"]["mem_used"] = int(parts[2])
-            status["system"]["mem_free"] = int(parts[3]) if len(parts) > 3 else 0
-
-    # Load average
-    loadavg = run_cmd("cat /proc/loadavg")
-    if loadavg:
-        parts = loadavg.split()
-        status["system"]["load_1m"] = float(parts[0])
-        status["system"]["load_5m"] = float(parts[1])
-        status["system"]["load_15m"] = float(parts[2])
-
-    # Network
-    ip_info = run_cmd("ip addr show eth0 2>/dev/null | grep 'inet '")
-    if ip_info:
-        parts = ip_info.strip().split()
-        status["network"]["ip"] = parts[1] if len(parts) > 1 else "unknown"
-    mac_info = run_cmd("ip link show eth0 2>/dev/null | grep 'link/ether'")
-    if mac_info:
-        parts = mac_info.strip().split()
-        status["network"]["mac"] = parts[1] if len(parts) > 1 else "unknown"
-    status["network"]["interface"] = "eth0"
-
-    # UIO devices (FPGA)
-    uio_count = 0
-    uio_devices = []
-    uio_base = Path("/sys/class/uio")
-    if uio_base.exists():
-        for uio_dir in sorted(uio_base.glob("uio*")):
-            uio_count += 1
-            name_file = uio_dir / "name"
-            addr_file = uio_dir / "maps" / "map0" / "addr"
-            name = name_file.read_text().strip() if name_file.exists() else "unknown"
-            addr = addr_file.read_text().strip() if addr_file.exists() else "unknown"
-            uio_devices.append({"id": uio_dir.name, "name": name, "addr": addr})
-    status["hardware"]["uio_count"] = uio_count
-    status["hardware"]["uio_devices"] = uio_devices
-
-    # FPGA version from chain 6 common register
-    fpga_ver = devmem_read(0x43C00000)
-    status["fpga"]["version_raw"] = f"0x{fpga_ver:08X}" if fpga_ver is not None else "N/A"
-    if fpga_ver is not None:
-        status["fpga"]["version"] = f"{(fpga_ver >> 12) & 0xF}.{(fpga_ver >> 8) & 0xF}.{fpga_ver & 0xFF}"
-    else:
-        status["fpga"]["version"] = "N/A"
-
-    # Per-chain FPGA status
-    status["chains"] = get_fpga_chain_status()
-
-    # Fan status
-    status["fan"] = get_fan_status()
-
-    # XADC (die temp + voltages)
-    status["xadc"] = get_xadc_values()
-
-    # I2C temperatures (cached, non-blocking)
-    status["temperature"] = get_i2c_temps_cached()
-
-    # NAND partitions
-    mtd_info = run_cmd("cat /proc/mtd 2>/dev/null")
-    if mtd_info:
-        partitions = []
-        for line in mtd_info.split("\n")[1:]:
-            if line.strip():
-                parts = line.split()
-                if len(parts) >= 4:
-                    partitions.append({
-                        "dev": parts[0].rstrip(":"),
-                        "size": parts[1],
-                        "erasesize": parts[2],
-                        "name": parts[3].strip('"'),
-                    })
-        status["nand"]["partitions"] = partitions
-
-    return status
 
 
 def get_dcentrald_pid():
@@ -855,43 +392,14 @@ def _last_error_line(log_lines):
     return None
 
 
-def get_dspic_probe():
-    """Cheap I2C probe of the three dsPIC slots. NOT destructive — single
-    1-byte read per address. Returns dict: {"0x21": {"present": True,
-    "raw_byte": "0x86"}, ...}.
-
-    fw=0x86 = locked (downgraded), fw=0x82/0x89/0x8A = production firmwares,
-    0xff or NACK = silent / hardware-degraded. See
-    .
-    """
-    out = {}
-    for addr in (0x20, 0x21, 0x22):
-        raw = run_cmd(f"i2cget -y 0 0x{addr:02X} b 2>&1", timeout=1)
-        present = raw.startswith("0x")
-        out[f"0x{addr:02X}"] = {
-            "present": present,
-            "raw_byte": raw if present else None,
-            "error": raw if not present else None,
-        }
-    return out
-
-
 def get_braiins_glitch_mirror():
-    """Read the am2 Braiins glitch monitor mirror registers (Braiins-am2 only).
-
-    W13.B1 (2026-05-10) RECLASSIFIED + RENAMED from `get_fpga_uart_relay`.
-    These are read-only Braiins-am2 status mirrors of BM1362 ASIC reg 0x2C —
-    NOT a control surface. Stock CV1835/AM335x/AML/S9 hardware does NOT
-    populate this IP. Value is 0x00000000 on stock hw and on cold-boot
-    Braiins-am2 (decays after bosminer dies). Real UART_RELAY control is
-    the BM1362 ASIC reg 0x2C broadcast in dcentrald s19j_hybrid_mining.rs.
-    """
-    out = {}
-    for off in (0x30, 0x34):
-        addr = 0x43D00000 + off
-        v = devmem_read(addr)
-        out[f"0x{addr:08X}"] = f"0x{v:08X}" if v is not None else None
-    return out
+    """Report unavailable until dcentrald publishes this FPGA snapshot."""
+    return {
+        "status": "unavailable",
+        "source": "dcentrald snapshot",
+        "hardware_access_attempted": False,
+        "reason": "Braiins glitch-mirror registers are not published by the runtime owner.",
+    }
 
 
 def get_slot_info():
@@ -966,39 +474,11 @@ def get_dashboard_health():
         "dcentrald_last_error": _last_error_line(log_lines),
         "slot": get_slot_info(),
         "network": get_network_info(),
-        "dspic_probe": get_dspic_probe(),
         "braiins_glitch_mirror": get_braiins_glitch_mirror(),
         "dcentrald_version": get_dcentrald_version(),
         "last_health_probe_ts": int(time.time()),
         "version": VERSION,
     }
-
-
-def get_dspic_flash_proto_probe(addr=0x21):
-    """Invoke the dspic-flash proto-probe tool (commit bf40efc) and parse
-    its output. Read-only; no risk of NAND erase. Tool is at /tmp/dspic-flash
-    on .74 (uploaded during 2026-04-29 live test) or
-    /usr/local/bin/dspic-flash if shipped in the firmware image."""
-    bin_path = None
-    for p in ("/tmp/dspic-flash", "/usr/local/bin/dspic-flash"):
-        if os.path.exists(p):
-            bin_path = p
-            break
-    if not bin_path:
-        return {"error": "dspic-flash binary not found at /tmp or /usr/local/bin"}
-    out = run_cmd(f"{bin_path} proto-probe /dev/i2c-0 0x{addr:02X} 2>&1", timeout=3)
-    parsed = {"raw": out, "fw_byte": None, "fw_byte_stable": None,
-              "framed_get_version_works": None}
-    for ln in out.split("\n"):
-        ln = ln.strip()
-        if ln.startswith("fw_byte") and "=" in ln and "stable" not in ln:
-            v = ln.split("=", 1)[1].strip()
-            parsed["fw_byte"] = v
-        elif "fw_byte_stable" in ln and "=" in ln:
-            parsed["fw_byte_stable"] = "true" in ln.split("=", 1)[1]
-        elif "framed_get_version_works" in ln and "=" in ln:
-            parsed["framed_get_version_works"] = "true" in ln.split("=", 1)[1]
-    return parsed
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -1061,11 +541,6 @@ class DCENTosHandler(http.server.SimpleHTTPRequestHandler):
             if self.path == "/api/dashboard/health":
                 self.send_json(get_dashboard_health())
                 return
-            if self.path == "/api/fan":
-                fan = get_fan_status()
-                status = 503 if fan.get("backend") == "dcentrald_uio" and not fan.get("ok") else 200
-                self.send_json(fan, status=status)
-                return
             if self.path.startswith("/api/dashboard/log"):
                 # /api/dashboard/log?lines=N (default 100, max 1000)
                 lines = 100
@@ -1086,7 +561,6 @@ class DCENTosHandler(http.server.SimpleHTTPRequestHandler):
             if self.path == "/api/dashboard/probe":
                 # Full diagnostic snapshot — same data as health but explicit
                 self.send_json({
-                    "dspic_probe": get_dspic_probe(),
                     "braiins_glitch_mirror": get_braiins_glitch_mirror(),
                     "slot": get_slot_info(),
                     "network": get_network_info(),
@@ -1094,16 +568,6 @@ class DCENTosHandler(http.server.SimpleHTTPRequestHandler):
                     "ts": int(time.time()),
                 })
                 return
-            if self.path.startswith("/api/dashboard/dspic-flash-probe"):
-                addr = 0x21
-                if "addr=" in self.path:
-                    try:
-                        addr = int(self.path.split("addr=", 1)[1].split("&")[0], 0)
-                    except ValueError:
-                        pass
-                self.send_json(get_dspic_flash_proto_probe(addr))
-                return
-
             # Try forwarding to dcentrald first; fall back to local handlers
             if self._proxy_to_dcentrald("GET"):
                 return
@@ -1215,32 +679,6 @@ class DCENTosHandler(http.server.SimpleHTTPRequestHandler):
                             "ts": int(time.time()),
                         }, status=500)
                         return
-            if self.path == "/api/fan":
-                if not local_control_authorized(self.headers):
-                    self.send_json({
-                        "status": "unauthorized",
-                        "error": "release image requires a valid Bearer token for dashboard-local control endpoints",
-                    }, status=401)
-                    return
-                try:
-                    payload = json.loads(body.decode("utf-8")) if body else {}
-                    if "pwm" in payload:
-                        pwm = payload["pwm"]
-                    elif "target_pwm" in payload:
-                        pwm = payload["target_pwm"]
-                    else:
-                        self.send_json({
-                            "status": "error",
-                            "error": "missing required pwm or target_pwm",
-                        }, status=400)
-                        return
-                    result = set_fan_speed(pwm)
-                    status = 503 if isinstance(result, dict) and result.get("backend") == "dcentrald_uio" and not result.get("ok") else 200
-                    self.send_json(result, status=status)
-                except Exception as e:
-                    self.send_json({"status": "error", "error": str(e)}, status=400)
-                return
-
             # Try forwarding to dcentrald first
             if self._proxy_to_dcentrald("POST", body):
                 return
@@ -1343,10 +781,6 @@ def main():
     parser.add_argument("--port", type=int, default=80, help="HTTP port (default: 80)")
     parser.add_argument("--bind", default="0.0.0.0", help="Bind address")
     args = parser.parse_args()
-
-    # Start background I2C temperature thread
-    i2c_thread = threading.Thread(target=_refresh_i2c_temps, daemon=True)
-    i2c_thread.start()
 
     server = ThreadedHTTPServer((args.bind, args.port), DCENTosHandler)
     hostname = socket.gethostname()

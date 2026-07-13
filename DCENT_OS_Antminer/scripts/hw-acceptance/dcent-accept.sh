@@ -275,7 +275,7 @@ cmd_bench() {
 cmd_install_hint() {
     info "PERSISTENT INSTALL is operator-gated — this only PRINTS the exact steps (no writes)"
     say "  1. Confirm 'backup' and 'shares' both PASSED on this exact unit first."
-    say "  2. Build a fresh signed image:  bash $SCRIPTS_DIR/build_in_docker.sh   ($ARCH; honors stale-binary guard)"
+    say "  2. Obtain a fresh independently verified signed image. New source builds are capsule-only; currently S9 only."
     if [ "$BOOT_CHAIN" = "single-image" ]; then
         say "  3. Amlogic (no A/B): efuse preflight (BP-AMLOGIC Step 0) MUST read UNLOCKED, then BP-2:"
         say "       dcent install $IP -f output/dcentos-sysupgrade-$BOARD_TARGET.tar --accept-vnish-aml-rootfs-window --yes"

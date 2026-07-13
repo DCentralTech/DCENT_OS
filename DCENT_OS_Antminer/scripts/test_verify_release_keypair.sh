@@ -40,6 +40,20 @@ bash "$DIR/verify_release_keypair.sh" "$PA_PRIV" "$PB_PUB" >/dev/null 2>&1
 rc=$?
 if [ "$rc" -eq 1 ]; then ok "mismatched pair -> CEREMONY FAIL"; else no "mismatched pair MUST fail (rc=$rc)"; fi
 
+# A matched RSA pair can sign/verify too, but it is not an Ed25519 release key
+# and its trailing SPKI bytes must never be emitted as a firmware pin.
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+    -out "$TMP/rsa.pem" >/dev/null 2>&1
+openssl pkey -in "$TMP/rsa.pem" -pubout -out "$TMP/rsa.pub.pem" >/dev/null 2>&1
+rsa_out=$(bash "$DIR/verify_release_keypair.sh" \
+    "$TMP/rsa.pem" "$TMP/rsa.pub.pem" 2>&1)
+rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$rsa_out" | grep -q 'not Ed25519'; then
+    ok "matched RSA pair -> CEREMONY FAIL"
+else
+    no "matched RSA pair MUST be rejected as non-Ed25519 (rc=$rc): $rsa_out"
+fi
+
 # Missing args -> non-zero (usage error).
 bash "$DIR/verify_release_keypair.sh" >/dev/null 2>&1
 rc=$?

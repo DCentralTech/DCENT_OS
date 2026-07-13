@@ -11,11 +11,17 @@
 //! BAP/J4 header (SPI2/FSPI) — so a UART-mode BAP accessory can never contend for
 //! or kill the radio bus. [`open_lora_bus`] acquires SPI3 ONLY.
 //!
-//! ## ⚠️ PROVISIONAL GPIO MAP — NEEDS-NETLIST-LOCK (doc 05 §1.3)
-//! The fork-plan worked example collided MOSI with the stock fan-tach pin; these
-//! are the corrected provisional pins. **Lock against the real DCENT_axe KiCad
-//! netlist before routing.** The host [`pin_map`] table test pins these numbers so
-//! a silent renumber is loud in CI (`cargo test -p dcentaxe-hal`).
+//! ## ✅ LOCKED GPIO MAP — netlist-confirmed 9/9 (2026-07-11)
+//! The dcent-axe-BM1397 KiCad netlist confirms every line of this map (SCLK 5 /
+//! MOSI 6 / MISO 7 / NSS 15 / BUSY 16 / DIO1 21 / NRESET 8, plus the R-24
+//! TXEN 2 / RXEN 9 RF-switch enables) — see
+//! `projects/dcent-axe/dcent-axe-BM1397/docs/FULL_PREFAB_REVIEW_2026-07-11.md`
+//! ("LoRa SPI map matches firmware `lora_pins.rs` 9/9"). Historical note: the
+//! fork-plan worked example collided MOSI with the stock fan-tach pin; these are
+//! the corrected pins. The host [`pin_map`] table test pins these numbers so a
+//! silent renumber is loud in CI (`cargo test -p dcentaxe-hal`) — any future
+//! board revision that moves a pin must update the netlist, the constants, and
+//! the table test in the same commit.
 //!
 //! | Signal      | GPIO | Notes                                             |
 //! |-------------|------|---------------------------------------------------|
@@ -47,7 +53,8 @@
 /// (esp-idf-hal takes GPIO peripherals by type, but the numeric map is what the
 /// netlist lock and the host table test compare against).
 ///
-/// ⚠️ PROVISIONAL — NEEDS-NETLIST-LOCK (doc 05 §1.3). Do NOT route from these.
+/// ✅ LOCKED — netlist-confirmed 9/9 against the dcent-axe-BM1397 KiCad netlist
+/// (FULL_PREFAB_REVIEW_2026-07-11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoraPinMap {
     /// SPI clock — dedicated SPI3/HSPI, non-strap.
@@ -72,7 +79,7 @@ pub struct LoraPinMap {
     pub rxen: Option<i32>,
 }
 
-// ── Provisional GPIO constants (doc 05 §1.3) — NEEDS-NETLIST-LOCK ──
+// ── GPIO constants — LOCKED, netlist-confirmed 9/9 (FULL_PREFAB_REVIEW_2026-07-11) ──
 pub const LORA_SCLK_GPIO: i32 = 5;
 pub const LORA_MOSI_GPIO: i32 = 6;
 pub const LORA_MISO_GPIO: i32 = 7;
@@ -89,9 +96,10 @@ pub const LORA_RXEN_GPIO: i32 = 9;
 /// rate; it clears the radio's ≤ 16 MHz limit with margin.
 pub const LORA_SPI_HZ: u32 = 16_000_000;
 
-/// The provisional DCENT_axe LoRa pin map. ⚠️ NEEDS-NETLIST-LOCK (doc 05 §1.3).
-/// TXEN/RXEN are populated (R-24) — the DCENT_axe BM1397 board wires the E22's
-/// discrete RF-switch enables to host GPIO2/GPIO9.
+/// The DCENT_axe LoRa pin map. ✅ LOCKED — netlist-confirmed 9/9
+/// (FULL_PREFAB_REVIEW_2026-07-11). TXEN/RXEN are populated (R-24) — the
+/// DCENT_axe BM1397 board wires the E22's discrete RF-switch enables to host
+/// GPIO2/GPIO9.
 pub const fn lora_pin_map() -> LoraPinMap {
     LoraPinMap {
         sclk: LORA_SCLK_GPIO,
@@ -220,11 +228,11 @@ pub use espidf_bus::{open_lora_bus, LoraBus};
 mod tests {
     use super::*;
 
-    /// Pin-map table test: pins the 9 provisional SX1262 GPIO numbers (7 core +
-    /// the 2 R-24 RF-switch enables) so a silent renumber (or a netlist-lock
-    /// edit) is LOUD in CI. When the real DCENT_axe netlist locks these, update
-    /// BOTH the constants and this table in the same commit — the mismatch fails
-    /// here first.
+    /// Pin-map table test: pins the 9 LOCKED SX1262 GPIO numbers (7 core + the
+    /// 2 R-24 RF-switch enables) so a silent renumber is LOUD in CI. The map is
+    /// netlist-confirmed 9/9 (FULL_PREFAB_REVIEW_2026-07-11); a future board
+    /// revision that moves a pin must update the netlist, the constants, and
+    /// this table in the same commit — the mismatch fails here first.
     #[test]
     fn pin_map_pins_the_provisional_gpio_numbers() {
         let m = lora_pin_map();

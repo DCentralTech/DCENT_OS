@@ -12,10 +12,31 @@
 //! - `report`       - HTML/PDF report generation (askama templates)
 //! - `progress`     - Progress tracking and WebSocket push
 //! - `subprocess`   - Phase 1 Python subprocess wrapper
+//!
+//! # Diagnostic evidence migration
+//!
+//! Passing repair/manufacturing grades require typed, directly measured
+//! evidence. Legacy serialized results have no trustworthy provenance, so new
+//! evidence fields default to `Unavailable` and A/B grades are withheld when
+//! recalculated. Current runtime-snapshot producers deliberately label voltage
+//! as `Commanded` and cumulative CRC state as `Inferred`; board model metadata
+//! is not treated as EEPROM presence or validation. Consequently snapshots are
+//! useful triage records, but cannot claim a measured pass.
+//!
+//! Dedicated hardware-test producers should migrate each observation to
+//! `DiagnosticEvidence::measured` or `measured_validated`, name the concrete
+//! sensor/protocol/checksum source, attach an observation time when available,
+//! and keep the evidence value identical to the field being graded. Residual
+//! producer gap: `SnapshotChain` has no voltage-readback, bounded CRC-window,
+//! or EEPROM read/checksum provenance, so snapshot reports remain capped until
+//! those data paths expose direct observations.
 
 pub mod board_health;
 pub mod builders;
+/// Pure chip anomaly math bridge (`dcentrald-chip-analysis`).
+pub mod chip_analysis_bridge;
 pub mod chip_health;
+pub mod evidence;
 pub mod hashreport;
 pub mod progress;
 pub mod report;
@@ -23,7 +44,14 @@ pub mod snapshot;
 pub mod subprocess;
 pub mod troubleshoot;
 
+pub use chip_analysis_bridge::{
+    analyze_chip, enrich_cell_anomalies, ChipAnalysis, ChipAnomalyScores,
+};
+pub use evidence::{DiagnosticEvidence, EvidenceKind, EvidenceQuality};
+
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -149,8 +177,12 @@ pub struct TestResult {
     pub recommendations: Vec<String>,
 }
 
-/// Finalizer invoked after the timed test window ends.
-pub type FinalizeTestFn = Arc<dyn Fn(Uuid, u64) -> Result<TestResult> + Send + Sync + 'static>;
+/// Async finalizer invoked after the timed test window ends.
+///
+/// Report rendering/persistence may use a bounded blocking owner. Returning a
+/// future keeps that work off the Tokio worker that drives diagnostic progress.
+pub type FinalizeTestFuture = Pin<Box<dyn Future<Output = Result<TestResult>> + Send + 'static>>;
+pub type FinalizeTestFn = Arc<dyn Fn(Uuid, u64) -> FinalizeTestFuture + Send + Sync + 'static>;
 
 /// Runtime options for the first timed HashReport engine step.
 pub struct HashReportJobConfig {
@@ -464,7 +496,7 @@ async fn run_hashreport_job(
         ),
     );
 
-    match (config.finalize)(test_id, tracker.elapsed_s()) {
+    match (config.finalize)(test_id, tracker.elapsed_s()).await {
         Ok(result) => {
             tracker.complete();
             mark_job_completed(

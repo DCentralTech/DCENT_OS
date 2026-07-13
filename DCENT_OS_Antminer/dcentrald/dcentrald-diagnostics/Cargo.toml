@@ -9,6 +9,10 @@ license = "GPL-3.0"
 dcentrald-hal = { path = "../dcentrald-hal" }
 dcentrald-asic = { path = "../dcentrald-asic" }
 dcentrald-thermal = { path = "../dcentrald-thermal" }
+# Pure chip-health math (A44); bridged via chip_analysis_bridge — no HAL.
+dcentrald-chip-analysis = { path = "../dcentrald-chip-analysis" }
+dcentrald-common = { path = "../dcentrald-common" }
+libc = "0.2"
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

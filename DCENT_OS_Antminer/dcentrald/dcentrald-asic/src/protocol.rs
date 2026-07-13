@@ -14,6 +14,7 @@
 //!
 //! CRC calculations:
 //!   CMD packets: CRC-5 (poly 0x05, init 0x1F)
+//!   CMD/REG responses: modified CRC-5 response state machine (init 0x03)
 //!   JOB packets: CRC-16 CCITT-FALSE (poly 0x1021, init 0xFFFF)
 
 pub use dcentrald_api_types::asic_protocol_spec::{
@@ -197,6 +198,52 @@ pub fn crc5(data: &[u8]) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// BM13xx command/register response CRC-5 (modified poly 0x0D state machine)
+// ---------------------------------------------------------------------------
+
+/// Calculate the lower-five-bit CRC carried by a BM13xx command/register
+/// response trailer.
+///
+/// This is a direct software port of Braiins'
+/// `crc5_resp_serial.vhd` modified response transition, initialized to `0x03`
+/// for command/register responses. It is deliberately separate from [`crc5`]:
+/// substituting the host-command polynomial produces different bytes.
+///
+/// `data` is the response payload only. Do not include the `AA 55` preamble or
+/// the final trailer byte. Only trailer bits 4:0 are covered; this function
+/// assigns no meaning to trailer bits 6:5.
+///
+/// The RTL also names a distinct job-response initial state. That surface is
+/// intentionally not exposed here until an independent retained job-response
+/// vector can test it; this function is not job-response production proof.
+///
+/// Source contract: `contracts/asic-wire/v1/bm13xx-response-crc5.json`.
+pub fn bm13xx_command_response_crc5(data: &[u8]) -> u8 {
+    bm13xx_response_crc5_with_init(data, 0x03)
+}
+
+fn bm13xx_response_crc5_with_init(data: &[u8], init: u8) -> u8 {
+    let mut crc = init & 0x1F;
+    for &byte in data {
+        for bit_index in (0..8).rev() {
+            let data_bit = (byte >> bit_index) & 1;
+            let feedback = data_bit ^ ((crc >> 4) & 1);
+
+            // Verbatim logical equivalent of crc5_resp_serial.vhd:
+            //   universal shift: c[4:0] <- c[3:0] & feedback
+            //   c2 <- old_c1 xor feedback
+            //   c3 <- old_c2 xor data_bit   (non-standard update)
+            crc = (((crc >> 3) & 1) << 4)
+                | ((((crc >> 2) & 1) ^ data_bit) << 3)
+                | ((((crc >> 1) & 1) ^ feedback) << 2)
+                | ((crc & 1) << 1)
+                | feedback;
+        }
+    }
+    crc
+}
+
+// ---------------------------------------------------------------------------
 // CRC-16 CCITT-FALSE (poly 0x1021, init 0xFFFF)
 // ---------------------------------------------------------------------------
 
@@ -284,5 +331,69 @@ mod tests {
     #[test]
     fn protocol_spec_lookup_rejects_unknown_chip_ids() {
         assert!(protocol_spec_for_detected_chip(0xFFFF).is_none());
+    }
+
+    #[test]
+    fn bm13xx_command_response_crc5_matches_all_retained_contract_vectors() {
+        let vectors: &[(&[u8], u8)] = &[
+            (&[0x13, 0x97, 0x18, 0x00, 0x00, 0x00], 0x06),
+            (&[0x13, 0x62, 0x03, 0x00, 0x00, 0x00], 0x0D),
+            (&[0x13, 0x62, 0x03, 0xCA, 0xCA, 0x00, 0x00, 0x00], 0x08),
+            (&[0x13, 0x62, 0x03, 0xCC, 0xCC, 0x00, 0x00, 0x00], 0x12),
+            (&[0x13, 0x62, 0x03, 0xF4, 0xF4, 0x00, 0x00, 0x00], 0x02),
+            (&[0x13, 0x62, 0x03, 0xF6, 0xF6, 0x00, 0x00, 0x00], 0x17),
+            (&[0x13, 0x62, 0x03, 0xF8, 0xF8, 0x00, 0x00, 0x00], 0x13),
+            (&[0x13, 0x62, 0x03, 0xFA, 0xFA, 0x00, 0x00, 0x00], 0x06),
+        ];
+
+        for &(payload, expected) in vectors {
+            assert_eq!(bm13xx_command_response_crc5(payload), expected);
+        }
+    }
+
+    #[test]
+    fn bm13xx_command_response_crc5_is_stream_composable_and_five_bit_bounded() {
+        let corpus = [
+            &[][..],
+            &[0x13][..],
+            &[0x13, 0x62, 0x03][..],
+            &[0x00, 0x55, 0xAA, 0xFF][..],
+        ];
+
+        assert_eq!(bm13xx_command_response_crc5(&[]), 0x03);
+        for prefix in corpus {
+            for suffix in corpus {
+                let mut joined = prefix.to_vec();
+                joined.extend_from_slice(suffix);
+                let prefix_state = bm13xx_command_response_crc5(prefix);
+                assert_eq!(
+                    bm13xx_command_response_crc5(&joined),
+                    bm13xx_response_crc5_with_init(suffix, prefix_state)
+                );
+                assert!(bm13xx_command_response_crc5(&joined) < 0x20);
+            }
+        }
+    }
+
+    #[test]
+    fn bm13xx_command_response_crc5_detects_each_single_bit_vector_mutation() {
+        let payloads: &[&[u8]] = &[
+            &[0x13, 0x97, 0x18, 0x00, 0x00, 0x00],
+            &[0x13, 0x62, 0x03, 0x00, 0x00, 0x00],
+            &[0x13, 0x62, 0x03, 0xCA, 0xCA, 0x00, 0x00, 0x00],
+        ];
+
+        for &payload in payloads {
+            let expected = bm13xx_command_response_crc5(payload);
+            for bit_index in 0..payload.len() * 8 {
+                let mut mutated = payload.to_vec();
+                mutated[bit_index / 8] ^= 1 << (bit_index % 8);
+                assert_ne!(
+                    bm13xx_command_response_crc5(&mutated),
+                    expected,
+                    "single-bit mutation {bit_index} was not detected for {payload:02X?}"
+                );
+            }
+        }
     }
 }

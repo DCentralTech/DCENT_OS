@@ -6,9 +6,8 @@
 # Provenance: derived from `build_am3_bb_sdcard.sh`. Wave reference:
 # AGENT B3 wave W10.x (2026-05-09).
 #
-# Routes through `build_in_docker.sh --target am3-bb-s19jpro`, which
-# (once registered in build_in_docker.sh's TARGET case-statement)
-# selects `dcentos_am3_bb_s19jpro_defconfig`, the variant
+# Routes through `build_in_docker.sh --target am3-bb-s19jpro`, which selects
+# `dcentos_am3_bb_s19jpro_defconfig`, the variant
 # board/beaglebone/am3-bb-s19jpro post-build.sh + post-image.sh, and
 # emits the staged SD-card payload tarball
 #   dcentos-am3-bb-s19jpro-sdcard.tar
@@ -20,14 +19,6 @@
 # evidence enables NAND install per
 # .
 #
-# NOTE: build_in_docker.sh does not yet ship an `am3-bb-s19jpro` target
-# entry. Until the operator (or B3 follow-up) lands the entry in the
-# TARGET case-statement, this helper falls through to the `am3-bb`
-# target as a clearly-flagged compatibility path so the variant
-# defconfig + overlay can still be exercised end-to-end without
-# blocking on a build_in_docker.sh edit. The fall-through emits a
-# loud WARN.
-
 set -e
 
 OUTPUT=""
@@ -77,6 +68,7 @@ esac
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+. "$SCRIPT_DIR/lib/am3_bb_dtb_contract.sh"
 BUILDROOT_DIR="${BUILDROOT_DIR:-$PROJECT_ROOT/buildroot}"
 BR2_EXTERNAL="$PROJECT_ROOT/br2_external_dcentos"
 BUILD_TARGET="am3-bb-s19jpro"
@@ -87,16 +79,13 @@ if [ -d "$BUILDROOT_DIR" ] && [ -f "$BUILDROOT_DIR/Makefile" ] && command -v mak
     make -C "$BUILDROOT_DIR" BR2_EXTERNAL="$BR2_EXTERNAL" "$BUILD_DEFCONFIG"
     make -C "$BUILDROOT_DIR"
 elif command -v docker >/dev/null 2>&1; then
-    OUTDIR=$(dirname "$OUTPUT")
-    if grep -q "^[[:space:]]*$BUILD_TARGET)" "$SCRIPT_DIR/build_in_docker.sh" 2>/dev/null; then
-        "$SCRIPT_DIR/build_in_docker.sh" --target "$BUILD_TARGET" --output-dir "$OUTDIR"
-    else
-        echo "WARN: build_in_docker.sh has no '--target $BUILD_TARGET' entry yet." >&2
-        echo "      Falling back to '--target am3-bb' so the SD payload still builds." >&2
-        echo "      Output will identify as am3-bb base until the entry is added." >&2
-        "$SCRIPT_DIR/build_in_docker.sh" --target am3-bb --output-dir "$OUTDIR"
-        EXPECTED_TARBALL="dcentos-am3-bb-sdcard.tar"
+    if [ -n "$ARTIFACT_DIR" ]; then
+        echo "ERROR: --artifacts is not supported by Docker packaging; refusing to ignore carrier boot artifacts" >&2
+        echo "Use a direct Buildroot/staging environment or a dedicated AM3-BB image builder." >&2
+        exit 1
     fi
+    OUTDIR=$(dirname "$OUTPUT")
+    "$SCRIPT_DIR/build_in_docker.sh" --target "$BUILD_TARGET" --output-dir "$OUTDIR"
     DOCKER_OUTPUT="$OUTDIR/$EXPECTED_TARBALL"
     if [ -f "$DOCKER_OUTPUT" ]; then
         if [ "$DOCKER_OUTPUT" != "$OUTPUT" ]; then
@@ -126,9 +115,23 @@ else
 fi
 
 if [ -n "$ARTIFACT_DIR" ]; then
-    for f in MLO u-boot.img uImage am335x-s19jpro.dtb am335x-boneblack.dtb bitmain-am335x.dtb; do
+    for f in MLO u-boot.img uImage; do
         [ -f "$ARTIFACT_DIR/$f" ] && cp "$ARTIFACT_DIR/$f" "$STAGE/$f"
     done
+
+    DTB_SOURCE=""
+    for f in devicetree.dtb am335x-s19jpro.dtb bitmain-am335x.dtb am335x-boneblack.dtb dtb; do
+        if [ -f "$ARTIFACT_DIR/$f" ]; then
+            DTB_SOURCE="$ARTIFACT_DIR/$f"
+            break
+        fi
+    done
+    [ -n "$DTB_SOURCE" ] || {
+        echo "ERROR: --artifacts must contain a carrier-aware AM3-BB DTB" >&2
+        exit 1
+    }
+    dcent_am3_bb_admit_carrier_dtb "$DTB_SOURCE" s19j-io-v2 0
+    cp "$DTB_SOURCE" "$STAGE/devicetree.dtb"
 fi
 
 cat > "$STAGE/MANIFEST.txt" <<EOF

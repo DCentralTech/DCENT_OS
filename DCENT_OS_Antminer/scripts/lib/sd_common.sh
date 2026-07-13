@@ -237,7 +237,9 @@ sd_common::write_mbr_p1_sector_aligned() {
     local p1_start_sectors="$2"
     local p1_size_sectors="$3"
     local p1_type="$4"
-    sfdisk "$img" >/dev/null <<EOF
+    # --force/--no-reread: file images (and WSL /mnt/c paths) hang on
+    # partition-table reread probes without these flags.
+    sfdisk --force --no-reread "$img" >/dev/null <<EOF
 label: dos
 label-id: 0x00000000
 unit: sectors
@@ -260,7 +262,7 @@ sd_common::write_mbr_two_part() {
     local p1_start_sectors=$((p1_off_mb * 2048))
     local p1_size_sectors=$((p1_size_mb * 2048))
     local p2_start_sectors=$((p2_off_mb * 2048))
-    sfdisk "$img" >/dev/null <<EOF
+    sfdisk --force --no-reread "$img" >/dev/null <<EOF
 label: dos
 unit: sectors
 
@@ -285,7 +287,7 @@ sd_common::write_mbr_three_part_sector_aligned() {
     local p3_start_sectors="$8"
     local p3_size_sectors="$9"
     local p3_type="${10}"
-    sfdisk "$img" >/dev/null <<EOF
+    sfdisk --force --no-reread "$img" >/dev/null <<EOF
 label: dos
 unit: sectors
 
@@ -299,6 +301,11 @@ EOF
 # FAT16 boot + RAW squashfs root + small ext2 /data). p1 bootable; all
 # sizes explicit so partition entries match the staged filesystems exactly.
 # Types are hex WITHOUT 0x prefix (e.g. "0e" + "83" + "83").
+#
+# Prefer pure-Python DOS MBR write for *file* images: util-linux sfdisk
+# 2.37 on WSL has been observed to hang indefinitely on both /mnt/c and
+# /tmp images during partition-table reread (D-state). Python path is
+# deterministic and does not call the block-layer ioctl path.
 sd_common::write_mbr_three_part_mb() {
     local img="$1"
     local p1_off_mb="$2"
@@ -310,14 +317,61 @@ sd_common::write_mbr_three_part_mb() {
     local p3_off_mb="$8"
     local p3_size_mb="$9"
     local p3_type="${10}"
-    # 2048 sectors/MiB at 512B sector size.
-    sfdisk "$img" >/dev/null <<EOF
+    local p1_start=$((p1_off_mb * 2048))
+    local p1_size=$((p1_size_mb * 2048))
+    local p2_start=$((p2_off_mb * 2048))
+    local p2_size=$((p2_size_mb * 2048))
+    local p3_start=$((p3_off_mb * 2048))
+    local p3_size=$((p3_size_mb * 2048))
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$img" "$p1_start" "$p1_size" "$p1_type" \
+            "$p2_start" "$p2_size" "$p2_type" \
+            "$p3_start" "$p3_size" "$p3_type" <<'PY'
+import struct, sys
+path = sys.argv[1]
+parts = [
+    (int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4], 16), True),
+    (int(sys.argv[5]), int(sys.argv[6]), int(sys.argv[7], 16), False),
+    (int(sys.argv[8]), int(sys.argv[9]), int(sys.argv[10], 16), False),
+]
+with open(path, "r+b") as fh:
+    fh.seek(0)
+    mbr = bytearray(fh.read(512))
+    if len(mbr) < 512:
+        mbr.extend(b"\x00" * (512 - len(mbr)))
+    # Zero partition table region then write three entries + signature.
+    for i in range(0x1BE, 0x1FE):
+        mbr[i] = 0
+    for idx, (start, size, ptype, bootable) in enumerate(parts):
+        off = 0x1BE + idx * 16
+        status = 0x80 if bootable else 0x00
+        # CHS fields unused for LBA boots; fill with conventional max values.
+        entry = struct.pack(
+            "<B3sB3sII",
+            status,
+            bytes([0xFE, 0xFF, 0xFF]),
+            ptype & 0xFF,
+            bytes([0xFE, 0xFF, 0xFF]),
+            start & 0xFFFFFFFF,
+            size & 0xFFFFFFFF,
+        )
+        mbr[off : off + 16] = entry
+    mbr[0x1FE] = 0x55
+    mbr[0x1FF] = 0xAA
+    fh.seek(0)
+    fh.write(mbr)
+PY
+        return $?
+    fi
+
+    sfdisk --force --no-reread "$img" >/dev/null <<EOF
 label: dos
 unit: sectors
 
-start=$((p1_off_mb * 2048)), size=$((p1_size_mb * 2048)), type=${p1_type}, bootable
-start=$((p2_off_mb * 2048)), size=$((p2_size_mb * 2048)), type=${p2_type}
-start=$((p3_off_mb * 2048)), size=$((p3_size_mb * 2048)), type=${p3_type}
+start=${p1_start}, size=${p1_size}, type=${p1_type}, bootable
+start=${p2_start}, size=${p2_size}, type=${p2_type}
+start=${p3_start}, size=${p3_size}, type=${p3_type}
 EOF
 }
 
