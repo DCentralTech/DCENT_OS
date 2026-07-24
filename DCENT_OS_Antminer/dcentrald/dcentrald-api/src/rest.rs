@@ -9441,11 +9441,10 @@ pub fn app_state_mqtt_command_sink(state: Arc<AppState>) -> Arc<dyn crate::mqtt:
 /// clamp itself is unchanged — bounded under the dangerous threshold so a remote
 /// MQTT setpoint can never disable cooling.
 pub(super) fn mqtt_clamp_target_temp_c(requested_temp_c: f64) -> u8 {
-    let clamped = (requested_temp_c.round() as i64).clamp(
+    (requested_temp_c.round() as i64).clamp(
         crate::mqtt::CMD_TARGET_TEMP_MIN_C as i64,
         crate::mqtt::CMD_TARGET_TEMP_MAX_C as i64,
-    ) as u8;
-    clamped
+    ) as u8
 }
 
 /// POST /api/pools/test -- non-persistent connectivity check for a pool endpoint.

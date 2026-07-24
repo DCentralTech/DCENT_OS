@@ -122,7 +122,7 @@ async fn read_cgminer_request_with_timeout<R: AsyncRead + Unpin>(
     let mut chunk = [0u8; 512];
 
     loop {
-        if buf.iter().any(|b| *b == b'\n') {
+        if buf.contains(&b'\n') {
             break;
         }
         if buf.len() >= MAX_REQUEST_SIZE {

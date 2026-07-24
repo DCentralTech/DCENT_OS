@@ -180,3 +180,9 @@ expect_used = { level = "warn", priority = -1 }
 panic = { level = "warn", priority = -1 }
 indexing_slicing = { level = "warn", priority = -1 }
 unwrap_in_result = { level = "warn", priority = -1 }
+# Doc-comment list formatting: the public-release scrub rewrites doc prose
+# (dropping internal citations/paths), which leaves cosmetically-imperfect
+# list markers that trip these purely-stylistic lints. They carry no
+# correctness signal, so allow them in the published tree.
+doc_lazy_continuation = { level = "allow", priority = -1 }
+doc_overindented_list_items = { level = "allow", priority = -1 }

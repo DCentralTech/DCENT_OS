@@ -2,6 +2,14 @@
 //
 // D-Central Technologies — GPL-3.0
 //
+// This PID-1 helper builds `CString`s from fixed device paths ("/dev/console",
+// "/", …) and argv strings before `libc` syscalls. `CString::new` only fails on
+// an interior NUL byte, which for these inputs is an impossible programming
+// bug — panicking (via `.expect`) is the correct init response. The workspace
+// denies `unwrap_used`/`expect_used`; that strict posture targets the fallible
+// runtime daemon, not these infallible init conversions, so it is relaxed here.
+#![allow(clippy::expect_used)]
+//
 // This replaces /sbin/init on DCENT_OS rootfs images deployed onto BraiinsOS
 // NAND slots. BraiinsOS's BusyBox lacks the init applet, and procd (OpenWrt)
 // ignores our /etc/inittab and runs its own incompatible boot chain.
@@ -111,11 +119,9 @@ fn main() {
 
         if waited > 0 {
             // Check if it was getty that died — respawn it
-            if waited == getty_pid {
-                if !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
-                    // Respawn getty (like inittab ::respawn::)
-                    getty_pid = spawn_getty();
-                }
+            if waited == getty_pid && !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                // Respawn getty (like inittab ::respawn::)
+                getty_pid = spawn_getty();
             }
             // Any other child: just reap (zombie prevention)
         }
@@ -297,7 +303,8 @@ fn ensure_console() -> io::Result<()> {
         // mount tmpfs on /dev first if /dev is read-only (squashfs)
         let _ = do_mount("tmpfs", "/dev", "tmpfs", 0, "size=512k,mode=0755");
         unsafe {
-            let path = CString::new(CONSOLE_DEV).unwrap();
+            let path = CString::new(CONSOLE_DEV)
+                .expect("CString conversion: init path/arg must not contain an interior NUL byte");
             libc::mknod(path.as_ptr(), libc::S_IFCHR | 0o600, libc::makedev(5, 1));
         }
     }
@@ -343,7 +350,9 @@ fn mount_virtual_fs() {
         for &(path, mode, major, minor) in nodes {
             if !Path::new(path).exists() {
                 unsafe {
-                    let cpath = CString::new(path).unwrap();
+                    let cpath = CString::new(path).expect(
+                        "CString conversion: init path/arg must not contain an interior NUL byte",
+                    );
                     libc::mknod(
                         cpath.as_ptr(),
                         libc::S_IFCHR | mode,
@@ -402,7 +411,8 @@ fn fallback_early_init() {
     ];
     for &(path, mode, major, minor) in nodes {
         unsafe {
-            let cpath = CString::new(path).unwrap();
+            let cpath = CString::new(path)
+                .expect("CString conversion: init path/arg must not contain an interior NUL byte");
             libc::mknod(
                 cpath.as_ptr(),
                 libc::S_IFCHR | mode,
@@ -426,13 +436,15 @@ fn fallback_early_init() {
 
     // Create ttyPS0 for serial console
     unsafe {
-        let cpath = CString::new("/dev/ttyPS0").unwrap();
+        let cpath = CString::new("/dev/ttyPS0")
+            .expect("CString conversion: init path/arg must not contain an interior NUL byte");
         libc::mknod(cpath.as_ptr(), libc::S_IFCHR | 0o660, libc::makedev(249, 0));
     }
 
     // Hostname
     unsafe {
-        let name = CString::new("dcentos").unwrap();
+        let name = CString::new("dcentos")
+            .expect("CString conversion: init path/arg must not contain an interior NUL byte");
         libc::sethostname(name.as_ptr(), 7);
     }
 
@@ -655,11 +667,19 @@ fn fork_exec(program: &str, args: &[&str]) -> io::Result<i32> {
             libc::setsid();
         }
 
-        let c_program = CString::new(program).unwrap();
+        let c_program = CString::new(program)
+            .expect("CString conversion: init path/arg must not contain an interior NUL byte");
         let mut c_args: Vec<CString> = Vec::new();
-        c_args.push(CString::new(program).unwrap());
+        c_args.push(
+            CString::new(program)
+                .expect("CString conversion: init path/arg must not contain an interior NUL byte"),
+        );
         for arg in args {
-            c_args.push(CString::new(*arg).unwrap());
+            c_args.push(
+                CString::new(*arg).expect(
+                    "CString conversion: init path/arg must not contain an interior NUL byte",
+                ),
+            );
         }
         let c_argv: Vec<*const libc::c_char> = c_args
             .iter()
@@ -691,7 +711,8 @@ fn fork_exec_with_tty(program: &str, args: &[&str], tty: &str) -> io::Result<i32
         unsafe {
             libc::setsid();
 
-            let c_tty = CString::new(tty).unwrap();
+            let c_tty = CString::new(tty)
+                .expect("CString conversion: init path/arg must not contain an interior NUL byte");
             let fd = libc::open(c_tty.as_ptr(), libc::O_RDWR);
             if fd >= 0 {
                 // Set as controlling terminal
@@ -705,11 +726,19 @@ fn fork_exec_with_tty(program: &str, args: &[&str], tty: &str) -> io::Result<i32
             }
         }
 
-        let c_program = CString::new(program).unwrap();
+        let c_program = CString::new(program)
+            .expect("CString conversion: init path/arg must not contain an interior NUL byte");
         let mut c_args: Vec<CString> = Vec::new();
-        c_args.push(CString::new(program).unwrap());
+        c_args.push(
+            CString::new(program)
+                .expect("CString conversion: init path/arg must not contain an interior NUL byte"),
+        );
         for arg in args {
-            c_args.push(CString::new(*arg).unwrap());
+            c_args.push(
+                CString::new(*arg).expect(
+                    "CString conversion: init path/arg must not contain an interior NUL byte",
+                ),
+            );
         }
         let c_argv: Vec<*const libc::c_char> = c_args
             .iter()
@@ -828,8 +857,10 @@ fn unmount_all() {
     }
 
     // Final: remount root read-only
-    let root = CString::new("/").unwrap();
-    let empty = CString::new("").unwrap();
+    let root = CString::new("/")
+        .expect("CString conversion: init path/arg must not contain an interior NUL byte");
+    let empty = CString::new("")
+        .expect("CString conversion: init path/arg must not contain an interior NUL byte");
     unsafe {
         libc::mount(
             std::ptr::null(),

@@ -2374,7 +2374,7 @@ impl WorkDispatcher {
 
                             // Decode the nonce using chip-specific driver
                             let Some(decode_context) = FpgaNonceDecodeContext::try_new(
-                                chain.fpga_midstate_cnt as u8,
+                                chain.fpga_midstate_cnt,
                             ) else {
                                 hw_errors += 1;
                                 error!(

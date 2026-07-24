@@ -832,19 +832,17 @@ fn drain_value_fd(fd: i32) -> std::io::Result<()> {
 fn tach_poll_has_edge(revents: libc::c_short) -> std::io::Result<bool> {
     use std::io;
     if revents & (libc::POLLHUP | libc::POLLNVAL) != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("fan tach poll reported error revents=0x{revents:04X}"),
-        ));
+        return Err(io::Error::other(format!(
+            "fan tach poll reported error revents=0x{revents:04X}"
+        )));
     }
     if revents & libc::POLLPRI != 0 {
         return Ok(true);
     }
     if revents & libc::POLLERR != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("fan tach poll reported bare POLLERR revents=0x{revents:04X}"),
-        ));
+        return Err(io::Error::other(format!(
+            "fan tach poll reported bare POLLERR revents=0x{revents:04X}"
+        )));
     }
     Ok(false)
 }
@@ -902,13 +900,10 @@ impl FanTachSource for SysfsFallingEdgeCounter {
                 // Re-arm the latch so the next falling edge fires POLLPRI again.
                 drain_value_fd(raw_fd)?;
             } else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "fan tach gpio{} poll woke without POLLPRI (revents=0x{:04X})",
-                        self.gpio, pollfd.revents
-                    ),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "fan tach gpio{} poll woke without POLLPRI (revents=0x{:04X})",
+                    self.gpio, pollfd.revents
+                )));
             }
         }
 

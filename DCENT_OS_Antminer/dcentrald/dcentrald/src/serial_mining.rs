@@ -2856,9 +2856,9 @@ impl SerialMiner {
         // compatibility path. Planning reads system identity before the
         // serialized service owns the bus and emits no controller traffic.
         let pending_am2_bm1362_plan = if is_bm1362 && !nopic && !passthrough {
-            dcentrald_hal::platform::try_discover_system_am2_controller_plan(&[
-                serial_device.clone()
-            ])?
+            dcentrald_hal::platform::try_discover_system_am2_controller_plan(std::slice::from_ref(
+                &serial_device,
+            ))?
         } else {
             None
         };
@@ -4042,7 +4042,7 @@ impl SerialMiner {
             rejected: 0,
             chains: vec![dcentrald_api::ChainState {
                 id: 0,
-                chips: chip_count as u8,
+                chips: chip_count,
                 frequency_mhz: target_freq,
                 voltage_mv: published_voltage_mv,
                 temp_c: 0.0,
@@ -5474,7 +5474,7 @@ impl SerialMiner {
                         s.hashrate_5s_ghs = current_ths * 1000.0;
                         s.chains = vec![dcentrald_api::ChainState {
                             id: 0,
-                            chips: chip_count as u8,
+                            chips: chip_count,
                             frequency_mhz: target_freq,
                             voltage_mv: published_voltage_mv,
                             temp_c: latest_temp_c,

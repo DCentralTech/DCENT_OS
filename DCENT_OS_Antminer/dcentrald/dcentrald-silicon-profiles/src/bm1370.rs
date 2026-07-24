@@ -281,7 +281,7 @@ pub fn bm1370_pll_compute(target_mhz: u32, ref_mhz: u32) -> Option<Bm1370PllPara
                 }
                 // VCO = fbdiv * ref / refdiv ∈ [2000, 3200]; ≤ 3125 when refdiv==1.
                 let vco = ((fbdiv * ref_mhz as u64) / refdiv as u64) as u32;
-                if vco < BM1370_VCO_MIN_MHZ || vco > BM1370_VCO_MAX_MHZ {
+                if !(BM1370_VCO_MIN_MHZ..=BM1370_VCO_MAX_MHZ).contains(&vco) {
                     continue;
                 }
                 if refdiv == 1 && vco > BM1370_VCO_MAX_MHZ_REFDIV1 {

@@ -710,7 +710,10 @@ mod tests {
                         .strip_prefix("echo \"")
                         .and_then(|rest| rest.split('"').next())
                         .expect("parse post-build board_target stamp");
-                    assert!(!target.is_empty(), "post-build board target must not be empty");
+                    assert!(
+                        !target.is_empty(),
+                        "post-build board target must not be empty"
+                    );
                     targets.push(target.to_string());
                 }
             }
@@ -813,7 +816,6 @@ mod tests {
             "generic BB post-build target drifted from BoardDesc: {}",
             stamps[0]
         );
-
     }
 
     #[test]
@@ -987,7 +989,9 @@ mod tests {
             let tarball = producer.artifact_filename;
             let arm = format!("\n    {build_target})");
             let arm_start = build_driver.find(&arm).unwrap_or_else(|| {
-                panic!("{runtime_target} claims an artifact but build target {build_target} is absent")
+                panic!(
+                    "{runtime_target} claims an artifact but build target {build_target} is absent"
+                )
             });
             let arm_body = &build_driver[arm_start + arm.len()..];
             let arm_end = arm_body
@@ -1030,8 +1034,7 @@ mod tests {
                     "{build_target} is absent from the fail-closed non-S9 inventory"
                 );
                 assert!(
-                    non_s9_inventory
-                        .contains(&format!(r#"[{build_target}]="{tarball}""#)),
+                    non_s9_inventory.contains(&format!(r#"[{build_target}]="{tarball}""#)),
                     "{build_target} inventory mapping does not name {tarball}"
                 );
             }

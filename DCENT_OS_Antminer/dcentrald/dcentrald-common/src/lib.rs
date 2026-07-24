@@ -23,10 +23,10 @@
 //!   deletion with directory fsync plus explicit publication/failure evidence.
 
 pub mod am2_topology;
-pub mod at3_rail;
-pub mod atomic_file;
 /// Canonical build target and published filename for each artifact claim.
 pub mod artifact_producer;
+pub mod at3_rail;
+pub mod atomic_file;
 /// Declarative control-board composition identity (ADR-0011). Scaffold registry.
 pub mod board_desc;
 pub mod chain_voltage;

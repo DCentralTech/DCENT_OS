@@ -36,6 +36,8 @@ tokio = { workspace = true }
 # Lints follow workspace defaults; per-crate overrides intentionally omitted
 # so the new scaffold inherits warn-level unwrap/expect/panic gates.
 [lints.clippy]
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
 unwrap_used = "allow"
 expect_used = "allow"
 panic = "allow"

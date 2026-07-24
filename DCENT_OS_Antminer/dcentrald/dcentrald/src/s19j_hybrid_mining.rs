@@ -357,6 +357,9 @@ const fn admit_open_core_rail_plan(
     })
 }
 
+// Distinct clamp conditions intentionally share the `1` result; keeping them
+// as separate arms documents each reason the budget floors to one attempt.
+#[allow(clippy::if_same_then_else)]
 const fn am2_hb_reset_attempt_budget(
     faithful_retry_enabled: bool,
     requested_attempts: u8,
@@ -539,9 +542,7 @@ fn am2_wave56_override_runtime_preflight(config: &DcentraldConfig) -> Result<()>
         );
     }
     if !config.pool.worker.to_ascii_lowercase().contains("xil") {
-        anyhow::bail!(
-            "Wave56 .25 proof run requires [pool].worker to include xil for attribution"
-        );
+        anyhow::bail!("Wave56 .25 proof run requires [pool].worker to include xil for attribution");
     }
     if config.pool.failover1.is_some()
         || config.pool.failover2.is_some()
@@ -977,9 +978,9 @@ fn am2_safe_teardown_sequence(
     // Step 5: formal disable_voltage. By this point chips are coasted +
     // caps drained; this is the dsPIC bookkeeping more than a power cut.
     let step5_result = match owner_policy {
-        Pic0x89CleanStopOwnerPolicy::Endpoint => endpoint_session
-            .as_deref_mut()
-            .map(|session| session.controller_mut().disable_voltage()),
+        Pic0x89CleanStopOwnerPolicy::Endpoint => {
+            endpoint_session.map(|session| session.controller_mut().disable_voltage())
+        }
         Pic0x89CleanStopOwnerPolicy::LegacyCompatibility => legacy_controller
             .as_mut()
             .map(|controller| controller.disable_voltage()),

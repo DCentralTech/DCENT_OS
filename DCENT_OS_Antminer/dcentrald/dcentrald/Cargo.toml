@@ -93,6 +93,8 @@ sim-hal = [
 # Audit ladder semantics preserved: each crate explicitly declares its stance
 # in `[lints.clippy]`..
 [lints.clippy]
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
 unwrap_used = "allow"
 expect_used = "allow"
 panic = "allow"

@@ -191,8 +191,9 @@ impl MinerModel {
     /// decision); the generic per-chip silicon profile is the safe fallback the
     /// autotuner uses meanwhile. The exact preset-row capture procedure is the
     /// named live task in the bench packages:
-    ///   - S17 →  (S17 datum list)
+    ///   - S17 datum list
     ///   - S21 Pro / S21 XP → `.../BP-AMLOGIC-BRINGUP.md` (BM1370 preset capture)
+    ///
     /// This emptiness is regression-pinned by `s19k_pro_has_no_preset_rows_yet`
     /// + the empty-table test — do NOT populate with synthetic rows.
     pub fn presets(&self) -> &'static [PowerProfile] {

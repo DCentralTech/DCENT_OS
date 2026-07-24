@@ -515,11 +515,9 @@ pub struct BhbSkuCatalogEntry {
 /// Known BHB/A3HB SKU-to-chip-family catalog.
 ///
 /// Source anchors:
-/// -  secs 1.5-1.11
-///   classifies `BHB42801`, `BHB42811`, `BHB42821`, `BHB42831`, and
-///   `BHB42841` as S19 XP / S19j XP BM1366 profile rows.
-/// -  line 278
-///   lists the same `BHB428xx` SKUs in the BM1366 board set.
+/// - RE notes secs 1.5-1.11 classify `BHB42801`, `BHB42811`, `BHB42821`,
+///   `BHB42831`, and `BHB42841` as S19 XP / S19j XP BM1366 profile rows.
+/// - The board-set table lists the same `BHB428xx` SKUs in the BM1366 set.
 ///
 /// Keep `BHB428xx -> BM1366` load-bearing; older model notes contained a
 /// stale `BHB42801 -> BM1362` line.
@@ -584,8 +582,7 @@ pub const BHB_SKU_CATALOG: &[BhbSkuCatalogEntry] = &[
         model_family: "S21 Pro / S21 XP family",
         eeprom_variant: "edf_v5_xxtea_key1",
         confidence: "medium",
-        source:
-            "BOSMINER_EEPROM_PARSERS_RE.md preamble table;  lines 539+",
+        source: "BOSMINER_EEPROM_PARSERS_RE.md preamble table;  lines 539+",
         note:
             "Cataloged as S21-class EDF v5 EEPROM; exact per-SKU silicon remains corpus-dependent.",
     },

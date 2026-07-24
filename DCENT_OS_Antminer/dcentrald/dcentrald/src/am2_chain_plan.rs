@@ -41,7 +41,7 @@ use dcentrald_common::am2_topology::{dspic_address_for_slot, slot_for_uart};
 /// Slot 1 = PL UART 1 = `/dev/ttyS2` → dsPIC 0x21
 /// Slot 2 = PL UART 2 = `/dev/ttyS3` → dsPIC 0x22
 /// Slot 3 = PL UART 3 = `/dev/ttyS4` → dsPIC 0x23
-
+///
 /// One planned chain — the runtime opens one `SerialChainBackend`,
 /// orchestrates one PIC's voltage path, and dispatches/polls work per
 /// instance of this record.

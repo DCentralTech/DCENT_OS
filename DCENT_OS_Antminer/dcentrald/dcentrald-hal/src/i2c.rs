@@ -3251,13 +3251,7 @@ impl I2cRawFabricLease {
     /// `O_CLOEXEC` handles exec, but a fork-only child shares the parent's
     /// open-file description and must never transact through inherited state.
     pub(crate) fn validate_current_process(&self) -> Result<()> {
-        let fabric = match self.key {
-            I2cFabricRegistryKey::PhysicalFabric(fabric) => fabric,
-            #[cfg(feature = "sim-hal")]
-            I2cFabricRegistryKey::SimulatedBus { bus, .. } => {
-                PhysicalI2cFabricId::linux_adapter(bus)
-            }
-        };
+        let I2cFabricRegistryKey::PhysicalFabric(fabric) = self.key;
         let current_pid = std::process::id();
         if current_pid != self.creator_pid {
             return Err(HalError::I2cFabricUnavailable {
@@ -4526,6 +4520,7 @@ impl I2cSafeOffMailbox {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn enqueue_conditional_plan(
         &self,
         bus: u8,
@@ -5150,7 +5145,7 @@ fn clone_safe_off_completion_error(error: &HalError, bus: u8, addr: u8) -> HalEr
             addr,
             detail: detail.clone(),
         },
-        HalError::PsuProtocol(detail) => HalError::PsuProtocol(*detail),
+        HalError::PsuProtocol(detail) => HalError::PsuProtocol(detail),
         HalError::PsuProtocolOwned(detail) => HalError::PsuProtocolOwned(detail.clone()),
         HalError::PsuUnsupported(detail) => HalError::PsuUnsupported(detail.clone()),
         other => HalError::I2c {
@@ -5928,11 +5923,7 @@ impl I2cServiceHandle {
             }));
         }
 
-        let tx = match &self.tx {
-            I2cServiceSender::Deadline(tx) => tx,
-            #[cfg(test)]
-            I2cServiceSender::Raw(_) => unreachable!("raw test sender returned above"),
-        };
+        let I2cServiceSender::Deadline(tx) = &self.tx;
         let submitted_at = Instant::now();
         let admission_deadline = submitted_at + budget.admission;
         let must_start_by = submitted_at + budget.start;

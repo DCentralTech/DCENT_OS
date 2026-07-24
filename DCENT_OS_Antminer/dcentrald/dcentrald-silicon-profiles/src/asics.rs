@@ -705,15 +705,16 @@ mod tests {
         assert_eq!(v54.cores, 114);
         assert_eq!(crate::bm1387::BM1387_CORES_PER_CHIP, 114);
         assert!(
-            !std
-                .used_in
+            !std.used_in
                 .iter()
                 .any(|m| ["S11", "S15", "S17", "T17"].contains(m)),
             "BM1387 is S9/T9-family only (S17=BM1397, S11=BM1391)"
         );
         // D2: BHB42801 chips/chain reconciled to 88 across hashboards + bm1362.
         assert_eq!(
-            crate::hashboards::Hashboard::Bhb42801.catalog().chips_per_chain,
+            crate::hashboards::Hashboard::Bhb42801
+                .catalog()
+                .chips_per_chain,
             88
         );
         assert_eq!(

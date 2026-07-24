@@ -293,7 +293,7 @@ pub fn atomic_write(
 ) -> Result<AtomicWriteOutcome, AtomicWriteError> {
     #[cfg(unix)]
     {
-        return atomic_write_with_hook(target.as_ref(), bytes.as_ref(), options, |_| Ok(()));
+        atomic_write_with_hook(target.as_ref(), bytes.as_ref(), options, |_| Ok(()))
     }
     #[cfg(not(unix))]
     {
@@ -324,7 +324,7 @@ pub fn atomic_write(
 pub fn remove_file(target: impl AsRef<Path>) -> Result<AtomicRemoveOutcome, AtomicRemoveError> {
     #[cfg(unix)]
     {
-        return remove_file_with_hook(target.as_ref(), |_| Ok(()));
+        remove_file_with_hook(target.as_ref(), |_| Ok(()))
     }
     #[cfg(not(unix))]
     {

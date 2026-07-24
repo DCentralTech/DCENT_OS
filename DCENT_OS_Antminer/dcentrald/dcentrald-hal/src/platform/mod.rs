@@ -16,8 +16,14 @@ pub mod amlogic;
 pub mod beaglebone;
 pub mod beaglebone_cold_boot;
 pub mod config;
+// CV1835 cold-boot/pinmux RE port: constants + helpers are pinned from the
+// dev-kit ground truth but not yet wired into a live path (env-gated bring-up),
+// so they are intentionally not-yet-constructed scaffolding.
+#[allow(dead_code)]
 pub mod cvitek;
+#[allow(dead_code)]
 pub(crate) mod cvitek_cold_boot;
+#[allow(dead_code)]
 pub(crate) mod cvitek_pinmux;
 #[cfg(feature = "sim-hal")]
 pub mod sim;

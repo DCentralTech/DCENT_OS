@@ -319,6 +319,9 @@ fn bind_am3_bb_dspic_endpoint_from_observations(
     // The exact `a lab unit` S19J_IO_BOARD_V2_0 trace proves fw=0x89 on all three
     // hashboard controllers. Accept only reply shapes already admitted by the
     // legacy direct-serial parser; this issuer must not broaden wire grammar.
+    // Several distinct BHB56 firmware-reply framings all attest fw 0x89; keeping
+    // them as separate arms documents each recognized shape.
+    #[allow(clippy::if_same_then_else)]
     let firmware = if firmware_reply.len() >= 3
         && firmware_reply[0] == 0x05
         && firmware_reply[1] == 0x17

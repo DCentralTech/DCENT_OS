@@ -84,6 +84,8 @@ required-features = ["recovery-tool"]
 # cargo 1.95+: per-crate overrides cannot coexist with `[lints] workspace = true`.
 # Per-crate stance stands alone; workspace inheritance dropped.
 [lints.clippy]
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
 unwrap_used = "allow"
 expect_used = "allow"
 panic = "allow"

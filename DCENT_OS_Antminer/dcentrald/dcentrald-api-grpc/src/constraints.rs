@@ -20,8 +20,7 @@ use crate::dcent::v1::{
 };
 
 /// Absolute SUPREMACY voltage ceiling for am2 (BM1362 family). Mirrored from
-///  + the dcentrald
-/// `[autotune.power_target]` Rust PI controller.
+/// the dcentrald `[autotune.power_target]` Rust PI controller.
 pub const VOLTAGE_MAX_MV_AM2: u32 = 14_500;
 
 /// SUPREMACY home-mode fan cap. Mirrored from `rust-firmware.md` ("NEVER

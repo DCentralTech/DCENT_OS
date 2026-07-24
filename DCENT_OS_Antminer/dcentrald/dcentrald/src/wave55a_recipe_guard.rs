@@ -569,7 +569,7 @@ pub fn enforce() -> std::result::Result<(), GuardRefusal> {
                 bypass_env = BYPASS_ENV_VAR,
                 "Wave-55a guard BYPASSED via {} — proceeding despite recipe-broken env. \
                  This is a LAB-ONLY override; production launchers MUST NOT set this. \
-.",
+            .",
                 BYPASS_ENV_VAR
             );
             Ok(())
@@ -666,11 +666,7 @@ mod inline_tests {
         ));
         // psu_hardware_variant absent — still matches (platform + suffix
         // are sufficient).
-        assert!(fingerprint_matches_xil_25(
-            "zynq-bm3-am2",
-            "am2-xil",
-            None
-        ));
+        assert!(fingerprint_matches_xil_25("zynq-bm3-am2", "am2-xil", None));
     }
 
     #[test]

@@ -1,0 +1,17 @@
+{
+  "schema": 2,
+  "producers": [
+    {"board_target":"am1-s9","build_target":"s9","artifact_filename":"dcentos-sysupgrade-118.tar","install_contract":"managed_s9_install"},
+    {"board_target":"am2-s19j","build_target":"am2-s19jpro","artifact_filename":"dcentos-sysupgrade-am2-s19jpro.tar","install_contract":"guarded_am2_self_update"},
+    {"board_target":"am2-s19pro","build_target":"am2-s19pro","artifact_filename":"dcentos-sysupgrade-am2-s19pro.tar","install_contract":"guarded_am2_self_update"},
+    {"board_target":"am2-s17p","build_target":"am2-s17pro","artifact_filename":"dcentos-sysupgrade-am2-s17pro.tar","install_contract":"guarded_am2_self_update"},
+    {"board_target":"am3-bb","build_target":"am3-bb","artifact_filename":"dcentos-am3-bb-sdcard.tar","install_contract":"external_media"},
+    {"board_target":"am3-bb-s19jpro","build_target":"am3-bb-s19jpro","artifact_filename":"dcentos-am3-bb-s19jpro-sdcard.tar","install_contract":"external_media"},
+    {"board_target":"am3-s21","build_target":"am3-s21","artifact_filename":"dcentos-sysupgrade-am3-s21.tar","install_contract":"guarded_amlogic_rootfs_window"},
+    {"board_target":"am3-s21pro","build_target":"am3-s21pro","artifact_filename":"dcentos-sysupgrade-am3-s21pro.tar","install_contract":"guarded_amlogic_rootfs_window"},
+    {"board_target":"am3-s21xp","build_target":"am3-s21xp","artifact_filename":"dcentos-sysupgrade-am3-s21xp.tar","install_contract":"guarded_amlogic_rootfs_window"},
+    {"board_target":"am3-t21","build_target":"am3-t21","artifact_filename":"dcentos-sysupgrade-am3-t21.tar","install_contract":"guarded_amlogic_rootfs_window"},
+    {"board_target":"am3-s19k","build_target":"am3-s19kpro","artifact_filename":"dcentos-sysupgrade-am3-s19kpro.tar","install_contract":"guarded_amlogic_rootfs_window"},
+    {"board_target":"am3-s19jpro-aml","build_target":"am3-s19jpro-aml","artifact_filename":"dcentos-sysupgrade-am3-s19jpro-aml.tar","install_contract":"guarded_amlogic_rootfs_window"}
+  ]
+}

@@ -153,8 +153,7 @@ mod tests {
     use super::*;
     use dcent_schema::hardware::{
         ArtifactKind, ArtifactMaturity, ImplementationMaturity, InstallAuthorization,
-        RecoveryMaturity,
-        StorageTopology,
+        RecoveryMaturity, StorageTopology,
     };
 
     #[test]

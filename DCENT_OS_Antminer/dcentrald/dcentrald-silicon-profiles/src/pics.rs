@@ -164,9 +164,8 @@ impl Pic {
 /// the W11.3 PIC1704 driver.
 pub mod registers {
     /// 0x00 — VERSION. Reads:
-    /// - `0x86` = bootloader (post-RESET corruption state on am2 Zynq;
-    /// writes are HAL-denied
-    ///   by default).
+    /// - `0x86` = bootloader (post-RESET corruption state on am2 Zynq; writes
+    ///   are HAL-denied by default).
     /// - `0x89` = application running.
     /// - `0x88` = Rev A.
     /// - `0x8A` = Rev B.

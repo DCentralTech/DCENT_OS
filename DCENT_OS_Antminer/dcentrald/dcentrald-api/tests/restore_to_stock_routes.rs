@@ -3934,12 +3934,7 @@ fn test_nand_backup_uses_profile_mtds_not_global_const() {
 async fn test_manifest_lookup_now_filters_by_platform_signature() {
     // Locate the manifest in-tree (same pattern as
     // test_sweep_orphan_partial_backups_wired_into_handler).
-    let candidates = [
-        "../../../",
-        "",
-        "../../",
-        "../../../../",
-    ];
+    let candidates = ["../../../", "", "../../", "../../../../"];
     let mut text = None;
     for c in &candidates {
         if let Ok(s) = std::fs::read_to_string(c) {

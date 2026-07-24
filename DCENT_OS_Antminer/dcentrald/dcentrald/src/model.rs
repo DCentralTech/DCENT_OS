@@ -761,10 +761,7 @@ mod tests {
         assert_eq!(board_target_chip_label("am2-s19pro"), Some("BM1398"));
         assert_eq!(board_target_chip_label("am2-s19j"), Some("BM1362"));
         assert_eq!(board_target_chip_label("am2-s19jpro-zynq"), Some("BM1362"));
-        assert_eq!(
-            board_target_chip_label("am2-s19jpro-xil"),
-            Some("BM1362")
-        );
+        assert_eq!(board_target_chip_label("am2-s19jpro-xil"), Some("BM1362"));
         assert_eq!(board_target_chip_label("am1-t15"), Some("BM1391"));
         assert_eq!(board_target_chip_label("am2-s17p"), Some("BM1397"));
         assert_eq!(board_target_chip_label("am2-s17plus"), Some("BM1396"));

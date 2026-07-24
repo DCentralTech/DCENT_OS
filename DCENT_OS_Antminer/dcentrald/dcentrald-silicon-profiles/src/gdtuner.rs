@@ -178,6 +178,9 @@ impl Gdtuner {
         // `!(x < limit)` (not `x >= limit`) so a NaN max_chip_temp_c — a garbled /
         // failed sensor read — trips the abort fail-closed instead of slipping
         // through (`NaN >= limit` and `NaN < limit` are both false).
+        // Deliberately `!(x < limit)`, not `x >= limit`, so a NaN trips the abort
+        // (see comment above); the partial_cmp form clippy suggests would lose that.
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
         if !(sample.max_chip_temp_c < self.config.hard_thermal_limit_c) {
             self.stage = GdtunerStage::Failed;
             return self.stage;

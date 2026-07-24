@@ -576,7 +576,10 @@ mod tests {
             classify_chain(1, Some(&[])),
             ChainProbe::ReadError { chain_id: 1 }
         ));
-        assert!(matches!(classify_chain(1, None), ChainProbe::ReadError { .. }));
+        assert!(matches!(
+            classify_chain(1, None),
+            ChainProbe::ReadError { .. }
+        ));
         assert!(matches!(
             classify_chain(1, Some(&[0x00])),
             ChainProbe::Unpopulated { chain_id: 1 }

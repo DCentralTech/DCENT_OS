@@ -48,6 +48,9 @@ impl WorkHistoryRing {
         self.depth
     }
 
+    // `slots` always holds exactly 256 deques (one per possible u8 slot, built
+    // in `new`), so indexing by a `u8` slot is provably in-bounds.
+    #[allow(clippy::indexing_slicing)]
     pub fn push(&mut self, slot: u8, entry: WorkHistoryEntry) {
         let q = &mut self.slots[slot as usize];
         if q.len() >= self.depth {
@@ -57,11 +60,13 @@ impl WorkHistoryRing {
     }
 
     /// Most recent entry for a slot (nonce match starts here).
+    #[allow(clippy::indexing_slicing)] // slots is always 256 (one per u8 slot)
     pub fn latest(&self, slot: u8) -> Option<&WorkHistoryEntry> {
         self.slots[slot as usize].back()
     }
 
     /// Iterate newest-first for a slot.
+    #[allow(clippy::indexing_slicing)] // slots is always 256 (one per u8 slot)
     pub fn iter_newest_first(&self, slot: u8) -> impl Iterator<Item = &WorkHistoryEntry> {
         self.slots[slot as usize].iter().rev()
     }

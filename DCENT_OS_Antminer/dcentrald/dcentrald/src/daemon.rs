@@ -1577,10 +1577,7 @@ fn cooling_readiness_from_tach(
 }
 
 fn hardware_bringup_permitted(cooling: &CoolingReadiness, presence: &[BoardPresence]) -> bool {
-    matches!(cooling, CoolingReadiness::Ready { .. })
-        && presence
-            .iter()
-            .any(|state| *state == BoardPresence::Present)
+    matches!(cooling, CoolingReadiness::Ready { .. }) && presence.contains(&BoardPresence::Present)
 }
 
 #[cfg(test)]
@@ -2238,59 +2235,57 @@ fn prepare_watchdog_kicker(
     })
 }
 
-fn watchdog_kicker_loop(
+async fn watchdog_kicker_loop(
     setup: WatchdogKickerSetup,
     shutdown: CancellationToken,
     safety_liveness: Option<Arc<AtomicU64>>,
     disarm_tx: Option<oneshot::Sender<WatchdogDisarmResult>>,
-) -> impl std::future::Future<Output = ()> + Send + 'static {
-    async move {
-        let WatchdogKickerSetup {
-            watchdog: wd,
-            kick_secs,
-            stall_limit,
-        } = setup;
-        let mut last_live: u64 = 0;
-        let mut stalls: u64 = 0;
-        // Use the panic-safe `kick_secs` (>= 1), NOT the raw `kick_interval`:
-        // tokio::time::interval panics on a zero Duration, and a validation-
-        // bypassing kick_interval of 0 would otherwise crash the daemon here and
-        // leave the miner with no watchdog.
-        let mut interval = tokio::time::interval(Duration::from_secs(kick_secs));
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    info!("Watchdog kicker stopping — sending magic close to disarm");
-                    let disarm_result = wd.close_magic().map_err(|error| error.to_string());
-                    match &disarm_result {
-                        Ok(()) => info!("Watchdog magic close completed"),
-                        Err(error) => error!(error, "Watchdog magic close failed; hardware watchdog remains armed"),
-                    }
-                    if let Some(disarm_tx) = disarm_tx {
-                        let _ = disarm_tx.send(disarm_result);
-                    }
-                    return;
+) {
+    let WatchdogKickerSetup {
+        watchdog: wd,
+        kick_secs,
+        stall_limit,
+    } = setup;
+    let mut last_live: u64 = 0;
+    let mut stalls: u64 = 0;
+    // Use the panic-safe `kick_secs` (>= 1), NOT the raw `kick_interval`:
+    // tokio::time::interval panics on a zero Duration, and a validation-
+    // bypassing kick_interval of 0 would otherwise crash the daemon here and
+    // leave the miner with no watchdog.
+    let mut interval = tokio::time::interval(Duration::from_secs(kick_secs));
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("Watchdog kicker stopping — sending magic close to disarm");
+                let disarm_result = wd.close_magic().map_err(|error| error.to_string());
+                match &disarm_result {
+                    Ok(()) => info!("Watchdog magic close completed"),
+                    Err(error) => error!(error, "Watchdog magic close failed; hardware watchdog remains armed"),
                 }
-                _ = interval.tick() => {
-                    if let Some(ref live) = safety_liveness {
-                        let cur = live.load(std::sync::atomic::Ordering::Relaxed);
-                        let (should_kick, new_last, new_stalls) =
-                            watchdog_kick_decision(cur, last_live, stalls, stall_limit);
-                        last_live = new_last;
-                        stalls = new_stalls;
-                        if !should_kick {
-                            error!(
-                                stalls,
-                                stall_limit,
-                                "Watchdog safety liveness has not advanced for ~{}s — WITHHOLDING watchdog kick so the SoC reboots (supervised loop appears hung)",
-                                stalls.saturating_mul(kick_secs)
-                            );
-                            continue; // do NOT kick — let the WDT fire
-                        }
+                if let Some(disarm_tx) = disarm_tx {
+                    let _ = disarm_tx.send(disarm_result);
+                }
+                return;
+            }
+            _ = interval.tick() => {
+                if let Some(ref live) = safety_liveness {
+                    let cur = live.load(std::sync::atomic::Ordering::Relaxed);
+                    let (should_kick, new_last, new_stalls) =
+                        watchdog_kick_decision(cur, last_live, stalls, stall_limit);
+                    last_live = new_last;
+                    stalls = new_stalls;
+                    if !should_kick {
+                        error!(
+                            stalls,
+                            stall_limit,
+                            "Watchdog safety liveness has not advanced for ~{}s — WITHHOLDING watchdog kick so the SoC reboots (supervised loop appears hung)",
+                            stalls.saturating_mul(kick_secs)
+                        );
+                        continue; // do NOT kick — let the WDT fire
                     }
-                    if let Err(e) = wd.kick() {
-                        error!(error = %e, "Watchdog kick failed — if this persists, the SoC may reboot!");
-                    }
+                }
+                if let Err(e) = wd.kick() {
+                    error!(error = %e, "Watchdog kick failed — if this persists, the SoC may reboot!");
                 }
             }
         }
@@ -2311,84 +2306,82 @@ enum WatchdogTaskReceipt {
     MagicCloseWriteFailed(String),
 }
 
-fn owned_watchdog_kicker(
+async fn owned_watchdog_kicker(
     config: crate::config::WatchdogConfig,
     expected_liveness_interval: Duration,
     owner_shutdown: CancellationToken,
     mut intent_rx: watch::Receiver<WatchdogIntent>,
     safety_liveness: Arc<AtomicU64>,
     receipt_tx: oneshot::Sender<WatchdogTaskReceipt>,
-) -> impl std::future::Future<Output = ()> + Send + 'static {
-    async move {
-        // Open only after RuntimeTaskGuard has accepted and spawned this future.
-        // Registration refusal therefore cannot leave an armed, unowned fd.
-        let Some(setup) = prepare_watchdog_kicker(&config, Some(expected_liveness_interval)) else {
-            let _ = receipt_tx.send(WatchdogTaskReceipt::NotOpenedByDaemon);
-            return;
-        };
-        let WatchdogKickerSetup {
-            watchdog: wd,
-            kick_secs,
-            stall_limit,
-        } = setup;
-        let mut last_live = 0_u64;
-        let mut stalls = 0_u64;
-        let mut interval = tokio::time::interval(Duration::from_secs(kick_secs));
-        let mut receipt_tx = Some(receipt_tx);
+) {
+    // Open only after RuntimeTaskGuard has accepted and spawned this future.
+    // Registration refusal therefore cannot leave an armed, unowned fd.
+    let Some(setup) = prepare_watchdog_kicker(&config, Some(expected_liveness_interval)) else {
+        let _ = receipt_tx.send(WatchdogTaskReceipt::NotOpenedByDaemon);
+        return;
+    };
+    let WatchdogKickerSetup {
+        watchdog: wd,
+        kick_secs,
+        stall_limit,
+    } = setup;
+    let mut last_live = 0_u64;
+    let mut stalls = 0_u64;
+    let mut interval = tokio::time::interval(Duration::from_secs(kick_secs));
+    let mut receipt_tx = Some(receipt_tx);
 
-        loop {
-            tokio::select! {
-                _ = owner_shutdown.cancelled() => {
-                    warn!("Watchdog task owner cancelled without explicit Disarm; leaving hardware watchdog armed");
+    loop {
+        tokio::select! {
+            _ = owner_shutdown.cancelled() => {
+                warn!("Watchdog task owner cancelled without explicit Disarm; leaving hardware watchdog armed");
+                return;
+            }
+            changed = intent_rx.changed() => {
+                if changed.is_err() {
+                    warn!("Watchdog intent owner disappeared without explicit Disarm; leaving hardware watchdog armed");
                     return;
                 }
-                changed = intent_rx.changed() => {
-                    if changed.is_err() {
-                        warn!("Watchdog intent owner disappeared without explicit Disarm; leaving hardware watchdog armed");
-                        return;
-                    }
-                    if matches!(*intent_rx.borrow_and_update(), WatchdogIntent::Disarm) {
-                        info!("Watchdog received explicit Disarm after bounded hardware teardown");
-                        let receipt = match wd.close_magic() {
-                            Ok(()) => WatchdogTaskReceipt::MagicCloseWriteCompleted,
-                            Err(error) => WatchdogTaskReceipt::MagicCloseWriteFailed(error.to_string()),
-                        };
-                        if let Some(receipt_tx) = receipt_tx.take() {
-                            let _ = receipt_tx.send(receipt);
-                        }
-                        return;
-                    }
-                }
-                _ = interval.tick() => {
-                    let should_kick = match *intent_rx.borrow() {
-                        WatchdogIntent::Mining => {
-                            let current = safety_liveness.load(Ordering::Relaxed);
-                            let (should_kick, new_last, new_stalls) =
-                                watchdog_kick_decision(current, last_live, stalls, stall_limit);
-                            last_live = new_last;
-                            stalls = new_stalls;
-                            should_kick
-                        }
-                        WatchdogIntent::Teardown { deadline } => {
-                            if watchdog_teardown_kick_allowed(
-                                deadline,
-                                tokio::time::Instant::now(),
-                            ) {
-                                true
-                            } else {
-                                error!(
-                                    grace_s = WATCHDOG_TEARDOWN_GRACE.as_secs(),
-                                    "Watchdog teardown deadline expired; WITHHOLDING kick so a wedged shutdown resets the SoC"
-                                );
-                                false
-                            }
-                        }
-                        WatchdogIntent::Disarm => false,
+                if matches!(*intent_rx.borrow_and_update(), WatchdogIntent::Disarm) {
+                    info!("Watchdog received explicit Disarm after bounded hardware teardown");
+                    let receipt = match wd.close_magic() {
+                        Ok(()) => WatchdogTaskReceipt::MagicCloseWriteCompleted,
+                        Err(error) => WatchdogTaskReceipt::MagicCloseWriteFailed(error.to_string()),
                     };
-                    if should_kick {
-                        if let Err(error) = wd.kick() {
-                            error!(error = %error, "Watchdog kick failed — if this persists, the SoC may reboot");
+                    if let Some(receipt_tx) = receipt_tx.take() {
+                        let _ = receipt_tx.send(receipt);
+                    }
+                    return;
+                }
+            }
+            _ = interval.tick() => {
+                let should_kick = match *intent_rx.borrow() {
+                    WatchdogIntent::Mining => {
+                        let current = safety_liveness.load(Ordering::Relaxed);
+                        let (should_kick, new_last, new_stalls) =
+                            watchdog_kick_decision(current, last_live, stalls, stall_limit);
+                        last_live = new_last;
+                        stalls = new_stalls;
+                        should_kick
+                    }
+                    WatchdogIntent::Teardown { deadline } => {
+                        if watchdog_teardown_kick_allowed(
+                            deadline,
+                            tokio::time::Instant::now(),
+                        ) {
+                            true
+                        } else {
+                            error!(
+                                grace_s = WATCHDOG_TEARDOWN_GRACE.as_secs(),
+                                "Watchdog teardown deadline expired; WITHHOLDING kick so a wedged shutdown resets the SoC"
+                            );
+                            false
                         }
+                    }
+                    WatchdogIntent::Disarm => false,
+                };
+                if should_kick {
+                    if let Err(error) = wd.kick() {
+                        error!(error = %error, "Watchdog kick failed — if this persists, the SoC may reboot");
                     }
                 }
             }
@@ -6310,6 +6303,8 @@ impl Daemon {
             dcentrald_silicon_profiles::bm1362::Bm1362HashboardSku,
         > = std::collections::HashMap::new();
         if matches!(self.pic_type()?, PicType::NoPic) {
+            // `slot` indexes several per-slot maps (preambles, chains), not just one.
+            #[allow(clippy::needless_range_loop)]
             for slot in 0..dispatch_chains.len() {
                 match self.bootstrap_eeprom_preambles.get(slot).copied().flatten() {
                     Some(preamble) => {
@@ -14480,16 +14475,14 @@ impl Daemon {
                  is now the only thing cutting voltage. Do NOT warm-restart until \
                  power is confirmed off (wait out the watchdog or AC-cycle)."
             );
+        } else if magic_close_write_completed {
+            info!(
+                "All hash-board voltage-disable commands completed, fans were commanded to idle, the SoC watchdog magic-close write completed, and its task exit was observed. Kernel timer state and physical rail-off were not independently measured; observe the documented discharge/watchdog interval before a warm restart."
+            );
         } else {
-            if magic_close_write_completed {
-                info!(
-                    "All hash-board voltage-disable commands completed, fans were commanded to idle, the SoC watchdog magic-close write completed, and its task exit was observed. Kernel timer state and physical rail-off were not independently measured; observe the documented discharge/watchdog interval before a warm restart."
-                );
-            } else {
-                info!(
-                    "All hash-board voltage-disable commands completed and fans were commanded to idle. This daemon performed no SoC watchdog magic-close write; pre-existing kernel watchdog state and physical rail-off remain unmeasured."
-                );
-            }
+            info!(
+                "All hash-board voltage-disable commands completed and fans were commanded to idle. This daemon performed no SoC watchdog magic-close write; pre-existing kernel watchdog state and physical rail-off remain unmeasured."
+            );
         }
         Ok(())
     }
