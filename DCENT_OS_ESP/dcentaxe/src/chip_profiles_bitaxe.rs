@@ -394,6 +394,21 @@ pub const MAX_AUTOTUNE_TARGET_TEMP_C: f32 = 95.0;
 ///   any value (including `0`/NaN) is accepted unchanged (`Ok(target)`).
 ///
 /// Pure: no alloc, no I/O — host-tested.
+impl BestPointMode {
+    /// Parse an autotuner-mode API/config string (the values used by the REST
+    /// API, MCP, and power-schedule slots) into the safety-envelope mode. Returns
+    /// `None` for an unknown string so callers can fail closed.
+    pub fn from_api_str(s: &str) -> Option<Self> {
+        match s {
+            "max_hashrate" => Some(Self::MaxHashrate),
+            "best_efficiency" => Some(Self::BestEfficiency),
+            "target_watts" => Some(Self::TargetWatts),
+            "target_temp" => Some(Self::TargetTemp),
+            _ => None,
+        }
+    }
+}
+
 pub fn validate_autotune_target(mode: BestPointMode, target: f32) -> Result<f32, &'static str> {
     match mode {
         BestPointMode::TargetWatts => {

@@ -66,26 +66,32 @@
 pub mod vnish_cold_boot;
 pub mod vnish_state;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::config::{
     amlogic_tty_candidate_order, probe_tty_chain_device, ChainTransport, PlatformConfig,
     VoltageControllerKind,
 };
-use super::subtype::{classify_with_probe, read_subtype};
 use super::{BoardType, ChainAccess, FanAccess, GpioAccess, Platform};
-use crate::i2c::{spawn_i2c_service_no_register_touch_with_denylist, I2cBus, I2cServiceHandle};
+use crate::i2c::{
+    spawn_i2c_service_no_register_touch_with_denylist,
+    spawn_i2c_service_no_register_touch_with_denylist_and_reserved_preparation, I2cBus,
+    I2cMutationLabel, I2cServiceHandle, I2cTransactionStep, Lm75TemperatureRegister,
+    TerminalSafeOffTransition,
+};
 use crate::serial::SerialChain;
 use crate::{HalError, Result};
 
 /// I²C bus that carries hashboard EEPROMs on am3-aml (S21, S19j Pro Amlogic,
 /// S19K Pro). PSU lives on bus 1 at 0x1f and is intentionally NOT on the
-/// denylist — writing to bus 1 is required for `enable_psu_pmbus()`.
+/// denylist — bus 1 is owned separately by `AmlogicPowerThermalService`.
 pub const AMLOGIC_HASHBOARD_EEPROM_BUS: u8 = 0;
 
 /// AT24C-class hashboard EEPROM addresses on am3-aml `/dev/i2c-0`.
@@ -137,7 +143,7 @@ const GPIO_RESET_BASE: u32 = 454;
 /// the AmlogicPlatform module header (S21 / S19j Pro Amlogic / S19K Pro
 /// share this layout).
 const GPIO_FAN_TACH_BASE: u32 = 447;
-const GPIO_FAN_TACH_COUNT: u32 = 4;
+const GPIO_FAN_TACH_COUNT: usize = 4;
 
 /// Pulses-per-revolution assumption for am3-aml fans. This matches the
 /// industry-standard 4-pin BLDC fan spec and the bosminer/BraiinsOS
@@ -152,32 +158,403 @@ const PULSES_PER_REV: u32 = 2;
 /// 4 s slack for the rest of the loop.
 const TACH_SAMPLE_MS: u64 = 1_000;
 
-/// Floor RPM the synthesized fallback returns when fans are spinning
-/// (PWM > 0) but the GPIO tach window saw zero pulses. Per
-/// : NEVER return 0 RPM when fans
-/// are physically spinning — that triggers FanFailure in 15 s and a
-/// voltage cut. The fallback uses `900 + (pwm * 40)` from the same
-/// memory rule. The thermal controller's 3-tick debounce + temperature
-/// guard still catches a real fan death (chip temp climbs → throttle
-/// → shutdown).
-fn synthesized_rpm_floor(pwm: u8) -> u32 {
-    if pwm == 0 {
-        0
-    } else {
-        900 + (pwm as u32 * 40)
-    }
-}
-
 /// Amlogic A113D platform.
 pub struct AmlogicPlatform {
     config: PlatformConfig,
 }
 
+/// File-backed Amlogic NoPic topology that may construct power, cooling, and
+/// thermal owners. Miner configuration alone never grants this capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmlogicNoPicProfile {
+    S19k,
+    S21,
+}
+
+const AML_BOOT_SAFE_RECEIPT: &str = "/run/dcentos/amlogic-boot-safe-state-v1";
+const AML_BOOT_SAFE_SCHEMA: &str = "dcentos.amlogic-safe-state/v1";
+const AML_BOOT_SAFE_RESOURCE: &str = "amlogic-gpio437-power-gate";
+const AML_BOOT_FAN_DUTY_NS: u32 = 30_000;
+const AML_BOOT_FAN_PERIOD_NS: u32 = 100_000;
+
+/// Command/readback evidence emitted by the early Amlogic Linux owner and
+/// revalidated immediately before the supervisor publishes dcentrald.
+///
+/// This is deliberately not named an electrical receipt: GPIO sysfs readback
+/// proves only controller software state. Hardware promotion still requires
+/// scoped pad/rail qualification across reset and brownout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AmlogicBootSafeHandoff {
+    boot_id: String,
+    platform: String,
+    board_target: String,
+    fan0_duty_ns: u32,
+    fan0_period_ns: u32,
+    fan1_duty_ns: u32,
+    fan1_period_ns: u32,
+}
+
+fn parse_amlogic_boot_safe_handoff(source: &str) -> Result<AmlogicBootSafeHandoff> {
+    let mut fields = BTreeMap::new();
+    for (index, line) in source.lines().enumerate() {
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            HalError::Platform(format!(
+                "Amlogic boot-safe receipt line {} lacks key=value framing",
+                index + 1
+            ))
+        })?;
+        if key.is_empty() || value.is_empty() {
+            return Err(HalError::Platform(format!(
+                "Amlogic boot-safe receipt line {} has an empty key or value",
+                index + 1
+            )));
+        }
+        if fields.insert(key, value).is_some() {
+            return Err(HalError::Platform(format!(
+                "Amlogic boot-safe receipt repeats field {key:?}"
+            )));
+        }
+    }
+
+    const REQUIRED: &[&str] = &[
+        "schema",
+        "state",
+        "boot_id",
+        "platform",
+        "board_target",
+        "resource",
+        "gpio_direction",
+        "gpio_active_low",
+        "commanded_value",
+        "readback_value",
+        "fan0_duty_ns",
+        "fan0_period_ns",
+        "fan0_enabled",
+        "fan1_duty_ns",
+        "fan1_period_ns",
+        "fan1_enabled",
+        "evidence_grade",
+        "physical_rail_measured",
+    ];
+    if fields.len() != REQUIRED.len() || REQUIRED.iter().any(|key| !fields.contains_key(key)) {
+        return Err(HalError::Platform(
+            "Amlogic boot-safe receipt fields do not match schema v1".into(),
+        ));
+    }
+    let require = |key: &str, expected: &str| -> Result<()> {
+        if fields.get(key).copied() == Some(expected) {
+            Ok(())
+        } else {
+            Err(HalError::Platform(format!(
+                "Amlogic boot-safe receipt {key} is {:?}, expected {expected:?}",
+                fields.get(key)
+            )))
+        }
+    };
+    require("schema", AML_BOOT_SAFE_SCHEMA)?;
+    require("state", "runtime-handoff")?;
+    require("resource", AML_BOOT_SAFE_RESOURCE)?;
+    require("gpio_direction", "out")?;
+    require("gpio_active_low", "0")?;
+    require("commanded_value", "0")?;
+    require("readback_value", "0")?;
+    require("fan0_enabled", "1")?;
+    require("fan1_enabled", "1")?;
+    require("evidence_grade", "software-readback")?;
+    require("physical_rail_measured", "false")?;
+
+    let parse_duty = |key: &str| -> Result<u32> {
+        fields[key].parse::<u32>().map_err(|error| {
+            HalError::Platform(format!(
+                "Amlogic boot-safe receipt {key} is not a duty in ns: {error}"
+            ))
+        })
+    };
+    let receipt = AmlogicBootSafeHandoff {
+        boot_id: fields["boot_id"].to_owned(),
+        platform: fields["platform"].to_owned(),
+        board_target: fields["board_target"].to_owned(),
+        fan0_duty_ns: parse_duty("fan0_duty_ns")?,
+        fan0_period_ns: parse_duty("fan0_period_ns")?,
+        fan1_duty_ns: parse_duty("fan1_duty_ns")?,
+        fan1_period_ns: parse_duty("fan1_period_ns")?,
+    };
+    if receipt.fan0_duty_ns != AML_BOOT_FAN_DUTY_NS || receipt.fan1_duty_ns != AML_BOOT_FAN_DUTY_NS
+    {
+        return Err(HalError::Platform(format!(
+            "Amlogic boot-safe receipt fan duties are {}/{}, expected {AML_BOOT_FAN_DUTY_NS}",
+            receipt.fan0_duty_ns, receipt.fan1_duty_ns
+        )));
+    }
+    if receipt.fan0_period_ns != AML_BOOT_FAN_PERIOD_NS
+        || receipt.fan1_period_ns != AML_BOOT_FAN_PERIOD_NS
+    {
+        return Err(HalError::Platform(format!(
+            "Amlogic boot-safe receipt fan periods are {}/{}, expected {AML_BOOT_FAN_PERIOD_NS}",
+            receipt.fan0_period_ns, receipt.fan1_period_ns
+        )));
+    }
+    Ok(receipt)
+}
+
+fn amlogic_handoff_identity_matches_profile(
+    expected: AmlogicNoPicProfile,
+    platform: &str,
+    board_target: &str,
+) -> bool {
+    match expected {
+        AmlogicNoPicProfile::S19k => platform == "am3-aml-s19k" && board_target == "am3-s19k",
+        AmlogicNoPicProfile::S21 => matches!(
+            (platform, board_target),
+            ("am3-aml-s21", "am3-s21")
+                | ("am3-aml-s21pro", "am3-s21pro")
+                | ("am3-aml-s21xp", "am3-s21xp")
+                | ("am3-aml-t21", "am3-t21")
+        ),
+    }
+}
+
+fn validate_amlogic_boot_safe_handoff(expected: AmlogicNoPicProfile) -> Result<()> {
+    let metadata = fs::symlink_metadata(AML_BOOT_SAFE_RECEIPT).map_err(|error| {
+        HalError::Platform(format!(
+            "Amlogic NoPic admission requires boot-safe handoff {AML_BOOT_SAFE_RECEIPT}: {error}"
+        ))
+    })?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o777 != 0o600
+    {
+        return Err(HalError::Platform(format!(
+            "Amlogic boot-safe handoff must be a root-owned regular 0600 file: {AML_BOOT_SAFE_RECEIPT}"
+        )));
+    }
+    let source = fs::read_to_string(AML_BOOT_SAFE_RECEIPT).map_err(|error| {
+        HalError::Platform(format!("Amlogic boot-safe handoff read failed: {error}"))
+    })?;
+    let receipt = parse_amlogic_boot_safe_handoff(&source)?;
+
+    let read_marker = |path: &str| -> Result<String> {
+        fs::read_to_string(path)
+            .map(|value| value.trim().to_owned())
+            .map_err(|error| {
+                HalError::Platform(format!("Amlogic marker {path} read failed: {error}"))
+            })
+    };
+    let boot_id = read_marker("/proc/sys/kernel/random/boot_id")?;
+    let platform = read_marker("/etc/dcentos/platform")?;
+    let board_target = read_marker("/etc/dcentos/board_target")?;
+    let rail_gpio = read_marker("/etc/dcentos/rail_gpio")?;
+    if rail_gpio != GPIO_PSU_ENABLE.to_string() {
+        return Err(HalError::Platform(format!(
+            "Amlogic rail marker {rail_gpio:?} does not bind GPIO{GPIO_PSU_ENABLE}"
+        )));
+    }
+    let identity_matches_profile =
+        amlogic_handoff_identity_matches_profile(expected, &platform, &board_target);
+    if !identity_matches_profile
+        || receipt.boot_id != boot_id
+        || receipt.platform != platform
+        || receipt.board_target != board_target
+    {
+        return Err(HalError::Platform(format!(
+            "Amlogic boot-safe handoff identity/profile mismatch: receipt={receipt:?} live_platform={platform:?} live_target={board_target:?}"
+        )));
+    }
+
+    let read_live = |path: &str| -> Result<String> {
+        fs::read_to_string(path)
+            .map(|value| value.trim().to_owned())
+            .map_err(|error| {
+                HalError::Platform(format!("Amlogic handoff revalidation {path}: {error}"))
+            })
+    };
+    let direction = read_live("/sys/class/gpio/gpio437/direction")?;
+    let value = read_live("/sys/class/gpio/gpio437/value")?;
+    let active_low = read_live("/sys/class/gpio/gpio437/active_low")?;
+    let fan0 = read_live("/sys/class/pwm/pwmchip0/pwm0/duty_cycle")?;
+    let fan0_period = read_live("/sys/class/pwm/pwmchip0/pwm0/period")?;
+    let fan0_enabled = read_live("/sys/class/pwm/pwmchip0/pwm0/enable")?;
+    let fan1 = read_live("/sys/class/pwm/pwmchip0/pwm1/duty_cycle")?;
+    let fan1_period = read_live("/sys/class/pwm/pwmchip0/pwm1/period")?;
+    let fan1_enabled = read_live("/sys/class/pwm/pwmchip0/pwm1/enable")?;
+    if direction != "out"
+        || value != "0"
+        || active_low != "0"
+        || fan0 != AML_BOOT_FAN_DUTY_NS.to_string()
+        || fan0_period != AML_BOOT_FAN_PERIOD_NS.to_string()
+        || fan0_enabled != "1"
+        || fan1 != AML_BOOT_FAN_DUTY_NS.to_string()
+        || fan1_period != AML_BOOT_FAN_PERIOD_NS.to_string()
+        || fan1_enabled != "1"
+    {
+        return Err(HalError::Platform(format!(
+            "Amlogic boot-safe live revalidation failed: direction={direction:?} value={value:?} active_low={active_low:?} fan0={fan0:?}/{fan0_period:?}/{fan0_enabled:?} fan1={fan1:?}/{fan1_period:?}/{fan1_enabled:?}"
+        )));
+    }
+    Ok(())
+}
+
+impl AmlogicNoPicProfile {
+    fn label(self) -> &'static str {
+        match self {
+            Self::S19k => "S19K/S19 XP Amlogic NoPic",
+            Self::S21 => "S21/T21 Amlogic NoPic",
+        }
+    }
+}
+
+/// Opaque admission proof for one physical Amlogic chain slot.
+#[derive(Debug)]
+pub struct AmlogicNoPicAdmission {
+    profile: AmlogicNoPicProfile,
+    active_slot: u8,
+    populated_slots: [bool; 3],
+}
+
+impl AmlogicNoPicAdmission {
+    /// Detect the control-board profile independently of mining configuration,
+    /// bind it to the configured chain UART, and refuse every mismatch before
+    /// GPIO, PWM, or management-I2C mutation.
+    pub fn detect(expected: AmlogicNoPicProfile, serial_device: &str) -> Result<Self> {
+        let active_slot = amlogic_slot_from_serial_device(serial_device).ok_or_else(|| {
+            HalError::Platform(format!(
+                "Amlogic NoPic admission does not recognize chain UART {serial_device:?}"
+            ))
+        })?;
+        if !Path::new(serial_device).exists() {
+            return Err(HalError::Platform(format!(
+                "Amlogic NoPic admission requires the selected chain UART to exist: {serial_device}"
+            )));
+        }
+        let observed = detect_amlogic_nopic_profile()?;
+        validate_amlogic_boot_safe_handoff(expected)?;
+        let populated_slots = read_plug_topology_checked()?;
+        Self::from_profile_evidence(expected, active_slot, observed, populated_slots)
+    }
+
+    fn from_profile_evidence(
+        expected: AmlogicNoPicProfile,
+        active_slot: u8,
+        observed: AmlogicNoPicProfile,
+        populated_slots: [bool; 3],
+    ) -> Result<Self> {
+        if observed != expected {
+            return Err(HalError::Platform(format!(
+                "Amlogic NoPic profile mismatch: miner requires {}, control-board identity resolved to {}",
+                expected.label(),
+                observed.label()
+            )));
+        }
+        if active_slot > 2 {
+            return Err(HalError::Platform(format!(
+                "Amlogic NoPic active slot {active_slot} is outside the verified three-slot topology"
+            )));
+        }
+        if !populated_slots[active_slot as usize] {
+            return Err(HalError::Platform(format!(
+                "Amlogic NoPic UART slot {active_slot} is not asserted by checked plug-detect topology {populated_slots:?}"
+            )));
+        }
+        Ok(Self {
+            profile: observed,
+            active_slot,
+            populated_slots,
+        })
+    }
+
+    pub fn profile(&self) -> AmlogicNoPicProfile {
+        self.profile
+    }
+
+    pub fn active_slot(&self) -> u8 {
+        self.active_slot
+    }
+
+    pub fn populated_slots(&self) -> [bool; 3] {
+        self.populated_slots
+    }
+
+    /// Establish the sole retained owner of management bus 1.
+    pub fn spawn_power_thermal_service(&self) -> Result<AmlogicPowerThermalService> {
+        AmlogicPowerThermalService::spawn(self)
+    }
+
+    /// Open only the admitted Amlogic cooling controller. The returned shared
+    /// owner can be moved to Tokio's blocking pool without reopening sysfs.
+    pub fn open_fan_controller(&self) -> Result<Arc<dyn FanAccess>> {
+        Ok(Arc::new(AmlogicFan::new()?))
+    }
+}
+
+fn amlogic_slot_from_serial_device(serial_device: &str) -> Option<u8> {
+    match serial_device {
+        "/dev/ttyS1" => Some(0),
+        "/dev/ttyS2" => Some(1),
+        "/dev/ttyS3" | "/dev/ttyS4" => Some(2),
+        _ => None,
+    }
+}
+
+fn read_plug_topology_checked() -> Result<[bool; 3]> {
+    let mut populated = [false; 3];
+    for slot in 0..3u32 {
+        let gpio = GPIO_PLUG_BASE + slot;
+        let root = format!("/sys/class/gpio/gpio{gpio}");
+        let value_path = format!("{root}/value");
+        if !Path::new(&value_path).exists() {
+            let export_result = fs::write("/sys/class/gpio/export", gpio.to_string());
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while !Path::new(&value_path).exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if !Path::new(&value_path).exists() {
+                return Err(HalError::Platform(format!(
+                    "Amlogic plug-detect GPIO{gpio} did not appear after export: {export_result:?}"
+                )));
+            }
+        }
+        let direction_path = format!("{root}/direction");
+        fs::write(&direction_path, "in").map_err(|error| {
+            HalError::Platform(format!(
+                "Amlogic plug-detect GPIO{gpio} direction input failed: {error}"
+            ))
+        })?;
+        let direction = fs::read_to_string(&direction_path).map_err(|error| {
+            HalError::Platform(format!(
+                "Amlogic plug-detect GPIO{gpio} direction readback failed: {error}"
+            ))
+        })?;
+        if direction.trim() != "in" {
+            return Err(HalError::Platform(format!(
+                "Amlogic plug-detect GPIO{gpio} direction readback was {:?}, expected input",
+                direction.trim()
+            )));
+        }
+        let value = fs::read_to_string(&value_path).map_err(|error| {
+            HalError::Platform(format!(
+                "Amlogic plug-detect GPIO{gpio} read failed: {error}"
+            ))
+        })?;
+        populated[slot as usize] = match value.trim() {
+            "0" => false,
+            "1" => true,
+            other => {
+                return Err(HalError::Platform(format!(
+                    "Amlogic plug-detect GPIO{gpio} returned invalid value {other:?}"
+                )))
+            }
+        };
+    }
+    Ok(populated)
+}
+
 impl AmlogicPlatform {
     /// Create a new Amlogic platform.
     ///
-    /// Auto-detects the specific model (S19 XP, S21, etc.) by probing
-    /// hardware characteristics.
+    /// Resolve enough file-backed identity to emit a precise refusal. The
+    /// generic `Platform` lifecycle cannot carry the retained bus-1 owner, so
+    /// production Amlogic mining must use the native serial engine.
     pub fn new() -> Result<Self> {
         // Verify we're actually on Amlogic
         if !["/dev/ttyS1", "/dev/ttyS2", "/dev/ttyS4"]
@@ -189,42 +566,17 @@ impl AmlogicPlatform {
             ));
         }
 
-        // BOS-3528 pinmux fix: export GPIO 476/477 BEFORE any I2C access.
-        // This changes the Amlogic pinmux away from PWM/other functions that
-        // corrupt the I2C bus. Verified from BraiinsOS S37board_setup on S21.
-        init_pinmux();
-
         // Detect specific model
-        let mut config = detect_amlogic_model()?;
+        let config = detect_amlogic_model()?;
 
-        // W2A.2 PIC1704 wire-up (2026-05-09):
-        //
-        // Amlogic carriers ship two distinct hashboard families:
-        //   - `AMLCtrl_BHB42XXX` (S19j Pro Amlogic — the new PIC1704 path)
-        //   - `AMLCtrl_BHB56xxx` (S19k Pro / S21 — existing dsPIC33EP path)
-        //
-        // The default voltage controller chosen by `detect_amlogic_model`
-        // (NoPic for S21 NoPic, Dspic33Ep for S19k Pro) is preserved
-        // unless `/etc/subtype` says BHB42XXX AND a 0x20 ACK probe
-        // succeeds on `AMLOGIC_HASHBOARD_EEPROM_BUS`. This ensures
-        // s19jpro (sustained-mining unit running existing dsPIC path)
-        // and s21 / .78 are never silently re-routed.
-        let subtype = read_subtype();
-        let kind = classify_with_probe(subtype.as_deref(), AMLOGIC_HASHBOARD_EEPROM_BUS);
-        config.voltage_controller = kind;
-        tracing::info!(
-            platform = %config.name,
-            chains = config.chains.len(),
-            has_pic = config.has_pic,
-            subtype = %subtype.as_deref().unwrap_or("<missing>"),
-            voltage_controller = kind.as_str(),
-            "Amlogic platform initialized"
-        );
-
-        Ok(Self { config })
+        Err(HalError::Platform(format!(
+            "{} requires the native serial-mining lifecycle with retained Amlogic power/thermal ownership; generic Platform construction is refused",
+            config.name
+        )))
     }
 
-    /// Create with explicit config (for testing or manual override).
+    /// Create with explicit config for host-only trait tests.
+    #[cfg(test)]
     pub fn with_config(config: PlatformConfig) -> Self {
         Self { config }
     }
@@ -289,7 +641,10 @@ impl Platform for AmlogicPlatform {
     }
 
     fn open_fan(&self) -> Result<Box<dyn FanAccess>> {
-        Ok(Box::new(AmlogicFan::new()?))
+        Err(HalError::Platform(
+            "generic Amlogic fan construction is refused; native mining must consume AmlogicNoPicAdmission"
+                .to_string(),
+        ))
     }
 
     fn open_gpio(&self) -> Result<Box<dyn GpioAccess>> {
@@ -297,9 +652,9 @@ impl Platform for AmlogicPlatform {
     }
 
     fn voltage_controller(&self) -> VoltageControllerKind {
-        // Cached from `new()` / `with_config()`. Defaults preserve the
-        // existing s19jpro dsPIC path; only `AMLCtrl_BHB42XXX` +
-        // 0x20 ACK upgrades to PIC1704. See `new()` doc comment.
+        // Production generic construction is refused above. Host-only trait
+        // tests preserve exactly the explicit PlatformConfig classification;
+        // the native serial lifecycle resolves controller authority itself.
         self.config.voltage_controller
     }
 }
@@ -368,10 +723,12 @@ impl ChainAccess for AmlogicChainAccess {
 /// Source of falling-edge counts for one fan tach line. Abstracted so
 /// unit tests can mock the edge stream without real GPIO hardware.
 pub(crate) trait FanTachSource: Send + Sync {
-    /// Sample falling edges over the given window and return the count.
+    /// Sample falling edges over the given window and return the count. Any
+    /// kernel/poll/read failure invalidates the complete sample; partial counts
+    /// must never be promoted to cooling evidence.
     /// Must be a non-blocking-style budget: implementations should bound
     /// the call to `window` regardless of whether edges arrive.
-    fn sample_falling_edges(&self, window: Duration) -> u32;
+    fn sample_falling_edges(&self, window: Duration) -> std::io::Result<u32>;
 }
 
 /// Sysfs-backed falling-edge counter for `/sys/class/gpio/gpioN/value`.
@@ -440,7 +797,12 @@ impl SysfsFallingEdgeCounter {
 
         // Drain any latched event so the first poll() represents the
         // first edge inside the sample window.
-        let _ = drain_value_fd(fd.as_raw_fd());
+        drain_value_fd(fd.as_raw_fd()).map_err(|e| {
+            HalError::Fan(format!(
+                "fan tach gpio{} initial value read failed: {}",
+                gpio, e
+            ))
+        })?;
 
         Ok(Self { gpio, fd })
     }
@@ -456,13 +818,39 @@ fn drain_value_fd(fd: i32) -> std::io::Result<()> {
         if libc::lseek(fd, 0, libc::SEEK_SET) < 0 {
             return Err(io::Error::last_os_error());
         }
-        let _ = libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+        if libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) < 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     Ok(())
 }
 
+/// Classify one sysfs GPIO poll result. Linux kernfs reports a valid sysfs
+/// attribute notification as `POLLPRI|POLLERR`, so `POLLPRI` remains
+/// authoritative even when `POLLERR` accompanies it. Bare `POLLERR`, hangup,
+/// and invalid-descriptor events are evidence failures.
+fn tach_poll_has_edge(revents: libc::c_short) -> std::io::Result<bool> {
+    use std::io;
+    if revents & (libc::POLLHUP | libc::POLLNVAL) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("fan tach poll reported error revents=0x{revents:04X}"),
+        ));
+    }
+    if revents & libc::POLLPRI != 0 {
+        return Ok(true);
+    }
+    if revents & libc::POLLERR != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("fan tach poll reported bare POLLERR revents=0x{revents:04X}"),
+        ));
+    }
+    Ok(false)
+}
+
 impl FanTachSource for SysfsFallingEdgeCounter {
-    fn sample_falling_edges(&self, window: Duration) -> u32 {
+    fn sample_falling_edges(&self, window: Duration) -> std::io::Result<u32> {
         let raw_fd = self.fd.as_raw_fd();
         let deadline = Instant::now() + window;
         let mut edges: u32 = 0;
@@ -472,7 +860,7 @@ impl FanTachSource for SysfsFallingEdgeCounter {
         const MAX_EDGES_PER_WINDOW: u32 = 100_000;
 
         // Make sure we start from a known-clean state.
-        let _ = drain_value_fd(raw_fd);
+        drain_value_fd(raw_fd)?;
 
         loop {
             let remaining = match deadline.checked_duration_since(Instant::now()) {
@@ -493,30 +881,38 @@ impl FanTachSource for SysfsFallingEdgeCounter {
                 if err.raw_os_error() == Some(libc::EINTR) {
                     continue;
                 }
-                tracing::warn!(gpio = self.gpio, error = %err, "fan tach poll() failed");
-                break;
+                return Err(err);
             }
             if rc == 0 {
                 // Timeout — window expired, no further edges.
                 break;
             }
 
-            if pollfd.revents & (libc::POLLPRI | libc::POLLERR) != 0 {
+            if tach_poll_has_edge(pollfd.revents)? {
                 edges = edges.saturating_add(1);
                 if edges >= MAX_EDGES_PER_WINDOW {
-                    tracing::warn!(
-                        gpio = self.gpio,
-                        edges,
-                        "fan tach exceeded MAX_EDGES_PER_WINDOW; aborting sample"
-                    );
-                    break;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "fan tach gpio{} exceeded maximum credible edges per window ({MAX_EDGES_PER_WINDOW})",
+                            self.gpio
+                        ),
+                    ));
                 }
                 // Re-arm the latch so the next falling edge fires POLLPRI again.
-                let _ = drain_value_fd(raw_fd);
+                drain_value_fd(raw_fd)?;
+            } else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "fan tach gpio{} poll woke without POLLPRI (revents=0x{:04X})",
+                        self.gpio, pollfd.revents
+                    ),
+                ));
             }
         }
 
-        edges
+        Ok(edges)
     }
 }
 
@@ -542,16 +938,12 @@ fn edges_to_rpm(edges: u32, window: Duration) -> u32 {
 ///   - duty_cycle range: 0 (off) to 100000 (100%)
 ///   - pwmchip0 at FF802000 (AO PWM), pwmchip4 at FFD1B000 (EE PWM)
 ///
-/// Tach (W3.2, 2026-05-07): falling-edge counter on gpio447-450
-/// (`SysfsFallingEdgeCounter`). When at least one tach line exports
-/// successfully, `tach_available()` flips to true and the thermal
-/// controller can act on real fan health (5-deadly-conditions
-/// FanFailure path)., when
-/// PWM > 0 but the GPIO sample sees zero edges (e.g. floating line on
-/// a board with the fan unplugged) we still return the synthesized
-/// floor so we don't hand the thermal controller a 0 RPM that would
-/// trigger FanFailure within 15 s on a unit that actually has fans
-/// spinning but a wiring fault on the tach pin.
+/// Tach uses falling-edge counters on gpio447-450. Production construction is
+/// atomic at the capability boundary: all four channels must arm before a fan
+/// controller is returned. A zero-edge sample remains zero RPM. This matches
+/// the held S21 Pro `single_board_test` binary, whose `fan_get_realtime_speed`
+/// returns zero for a zero FPGA tach byte and whose `fan_speed_check` treats
+/// low/zero RPM as a protection failure instead of inventing a positive value.
 struct AmlogicFan {
     /// Rear fans duty_cycle path
     rear_duty_path: String,
@@ -559,10 +951,17 @@ struct AmlogicFan {
     front_duty_path: String,
     /// PWM period in nanoseconds (10kHz = 100000ns)
     period_ns: u32,
-    /// One falling-edge counter per fan slot (0..GPIO_FAN_TACH_COUNT).
-    /// `None` means the slot's GPIO failed to export — that fan falls
-    /// back to the synthesized RPM floor on `get_rpm()`.
-    tach_sources: Vec<Option<Box<dyn FanTachSource>>>,
+    /// Complete falling-edge counter set for fan slots 0..3. The fixed-size
+    /// representation prevents a partially observable cooling controller from
+    /// escaping production acquisition.
+    tach_sources: [Box<dyn FanTachSource>; GPIO_FAN_TACH_COUNT],
+    /// Monotonic health latch. Acquisition starts healthy; any typed sample or
+    /// worker-creation error permanently revokes tach availability for this
+    /// owner. In unwind builds a worker panic is also caught and revoked. The
+    /// production abort profile instead delegates programmer-fault containment
+    /// to the daemon crash-safe state and watchdog because destructors do not
+    /// run after an abort.
+    tach_healthy: AtomicBool,
     /// Sample window passed to each `FanTachSource::sample_falling_edges`.
     /// Owned by the struct so tests can shorten it.
     sample_window: Duration,
@@ -570,6 +969,20 @@ struct AmlogicFan {
 
 /// PWM period for Amlogic fans: 100000ns = 10kHz (confirmed on S21 probe)
 const AMLOGIC_PWM_PERIOD_NS: u32 = 100_000;
+
+/// Minimum commanded duty while an air-cooled Amlogic miner owns hash power.
+/// Current shipped S21/S21 Pro profiles use 10%; lower config values are idle
+/// policy, not proof that an energized chassis can safely stop its fans. The
+/// pre-energization motion gate remains authoritative if a particular fan does
+/// not move at this command.
+pub const REQUIRED_AIRFLOW_MIN_PWM: u8 = 10;
+
+/// Conservative minimum credible tach reading for an energized air-cooled
+/// Amlogic chassis. This is an admission floor, not a target fan curve: one
+/// stray edge in the one-second sample window (~30 RPM at 2 PPR) must not prove
+/// cooling motion. Future board descriptions can replace this platform default
+/// with PWM-dependent calibrated capability data.
+pub const REQUIRED_AIRFLOW_MIN_RPM: u32 = 300;
 
 /// Convert PWM percent (0-100) to nanosecond duty cycle for sysfs PWM.
 /// Shared by Amlogic + BeagleBone fan paths so the kernel-write conversion
@@ -605,48 +1018,42 @@ impl AmlogicFan {
             }
         }
 
-        // Try to bring up gpio447-450 as falling-edge tach inputs.
-        // Each slot can fail independently — a single failed export is
-        // logged and the slot falls back to synthesized RPM, but the
-        // rest still report real edges.
-        let mut tach_sources: Vec<Option<Box<dyn FanTachSource>>> =
-            Vec::with_capacity(GPIO_FAN_TACH_COUNT as usize);
-        let mut any_tach_alive = false;
+        // Bring up gpio447-450 as one complete cooling-observation capability.
+        // Mining must not be admitted with a controller that can observe only a
+        // subset of the fans.
+        let mut tach_sources: Vec<Box<dyn FanTachSource>> = Vec::with_capacity(GPIO_FAN_TACH_COUNT);
         for slot in 0..GPIO_FAN_TACH_COUNT {
-            let gpio = GPIO_FAN_TACH_BASE + slot;
-            match SysfsFallingEdgeCounter::export(gpio) {
-                Ok(counter) => {
-                    tach_sources.push(Some(Box::new(counter)));
-                    any_tach_alive = true;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        slot,
-                        gpio,
-                        error = %e,
-                        "Amlogic fan tach: GPIO export failed; slot will report synthesized RPM"
-                    );
-                    tach_sources.push(None);
-                }
-            }
+            let gpio = GPIO_FAN_TACH_BASE + slot as u32;
+            let counter = SysfsFallingEdgeCounter::export(gpio).map_err(|e| {
+                HalError::Fan(format!(
+                    "Amlogic fan tach capability incomplete: slot {} gpio{} failed: {}",
+                    slot, gpio, e
+                ))
+            })?;
+            tach_sources.push(Box::new(counter));
         }
 
-        if any_tach_alive {
-            tracing::info!(
-                tach_count = tach_sources.iter().filter(|s| s.is_some()).count(),
-                "Amlogic fan tach: GPIO falling-edge counters armed on gpio447-450"
-            );
-        } else {
-            tracing::warn!(
-                "Amlogic fan tach: NO GPIO tach lines exported — falling back to synthesized RPM"
-            );
-        }
+        let tach_sources: [Box<dyn FanTachSource>; GPIO_FAN_TACH_COUNT] =
+            tach_sources
+                .try_into()
+                .map_err(|sources: Vec<Box<dyn FanTachSource>>| {
+                    HalError::Fan(format!(
+                        "Amlogic fan tach capability incomplete: armed {} of {} channels",
+                        sources.len(),
+                        GPIO_FAN_TACH_COUNT
+                    ))
+                })?;
+        tracing::info!(
+            tach_count = GPIO_FAN_TACH_COUNT,
+            "Amlogic fan tach: complete GPIO falling-edge counter set armed"
+        );
 
         Ok(Self {
             rear_duty_path: rear_path,
             front_duty_path: front_path,
             period_ns: AMLOGIC_PWM_PERIOD_NS,
             tach_sources,
+            tach_healthy: AtomicBool::new(true),
             sample_window: Duration::from_millis(TACH_SAMPLE_MS),
         })
     }
@@ -654,39 +1061,74 @@ impl AmlogicFan {
     /// Test-only constructor that injects mock tach sources. Lets unit
     /// tests assert RPM math without poking real GPIO sysfs.
     #[cfg(test)]
-    fn for_test(tach_sources: Vec<Option<Box<dyn FanTachSource>>>) -> Self {
+    fn for_test(tach_sources: [Box<dyn FanTachSource>; GPIO_FAN_TACH_COUNT]) -> Self {
         Self {
             rear_duty_path: String::new(),
             front_duty_path: String::new(),
             period_ns: AMLOGIC_PWM_PERIOD_NS,
             tach_sources,
+            tach_healthy: AtomicBool::new(true),
             sample_window: Duration::from_millis(10),
         }
     }
 
-    /// Sample one fan slot. Returns the measured RPM, or the
-    /// synthesized floor if the slot has no tach source or the sample
-    /// returned zero edges while PWM > 0.
-    fn sample_slot_rpm(&self, slot: usize, pwm: u8) -> u32 {
-        let measured = match self.tach_sources.get(slot).and_then(|s| s.as_ref()) {
-            Some(src) => edges_to_rpm(
-                src.sample_falling_edges(self.sample_window),
-                self.sample_window,
-            ),
-            None => 0,
+    /// Sample one fan slot. Zero edges deliberately remain zero RPM: callers
+    /// must never confuse absence of cooling evidence with evidence of motion.
+    fn sample_slot_rpm(&self, slot: usize) -> u32 {
+        let Some(source) = self.tach_sources.get(slot) else {
+            self.tach_healthy.store(false, Ordering::Release);
+            return 0;
         };
-
-        if measured > 0 {
-            return measured;
+        match source.sample_falling_edges(self.sample_window) {
+            Ok(edges) => edges_to_rpm(edges, self.sample_window),
+            Err(error) => {
+                self.tach_healthy.store(false, Ordering::Release);
+                tracing::error!(slot, %error, "Amlogic fan tach sample invalidated");
+                0
+            }
         }
+    }
 
-        //: if PWM > 0, we
-        // must NEVER hand 0 RPM to the thermal controller — that
-        // path is the FanFailure trigger and would kill the unit
-        // within 15 s on a wiring fault that doesn't actually mean
-        // the fan stopped. Real fan death still surfaces because
-        // chip temp climbs and the temperature path takes over.
-        synthesized_rpm_floor(pwm)
+    /// Observe every tach input in one shared wall-clock window. Sampling the
+    /// four one-second counters sequentially used to stall the serial miner for
+    /// roughly four seconds and a later telemetry read repeated the stall.
+    fn sample_all_rpm(&self) -> Vec<(u8, u32)> {
+        std::thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(self.tach_sources.len());
+            for slot in 0..self.tach_sources.len() {
+                let worker = std::thread::Builder::new()
+                    .name(format!("amlogic-fan-tach-{slot}"))
+                    .spawn_scoped(scope, move || self.sample_slot_rpm(slot));
+                match worker {
+                    Ok(worker) => workers.push((slot, Some(worker))),
+                    Err(error) => {
+                        self.tach_healthy.store(false, Ordering::Release);
+                        tracing::error!(
+                            slot,
+                            %error,
+                            "Amlogic fan tach sampler thread could not start; reporting zero RPM"
+                        );
+                        workers.push((slot, None));
+                    }
+                }
+            }
+            workers
+                .into_iter()
+                .map(|(slot, worker)| {
+                    let rpm = worker.map_or(0, |worker| {
+                        worker.join().unwrap_or_else(|_| {
+                            self.tach_healthy.store(false, Ordering::Release);
+                            tracing::error!(
+                                slot,
+                                "Amlogic fan tach sampler panicked in an unwind build; reporting zero RPM"
+                            );
+                            0
+                        })
+                    });
+                    (slot as u8, rpm)
+                })
+                .collect()
+        })
     }
 }
 
@@ -743,35 +1185,13 @@ impl FanAccess for AmlogicFan {
     }
 
     fn get_rpm(&self) -> u32 {
-        // W3.2 (2026-05-07): real GPIO falling-edge tach on gpio447-450.
-        // The legacy `900 + pwm*51` synthesized formula is gone — the
-        // thermal controller now sees real fan RPM and can fire the
-        // 5-deadly-conditions FanFailure path. The synthesized floor
-        // still kicks in for unexported slots and zero-edge windows
-        // while PWM > 0.
-        //
-        // Convention used by the upstream thermal controller: return
-        // the slowest non-zero RPM across all slots so a single
-        // failing fan can latch the FanFailure debounce. If a slot's
-        // tach is unavailable we fall back to synthesized RPM for
-        // that slot (and that slot won't dominate the min unless all
-        // others are also synthesized).
-        let pwm = self.get_speed_pwm();
-        if self.tach_sources.is_empty() {
-            return synthesized_rpm_floor(pwm);
-        }
-        // Use min-non-zero across slots. Fall back to synthesized
-        // floor so we never return 0 when PWM > 0.
-        let mut min_rpm: Option<u32> = None;
-        for slot in 0..self.tach_sources.len() {
-            let rpm = self.sample_slot_rpm(slot, pwm);
-            min_rpm = Some(min_rpm.map_or(rpm, |m| m.min(rpm)));
-        }
-        match min_rpm {
-            Some(0) => synthesized_rpm_floor(pwm),
-            Some(r) => r,
-            None => synthesized_rpm_floor(pwm),
-        }
+        // Return the slowest RPM including zero. One stopped fan must dominate
+        // the aggregate used by the thermal protection state machine.
+        self.sample_all_rpm()
+            .into_iter()
+            .map(|(_, rpm)| rpm)
+            .min()
+            .unwrap_or(0)
     }
 
     fn get_speed_pwm(&self) -> u8 {
@@ -786,15 +1206,7 @@ impl FanAccess for AmlogicFan {
         // S21 has 4 fans (GPIO tach at 447-450). Sample each slot
         // independently so the dashboard / per-fan UI can flag the
         // exact fan that's slowing down.
-        let pwm = self.get_speed_pwm();
-        if self.tach_sources.is_empty() {
-            return (0..GPIO_FAN_TACH_COUNT as u8)
-                .map(|id| (id, synthesized_rpm_floor(pwm)))
-                .collect();
-        }
-        (0..self.tach_sources.len())
-            .map(|slot| (slot as u8, self.sample_slot_rpm(slot, pwm)))
-            .collect()
+        self.sample_all_rpm()
     }
 
     fn fan_count(&self) -> u8 {
@@ -803,12 +1215,9 @@ impl FanAccess for AmlogicFan {
     }
 
     fn tach_available(&self) -> bool {
-        // True when at least one tach line armed successfully. The
-        // thermal controller uses this flag to decide whether to act
-        // on RPM=0 (5-deadly-conditions FanFailure) or rely on
-        // temperature thresholds alone. W3.2 flips this from the
-        // hard-coded `false` to a live check.
-        self.tach_sources.iter().any(|slot| slot.is_some())
+        // AmlogicFan can only be constructed after all four channels arm, and
+        // any later sampler failure permanently revokes this owner's evidence.
+        self.tach_healthy.load(Ordering::Acquire)
     }
 }
 
@@ -868,20 +1277,30 @@ impl GpioAccess for AmlogicGpio {
 /// matters on a true cold boot — which is exactly the production path this
 /// unblocks.
 ///
-/// GPIO is necessary but not sufficient for native cold boot. BraiinsOS/Amlogic
-/// U-Boot also runs an APW enable sequence on I2C bus 1, address 0x1f:
+/// GPIO is necessary but not sufficient for native cold boot. A captured
+/// S19K Pro `a lab unit` BraiinsOS NAND environment contains these U-Boot `preboot`
+/// commands while U-Boot's current I2C adapter is selected:
 ///   `i2c mw 1f 3.1 0 2; i2c mw 1f 1.1 fc 2`
+///
+/// The environment contains no `i2c dev 1`, so it does not establish that
+/// U-Boot's adapter is Linux `/dev/i2c-1`. It is not S21 evidence and does not
+/// prove device acknowledgement, APW output state, or rail behavior.
 ///
 /// Keep this GPIO gate first because it is the hard board-level enable.
 const GPIO_PSU_ENABLE: u32 = 437;
 
-/// APW PSU I2C bus/address from the extracted S21 U-Boot preboot environment.
-const APW_PMBUS_I2C_BUS: u8 = 1;
+/// Linux adapter selected by DCENT's current Amlogic management-fabric policy.
+/// This bus number is not derived from the captured U-Boot environment.
+pub const AMLOGIC_MANAGEMENT_I2C_BUS: u8 = 1;
 const APW_PMBUS_ADDR: u8 = 0x1f;
 
-/// Exact payloads represented by U-Boot:
-///   `i2c mw 1f 3.1 0 2`  -> register 0x03, two zero bytes
-///   `i2c mw 1f 1.1 fc 2` -> register 0x01, two 0xfc bytes
+/// Current Linux raw-write translation of the captured U-Boot command text:
+///   `[0x03, 0x00, 0x00]`
+///   `[0x01, 0xfc, 0xfc]`
+///
+/// U-Boot `i2c mw` describes memory-write operations. Without the exact vendor
+/// implementation or a bus trace, the command text does not prove these bytes
+/// were grouped into identical wire transactions.
 const APW_PMBUS_CLEAR_FAULTS: [u8; 3] = [0x03, 0x00, 0x00];
 const APW_PMBUS_OPERATION_ENABLE: [u8; 3] = [0x01, 0xfc, 0xfc];
 
@@ -895,6 +1314,198 @@ const PMBUS_STATUS_WORD: u8 = 0x79;
 /// Verified from BraiinsOS S37board_setup: exported as "in" direction.
 const GPIO_PINMUX_FIX: [u32; 2] = [476, 477];
 
+/// Retained single owner of the Amlogic management fabric. APW power commands
+/// and LM75 telemetry must use this service for the complete hardware session;
+/// callers never receive its generic I2C handle.
+#[derive(Clone)]
+pub struct AmlogicPowerThermalService {
+    i2c: I2cServiceHandle,
+    required_slots: [bool; 3],
+}
+
+/// Cloneable, operation-free capability used by teardown guards to fence all
+/// future bus-1 mutations before they cut GPIO437.
+#[derive(Clone)]
+pub struct AmlogicPowerThermalFence {
+    i2c: I2cServiceHandle,
+}
+
+impl AmlogicPowerThermalFence {
+    pub fn latch_terminal_safe_off(&self) -> TerminalSafeOffTransition {
+        self.i2c.latch_terminal_safe_off()
+    }
+}
+
+/// Software evidence that both fixed APW enable writes completed. Optional
+/// STATUS_WORD is diagnostic only and does not prove physical rail voltage.
+#[derive(Debug, Clone, Copy)]
+pub struct ApwEnableReceipt {
+    writes_completed_at: Instant,
+    status_word: Option<u16>,
+}
+
+impl ApwEnableReceipt {
+    pub fn writes_completed_at(self) -> Instant {
+        self.writes_completed_at
+    }
+
+    pub fn status_word(self) -> Option<u16> {
+        self.status_word
+    }
+}
+
+impl AmlogicPowerThermalService {
+    /// Reserve `/dev/i2c-1`, perform the checked BOS-3528 pinmux preparation
+    /// under that reservation, and start one kernel-fd-only service.
+    fn spawn(admission: &AmlogicNoPicAdmission) -> Result<Self> {
+        let i2c = spawn_i2c_service_no_register_touch_with_denylist_and_reserved_preparation(
+            AMLOGIC_MANAGEMENT_I2C_BUS,
+            Vec::new(),
+            prepare_management_i2c_pinmux,
+        )
+        .map_err(|error| {
+            HalError::Platform(format!(
+                "failed to reserve Amlogic management I2C fabric: {error}"
+            ))
+        })?;
+        // A synchronous control round-trip proves the worker opened its fd and
+        // accepted the fixed timeout before any power or telemetry operation.
+        i2c.set_timeout(10)?;
+        Ok(Self {
+            i2c,
+            required_slots: admission.populated_slots(),
+        })
+    }
+
+    pub fn terminal_fence(&self) -> AmlogicPowerThermalFence {
+        AmlogicPowerThermalFence {
+            i2c: self.i2c.clone(),
+        }
+    }
+
+    /// Enable GPIO437 and issue the two fixed DCENT APW compatibility writes
+    /// derived from captured S19K Pro `a lab unit` U-Boot command text. Any failure
+    /// after the GPIO mutation performs checked GPIO rollback before returning.
+    pub fn enable_psu(&self) -> Result<ApwEnableReceipt> {
+        if let Err(enable_error) = enable_psu_gpio() {
+            return match disable_psu_checked() {
+                Ok(_) => Err(enable_error),
+                Err(rollback_error) => Err(HalError::Platform(format!(
+                    "PSU GPIO enable failed ({enable_error}); checked rollback also failed ({rollback_error})"
+                ))),
+            };
+        }
+        if let Err(enable_error) = self.enable_apw() {
+            return match disable_psu_checked() {
+                Ok(_) => Err(enable_error),
+                Err(rollback_error) => Err(HalError::Platform(format!(
+                    "PSU PMBus enable failed ({enable_error}); checked rollback also failed ({rollback_error})"
+                ))),
+            };
+        }
+
+        let writes_completed_at = Instant::now();
+        std::thread::sleep(Duration::from_secs(2));
+        let status_word = match self.read_apw_status_word() {
+            Ok(status) => {
+                tracing::info!(
+                    bus = AMLOGIC_MANAGEMENT_I2C_BUS,
+                    addr = format_args!("0x{:02X}", APW_PMBUS_ADDR),
+                    status = format_args!("0x{:04X}", status),
+                    "Amlogic APW enable writes completed; optional STATUS_WORD available"
+                );
+                Some(status)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    bus = AMLOGIC_MANAGEMENT_I2C_BUS,
+                    addr = format_args!("0x{:02X}", APW_PMBUS_ADDR),
+                    %error,
+                    "Amlogic APW enable writes completed; optional STATUS_WORD unavailable"
+                );
+                None
+            }
+        };
+        Ok(ApwEnableReceipt {
+            writes_completed_at,
+            status_word,
+        })
+    }
+
+    fn enable_apw(&self) -> Result<()> {
+        self.i2c.transaction_mutating(
+            I2cMutationLabel::Energize,
+            APW_PMBUS_ADDR,
+            vec![
+                I2cTransactionStep::Write(APW_PMBUS_CLEAR_FAULTS.to_vec()),
+                I2cTransactionStep::SleepMs(10),
+                I2cTransactionStep::Write(APW_PMBUS_OPERATION_ENABLE.to_vec()),
+                I2cTransactionStep::SleepMs(200),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn read_apw_status_word(&self) -> Result<u16> {
+        let bytes = self.i2c.write_read_mutating(
+            I2cMutationLabel::QueryPrelude,
+            APW_PMBUS_ADDR,
+            &[PMBUS_STATUS_WORD],
+            2,
+        )?;
+        let bytes: [u8; 2] = bytes.try_into().map_err(|bytes: Vec<u8>| HalError::I2c {
+            bus: AMLOGIC_MANAGEMENT_I2C_BUS,
+            addr: APW_PMBUS_ADDR,
+            detail: format!(
+                "APW STATUS_WORD returned {} byte(s); exactly 2 required",
+                bytes.len()
+            ),
+        })?;
+        Ok(u16::from_le_bytes(bytes))
+    }
+
+    /// Capture all statically mapped board sensors through the same retained
+    /// fabric owner. Unpowered/unpopulated endpoints remain explicit evidence
+    /// in the returned snapshot rather than causing an adapter reset.
+    pub fn read_board_temperatures(&self, deadline: Instant) -> AmlogicTemperatureSnapshot {
+        let mut readings = Vec::with_capacity(AMLOGIC_TEMPERATURE_ENDPOINTS.len());
+        let mut unavailable = Vec::new();
+        for endpoint in AMLOGIC_TEMPERATURE_ENDPOINTS {
+            match self
+                .i2c
+                .read_lm75_temperature_register_at(endpoint.address, deadline)
+            {
+                // LM75-family wire values top out below 128 C. Preserve every
+                // high observation as hot evidence; 125 C must never be hidden
+                // as "unavailable" while a cooler endpoint survives.
+                Ok(register) if register.celsius() >= -40.0 => {
+                    readings.push(AmlogicTemperatureReading { endpoint, register });
+                }
+                Ok(register) => unavailable.push(AmlogicTemperatureUnavailable {
+                    endpoint,
+                    reason: AmlogicTemperatureUnavailableReason::BelowAdmittedRange {
+                        raw_register: register.raw_be(),
+                    },
+                    detail: format!(
+                        "temperature {:.4} C is below the admitted board-sensor range",
+                        register.celsius()
+                    ),
+                }),
+                Err(error) => unavailable.push(AmlogicTemperatureUnavailable {
+                    endpoint,
+                    reason: AmlogicTemperatureUnavailableReason::from_hal_error(&error),
+                    detail: error.to_string(),
+                }),
+            }
+        }
+        AmlogicTemperatureSnapshot {
+            required_slots: self.required_slots,
+            readings,
+            unavailable,
+        }
+    }
+}
+
 /// Enable the APW PSU output for cold boot.
 ///
 /// On S21, the PSU bring-up has two layers (polarity corrected 2026-05-21):
@@ -906,30 +1517,6 @@ const GPIO_PINMUX_FIX: [u32; 2] = [476, 477];
 /// Stock/VNish userspace drives gpio437 HIGH (`echo 1`) to enable hashboard
 /// power. Native DCENT_OS must also replay the APW I2C sequence because there
 /// is no bosminer/BraiinsOS rootfs in the final boot.
-pub fn enable_psu() -> Result<()> {
-    if let Err(enable_error) = enable_psu_gpio() {
-        return match disable_psu_checked() {
-            Ok(_) => Err(enable_error),
-            Err(rollback_error) => Err(HalError::Platform(format!(
-                "PSU GPIO enable failed ({enable_error}); checked rollback also failed ({rollback_error})"
-            ))),
-        };
-    }
-    if let Err(e) = enable_psu_pmbus() {
-        return match disable_psu_checked() {
-            Ok(_) => Err(e),
-            Err(rollback_error) => Err(HalError::Platform(format!(
-                "PSU PMBus enable failed ({e}); checked rollback also failed ({rollback_error})"
-            ))),
-        };
-    }
-
-    // Wait for PSU to stabilize (APW PSU soft-start is ~1 second).
-    std::thread::sleep(Duration::from_secs(2));
-
-    Ok(())
-}
-
 fn enable_psu_gpio() -> Result<()> {
     let gpio_path = format!("/sys/class/gpio/gpio{}/value", GPIO_PSU_ENABLE);
 
@@ -940,11 +1527,11 @@ fn enable_psu_gpio() -> Result<()> {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // Set as output, drive HIGH to enable PSU (active HIGH,  Q10).
-    // Do NOT write the `active_low` sysfs file — stock/VNish leave it at the
-    // kernel default (0), so `value=1` means the pin is electrically HIGH.
+    // Pin raw active-high mode explicitly. A stale active_low=1 would invert
+    // logical sysfs readback and could turn a requested safety LOW into HIGH.
+    ensure_psu_active_low_disabled_checked()?;
     let dir_path = format!("/sys/class/gpio/gpio{}/direction", GPIO_PSU_ENABLE);
-    fs::write(&dir_path, "out")
+    fs::write(&dir_path, "low")
         .map_err(|e| HalError::Platform(format!("PSU GPIO direction: {}", e)))?;
     fs::write(&gpio_path, "1")
         .map_err(|e| HalError::Platform(format!("PSU GPIO enable: {}", e)))?;
@@ -965,48 +1552,26 @@ fn enable_psu_gpio() -> Result<()> {
     Ok(())
 }
 
-/// Replay the APW I2C/PMBus enable sequence from the Amlogic U-Boot `preboot`.
-///
-/// Evidence source:
-/// `preboot=...;i2c mw 1f 3.1 0 2;i2c mw 1f 1.1 fc 2;...`
-///
-/// This is intentionally narrower than a generic PMBus driver:
-/// - writes only the two live-observed APW registers at 0x1f,
-/// - does not touch TAS5782M DAC addresses,
-/// - treats generic STATUS_WORD readback as optional because APW firmware
-///   telemetry support varies by revision.
-pub fn enable_psu_pmbus() -> Result<()> {
-    init_pinmux();
-
-    let mut bus = I2cBus::open(APW_PMBUS_I2C_BUS)?;
-    bus.set_slave(APW_PMBUS_ADDR)?;
-    bus.write(&APW_PMBUS_CLEAR_FAULTS)?;
-    std::thread::sleep(Duration::from_millis(10));
-    bus.write(&APW_PMBUS_OPERATION_ENABLE)?;
-    std::thread::sleep(Duration::from_millis(200));
-
-    match read_pmbus_status_word(&mut bus) {
-        Ok(status) => tracing::info!(
-            bus = APW_PMBUS_I2C_BUS,
-            addr = format_args!("0x{:02X}", APW_PMBUS_ADDR),
-            status = format_args!("0x{:04X}", status),
-            "Amlogic APW PMBus enable sequence completed"
-        ),
-        Err(e) => tracing::warn!(
-            bus = APW_PMBUS_I2C_BUS,
-            addr = format_args!("0x{:02X}", APW_PMBUS_ADDR),
-            error = %e,
-            "Amlogic APW PMBus enable writes completed; STATUS_WORD read unavailable"
-        ),
+fn read_psu_active_low_disabled_checked() -> Result<()> {
+    let path = format!("/sys/class/gpio/gpio{}/active_low", GPIO_PSU_ENABLE);
+    let value = fs::read_to_string(&path)
+        .map_err(|error| HalError::Platform(format!("PSU GPIO active_low readback: {error}")))?;
+    if value.trim() == "0" {
+        Ok(())
+    } else {
+        Err(HalError::Platform(format!(
+            "PSU GPIO {} active_low readback was {:?}, expected raw active-high mode 0",
+            GPIO_PSU_ENABLE,
+            value.trim()
+        )))
     }
-
-    Ok(())
 }
 
-fn read_pmbus_status_word(bus: &mut I2cBus) -> Result<u16> {
-    let mut buf = [0u8; 2];
-    bus.write_read(&[PMBUS_STATUS_WORD], &mut buf)?;
-    Ok(u16::from_le_bytes(buf))
+fn ensure_psu_active_low_disabled_checked() -> Result<()> {
+    let path = format!("/sys/class/gpio/gpio{}/active_low", GPIO_PSU_ENABLE);
+    fs::write(&path, "0")
+        .map_err(|error| HalError::Platform(format!("PSU GPIO active_low=0: {error}")))?;
+    read_psu_active_low_disabled_checked()
 }
 
 /// Checked software safe-off evidence for GPIO437. This proves that the LOW
@@ -1031,6 +1596,7 @@ impl PsuSafeOffReceipt {
 /// Disable the APW PSU output and require a checked LOW readback.
 pub fn disable_psu_checked() -> Result<PsuSafeOffReceipt> {
     let gpio_path = format!("/sys/class/gpio/gpio{}/value", GPIO_PSU_ENABLE);
+    ensure_psu_active_low_disabled_checked()?;
     // Drive LOW to disable PSU (active HIGH,  Q10 — corrected 2026-05-21).
     fs::write(&gpio_path, "0")
         .map_err(|e| HalError::Platform(format!("PSU GPIO disable: {}", e)))?;
@@ -1060,6 +1626,7 @@ pub fn disable_psu() -> Result<()> {
 
 /// Read GPIO437 without converting I/O or parse failures into a false `off`.
 pub fn read_psu_enabled_checked() -> Result<bool> {
+    read_psu_active_low_disabled_checked()?;
     let gpio_path = format!("/sys/class/gpio/gpio{}/value", GPIO_PSU_ENABLE);
     let value = fs::read_to_string(&gpio_path)
         .map_err(|error| HalError::Platform(format!("PSU GPIO readback: {error}")))?;
@@ -1082,29 +1649,60 @@ pub fn is_psu_enabled() -> bool {
     read_psu_enabled_checked().unwrap_or(false)
 }
 
-/// Initialize GPIO pinmux to prevent I2C bus corruption (BOS-3528).
-///
-/// On Amlogic A113D, GPIO 476 (I2C_SCL) and 477 (I2C_SDA) must be exported
-/// before any I2C bus access. Exporting them switches the pinmux from the
-/// default function (which conflicts with PWM) to GPIO, allowing the I2C
-/// controller to work correctly.
-///
-/// Verified from BraiinsOS S37board_setup on live S21 at .135 (2026-04-12).
-fn init_pinmux() {
+/// Checked BOS-3528 pinmux preparation. This runs only inside the bus-1 fabric
+/// reservation, before the worker opens `/dev/i2c-1`.
+fn prepare_management_i2c_pinmux() -> std::io::Result<()> {
     let export_path = "/sys/class/gpio/export";
-    for gpio in &GPIO_PINMUX_FIX {
+    for gpio in GPIO_PINMUX_FIX {
         let gpio_dir = format!("/sys/class/gpio/gpio{}", gpio);
-        if !std::path::Path::new(&gpio_dir).exists() {
-            if let Err(e) = fs::write(export_path, format!("{}", gpio)) {
-                tracing::warn!("Pinmux: failed to export GPIO {}: {}", gpio, e);
-            } else {
-                // Set as input (matches BraiinsOS behavior)
-                let dir_path = format!("{}/direction", gpio_dir);
-                let _ = fs::write(&dir_path, "in");
-                tracing::debug!("Pinmux: exported GPIO {} as input", gpio);
+        let gpio_path = Path::new(&gpio_dir);
+        if !gpio_path.exists() {
+            if let Err(error) = fs::write(export_path, gpio.to_string()) {
+                if error.raw_os_error() != Some(libc::EBUSY) {
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!("failed to export pinmux GPIO {gpio}: {error}"),
+                    ));
+                }
             }
         }
+
+        let ready_deadline = Instant::now() + Duration::from_millis(500);
+        while !gpio_path.exists() && Instant::now() < ready_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !gpio_path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("pinmux GPIO {gpio} did not appear after export"),
+            ));
+        }
+
+        let direction_path = format!("{gpio_dir}/direction");
+        fs::write(&direction_path, "in").map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("failed to set pinmux GPIO {gpio} input: {error}"),
+            )
+        })?;
+        let observed = fs::read_to_string(&direction_path).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("failed to read pinmux GPIO {gpio} direction: {error}"),
+            )
+        })?;
+        if observed.trim() != "in" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "pinmux GPIO {gpio} direction readback was {:?}, expected input",
+                    observed.trim()
+                ),
+            ));
+        }
+        tracing::debug!(gpio, "Amlogic management-I2C pinmux GPIO verified as input");
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1128,85 +1726,223 @@ fn init_pinmux() {
 /// so temperature reads silently failed. Per Phase H.5 expert-agent
 /// finding (Thermal+Perf).
 ///
-/// `chain_id_count` controls how many chains to probe (1 for S21
-/// single-chain layouts, 3 for multi-chain S19K Pro / S19 XP / etc.).
-fn temp_sensors_for(chain_id_count: u8) -> Vec<(u8, &'static str)> {
-    let mut sensors = Vec::with_capacity(2 * chain_id_count as usize);
-    for cid in 0..chain_id_count {
-        sensors.push((0x48 + cid, "inlet"));
-    }
-    for cid in 0..chain_id_count {
-        sensors.push((0x4C + cid, "outlet"));
-    }
-    sensors
+/// The table below is keyed by physical slot, not a runtime chain count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmlogicTemperaturePosition {
+    Inlet,
+    Outlet,
 }
 
-/// Read board temperatures from LM75-compatible sensors on Amlogic platforms.
-///
-/// Returns a vector of (sensor_address, temperature_celsius).
-/// On read failure, that sensor is silently skipped (may not be present
-/// if hash board is not populated or powered).
-///
-/// Uses raw I2C fd operations (not the I2cBus service which is designed
-/// for PIC communication). LM75 register 0x00: 16-bit big-endian temperature.
-/// Upper 9 bits = temperature in 0.5°C steps (signed).
-pub fn read_board_temps(i2c_bus: u8) -> Vec<(u8, f32)> {
-    // Default to 3-chain probe (covers S19K Pro / S19j Pro Amlogic /
-    // S19 XP). For S21 single-chain layouts, the extra 2 reads NACK
-    // gracefully and add ~10ms of probe time.
-    read_board_temps_for_chain_count(i2c_bus, 3)
+/// Board-slot-bound sensor endpoint. This is physical wiring data and must
+/// never be inferred from ASIC count or runtime chain enumeration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AmlogicTemperatureEndpoint {
+    slot: u8,
+    address: u8,
+    position: AmlogicTemperaturePosition,
 }
 
-/// Read board temps with explicit chain count (preferred).
-pub fn read_board_temps_for_chain_count(i2c_bus: u8, chain_count: u8) -> Vec<(u8, f32)> {
-    use std::os::fd::AsRawFd;
+impl AmlogicTemperatureEndpoint {
+    pub fn slot(self) -> u8 {
+        self.slot
+    }
 
-    let mut temps = Vec::new();
-    let path = format!("/dev/i2c-{}", i2c_bus);
-    let fd = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-    {
-        Ok(f) => f,
-        Err(_) => return temps,
-    };
+    pub fn address(self) -> u8 {
+        self.address
+    }
 
-    let sensors = temp_sensors_for(chain_count);
-    for &(addr, name) in &sensors {
-        // Set slave address via ioctl
-        let ret = unsafe { libc::ioctl(fd.as_raw_fd(), 0x0706, addr as libc::c_ulong) };
-        if ret < 0 {
-            continue;
+    pub fn position(self) -> AmlogicTemperaturePosition {
+        self.position
+    }
+}
+
+/// Verified live on the .78 S19K Pro: inlet 0x48..=0x4a and outlet
+/// 0x4c..=0x4e, paired by physical board slot.
+const AMLOGIC_TEMPERATURE_ENDPOINTS: [AmlogicTemperatureEndpoint; 6] = [
+    AmlogicTemperatureEndpoint {
+        slot: 0,
+        address: 0x48,
+        position: AmlogicTemperaturePosition::Inlet,
+    },
+    AmlogicTemperatureEndpoint {
+        slot: 0,
+        address: 0x4c,
+        position: AmlogicTemperaturePosition::Outlet,
+    },
+    AmlogicTemperatureEndpoint {
+        slot: 1,
+        address: 0x49,
+        position: AmlogicTemperaturePosition::Inlet,
+    },
+    AmlogicTemperatureEndpoint {
+        slot: 1,
+        address: 0x4d,
+        position: AmlogicTemperaturePosition::Outlet,
+    },
+    AmlogicTemperatureEndpoint {
+        slot: 2,
+        address: 0x4a,
+        position: AmlogicTemperaturePosition::Inlet,
+    },
+    AmlogicTemperatureEndpoint {
+        slot: 2,
+        address: 0x4e,
+        position: AmlogicTemperaturePosition::Outlet,
+    },
+];
+
+#[derive(Debug, Clone, Copy)]
+pub struct AmlogicTemperatureReading {
+    endpoint: AmlogicTemperatureEndpoint,
+    register: Lm75TemperatureRegister,
+}
+
+impl AmlogicTemperatureReading {
+    pub fn endpoint(self) -> AmlogicTemperatureEndpoint {
+        self.endpoint
+    }
+
+    pub fn raw_register(self) -> i16 {
+        self.register.raw_be()
+    }
+
+    pub fn celsius(self) -> f32 {
+        self.register.celsius()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AmlogicTemperatureUnavailable {
+    endpoint: AmlogicTemperatureEndpoint,
+    reason: AmlogicTemperatureUnavailableReason,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmlogicTemperatureUnavailableReason {
+    BelowAdmittedRange { raw_register: i16 },
+    EndpointNotReady,
+    EndpointRefused,
+    TransportFault,
+}
+
+impl AmlogicTemperatureUnavailableReason {
+    fn from_hal_error(error: &HalError) -> Self {
+        match error {
+            HalError::I2cEndpointNotReady { .. } => Self::EndpointNotReady,
+            HalError::I2cEndpointRefused { .. }
+            | HalError::I2cAdmissionBusy { .. }
+            | HalError::I2cSafetySuperseded { .. } => Self::EndpointRefused,
+            _ => Self::TransportFault,
         }
+    }
+}
 
-        // Write register address 0x00
-        let reg: [u8; 1] = [0x00];
-        let written =
-            unsafe { libc::write(fd.as_raw_fd(), reg.as_ptr() as *const libc::c_void, 1) };
-        if written != 1 {
-            continue;
+impl AmlogicTemperatureUnavailable {
+    pub fn endpoint(&self) -> AmlogicTemperatureEndpoint {
+        self.endpoint
+    }
+
+    pub fn reason(&self) -> AmlogicTemperatureUnavailableReason {
+        self.reason
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AmlogicTemperatureSnapshot {
+    required_slots: [bool; 3],
+    readings: Vec<AmlogicTemperatureReading>,
+    unavailable: Vec<AmlogicTemperatureUnavailable>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AmlogicTemperatureCoverage {
+    required_slots: [bool; 3],
+    inlet_available: [bool; 3],
+    outlet_available: [bool; 3],
+}
+
+impl AmlogicTemperatureCoverage {
+    pub fn required_slots(self) -> [bool; 3] {
+        self.required_slots
+    }
+
+    pub fn inlet_available(self, slot: u8) -> bool {
+        self.inlet_available
+            .get(slot as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    pub fn outlet_available(self, slot: u8) -> bool {
+        self.outlet_available
+            .get(slot as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    pub fn is_complete(self) -> bool {
+        (0..3).all(|slot| {
+            !self.required_slots[slot]
+                || (self.inlet_available[slot] && self.outlet_available[slot])
+        })
+    }
+
+    pub fn missing_slots(self) -> Vec<u8> {
+        (0..3u8)
+            .filter(|slot| {
+                self.required_slots[*slot as usize]
+                    && !(self.inlet_available(*slot) && self.outlet_available(*slot))
+            })
+            .collect()
+    }
+}
+
+impl AmlogicTemperatureSnapshot {
+    pub fn readings(&self) -> &[AmlogicTemperatureReading] {
+        &self.readings
+    }
+
+    pub fn unavailable(&self) -> &[AmlogicTemperatureUnavailable] {
+        &self.unavailable
+    }
+
+    /// The PSU gate is chassis-wide, so every slot asserted by checked
+    /// plug-detect topology requires both its inlet and outlet sensor.
+    pub fn required_coverage(&self) -> AmlogicTemperatureCoverage {
+        let mut inlet_available = [false; 3];
+        let mut outlet_available = [false; 3];
+        for reading in &self.readings {
+            let slot = reading.endpoint.slot as usize;
+            if slot >= self.required_slots.len() || !self.required_slots[slot] {
+                continue;
+            }
+            match reading.endpoint.position {
+                AmlogicTemperaturePosition::Inlet => inlet_available[slot] = true,
+                AmlogicTemperaturePosition::Outlet => outlet_available[slot] = true,
+            }
         }
-
-        // Read 2 bytes of temperature data
-        let mut buf = [0u8; 2];
-        let read = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, 2) };
-        if read != 2 {
-            continue;
-        }
-
-        // LM75 format: [MSB, LSB], upper 9 bits = temp in 0.5°C steps
-        let raw = ((buf[0] as i16) << 8) | (buf[1] as i16);
-        let temp = (raw >> 7) as f32 * 0.5;
-        if temp > -40.0 && temp < 125.0 {
-            tracing::trace!(addr, name, temp, "Board temp");
-            temps.push((addr, temp));
+        AmlogicTemperatureCoverage {
+            required_slots: self.required_slots,
+            inlet_available,
+            outlet_available,
         }
     }
 
-    temps
+    pub fn hottest_celsius(&self) -> Option<f32> {
+        self.readings
+            .iter()
+            .map(|reading| reading.celsius())
+            .reduce(f32::max)
+    }
 }
 
+// Board temperatures are available only through
+// `AmlogicPowerThermalService::read_board_temperatures`.
 fn normalize_model_token(model: &str) -> String {
     model
         .trim()
@@ -1214,6 +1950,99 @@ fn normalize_model_token(model: &str) -> String {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '+')
         .collect()
+}
+
+fn config_for_dcentos_platform(marker: &str) -> Result<Option<PlatformConfig>> {
+    let normalized = marker.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "am3-aml-s19k" | "am3-aml-s19kpro" | "am3-aml-s19xp" => {
+            Ok(Some(PlatformConfig::s19k_amlogic()))
+        }
+        "am3-aml" | "am3-aml-s21" | "am3-aml-s21pro" | "am3-aml-s21xp"
+        | "am3-aml-t21" => Ok(Some(PlatformConfig::s21_amlogic())),
+        // These targets use a per-hashboard controller and cannot inherit a
+        // NoPic profile merely because the control board is also A113D.
+        "am3-aml-s19jpro" | "am3-aml-s19jproplus" => Err(HalError::Platform(format!(
+            "Amlogic S19j Pro platform {normalized:?} requires its dedicated controller profile; refusing NoPic fallback"
+        ))),
+        _ => Ok(None),
+    }
+}
+
+fn nopic_profile_for_model_value(model: &str) -> Option<AmlogicNoPicProfile> {
+    match normalize_model_token(model).as_str() {
+        "antminers19kpro"
+        | "antminers19kpronopic"
+        | "s19kpro"
+        | "s19kpronopic"
+        | "antminers19xp"
+        | "s19xp" => Some(AmlogicNoPicProfile::S19k),
+        "antminers21" | "antminers21pro" | "antminers21xp" | "antminers21+" | "antminert21"
+        | "s21" | "s21pro" | "s21xp" | "s21+" | "t21" => Some(AmlogicNoPicProfile::S21),
+        _ => None,
+    }
+}
+
+fn nopic_profile_for_bosminer_toml(source: &str) -> Result<Option<AmlogicNoPicProfile>> {
+    let document: toml::Value = toml::from_str(source).map_err(|error| {
+        HalError::Platform(format!(
+            "failed to parse /etc/bosminer.toml for Amlogic admission: {error}"
+        ))
+    })?;
+    let model = document
+        .get("format")
+        .and_then(|format| format.get("model"))
+        .and_then(toml::Value::as_str);
+    Ok(model.and_then(nopic_profile_for_model_value))
+}
+
+fn config_for_bosminer_model(source: &str) -> Result<Option<PlatformConfig>> {
+    Ok(match nopic_profile_for_bosminer_toml(source)? {
+        Some(AmlogicNoPicProfile::S19k) => Some(PlatformConfig::s19k_amlogic()),
+        Some(AmlogicNoPicProfile::S21) => Some(PlatformConfig::s21_amlogic()),
+        None => None,
+    })
+}
+
+fn nopic_profile_for_dcentos_marker(marker: &str) -> Option<AmlogicNoPicProfile> {
+    match marker.trim().to_ascii_lowercase().as_str() {
+        "am3-aml-s19k" | "am3-aml-s19kpro" | "am3-aml-s19xp" => Some(AmlogicNoPicProfile::S19k),
+        "am3-aml-s21" | "am3-aml-s21pro" | "am3-aml-s21xp" | "am3-aml-t21" => {
+            Some(AmlogicNoPicProfile::S21)
+        }
+        _ => None,
+    }
+}
+
+/// Detect only identity evidence strong enough to authorize Amlogic NoPic
+/// mutation. Unlike generic platform reporting, this never guesses from the
+/// cross-SKU `am3-aml` marker or substring-scans an arbitrary config file.
+fn detect_amlogic_nopic_profile() -> Result<AmlogicNoPicProfile> {
+    if let Ok(marker) = fs::read_to_string("/etc/dcentos-platform") {
+        return nopic_profile_for_dcentos_marker(&marker).ok_or_else(|| {
+            HalError::Platform(format!(
+                "/etc/dcentos-platform value {:?} is not SKU-qualified for Amlogic NoPic mutation",
+                marker.trim()
+            ))
+        });
+    }
+    if let Ok(source) = fs::read_to_string("/etc/bosminer.toml") {
+        return nopic_profile_for_bosminer_toml(&source)?.ok_or_else(|| {
+            HalError::Platform(
+                "/etc/bosminer.toml [format].model is missing or not an admitted Amlogic NoPic SKU"
+                    .to_string(),
+            )
+        });
+    }
+    let model = fs::read_to_string("/proc/device-tree/model")
+        .unwrap_or_default()
+        .trim_end_matches('\0')
+        .to_string();
+    nopic_profile_for_model_value(&model).ok_or_else(|| {
+        HalError::Platform(format!(
+            "device-tree model {model:?} is not SKU-qualified for Amlogic NoPic mutation"
+        ))
+    })
 }
 
 /// Detect which Amlogic model we're running on.
@@ -1232,10 +2061,9 @@ fn detect_amlogic_model() -> Result<PlatformConfig> {
     if let Ok(plat) = fs::read_to_string("/etc/dcentos-platform") {
         let plat_norm = plat.trim().to_ascii_lowercase();
         tracing::debug!(platform = %plat_norm, "Read /etc/dcentos-platform");
-        match plat_norm.as_str() {
-            "am3-aml-s19k" | "am3-aml-s19xp" => return Ok(PlatformConfig::s19k_amlogic()),
-            "am3-aml-s21" | "am3-aml" => return Ok(PlatformConfig::s21_amlogic()),
-            _ => tracing::debug!(
+        match config_for_dcentos_platform(&plat_norm)? {
+            Some(config) => return Ok(config),
+            None => tracing::debug!(
                 platform = %plat_norm,
                 "/etc/dcentos-platform did not match a known token; falling back"
             ),
@@ -1246,14 +2074,9 @@ fn detect_amlogic_model() -> Result<PlatformConfig> {
     //    This wins over DTB when bosminer is the running rootfs because
     //    it carries the exact factory model name (e.g. "Antminer S19K Pro NoPic").
     if let Ok(toml) = fs::read_to_string("/etc/bosminer.toml") {
-        let lower = toml.to_ascii_lowercase();
-        if lower.contains("model") && lower.contains("s19k pro") {
-            tracing::info!("Detected S19K Pro from /etc/bosminer.toml model field");
-            return Ok(PlatformConfig::s19k_amlogic());
-        }
-        if lower.contains("model") && (lower.contains("s19 xp") || lower.contains("s19xp")) {
-            tracing::info!("Detected S19 XP from /etc/bosminer.toml model field");
-            return Ok(PlatformConfig::s19k_amlogic());
+        if let Some(config) = config_for_bosminer_model(&toml)? {
+            tracing::info!(profile = %config.name, "Detected Amlogic profile from /etc/bosminer.toml model field");
+            return Ok(config);
         }
     }
 
@@ -1314,6 +2137,100 @@ fn detect_amlogic_model() -> Result<PlatformConfig> {
 mod tests {
     use super::*;
 
+    fn boot_safe_handoff_fixture() -> String {
+        [
+            "schema=dcentos.amlogic-safe-state/v1",
+            "state=runtime-handoff",
+            "boot_id=11111111-2222-3333-4444-555555555555",
+            "platform=am3-aml-s21",
+            "board_target=am3-s21",
+            "resource=amlogic-gpio437-power-gate",
+            "gpio_direction=out",
+            "gpio_active_low=0",
+            "commanded_value=0",
+            "readback_value=0",
+            "fan0_duty_ns=30000",
+            "fan0_period_ns=100000",
+            "fan0_enabled=1",
+            "fan1_duty_ns=30000",
+            "fan1_period_ns=100000",
+            "fan1_enabled=1",
+            "evidence_grade=software-readback",
+            "physical_rail_measured=false",
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn boot_safe_handoff_parser_is_exact_and_honest_about_evidence() {
+        let receipt = parse_amlogic_boot_safe_handoff(&boot_safe_handoff_fixture()).unwrap();
+        assert_eq!(receipt.platform, "am3-aml-s21");
+        assert_eq!(receipt.board_target, "am3-s21");
+        assert_eq!(receipt.fan0_duty_ns, AML_BOOT_FAN_DUTY_NS);
+
+        for mutation in [
+            ("state=runtime-handoff", "state=boot-safe"),
+            ("readback_value=0", "readback_value=1"),
+            ("gpio_active_low=0", "gpio_active_low=1"),
+            (
+                "evidence_grade=software-readback",
+                "evidence_grade=measured-rail-off",
+            ),
+            (
+                "physical_rail_measured=false",
+                "physical_rail_measured=true",
+            ),
+            ("fan1_duty_ns=30000", "fan1_duty_ns=100000"),
+            ("fan0_period_ns=100000", "fan0_period_ns=30000"),
+            ("fan1_enabled=1", "fan1_enabled=0"),
+        ] {
+            let invalid = boot_safe_handoff_fixture().replace(mutation.0, mutation.1);
+            assert!(
+                parse_amlogic_boot_safe_handoff(&invalid).is_err(),
+                "mutation {:?} must be refused",
+                mutation
+            );
+        }
+
+        let duplicate = format!("{}\nstate=runtime-handoff", boot_safe_handoff_fixture());
+        assert!(parse_amlogic_boot_safe_handoff(&duplicate).is_err());
+        let unknown = format!("{}\nunexpected=true", boot_safe_handoff_fixture());
+        assert!(parse_amlogic_boot_safe_handoff(&unknown).is_err());
+    }
+
+    #[test]
+    fn boot_safe_handoff_identity_is_exact_sku_not_prefix_based() {
+        assert!(amlogic_handoff_identity_matches_profile(
+            AmlogicNoPicProfile::S19k,
+            "am3-aml-s19k",
+            "am3-s19k"
+        ));
+        for (platform, target) in [
+            ("am3-aml-s21", "am3-s21"),
+            ("am3-aml-s21pro", "am3-s21pro"),
+            ("am3-aml-s21xp", "am3-s21xp"),
+            ("am3-aml-t21", "am3-t21"),
+        ] {
+            assert!(amlogic_handoff_identity_matches_profile(
+                AmlogicNoPicProfile::S21,
+                platform,
+                target
+            ));
+        }
+        for (platform, target) in [
+            ("am3-aml", "am3-s21"),
+            ("am3-aml-s21", "am3-s21xp"),
+            ("am3-aml-s19jpro", "am3-s19jpro-aml"),
+            ("am3-aml-s21-future", "am3-s21-future"),
+        ] {
+            assert!(!amlogic_handoff_identity_matches_profile(
+                AmlogicNoPicProfile::S21,
+                platform,
+                target
+            ));
+        }
+    }
+
     #[test]
     fn checked_psu_gpio_parser_never_converts_unknown_data_to_off() {
         assert_eq!(parse_psu_gpio_enabled("0\n").unwrap(), false);
@@ -1324,6 +2241,100 @@ mod tests {
                 "value={invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn shipped_amlogic_platform_tokens_are_explicitly_classified_or_refused() {
+        for marker in [
+            "am3-aml-s19k",
+            "am3-aml-s19kpro",
+            "am3-aml-s19xp",
+            "am3-aml-s21",
+            "am3-aml-s21pro",
+            "am3-aml-s21xp",
+            "am3-aml-t21",
+        ] {
+            assert!(
+                config_for_dcentos_platform(marker).unwrap().is_some(),
+                "shipped marker {marker} must not fall through to generic DT detection"
+            );
+        }
+        for marker in ["am3-aml-s19jpro", "am3-aml-s19jproplus"] {
+            let error = config_for_dcentos_platform(marker)
+                .expect_err("S19j Pro must not inherit a NoPic transport profile");
+            assert!(error.to_string().contains("dedicated controller profile"));
+        }
+        assert!(config_for_dcentos_platform("future-amlogic")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn bosminer_model_identity_covers_admitted_s19k_and_s21_families() {
+        for model in ["Antminer S19K Pro NoPic", "Antminer S19 XP"] {
+            let config = config_for_bosminer_model(&format!("[format]\nmodel = {model:?}"))
+                .unwrap()
+                .expect("S19K/S19 XP bosminer identity");
+            assert_eq!(config.name, PlatformConfig::s19k_amlogic().name);
+        }
+        for model in ["Antminer S21", "Antminer S21 Pro", "Antminer T21"] {
+            let config = config_for_bosminer_model(&format!("[format]\nmodel = {model:?}"))
+                .unwrap()
+                .expect("S21/T21 bosminer identity");
+            assert_eq!(config.name, PlatformConfig::s21_amlogic().name);
+        }
+        assert!(config_for_bosminer_model("[format]\nnotes = 'S21 spare'")
+            .unwrap()
+            .is_none());
+        assert!(
+            config_for_bosminer_model("[format]\nmodel = 'future miner'")
+                .unwrap()
+                .is_none()
+        );
+        assert!(config_for_bosminer_model("[format\nmodel = 'Antminer S21'").is_err());
+        assert_eq!(nopic_profile_for_dcentos_marker("am3-aml"), None);
+    }
+
+    #[test]
+    fn nopic_admission_binds_detected_profile_and_physical_uart_slot() {
+        assert_eq!(amlogic_slot_from_serial_device("/dev/ttyS1"), Some(0));
+        assert_eq!(amlogic_slot_from_serial_device("/dev/ttyS2"), Some(1));
+        assert_eq!(amlogic_slot_from_serial_device("/dev/ttyS3"), Some(2));
+        assert_eq!(amlogic_slot_from_serial_device("/dev/ttyS4"), Some(2));
+        assert_eq!(amlogic_slot_from_serial_device("/dev/ttyO1"), None);
+
+        let admission = AmlogicNoPicAdmission::from_profile_evidence(
+            AmlogicNoPicProfile::S21,
+            1,
+            AmlogicNoPicProfile::S21,
+            [true, true, false],
+        )
+        .unwrap();
+        assert_eq!(admission.profile(), AmlogicNoPicProfile::S21);
+        assert_eq!(admission.active_slot(), 1);
+        assert_eq!(admission.populated_slots(), [true, true, false]);
+
+        assert!(AmlogicNoPicAdmission::from_profile_evidence(
+            AmlogicNoPicProfile::S21,
+            1,
+            AmlogicNoPicProfile::S19k,
+            [false, true, false],
+        )
+        .is_err());
+        assert!(AmlogicNoPicAdmission::from_profile_evidence(
+            AmlogicNoPicProfile::S21,
+            3,
+            AmlogicNoPicProfile::S21,
+            [false, true, false],
+        )
+        .is_err());
+        assert!(AmlogicNoPicAdmission::from_profile_evidence(
+            AmlogicNoPicProfile::S21,
+            1,
+            AmlogicNoPicProfile::S21,
+            [true, false, false],
+        )
+        .is_err());
     }
 
     #[test]
@@ -1344,7 +2355,10 @@ mod tests {
             rear_duty_path: rear.to_string_lossy().into_owned(),
             front_duty_path: front.to_string_lossy().into_owned(),
             period_ns: AMLOGIC_PWM_PERIOD_NS,
-            tach_sources: Vec::new(),
+            tach_sources: std::array::from_fn(|_| {
+                Box::new(FixedEdgeMock(0)) as Box<dyn FanTachSource>
+            }),
+            tach_healthy: AtomicBool::new(true),
             sample_window: Duration::from_millis(1),
         };
 
@@ -1355,11 +2369,128 @@ mod tests {
     }
 
     #[test]
-    fn apw_pmbus_enable_sequence_matches_extracted_uboot_preboot() {
-        assert_eq!(APW_PMBUS_I2C_BUS, 1);
+    fn apw_pmbus_compatibility_translation_is_stable() {
+        // This pins DCENT's current Linux translation; it does not prove U-Boot
+        // wire framing, U-Boot/Linux adapter identity, or S21 applicability.
+        assert_eq!(AMLOGIC_MANAGEMENT_I2C_BUS, 1);
         assert_eq!(APW_PMBUS_ADDR, 0x1f);
         assert_eq!(APW_PMBUS_CLEAR_FAULTS, [0x03, 0x00, 0x00]);
         assert_eq!(APW_PMBUS_OPERATION_ENABLE, [0x01, 0xfc, 0xfc]);
+    }
+
+    #[test]
+    fn amlogic_management_source_has_one_service_owned_bus1_path() {
+        let source = include_str!("mod.rs");
+        assert!(source.contains(
+            "spawn_i2c_service_no_register_touch_with_denylist_and_reserved_preparation"
+        ));
+        assert!(source.contains("prepare_management_i2c_pinmux"));
+        assert!(source.contains("read_lm75_temperature_register_at"));
+        assert!(source.contains("AmlogicNoPicAdmission"));
+        assert!(!source
+            .lines()
+            .any(|line| line.starts_with("pub fn open_fan_controller()")));
+        assert!(!source
+            .lines()
+            .any(|line| line.starts_with("pub fn spawn() -> Result<Self>")));
+        let raw_apw_open = ["I2cBus::", "open(APW_PMBUS"].concat();
+        assert!(!source.contains(&raw_apw_open));
+        let raw_temperature_helper = ["pub fn read_board_", "temps("].concat();
+        let raw_apw_helper = ["pub fn enable_psu_", "pmbus("].concat();
+        assert!(!source.contains(&raw_temperature_helper));
+        assert!(!source.contains(&raw_apw_helper));
+    }
+
+    #[cfg(feature = "sim-hal")]
+    struct ApwSequenceBackend {
+        identity: usize,
+        writes: std::sync::Mutex<Vec<(u8, u8, Vec<u8>)>>,
+    }
+
+    #[cfg(feature = "sim-hal")]
+    impl ApwSequenceBackend {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+            Self {
+                identity: usize::MAX
+                    - 10_000
+                    - NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                writes: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[cfg(feature = "sim-hal")]
+    impl crate::i2c::I2cSimBackend for ApwSequenceBackend {
+        fn write(&self, bus: u8, addr: u8, data: &[u8]) -> Result<usize> {
+            self.writes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((bus, addr, data.to_vec()));
+            Ok(data.len())
+        }
+
+        fn read(&self, bus: u8, addr: u8, _buf: &mut [u8]) -> Result<usize> {
+            Err(HalError::I2c {
+                bus,
+                addr,
+                detail: "APW test backend refuses standalone reads".into(),
+            })
+        }
+
+        fn write_read(
+            &self,
+            bus: u8,
+            addr: u8,
+            _write_data: &[u8],
+            _read_buf: &mut [u8],
+        ) -> Result<()> {
+            Err(HalError::I2cEndpointNotReady {
+                bus,
+                addr,
+                detail: "simulated APW STATUS_WORD NACK".into(),
+            })
+        }
+
+        fn service_identity(&self) -> Option<usize> {
+            Some(self.identity)
+        }
+    }
+
+    #[cfg(feature = "sim-hal")]
+    #[test]
+    fn apw_enable_writes_complete_even_when_optional_status_is_unavailable() {
+        let backend = std::sync::Arc::new(ApwSequenceBackend::new());
+        let service = AmlogicPowerThermalService {
+            i2c: crate::i2c::spawn_sim_i2c_service(
+                AMLOGIC_MANAGEMENT_I2C_BUS,
+                backend.clone(),
+                Vec::new(),
+            )
+            .unwrap(),
+            required_slots: [false, true, false],
+        };
+
+        service.enable_apw().unwrap();
+        assert!(service.read_apw_status_word().is_err());
+        assert_eq!(
+            *backend
+                .writes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![
+                (
+                    AMLOGIC_MANAGEMENT_I2C_BUS,
+                    APW_PMBUS_ADDR,
+                    APW_PMBUS_CLEAR_FAULTS.to_vec(),
+                ),
+                (
+                    AMLOGIC_MANAGEMENT_I2C_BUS,
+                    APW_PMBUS_ADDR,
+                    APW_PMBUS_OPERATION_ENABLE.to_vec(),
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -1399,35 +2530,70 @@ mod tests {
     }
 
     #[test]
-    fn temp_sensors_for_three_chains_matches_live_78_layout() {
+    fn temperature_topology_matches_live_78_physical_slots() {
         // Live-verified per .78 bosminer.log:
         //   hb1.72 (Inlet=0x48), hb1.76 (Outlet=0x4C)
         //   hb2.73 (Inlet=0x49), hb2.77 (Outlet=0x4D)
         //   hb3.74 (Inlet=0x4A), hb3.78 (Outlet=0x4E)
-        let s = temp_sensors_for(3);
-        assert_eq!(s.len(), 6);
-        assert_eq!(s[0], (0x48, "inlet"));
-        assert_eq!(s[1], (0x49, "inlet"));
-        assert_eq!(s[2], (0x4A, "inlet"));
-        assert_eq!(s[3], (0x4C, "outlet"));
-        assert_eq!(s[4], (0x4D, "outlet"));
-        assert_eq!(s[5], (0x4E, "outlet"));
+        assert_eq!(AMLOGIC_TEMPERATURE_ENDPOINTS.len(), 6);
+        for slot in 0..=2 {
+            let pair: Vec<_> = AMLOGIC_TEMPERATURE_ENDPOINTS
+                .iter()
+                .copied()
+                .filter(|endpoint| endpoint.slot() == slot)
+                .collect();
+            assert_eq!(pair.len(), 2);
+            assert_eq!(pair[0].address(), 0x48 + slot);
+            assert_eq!(pair[0].position(), AmlogicTemperaturePosition::Inlet);
+            assert_eq!(pair[1].address(), 0x4c + slot);
+            assert_eq!(pair[1].position(), AmlogicTemperaturePosition::Outlet);
+        }
     }
 
     #[test]
-    fn temp_sensors_for_one_chain_matches_s21_singlechain_layout() {
-        // S21 single-chain: just hb1's pair
-        let s = temp_sensors_for(1);
-        assert_eq!(s.len(), 2);
-        assert_eq!(s[0], (0x48, "inlet"));
-        assert_eq!(s[1], (0x4C, "outlet"));
-    }
+    fn required_slot_coverage_cannot_be_masked_by_other_slots_or_extreme_heat() {
+        let reading =
+            |endpoint: AmlogicTemperatureEndpoint, celsius: i16| AmlogicTemperatureReading {
+                endpoint,
+                register: Lm75TemperatureRegister::from_raw_be(celsius * 256),
+            };
+        let slot0_inlet = AMLOGIC_TEMPERATURE_ENDPOINTS[0];
+        let slot0_outlet = AMLOGIC_TEMPERATURE_ENDPOINTS[1];
+        let slot1_inlet = AMLOGIC_TEMPERATURE_ENDPOINTS[2];
+        let slot1_outlet = AMLOGIC_TEMPERATURE_ENDPOINTS[3];
 
-    #[test]
-    fn temp_sensors_for_zero_chains_returns_empty() {
-        // Defensive: chain_count=0 should not panic
-        let s = temp_sensors_for(0);
-        assert!(s.is_empty());
+        let incomplete = AmlogicTemperatureSnapshot {
+            required_slots: [true, true, false],
+            readings: vec![reading(slot0_inlet, 40), reading(slot1_inlet, 45)],
+            unavailable: Vec::new(),
+        };
+        let coverage = incomplete.required_coverage();
+        assert!(coverage.inlet_available(0));
+        assert!(coverage.inlet_available(1));
+        assert!(!coverage.outlet_available(0));
+        assert!(!coverage.outlet_available(1));
+        assert_eq!(coverage.missing_slots(), vec![0, 1]);
+        assert!(!coverage.is_complete());
+
+        let complete = AmlogicTemperatureSnapshot {
+            required_slots: [true, true, false],
+            readings: vec![
+                reading(slot0_inlet, 40),
+                reading(slot0_outlet, 50),
+                reading(slot1_inlet, 45),
+                reading(slot1_outlet, 55),
+            ],
+            unavailable: Vec::new(),
+        };
+        assert!(complete.required_coverage().is_complete());
+
+        let extreme = AmlogicTemperatureSnapshot {
+            required_slots: [false, true, false],
+            readings: vec![reading(slot1_inlet, 45), reading(slot1_outlet, 125)],
+            unavailable: Vec::new(),
+        };
+        assert!(extreme.required_coverage().is_complete());
+        assert_eq!(extreme.hottest_celsius(), Some(125.0));
     }
 
     // ---------------------------------------------------------------------
@@ -1459,8 +2625,48 @@ mod tests {
     /// the test assert the edges→RPM math without real GPIO.
     struct FixedEdgeMock(u32);
     impl FanTachSource for FixedEdgeMock {
-        fn sample_falling_edges(&self, _window: Duration) -> u32 {
-            self.0
+        fn sample_falling_edges(&self, _window: Duration) -> std::io::Result<u32> {
+            Ok(self.0)
+        }
+    }
+
+    struct FailingEdgeMock;
+    impl FanTachSource for FailingEdgeMock {
+        fn sample_falling_edges(&self, _window: Duration) -> std::io::Result<u32> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "injected tach failure",
+            ))
+        }
+    }
+
+    #[cfg(panic = "unwind")]
+    struct PanickingEdgeMock;
+    #[cfg(panic = "unwind")]
+    impl FanTachSource for PanickingEdgeMock {
+        fn sample_falling_edges(&self, _window: Duration) -> std::io::Result<u32> {
+            panic!("injected tach sampler panic")
+        }
+    }
+
+    struct ConcurrentEdgeMock {
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        maximum: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FanTachSource for ConcurrentEdgeMock {
+        fn sample_falling_edges(&self, _window: Duration) -> std::io::Result<u32> {
+            use std::sync::atomic::Ordering;
+
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = self
+                .maximum
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |maximum| {
+                    Some(maximum.max(active))
+                });
+            std::thread::sleep(Duration::from_millis(20));
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(1)
         }
     }
 
@@ -1582,7 +2788,7 @@ mod tests {
     fn edges_to_rpm_uses_2_pulses_per_revolution_at_1s_window() {
         // 60 falling edges in 1 s, 2 PPR ⇒ 60 * 60 / (1 * 2) = 1800 RPM.
         assert_eq!(edges_to_rpm(60, Duration::from_secs(1)), 1800);
-        // 0 edges ⇒ 0 RPM (caller decides whether to fall back to floor).
+        // 0 edges ⇒ 0 RPM. No positive fallback may hide a stopped fan.
         assert_eq!(edges_to_rpm(0, Duration::from_secs(1)), 0);
         // Very high count (industrial fan at 6000 RPM ≈ 200 edges/s).
         assert_eq!(edges_to_rpm(200, Duration::from_secs(1)), 6000);
@@ -1601,37 +2807,34 @@ mod tests {
     }
 
     #[test]
-    fn synthesized_rpm_floor_zero_when_fans_off() {
-        assert_eq!(synthesized_rpm_floor(0), 0);
+    fn tach_poll_classifier_accepts_kernfs_pri_err_but_rejects_bare_errors() {
+        assert_eq!(tach_poll_has_edge(libc::POLLPRI).unwrap(), true);
+        assert_eq!(
+            tach_poll_has_edge(libc::POLLPRI | libc::POLLERR).unwrap(),
+            true,
+            "kernfs valid sysfs notifications carry POLLPRI|POLLERR"
+        );
+        assert_eq!(tach_poll_has_edge(0).unwrap(), false);
+        for revents in [libc::POLLERR, libc::POLLHUP, libc::POLLNVAL] {
+            assert!(
+                tach_poll_has_edge(revents).is_err(),
+                "revents=0x{revents:04X} must invalidate the tach sample"
+            );
+        }
     }
 
     #[test]
-    fn synthesized_rpm_floor_nonzero_when_fans_on() {
-        // formula: 900 + pwm*40.
-        assert_eq!(synthesized_rpm_floor(10), 1300);
-        assert_eq!(synthesized_rpm_floor(30), 2100);
-        assert_eq!(synthesized_rpm_floor(100), 4900);
-    }
-
-    #[test]
-    fn test_amlogic_synthetic_rpm_replaced() {
-        // Acceptance for W3.2: tach_available flips to true with at least
-        // one armed slot, and per-fan RPM matches the mocked edge stream
-        // through the edges→RPM conversion. With sample_window = 10 ms
-        // (test constructor) and 2 PPR, an edge count of N produces
-        // N * 60 / (0.01 * 2) = N * 3000 RPM.
-        let sources: Vec<Option<Box<dyn FanTachSource>>> = vec![
-            Some(Box::new(FixedEdgeMock(20))), // 60_000 RPM (clamped expectation only in math)
-            Some(Box::new(FixedEdgeMock(10))), // 30_000 RPM
-            Some(Box::new(FixedEdgeMock(5))),  // 15_000 RPM
-            None,                              // unexported slot
+    fn amlogic_fan_reports_each_measured_tach_channel() {
+        // With sample_window = 10 ms and 2 PPR, N edges produces N * 3000 RPM.
+        let sources: [Box<dyn FanTachSource>; GPIO_FAN_TACH_COUNT] = [
+            Box::new(FixedEdgeMock(20)),
+            Box::new(FixedEdgeMock(10)),
+            Box::new(FixedEdgeMock(5)),
+            Box::new(FixedEdgeMock(2)),
         ];
         let fan = AmlogicFan::for_test(sources);
 
-        assert!(
-            fan.tach_available(),
-            "tach_available must flip to true once any GPIO slot is armed (W3.2 acceptance)"
-        );
+        assert!(fan.tach_available());
 
         // Sample window is 10 ms in the test constructor.
         let window = Duration::from_millis(10);
@@ -1640,27 +2843,79 @@ mod tests {
         assert_eq!(per_fan[0], (0, edges_to_rpm(20, window)));
         assert_eq!(per_fan[1], (1, edges_to_rpm(10, window)));
         assert_eq!(per_fan[2], (2, edges_to_rpm(5, window)));
-        // Slot 3 has no tach. PWM is 0 in the test (no real sysfs write),
-        // so the synthesized floor returns 0 — the min-non-zero rule
-        // ensures we don't false-flag a wiring fault.
-        assert_eq!(per_fan[3], (3, 0));
+        assert_eq!(per_fan[3], (3, edges_to_rpm(2, window)));
     }
 
     #[test]
-    fn fan_with_no_tach_sources_falls_back_to_synthesized() {
-        // Construct an AmlogicFan with zero armed slots. tach_available
-        // must be false and the synthesized floor must protect against
-        // returning 0 RPM when PWM > 0. Since the test constructor
-        // can't drive real PWM, we exercise the empty-vec branch
-        // directly via the helper.
-        let fan = AmlogicFan::for_test(vec![None, None, None, None]);
+    fn amlogic_zero_tach_dominates_aggregate_rpm() {
+        let sources: [Box<dyn FanTachSource>; GPIO_FAN_TACH_COUNT] = [
+            Box::new(FixedEdgeMock(20)),
+            Box::new(FixedEdgeMock(10)),
+            Box::new(FixedEdgeMock(0)),
+            Box::new(FixedEdgeMock(5)),
+        ];
+        let fan = AmlogicFan::for_test(sources);
+
+        assert_eq!(fan.get_per_fan_rpm()[2], (2, 0));
+        assert_eq!(fan.get_rpm(), 0, "a stopped fan must not be filtered out");
+    }
+
+    #[test]
+    fn amlogic_tach_sample_error_revokes_runtime_availability() {
+        let sources: [Box<dyn FanTachSource>; GPIO_FAN_TACH_COUNT] = [
+            Box::new(FixedEdgeMock(20)),
+            Box::new(FailingEdgeMock),
+            Box::new(FixedEdgeMock(10)),
+            Box::new(FixedEdgeMock(5)),
+        ];
+        let fan = AmlogicFan::for_test(sources);
+
+        assert!(fan.tach_available());
+        let readings = fan.get_per_fan_rpm();
+        assert_eq!(readings[1], (1, 0));
         assert!(
             !fan.tach_available(),
-            "tach_available must stay false when no slot exported"
+            "an invalid sample must permanently revoke this owner's evidence"
         );
-        // All slots return synthesized floor; PWM=0 in test sysfs ⇒ 0.
-        let per_fan = fan.get_per_fan_rpm();
-        assert!(per_fan.iter().all(|&(_, rpm)| rpm == 0));
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn amlogic_tach_sampler_panic_revokes_runtime_availability() {
+        let sources: [Box<dyn FanTachSource>; GPIO_FAN_TACH_COUNT] = [
+            Box::new(FixedEdgeMock(20)),
+            Box::new(PanickingEdgeMock),
+            Box::new(FixedEdgeMock(10)),
+            Box::new(FixedEdgeMock(5)),
+        ];
+        let fan = AmlogicFan::for_test(sources);
+
+        assert!(fan.tach_available());
+        let readings = fan.get_per_fan_rpm();
+        assert_eq!(readings[1], (1, 0));
+        assert!(
+            !fan.tach_available(),
+            "a panicked sampler must permanently revoke this owner's evidence"
+        );
+    }
+
+    #[test]
+    fn fan_tach_slots_share_one_parallel_observation_window() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let maximum = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sources: [Box<dyn FanTachSource>; GPIO_FAN_TACH_COUNT] = std::array::from_fn(|_| {
+            Box::new(ConcurrentEdgeMock {
+                active: active.clone(),
+                maximum: maximum.clone(),
+            }) as Box<dyn FanTachSource>
+        });
+        let fan = AmlogicFan::for_test(sources);
+
+        assert_eq!(fan.get_per_fan_rpm().len(), 4);
+        assert!(
+            maximum.load(std::sync::atomic::Ordering::SeqCst) > 1,
+            "tach sources must overlap instead of consuming four sequential windows"
+        );
     }
 
     // ─── W2A.2: PIC1704 wire-up regression guards ───
@@ -1737,6 +2992,14 @@ mod tests {
         assert!(
             src.contains("fs::write(&gpio_path, \"1\")"),
             "enable_psu_gpio must write \"1\" to enable (active HIGH, Wave 5 Q10)"
+        );
+        assert!(
+            src.contains("ensure_psu_active_low_disabled_checked()?;"),
+            "all GPIO437 mutations must first pin and check raw active-high mode"
+        );
+        assert!(
+            src.contains("fs::write(&dir_path, \"low\")"),
+            "enable_psu_gpio must establish a glitch-free LOW before driving HIGH"
         );
         // Disable path drives the value file LOW.
         assert!(

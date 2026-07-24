@@ -149,7 +149,10 @@ jobs:
           DCENT_OTA_PUBLIC_KEY_HEX: ${{ secrets.DCENT_OTA_PUBLIC_KEY_HEX }}
           DCENT_OTA_KEY_ID: ${{ secrets.DCENT_OTA_KEY_ID }}
         run: |
-          cargo +stable test --locked -p dcentaxe-core --lib --target x86_64-unknown-linux-gnu release_gate_can_require_signature_capable_build
+          sh scripts/test_run_exact_cargo_test.sh
+          RUSTUP_TOOLCHAIN=stable sh scripts/run_exact_cargo_test.sh \
+            ota_signature::tests::release_gate_can_require_signature_capable_build \
+            --locked -p dcentaxe-core --lib --target x86_64-unknown-linux-gnu
           python - <<'PY'
           import os
           import pathlib

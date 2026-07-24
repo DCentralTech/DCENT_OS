@@ -660,6 +660,7 @@ fn migrate_axeos_config(nvs_partition: &EspDefaultNvsPartition) -> Option<DcentA
             suggest_difficulty: read_u16("stratumdiff") as u32,
             version_rolling: crate::config::chip_rolls_versions(&final_asic_model),
         },
+        mining_mode: crate::config::MiningMode::Pool,
         board_model: if device_model.is_empty() {
             resolved_profile.device_model.into()
         } else {
@@ -674,6 +675,13 @@ fn migrate_axeos_config(nvs_partition: &EspDefaultNvsPartition) -> Option<DcentA
         // MQTT/HA is a DCENT_axe-native feature with no legacy AxeOS NVS key —
         // default-OFF on migration; the operator opts in via Settings.
         mqtt: crate::config::MqttConfig::default(),
+        donation: crate::config::DonationConfig::default(),
+        notifications: crate::config::NotificationsConfig::default(),
+        // W5500 LAN (PLAN-E): Ethernet-dark on AxeOS migration; the operator
+        // opts in via config (and only an eth-w5500 build can act on it).
+        network: crate::config::NetworkConfig::default(),
+        #[cfg(feature = "lora")]
+        mesh: dcentaxe_lora::config::MeshConfig::default(),
         hostname,
         target_frequency: if frequency == 0 {
             resolved_board.default_frequency

@@ -49,8 +49,169 @@ const MAX_SYSUPGRADE_TAR_ENTRIES: usize = 32;
 const MAX_SYSUPGRADE_METADATA_BYTES: u64 = 1024 * 1024;
 const MAX_SYSUPGRADE_IMAGE_PAYLOAD_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_SYSUPGRADE_TOTAL_PAYLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+pub const SYSUPGRADE_AUTHORITY_PROFILE: &str = "dcentos.sysupgrade-authority/v1";
+pub const SYSUPGRADE_UNSIGNED_LAB_PROFILE: &str = "dcentos.sysupgrade-unsigned-lab/v1";
 
+use dcentrald_common::{
+    ArtifactKind, ArtifactMaturity, BoardDesc, InstallAuthorization, StorageTopology,
+    UpdateMechanism,
+};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
+
+#[derive(Debug, PartialEq, Eq)]
+enum ManifestJsonError {
+    Malformed(String),
+    DuplicateObjectKey(String),
+}
+
+/// Recursive JSON seed that refuses duplicate object keys before a manifest is
+/// represented as `serde_json::Value`. `Value`'s normal deserializer silently
+/// keeps one duplicate (currently the last), which is unsafe for signed policy:
+/// different consumers could authorize different occurrences of the same key.
+struct UniqueJsonValueSeed<'a> {
+    duplicate_key: &'a mut Option<String>,
+}
+
+struct UniqueJsonValueVisitor<'a> {
+    duplicate_key: &'a mut Option<String>,
+}
+
+impl<'de> DeserializeSeed<'de> for UniqueJsonValueSeed<'_> {
+    type Value = serde_json::Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonValueVisitor {
+            duplicate_key: self.duplicate_key,
+        })
+    }
+}
+
+impl<'de> Visitor<'de> for UniqueJsonValueVisitor<'_> {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value with unique object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Number(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Number(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| E::custom("JSON numbers must be finite"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(value.to_string()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(value))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        UniqueJsonValueSeed {
+            duplicate_key: self.duplicate_key,
+        }
+        .deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+        while let Some(value) = sequence.next_element_seed(UniqueJsonValueSeed {
+            duplicate_key: self.duplicate_key,
+        })? {
+            values.push(value);
+        }
+        Ok(serde_json::Value::Array(values))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::with_capacity(map.size_hint().unwrap_or(0));
+        while let Some(key) = map.next_key::<String>()? {
+            if values.contains_key(&key) {
+                *self.duplicate_key = Some(key.clone());
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate object key '{key}'"
+                )));
+            }
+            let value = map.next_value_seed(UniqueJsonValueSeed {
+                duplicate_key: self.duplicate_key,
+            })?;
+            values.insert(key, value);
+        }
+        Ok(serde_json::Value::Object(values))
+    }
+}
+
+fn parse_unique_manifest_json(
+    manifest_bytes: &[u8],
+) -> Result<serde_json::Value, ManifestJsonError> {
+    let mut duplicate_key = None;
+    let mut deserializer = serde_json::Deserializer::from_slice(manifest_bytes);
+    let parsed = UniqueJsonValueSeed {
+        duplicate_key: &mut duplicate_key,
+    }
+    .deserialize(&mut deserializer);
+
+    match parsed {
+        Ok(value) => {
+            deserializer
+                .end()
+                .map_err(|error| ManifestJsonError::Malformed(error.to_string()))?;
+            Ok(value)
+        }
+        Err(error) => match duplicate_key {
+            Some(key) => Err(ManifestJsonError::DuplicateObjectKey(key)),
+            None => Err(ManifestJsonError::Malformed(error.to_string())),
+        },
+    }
+}
+
+fn parse_authority_manifest_json(manifest_bytes: &[u8]) -> Result<serde_json::Value, String> {
+    parse_unique_manifest_json(manifest_bytes).map_err(|error| match error {
+        ManifestJsonError::Malformed(message) => {
+            format!("OTA bundle: malformed MANIFEST.json: {message}")
+        }
+        ManifestJsonError::DuplicateObjectKey(key) => {
+            format!("OTA bundle: MANIFEST.json contains duplicate object key '{key}'")
+        }
+    })
+}
 
 /// Returns true when this build was compiled with a pinned OTA public key.
 pub fn signature_required() -> bool {
@@ -237,6 +398,49 @@ pub fn verify_raw(
         .map_err(|e| format!("Ed25519 verification failed: {}", e))
 }
 
+/// Signed, schema-validated authority carried by a sysupgrade manifest.
+///
+/// This is deliberately separate from payload paths: a valid Ed25519
+/// signature and matching payload hashes do not by themselves authorize a
+/// persistent write.  The manifest must also state an exact target, typed
+/// artifact kind and maturity, explicit installability, and version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedArtifact {
+    pub board_target: String,
+    pub artifact_kind: ArtifactKind,
+    pub artifact_maturity: ArtifactMaturity,
+    pub installable: bool,
+    pub version: String,
+    pub payload_prefix: String,
+}
+
+/// Opaque proof that a verified artifact and the running board's declarative
+/// enablement policy agree. Only this type may cross the browser OTA admission
+/// boundary into preflight/scheduling.
+#[derive(Debug, Clone)]
+pub struct AuthorizedSysupgrade {
+    bundle: SysupgradeBundle,
+    board_target: &'static str,
+}
+
+impl AuthorizedSysupgrade {
+    pub fn board_target(&self) -> &'static str {
+        self.board_target
+    }
+
+    pub fn version(&self) -> &str {
+        self.bundle
+            .verified_artifact
+            .as_ref()
+            .map(|artifact| artifact.version.as_str())
+            .unwrap_or_default()
+    }
+
+    pub fn bundle(&self) -> &SysupgradeBundle {
+        &self.bundle
+    }
+}
+
 /// Outcome of inspecting a staged sysupgrade `.tar`.
 #[derive(Debug, Clone)]
 pub struct SysupgradeBundle {
@@ -247,6 +451,10 @@ pub struct SysupgradeBundle {
     /// flash production hardware must require an exact match rather than
     /// inferring identity from the archive name or payload directory.
     pub authenticated_board_target: Option<String>,
+    /// Complete signed authority contract. `None` is possible only for the
+    /// explicit unsigned laboratory inspection path and can never authorize a
+    /// browser/public update.
+    pub verified_artifact: Option<VerifiedArtifact>,
     pub manifest_path: PathBuf,
     pub signature_path: PathBuf,
     pub release_key_path: PathBuf,
@@ -258,6 +466,7 @@ impl Default for SysupgradeBundle {
     fn default() -> Self {
         Self {
             authenticated_board_target: None,
+            verified_artifact: None,
             manifest_path: PathBuf::new(),
             signature_path: PathBuf::new(),
             release_key_path: PathBuf::new(),
@@ -268,7 +477,7 @@ impl Default for SysupgradeBundle {
 }
 
 impl SysupgradeBundle {
-    /// Require the signed manifest to authorize exactly `expected`.
+    /// Require authenticated manifest authority for exactly `expected`.
     ///
     /// This intentionally rejects legacy signed manifests that omit
     /// `board_target`; production release/install paths are fail closed. A
@@ -288,10 +497,116 @@ impl SysupgradeBundle {
                 "OTA board-target mismatch: signed manifest targets '{actual}', expected '{expected}'"
             )),
             None => Err(format!(
-                "OTA board-target check: signed manifest does not declare board_target; expected '{expected}'"
+                "OTA board-target check: bundle has no authenticated board_target; expected '{expected}'"
             )),
         }
     }
+
+    /// Consume this verified bundle and bind it to the exact running target's
+    /// public update policy.
+    pub fn authorize_public_update(
+        self,
+        expected_board_target: &str,
+    ) -> Result<AuthorizedSysupgrade, String> {
+        self.require_authenticated_board_target(expected_board_target)?;
+        let artifact = self.verified_artifact.as_ref().ok_or_else(|| {
+            "OTA authorization: bundle has no authenticated artifact contract".to_string()
+        })?;
+        if artifact.board_target != expected_board_target {
+            return Err(format!(
+                "OTA authorization: verified artifact targets '{}', expected '{}'",
+                artifact.board_target, expected_board_target
+            ));
+        }
+
+        let descriptor = require_public_update_policy(expected_board_target)?;
+        if artifact.artifact_kind != descriptor.enablement.artifact_kind {
+            return Err(format!(
+                "OTA authorization: artifact kind '{}' conflicts with target policy '{}'",
+                artifact.artifact_kind.as_str(),
+                descriptor.enablement.artifact_kind.as_str()
+            ));
+        }
+        if artifact.artifact_maturity != descriptor.enablement.artifact_maturity {
+            return Err(format!(
+                "OTA authorization: artifact maturity '{}' conflicts with target policy '{}'",
+                artifact.artifact_maturity.as_str(),
+                descriptor.enablement.artifact_maturity.as_str()
+            ));
+        }
+        if !artifact.installable {
+            return Err(
+                "OTA authorization: artifact explicitly declares installable=false".to_string(),
+            );
+        }
+
+        Ok(AuthorizedSysupgrade {
+            bundle: self,
+            board_target: descriptor.board_target,
+        })
+    }
+}
+
+/// Admit the exact running board target to the public browser update API.
+///
+/// Laboratory-only writers remain accessible through their explicit guarded
+/// workflows; this public endpoint is restricted to production/public-beta,
+/// redundant-slot Zynq sysupgrade policies.
+pub fn require_public_update_policy(board_target: &str) -> Result<&'static BoardDesc, String> {
+    let descriptor = BoardDesc::lookup(board_target)
+        .ok_or_else(|| format!("OTA policy: unknown canonical board target '{board_target}'"))?;
+    let policy = descriptor.enablement;
+    if !matches!(
+        policy.install_authorization,
+        InstallAuthorization::PublicBeta | InstallAuthorization::Production
+    ) || !policy.allows_persistent_update()
+    {
+        return Err(format!(
+            "OTA policy: target '{board_target}' is not authorized for public persistent updates"
+        ));
+    }
+    if policy.storage_topology != StorageTopology::RedundantSlots
+        || policy.update_mechanism != UpdateMechanism::ZynqUbiFwSetenv
+        || policy.artifact_kind != ArtifactKind::SysupgradeBundle
+    {
+        return Err(format!(
+            "OTA policy: target '{board_target}' is not a redundant-slot Zynq sysupgrade target"
+        ));
+    }
+    Ok(descriptor)
+}
+
+pub const MAX_BOARD_TARGET_MARKER_BYTES: usize = 128;
+
+/// Parse `/etc/dcentos/board_target` without trimming arbitrary whitespace or
+/// accepting multiple lines. One conventional trailing LF (or CRLF) is
+/// allowed; every other byte is part of the identity and must satisfy the
+/// canonical lowercase target grammar.
+pub fn parse_board_target_marker(bytes: &[u8]) -> Result<String, String> {
+    if bytes.is_empty() || bytes.len() > MAX_BOARD_TARGET_MARKER_BYTES {
+        return Err(format!(
+            "board_target marker must contain 1..={MAX_BOARD_TARGET_MARKER_BYTES} bytes"
+        ));
+    }
+    let without_lf = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let value_bytes = without_lf.strip_suffix(b"\r").unwrap_or(without_lf);
+    if value_bytes.is_empty()
+        || value_bytes
+            .iter()
+            .any(|byte| matches!(*byte, b'\r' | b'\n'))
+    {
+        return Err("board_target marker must contain exactly one identity line".to_string());
+    }
+    let value = std::str::from_utf8(value_bytes)
+        .map_err(|_| "board_target marker must be valid UTF-8".to_string())?;
+    if !value.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+    }) {
+        return Err(format!(
+            "board_target marker contains non-canonical identity '{value}'"
+        ));
+    }
+    Ok(value.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,12 +629,12 @@ struct SupportedPayloadKind {
 const SUPPORTED_PAYLOAD_KINDS: &[SupportedPayloadKind] = &[
     SupportedPayloadKind {
         manifest_kind: "kernel",
-        accepted_leaves: &["kernel", "uImage"],
+        accepted_leaves: &["kernel"],
         role: PayloadRole::Kernel,
     },
     SupportedPayloadKind {
         manifest_kind: "rootfs",
-        accepted_leaves: &["root", "rootfs.gz"],
+        accepted_leaves: &["root"],
         role: PayloadRole::Rootfs,
     },
     SupportedPayloadKind {
@@ -336,19 +651,6 @@ const SUPPORTED_PAYLOAD_KINDS: &[SupportedPayloadKind] = &[
         manifest_kind: "verification_key",
         accepted_leaves: &["release_ed25519.pub"],
         role: PayloadRole::Other,
-    },
-    // CV1835's established manifest schema uses the payload leaf as the key and
-    // stores the SHA-256 as a string. It remains supported while sharing the
-    // same post-signature contract as the structured Zynq/Amlogic schema.
-    SupportedPayloadKind {
-        manifest_kind: "uImage",
-        accepted_leaves: &["uImage"],
-        role: PayloadRole::Kernel,
-    },
-    SupportedPayloadKind {
-        manifest_kind: "rootfs.gz",
-        accepted_leaves: &["rootfs.gz"],
-        role: PayloadRole::Rootfs,
     },
 ];
 
@@ -455,8 +757,16 @@ pub fn read_manifest_version_from_bundle(bundle_path: &Path) -> Result<Option<St
         #[serde(default)]
         version: Option<String>,
     }
-    let parsed: ManifestVersion = serde_json::from_slice(&manifest_bytes)
-        .map_err(|e| format!("OTA rollback check: malformed MANIFEST.json: {}", e))?;
+    let manifest = parse_unique_manifest_json(&manifest_bytes).map_err(|error| match error {
+        ManifestJsonError::Malformed(message) => {
+            format!("OTA rollback check: malformed MANIFEST.json: {message}")
+        }
+        ManifestJsonError::DuplicateObjectKey(key) => {
+            format!("OTA rollback check: MANIFEST.json contains duplicate object key '{key}'")
+        }
+    })?;
+    let parsed: ManifestVersion = serde_json::from_value(manifest)
+        .map_err(|e| format!("OTA rollback check: malformed MANIFEST.json: {e}"))?;
     Ok(parsed
         .version
         .map(|v| v.trim().to_string())
@@ -466,7 +776,7 @@ pub fn read_manifest_version_from_bundle(bundle_path: &Path) -> Result<Option<St
 /// CE-183: manifest-declared package status. Missing/unparseable status is
 /// treated as release (fail-closed), matching the target sysupgrade script.
 fn manifest_declares_release_status(manifest_bytes: &[u8]) -> bool {
-    let status = serde_json::from_slice::<serde_json::Value>(manifest_bytes)
+    let status = parse_unique_manifest_json(manifest_bytes)
         .ok()
         .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_owned))
         .unwrap_or_else(|| "release".to_string());
@@ -479,8 +789,7 @@ fn manifest_declares_release_status(manifest_bytes: &[u8]) -> bool {
 /// value, surrounding whitespace, and an empty string are malformed identity
 /// claims and must not silently degrade to `None`.
 fn manifest_board_target(manifest_bytes: &[u8]) -> Result<Option<String>, String> {
-    let manifest: serde_json::Value = serde_json::from_slice(manifest_bytes)
-        .map_err(|e| format!("OTA bundle: malformed MANIFEST.json: {e}"))?;
+    let manifest = parse_authority_manifest_json(manifest_bytes)?;
     let Some(value) = manifest.get("board_target") else {
         return Ok(None);
     };
@@ -494,6 +803,276 @@ fn manifest_board_target(manifest_bytes: &[u8]) -> Result<Option<String>, String
         );
     }
     Ok(Some(target.to_string()))
+}
+
+fn required_manifest_string(manifest: &serde_json::Value, field: &str) -> Result<String, String> {
+    let value = manifest
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("OTA bundle: MANIFEST.json {field} must be a non-empty string"))?;
+    if value.is_empty() || value != value.trim() {
+        return Err(format!(
+            "OTA bundle: MANIFEST.json {field} must be non-empty with no surrounding whitespace"
+        ));
+    }
+    Ok(value.to_string())
+}
+
+/// Parse the signed, write-authorizing manifest fields independently from the
+/// payload registry. Missing fields are not legacy-compatible on a mutating
+/// path: an artifact that does not explicitly say what it is and whether it is
+/// installable cannot authorize a persistent update.
+fn verified_artifact_contract(
+    manifest_bytes: &[u8],
+    payload_prefix: &str,
+) -> Result<VerifiedArtifact, String> {
+    let manifest = parse_authority_manifest_json(manifest_bytes)?;
+    let schema = manifest
+        .get("schema")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "OTA bundle: MANIFEST.json schema must be integer 1".to_string())?;
+    if schema != 1 {
+        return Err(format!(
+            "OTA bundle: unsupported MANIFEST.json schema {schema}; expected 1"
+        ));
+    }
+
+    let manifest_profile = required_manifest_string(&manifest, "manifest_profile")?;
+    if manifest_profile != SYSUPGRADE_AUTHORITY_PROFILE {
+        return Err(format!(
+            "OTA bundle: unsupported MANIFEST.json manifest_profile '{manifest_profile}'; expected '{SYSUPGRADE_AUTHORITY_PROFILE}'"
+        ));
+    }
+
+    // Authority-v1 is deliberately bound to a direct signature by the
+    // long-lived release root.  The older two-level verifier uses wall-clock
+    // validity windows, but Zynq recovery/first-flash environments do not have
+    // an authenticated RTC or a guaranteed NTP fix before update admission.
+    // Treating that clock as authority would make the same signed bundle
+    // accept or reject according to mutable boot-time state.  Keep the
+    // low-level certificate parser available for read-only research and a
+    // future profile with trusted-time evidence, but never let its fields
+    // authorize a profile-v1 persistent write.
+    for unsupported_chain_field in ["ota_intermediate_cert", "ota_revoked_intermediates"] {
+        if manifest.get(unsupported_chain_field).is_some() {
+            return Err(format!(
+                "OTA bundle: {SYSUPGRADE_AUTHORITY_PROFILE} requires a direct release-root signature and forbids '{unsupported_chain_field}'; certificate validity has no trusted-time authority on Zynq"
+            ));
+        }
+    }
+
+    let status = required_manifest_string(&manifest, "status")?;
+    if status == "lab_unsigned" {
+        return Err(format!(
+            "OTA bundle: {SYSUPGRADE_AUTHORITY_PROFILE} forbids status 'lab_unsigned'"
+        ));
+    }
+
+    let product = required_manifest_string(&manifest, "product")?;
+    if product != "DCENT_OS" {
+        return Err(format!(
+            "OTA bundle: MANIFEST.json product must be DCENT_OS, found '{product}'"
+        ));
+    }
+
+    let package_type = required_manifest_string(&manifest, "package_type")?;
+    let artifact_kind = ArtifactKind::parse(&package_type).ok_or_else(|| {
+        format!("OTA bundle: unsupported MANIFEST.json package_type '{package_type}'")
+    })?;
+    if artifact_kind != ArtifactKind::SysupgradeBundle {
+        return Err(format!(
+            "OTA bundle: package_type '{}' is not a persistent sysupgrade artifact",
+            artifact_kind.as_str()
+        ));
+    }
+
+    match manifest
+        .get("installable")
+        .and_then(serde_json::Value::as_bool)
+    {
+        Some(true) => {}
+        Some(false) => {
+            return Err(
+                "OTA bundle: MANIFEST.json explicitly declares installable=false".to_string(),
+            )
+        }
+        None => {
+            return Err(
+                "OTA bundle: MANIFEST.json must explicitly declare installable=true".to_string(),
+            )
+        }
+    }
+
+    let artifact_maturity_value = manifest.get("artifact_maturity").ok_or_else(|| {
+        "OTA bundle: MANIFEST.json must declare typed artifact_maturity".to_string()
+    })?;
+    let artifact_maturity: ArtifactMaturity =
+        serde_json::from_value(artifact_maturity_value.clone()).map_err(|_| {
+            "OTA bundle: MANIFEST.json artifact_maturity must match the current 'experimental' authority policy"
+                .to_string()
+        })?;
+    if artifact_maturity != ArtifactMaturity::Experimental {
+        return Err(
+            "OTA bundle: MANIFEST.json artifact_maturity must match the current 'experimental' authority policy"
+                .to_string(),
+        );
+    }
+
+    let board_target = manifest_board_target(manifest_bytes)?.ok_or_else(|| {
+        "OTA bundle: MANIFEST.json must declare an exact board_target".to_string()
+    })?;
+    let board = required_manifest_string(&manifest, "board")?;
+    if board != board_target {
+        return Err(format!(
+            "OTA bundle: MANIFEST.json board '{board}' conflicts with board_target '{board_target}'"
+        ));
+    }
+
+    let expected_prefix = format!("sysupgrade-{board_target}");
+    if payload_prefix != expected_prefix {
+        return Err(format!(
+            "OTA bundle: payload directory '{payload_prefix}' does not match signed target prefix '{expected_prefix}'"
+        ));
+    }
+
+    Ok(VerifiedArtifact {
+        board_target,
+        artifact_kind,
+        artifact_maturity,
+        installable: true,
+        version: required_manifest_string(&manifest, "version")?,
+        payload_prefix: payload_prefix.to_string(),
+    })
+}
+
+/// Validate the deliberately non-authoritative unsigned laboratory profile.
+///
+/// This function returns only `()` by design. Even a structurally valid lab
+/// manifest is unauthenticated input and must never mint `VerifiedArtifact`,
+/// an authenticated board target, or `AuthorizedSysupgrade`.
+fn validate_unsigned_lab_artifact_contract(
+    manifest_bytes: &[u8],
+    payload_prefix: &str,
+) -> Result<(), String> {
+    let manifest = parse_authority_manifest_json(manifest_bytes)?;
+    let schema = manifest
+        .get("schema")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            "OTA bundle: unsigned lab MANIFEST.json schema must be integer 1".to_string()
+        })?;
+    if schema != 1 {
+        return Err(format!(
+            "OTA bundle: unsupported unsigned lab MANIFEST.json schema {schema}; expected 1"
+        ));
+    }
+
+    let manifest_profile = required_manifest_string(&manifest, "manifest_profile")?;
+    if manifest_profile != SYSUPGRADE_UNSIGNED_LAB_PROFILE {
+        return Err(format!(
+            "OTA bundle: unsigned lab MANIFEST.json manifest_profile must be '{SYSUPGRADE_UNSIGNED_LAB_PROFILE}', found '{manifest_profile}'"
+        ));
+    }
+
+    let status = required_manifest_string(&manifest, "status")?;
+    if status != "lab_unsigned" {
+        return Err(format!(
+            "OTA bundle: {SYSUPGRADE_UNSIGNED_LAB_PROFILE} requires exact status 'lab_unsigned', found '{status}'"
+        ));
+    }
+
+    for forbidden_authority_field in ["ota_intermediate_cert", "ota_revoked_intermediates"] {
+        if manifest.get(forbidden_authority_field).is_some() {
+            return Err(format!(
+                "OTA bundle: {SYSUPGRADE_UNSIGNED_LAB_PROFILE} forbids authority field '{forbidden_authority_field}'"
+            ));
+        }
+    }
+
+    let payloads = manifest
+        .get("payloads")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            "OTA bundle: unsigned lab MANIFEST.json must contain an object-valued payloads registry"
+                .to_string()
+        })?;
+    if payloads.contains_key("verification_key") {
+        return Err(format!(
+            "OTA bundle: {SYSUPGRADE_UNSIGNED_LAB_PROFILE} forbids payload kind 'verification_key'"
+        ));
+    }
+
+    let product = required_manifest_string(&manifest, "product")?;
+    if product != "DCENT_OS" {
+        return Err(format!(
+            "OTA bundle: unsigned lab MANIFEST.json product must be DCENT_OS, found '{product}'"
+        ));
+    }
+
+    let package_type = required_manifest_string(&manifest, "package_type")?;
+    if package_type != ArtifactKind::SysupgradeBundle.as_str() {
+        return Err(format!(
+            "OTA bundle: unsigned lab package_type must be '{}', found '{package_type}'",
+            ArtifactKind::SysupgradeBundle.as_str()
+        ));
+    }
+
+    if manifest
+        .get("installable")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err(
+            "OTA bundle: unsigned lab MANIFEST.json must explicitly declare installable=true"
+                .to_string(),
+        );
+    }
+
+    let artifact_maturity_value = manifest.get("artifact_maturity").ok_or_else(|| {
+        "OTA bundle: unsigned lab MANIFEST.json must declare typed artifact_maturity".to_string()
+    })?;
+    let artifact_maturity: ArtifactMaturity =
+        serde_json::from_value(artifact_maturity_value.clone()).map_err(|_| {
+            "OTA bundle: unsigned lab artifact_maturity must be 'experimental'".to_string()
+        })?;
+    if artifact_maturity != ArtifactMaturity::Experimental {
+        return Err(
+            "OTA bundle: unsigned lab artifact_maturity must be 'experimental'".to_string(),
+        );
+    }
+
+    let board_target = manifest_board_target(manifest_bytes)?.ok_or_else(|| {
+        "OTA bundle: unsigned lab MANIFEST.json must declare an exact board_target".to_string()
+    })?;
+    let board = required_manifest_string(&manifest, "board")?;
+    if board != board_target {
+        return Err(format!(
+            "OTA bundle: unsigned lab board '{board}' conflicts with board_target '{board_target}'"
+        ));
+    }
+
+    let expected_prefix = format!("sysupgrade-{board_target}");
+    if payload_prefix != expected_prefix {
+        return Err(format!(
+            "OTA bundle: unsigned lab payload directory '{payload_prefix}' does not match target prefix '{expected_prefix}'"
+        ));
+    }
+
+    required_manifest_string(&manifest, "version")?;
+    Ok(())
+}
+
+fn require_extracted_entry_absent(path: &Path, leaf: &str) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Err(format!(
+            "OTA bundle: unsigned lab profile forbids archive member '{leaf}'"
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "OTA bundle: failed to inspect extracted file '{}': {error}",
+            path.display()
+        )),
+    }
 }
 
 fn is_direct_regular_file(path: &Path) -> Result<bool, String> {
@@ -540,8 +1119,8 @@ fn verify_sysupgrade_extracted_bundle(
     allow_unsigned: bool,
     pinned_release_key_path: Option<&Path>,
 ) -> Result<SysupgradeBundle, String> {
-    // Find the single safe manifest-bearing payload subdir. Standard packages
-    // use `sysupgrade-*`; CV1835 uses `dcentos-*-sysupgrade`.
+    // Find the single safe manifest-bearing payload subdir. Authorization
+    // later binds it exactly to `sysupgrade-{signed board_target}`.
     let entries = std::fs::read_dir(extracted_root).map_err(|e| {
         format!(
             "OTA bundle: failed to read extracted root '{}': {}",
@@ -624,11 +1203,15 @@ fn verify_sysupgrade_extracted_bundle(
                     .to_string(),
             );
         }
+        require_extracted_entry_absent(&signature_path, "MANIFEST.sig")?;
+        require_extracted_entry_absent(&release_key_path, "release_ed25519.pub")?;
+        validate_unsigned_lab_artifact_contract(&manifest_bytes, payload_prefix)?;
         let observed = observe_extracted_payloads(&payload_dir, payload_prefix)?;
         let contract =
             verify_manifest_payload_contract(&manifest_bytes, payload_prefix, &observed)?;
         return Ok(SysupgradeBundle {
             authenticated_board_target: None,
+            verified_artifact: None,
             manifest_path,
             signature_path,
             release_key_path,
@@ -702,13 +1285,15 @@ fn verify_sysupgrade_extracted_bundle(
         pinned_release_key_path,
     )?;
 
-    let authenticated_board_target = manifest_board_target(&manifest_bytes)?;
+    let verified_artifact = verified_artifact_contract(&manifest_bytes, payload_prefix)?;
+    let authenticated_board_target = Some(verified_artifact.board_target.clone());
 
     let observed = observe_extracted_payloads(&payload_dir, payload_prefix)?;
     let contract = verify_manifest_payload_contract(&manifest_bytes, payload_prefix, &observed)?;
 
     Ok(SysupgradeBundle {
         authenticated_board_target,
+        verified_artifact: Some(verified_artifact),
         manifest_path,
         signature_path,
         release_key_path,
@@ -725,15 +1310,7 @@ fn extracted_contract_path(payload_dir: &Path, contract_path: &Path) -> Result<P
 }
 
 fn is_auxiliary_payload_leaf(leaf: &str) -> bool {
-    matches!(
-        leaf,
-        "MANIFEST.json"
-            | "MANIFEST.sig"
-            | "SHA256SUMS"
-            | "uImage.sha256"
-            | "rootfs.gz.sha256"
-            | "uboot-bootcmd.txt"
-    )
+    matches!(leaf, "MANIFEST.json" | "MANIFEST.sig" | "SHA256SUMS")
 }
 
 fn observe_extracted_payloads(
@@ -841,7 +1418,7 @@ fn verify_sysupgrade_tar_bundle(
         return Err("OTA bundle is missing MANIFEST.json".to_string());
     }
 
-    if archive.signature.is_empty() {
+    if archive.bundle.signature_path.as_os_str().is_empty() {
         if !allow_unsigned {
             return Err(
                 "OTA bundle is missing MANIFEST.sig - refusing unsigned upgrade. \
@@ -860,6 +1437,13 @@ fn verify_sysupgrade_tar_bundle(
                     .to_string(),
             );
         }
+        if !archive.bundle.release_key_path.as_os_str().is_empty() {
+            return Err(
+                "OTA bundle: unsigned lab profile forbids archive member 'release_ed25519.pub'"
+                    .to_string(),
+            );
+        }
+        validate_unsigned_lab_artifact_contract(&archive.manifest, &archive.payload_prefix)?;
         // Unsigned lab bundle: the manifest is not authenticated, but the
         // explicit lab escape still requires the same closed payload contract.
         let contract = verify_manifest_payload_contract(
@@ -883,7 +1467,8 @@ fn verify_sysupgrade_tar_bundle(
         &archive.release_key,
         pinned_release_key_path,
     )?;
-    let authenticated_board_target = manifest_board_target(&archive.manifest)?;
+    let verified_artifact = verified_artifact_contract(&archive.manifest, &archive.payload_prefix)?;
+    let authenticated_board_target = Some(verified_artifact.board_target.clone());
 
     // Bind every supported payload byte-for-byte to the now-authenticated
     // manifest and reject unknown or unmanifested image members.
@@ -895,6 +1480,7 @@ fn verify_sysupgrade_tar_bundle(
 
     let mut bundle = archive.bundle;
     bundle.authenticated_board_target = authenticated_board_target;
+    bundle.verified_artifact = Some(verified_artifact);
     bundle.kernel_path = contract.kernel_path;
     bundle.rootfs_path = contract.rootfs_path;
     Ok(bundle)
@@ -916,6 +1502,7 @@ fn read_sysupgrade_tar<R: Read + Seek>(reader: &mut R) -> Result<TarSysupgradeAr
     let mut archive = TarSysupgradeArchive::default();
     let mut payload_prefix: Option<String> = None;
     let mut seen_payload_files = std::collections::BTreeSet::<String>::new();
+    let mut payload_directory_count = 0usize;
     let mut entry_count = 0usize;
     let mut total_payload_bytes = 0u64;
 
@@ -968,6 +1555,15 @@ fn read_sysupgrade_tar<R: Read + Seek>(reader: &mut R) -> Result<TarSysupgradeAr
                     ));
                 }
                 remember_payload_prefix(&mut payload_prefix, prefix)?;
+                payload_directory_count = payload_directory_count
+                    .checked_add(1)
+                    .ok_or_else(|| "OTA bundle payload directory count overflow".to_string())?;
+                if payload_directory_count > 1 {
+                    return Err(
+                        "OTA bundle must contain exactly one canonical payload directory entry"
+                            .to_string(),
+                    );
+                }
                 skip_tar_padding(reader, size)?;
             }
             SysupgradeTarEntry::File { prefix, leaf } => {
@@ -1019,7 +1615,7 @@ fn read_sysupgrade_tar<R: Read + Seek>(reader: &mut R) -> Result<TarSysupgradeAr
                             },
                         );
                     }
-                    "SHA256SUMS" | "uImage.sha256" | "rootfs.gz.sha256" | "uboot-bootcmd.txt" => {
+                    "SHA256SUMS" => {
                         if size > MAX_SYSUPGRADE_METADATA_BYTES {
                             return Err(format!(
                                 "OTA bundle metadata '{}' exceeds safety ceiling ({} > {})",
@@ -1052,8 +1648,10 @@ fn read_sysupgrade_tar<R: Read + Seek>(reader: &mut R) -> Result<TarSysupgradeAr
         }
     }
 
-    if payload_prefix.is_none() {
-        return Err("OTA bundle is missing a payload directory".to_string());
+    if payload_prefix.is_none() || payload_directory_count != 1 {
+        return Err(
+            "OTA bundle must contain exactly one canonical payload directory entry".to_string(),
+        );
     }
     archive.payload_prefix = payload_prefix.unwrap_or_default();
 
@@ -1144,7 +1742,6 @@ enum SysupgradeTarEntry<'a> {
 }
 
 fn classify_sysupgrade_tar_entry(path: &str) -> Result<SysupgradeTarEntry<'_>, String> {
-    let path = path.trim_start_matches("./");
     if path.is_empty() {
         return Err("OTA bundle tar entry has empty name".to_string());
     }
@@ -1176,6 +1773,12 @@ fn classify_sysupgrade_tar_entry(path: &str) -> Result<SysupgradeTarEntry<'_>, S
     }
 
     if parts.len() == 1 {
+        if !directory_path {
+            return Err(format!(
+                "OTA bundle tar directory entry '{}' must use the canonical trailing slash",
+                path
+            ));
+        }
         return Ok(SysupgradeTarEntry::Directory { prefix });
     }
 
@@ -1303,8 +1906,7 @@ fn verify_manifest_payload_contract(
     payload_prefix: &str,
     observed_payloads: &std::collections::BTreeMap<String, ObservedPayload>,
 ) -> Result<VerifiedPayloadContract, String> {
-    let manifest: serde_json::Value = serde_json::from_slice(manifest_bytes)
-        .map_err(|e| format!("OTA bundle: malformed MANIFEST.json: {e}"))?;
+    let manifest = parse_authority_manifest_json(manifest_bytes)?;
     let payloads = manifest
         .get("payloads")
         .and_then(serde_json::Value::as_object)
@@ -1314,39 +1916,28 @@ fn verify_manifest_payload_contract(
     if payloads.is_empty() {
         return Err("OTA bundle: MANIFEST.json payloads registry is empty".to_string());
     }
+    let requires_verification_key = manifest
+        .get("manifest_profile")
+        .and_then(serde_json::Value::as_str)
+        == Some(SYSUPGRADE_AUTHORITY_PROFILE);
 
     let mut declared_leaves = std::collections::BTreeSet::<String>::new();
     let mut kernel_path: Option<PathBuf> = None;
     let mut rootfs_path: Option<PathBuf> = None;
+    let mut metadata_declared = false;
+    let mut verification_key_declared = false;
 
     for (kind, declaration) in payloads {
         let spec = supported_payload_kind(kind)
             .ok_or_else(|| format!("OTA bundle: unsupported manifest payload kind '{kind}'"))?;
 
-        let (declared_path, declared_size, declared_sha256) = if let Some(sha256) =
-            declaration.as_str()
-        {
-            // CV1835 schema 1: the payload key is also its archive leaf.
-            if !spec.accepted_leaves.contains(&kind.as_str()) {
-                return Err(format!(
-                        "OTA bundle: payload kind '{kind}' requires a structured path/size/sha256 declaration"
-                    ));
-            }
-            (
-                format!("{payload_prefix}/{kind}"),
-                None,
-                sha256.trim().to_ascii_lowercase(),
-            )
-        } else {
+        let (declared_path, declared_size, declared_sha256) = {
             let object = declaration.as_object().ok_or_else(|| {
-                    format!(
-                        "OTA bundle: payload kind '{kind}' must be a SHA-256 string or path/size/sha256 object"
-                    )
-                })?;
+                format!("OTA bundle: payload kind '{kind}' must be a path/size/sha256 object")
+            })?;
             let path = object
                 .get("path")
                 .and_then(serde_json::Value::as_str)
-                .map(str::trim)
                 .filter(|path| !path.is_empty())
                 .ok_or_else(|| {
                     format!("OTA bundle: payload kind '{kind}' is missing a non-empty path")
@@ -1361,17 +1952,29 @@ fn verify_manifest_payload_contract(
             let sha256 = object
                 .get("sha256")
                 .and_then(serde_json::Value::as_str)
-                .map(str::trim)
                 .unwrap_or_default()
-                .to_ascii_lowercase();
-            (path, Some(size), sha256)
+                .to_string();
+            (path, size, sha256)
         };
 
+        if declared_path != declared_path.trim() {
+            return Err(format!(
+                "OTA bundle: payload kind '{kind}' path must not contain surrounding whitespace"
+            ));
+        }
+        if declared_size == 0 {
+            return Err(format!(
+                "OTA bundle: payload kind '{kind}' size must be a positive integer"
+            ));
+        }
+
         if declared_sha256.len() != 64
-            || !declared_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !declared_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
         {
             return Err(format!(
-                "OTA bundle: payload kind '{kind}' has an invalid SHA-256"
+                "OTA bundle: payload kind '{kind}' SHA-256 must be exact lowercase hexadecimal"
             ));
         }
 
@@ -1395,6 +1998,11 @@ fn verify_manifest_payload_contract(
                 "OTA bundle: multiple manifest payload kinds resolve to archive leaf '{leaf}'"
             ));
         }
+        match kind.as_str() {
+            "metadata" => metadata_declared = true,
+            "verification_key" => verification_key_declared = true,
+            _ => {}
+        }
 
         let observed = observed_payloads.get(leaf).ok_or_else(|| {
             format!(
@@ -1407,13 +2015,11 @@ fn verify_manifest_payload_contract(
                 declared_path, observed.path
             ));
         }
-        if let Some(size) = declared_size {
-            if size != observed.size {
-                return Err(format!(
-                    "OTA bundle: payload kind '{kind}' size mismatch (manifest {}, archive {})",
-                    size, observed.size
-                ));
-            }
+        if declared_size != observed.size {
+            return Err(format!(
+                "OTA bundle: payload kind '{kind}' size mismatch (manifest {}, archive {})",
+                declared_size, observed.size
+            ));
         }
         if declared_sha256 != observed.sha256 {
             return Err(format!(
@@ -1441,14 +2047,24 @@ fn verify_manifest_payload_contract(
         }
     }
 
+    if requires_verification_key && !verification_key_declared {
+        return Err(format!(
+            "OTA bundle: manifest_profile '{SYSUPGRADE_AUTHORITY_PROFILE}' requires payload kind 'verification_key' binding release_ed25519.pub"
+        ));
+    }
+    if !metadata_declared {
+        return Err(
+            "OTA bundle manifest is missing required payload kind 'metadata' binding METADATA"
+                .to_string(),
+        );
+    }
+
     for leaf in observed_payloads.keys() {
-        // The embedded key is independently compared to the pinned trust anchor.
-        // Older signed manifests did not list it as a payload, so keep that one
-        // compatibility exception. Every image-bearing member must be declared.
-        if leaf != "release_ed25519.pub" && !declared_leaves.contains(leaf) {
-            return Err(format!(
-                "OTA bundle contains unmanifested image payload '{leaf}'"
-            ));
+        // The signed registry binds every accepted archive member. Trust-anchor
+        // comparison establishes who may sign; it does not authenticate an
+        // otherwise undeclared embedded key's path, size, or bytes.
+        if !declared_leaves.contains(leaf) {
+            return Err(format!("OTA bundle contains unmanifested payload '{leaf}'"));
         }
     }
 
@@ -1489,17 +2105,32 @@ fn skip_tar_padding<R: Seek>(reader: &mut R, size: u64) -> Result<(), String> {
 }
 
 fn tar_header_path(header: &[u8; 512]) -> Result<String, String> {
-    let name = tar_string(&header[0..100]);
+    let name = tar_path_string(&header[0..100], "name")?;
     if name.is_empty() {
         return Err("OTA bundle tar entry has empty name".to_string());
     }
-    let prefix = tar_string(&header[345..500]);
+    let prefix = tar_path_string(&header[345..500], "prefix")?;
     let path = if prefix.is_empty() {
         name
     } else {
         format!("{}/{}", prefix, name)
     };
-    Ok(path.trim_start_matches("./").to_string())
+    Ok(path)
+}
+
+fn tar_path_string(bytes: &[u8], field: &str) -> Result<String, String> {
+    let end = bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(bytes.len());
+    if bytes[end..].iter().any(|byte| *byte != 0) {
+        return Err(format!(
+            "OTA bundle tar {field} contains non-zero bytes after its terminator"
+        ));
+    }
+    std::str::from_utf8(&bytes[..end])
+        .map(str::to_string)
+        .map_err(|_| format!("OTA bundle tar {field} is not valid UTF-8"))
 }
 
 fn tar_string(bytes: &[u8]) -> String {
@@ -1902,9 +2533,14 @@ pub fn parse_intermediate_cert_from_manifest(
     // If the whole manifest is not valid JSON, there cannot be an
     // `ota_intermediate_cert`, so return Ok(None) and let the caller run the
     // unchanged legacy direct path — we do NOT newly reject a bundle here.
-    let root_value: serde_json::Value = match serde_json::from_slice(manifest_bytes) {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
+    let root_value = match parse_unique_manifest_json(manifest_bytes) {
+        Ok(value) => value,
+        Err(ManifestJsonError::Malformed(_)) => return Ok(None),
+        Err(ManifestJsonError::DuplicateObjectKey(key)) => {
+            return Err(format!(
+                "OTA two-level cert: MANIFEST.json contains duplicate object key '{key}'"
+            ))
+        }
     };
 
     // No `ota_intermediate_cert` key => legacy single-key path (Ok(None)).
@@ -2157,6 +2793,8 @@ fn to_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    const TEST_SYSUPGRADE_METADATA: &[u8] = b"metadata";
+
     #[test]
     fn classify_sysupgrade_tar_entry_rejects_all_hostile_member_names() {
         // Security pin (priority 5: upgrade reliability). classify_sysupgrade_tar_entry
@@ -2168,7 +2806,7 @@ mod tests {
 
         // Positive: the only two accepted shapes.
         assert!(matches!(
-            classify_sysupgrade_tar_entry("sysupgrade-am1-s9"),
+            classify_sysupgrade_tar_entry("sysupgrade-am1-s9/"),
             Ok(SysupgradeTarEntry::Directory { .. })
         ));
         for leaf in [
@@ -2191,10 +2829,6 @@ mod tests {
                 ),
                 "expected {p} to classify as a File"
             );
-            assert!(matches!(
-                classify_sysupgrade_tar_entry(&format!("./{p}")),
-                Ok(SysupgradeTarEntry::File { .. })
-            ));
         }
 
         // Hostile: every one of these MUST be Err.
@@ -2212,6 +2846,7 @@ mod tests {
             "sysupgrade-x/sub/kernel",   // nested (parts != 2)
             "sysupgrade-x/kernel/",      // dir-shaped file
             "sysupgrade-x\\kernel",      // backslash
+            "./sysupgrade-x/kernel",     // non-canonical relative alias
             "sysupgrade-x/payload name", // unsafe whitespace
             "sysupgrade-x/payload:$",    // unsafe punctuation
         ] {
@@ -2487,7 +3122,34 @@ mod tests {
 
         let err = read_sysupgrade_tar(&mut finish_tar(tar))
             .expect_err("outside payload entry must be rejected");
-        assert!(err.contains("must be a directory"), "err = {err}");
+        assert!(err.contains("canonical trailing slash"), "err = {err}");
+    }
+
+    #[test]
+    fn read_sysupgrade_tar_requires_one_exact_canonical_directory_entry() {
+        let mut missing = Vec::new();
+        append_tar_entry(&mut missing, "sysupgrade-am1-s9/kernel", b'0', b"kernel");
+
+        let mut duplicate = Vec::new();
+        append_tar_entry(&mut duplicate, "sysupgrade-am1-s9/", b'5', &[]);
+        append_tar_entry(&mut duplicate, "sysupgrade-am1-s9/", b'5', &[]);
+
+        let mut missing_slash = Vec::new();
+        append_tar_entry(&mut missing_slash, "sysupgrade-am1-s9", b'5', &[]);
+
+        for (label, tar) in [
+            ("missing", missing),
+            ("duplicate", duplicate),
+            ("missing trailing slash", missing_slash),
+        ] {
+            let err = read_sysupgrade_tar(&mut finish_tar(tar))
+                .expect_err("non-canonical payload directory shape must reject");
+            assert!(
+                err.contains("canonical payload directory")
+                    || err.contains("canonical trailing slash"),
+                "{label}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -2727,50 +3389,144 @@ mod tests {
         embedded_pubkey: Option<&[u8]>,
         extra_payloads: &[(&str, &[u8])],
     ) -> Vec<u8> {
+        let prefix = test_manifest_payload_prefix(manifest);
         let mut tar = Vec::new();
-        append_tar_entry(&mut tar, "sysupgrade-am1-s9/", b'5', &[]);
-        append_tar_entry(&mut tar, "sysupgrade-am1-s9/kernel", b'0', b"kernel");
-        append_tar_entry(&mut tar, "sysupgrade-am1-s9/root", b'0', b"rootfs");
+        append_tar_entry(&mut tar, &format!("{prefix}/"), b'5', &[]);
+        append_tar_entry(&mut tar, &format!("{prefix}/kernel"), b'0', b"kernel");
+        append_tar_entry(&mut tar, &format!("{prefix}/root"), b'0', b"rootfs");
+        append_tar_entry(
+            &mut tar,
+            &format!("{prefix}/METADATA"),
+            b'0',
+            TEST_SYSUPGRADE_METADATA,
+        );
         for (leaf, payload) in extra_payloads {
-            append_tar_entry(
-                &mut tar,
-                &format!("sysupgrade-am1-s9/{leaf}"),
-                b'0',
-                payload,
-            );
+            append_tar_entry(&mut tar, &format!("{prefix}/{leaf}"), b'0', payload);
         }
-        append_tar_entry(&mut tar, "sysupgrade-am1-s9/MANIFEST.json", b'0', manifest);
+        append_tar_entry(&mut tar, &format!("{prefix}/MANIFEST.json"), b'0', manifest);
         if let Some(sig) = signature {
-            append_tar_entry(&mut tar, "sysupgrade-am1-s9/MANIFEST.sig", b'0', sig);
+            append_tar_entry(&mut tar, &format!("{prefix}/MANIFEST.sig"), b'0', sig);
         }
         if let Some(key) = embedded_pubkey {
-            append_tar_entry(&mut tar, "sysupgrade-am1-s9/release_ed25519.pub", b'0', key);
+            append_tar_entry(
+                &mut tar,
+                &format!("{prefix}/release_ed25519.pub"),
+                b'0',
+                key,
+            );
         }
         // finish_tar returns a Cursor; we want the raw bytes to write to disk.
         finish_tar(tar).into_inner()
     }
 
+    fn test_manifest_payload_prefix(manifest: &[u8]) -> String {
+        let target = serde_json::from_slice::<serde_json::Value>(manifest)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("board_target")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|target| {
+                        !target.is_empty()
+                            && target.bytes().all(|byte| {
+                                byte.is_ascii_lowercase()
+                                    || byte.is_ascii_digit()
+                                    || matches!(byte, b'-' | b'_')
+                            })
+                    })
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "am1-s9".to_string());
+        format!("sysupgrade-{target}")
+    }
+
     fn manifest_with_standard_payloads(base_manifest: &[u8]) -> Vec<u8> {
+        manifest_with_standard_payloads_and_key(
+            base_manifest,
+            make_key().verifying_key().as_bytes(),
+        )
+    }
+
+    fn manifest_with_unsigned_lab_payloads(base_manifest: &[u8]) -> Vec<u8> {
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&manifest_with_standard_payloads(base_manifest))
+                .expect("test manifest JSON");
+        manifest["manifest_profile"] = serde_json::json!(SYSUPGRADE_UNSIGNED_LAB_PROFILE);
+        manifest["status"] = serde_json::json!("lab_unsigned");
+        manifest
+            .get_mut("payloads")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("test payload registry")
+            .remove("verification_key");
+        serde_json::to_vec(&manifest).expect("serialize unsigned lab test manifest")
+    }
+
+    fn manifest_with_standard_payloads_and_key(
+        base_manifest: &[u8],
+        verification_key: &[u8],
+    ) -> Vec<u8> {
         let mut manifest: serde_json::Value =
             serde_json::from_slice(base_manifest).expect("test manifest JSON");
-        manifest
-            .as_object_mut()
-            .expect("test manifest object")
-            .insert(
-                "payloads".to_string(),
-                serde_json::json!({
-                    "kernel": {
-                        "path": "sysupgrade-am1-s9/kernel",
-                        "size": 6,
-                        "sha256": sha256_hex(b"kernel"),
-                    },
-                    "rootfs": {
-                        "path": "sysupgrade-am1-s9/root",
-                        "size": 6,
-                        "sha256": sha256_hex(b"rootfs"),
-                    }
-                }),
-            );
+        let prefix = test_manifest_payload_prefix(base_manifest);
+        let object = manifest.as_object_mut().expect("test manifest object");
+        object
+            .entry("schema".to_string())
+            .or_insert(serde_json::json!(1));
+        object
+            .entry("manifest_profile".to_string())
+            .or_insert(serde_json::json!(SYSUPGRADE_AUTHORITY_PROFILE));
+        object
+            .entry("product".to_string())
+            .or_insert(serde_json::json!("DCENT_OS"));
+        object
+            .entry("package_type".to_string())
+            .or_insert(serde_json::json!("sysupgrade"));
+        object
+            .entry("installable".to_string())
+            .or_insert(serde_json::json!(true));
+        object
+            .entry("artifact_maturity".to_string())
+            .or_insert(serde_json::json!("experimental"));
+        object
+            .entry("version".to_string())
+            .or_insert(serde_json::json!("0.20.1"));
+        object
+            .entry("status".to_string())
+            .or_insert(serde_json::json!("release"));
+        if !object.contains_key("board") {
+            if let Some(board_target) = object
+                .get("board_target")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+            {
+                object.insert("board".to_string(), serde_json::json!(board_target));
+            }
+        }
+        object.insert(
+            "payloads".to_string(),
+            serde_json::json!({
+                "kernel": {
+                    "path": format!("{prefix}/kernel"),
+                    "size": 6,
+                    "sha256": sha256_hex(b"kernel"),
+                },
+                "rootfs": {
+                    "path": format!("{prefix}/root"),
+                    "size": 6,
+                    "sha256": sha256_hex(b"rootfs"),
+                },
+                "metadata": {
+                    "path": format!("{prefix}/METADATA"),
+                    "size": TEST_SYSUPGRADE_METADATA.len(),
+                    "sha256": sha256_hex(TEST_SYSUPGRADE_METADATA),
+                },
+                "verification_key": {
+                    "path": format!("{prefix}/release_ed25519.pub"),
+                    "size": verification_key.len(),
+                    "sha256": sha256_hex(verification_key),
+                }
+            }),
+        );
         serde_json::to_vec(&manifest).expect("serialize test manifest")
     }
 
@@ -2784,12 +3540,226 @@ mod tests {
     fn add_manifest_payload(manifest: &[u8], kind: &str, leaf: &str, payload: &[u8]) -> Vec<u8> {
         let mut value: serde_json::Value =
             serde_json::from_slice(manifest).expect("test manifest JSON");
+        let prefix = test_manifest_payload_prefix(manifest);
         value["payloads"][kind] = serde_json::json!({
-            "path": format!("sysupgrade-am1-s9/{leaf}"),
+            "path": format!("{prefix}/{leaf}"),
             "size": payload.len(),
             "sha256": sha256_hex(payload),
         });
         serde_json::to_vec(&value).expect("serialize test manifest")
+    }
+
+    fn signed_manifest_rejection(manifest: &[u8], label: &str) -> String {
+        let scratch = ota_scratch_dir(label);
+        let signing = make_key();
+        let pubkey = signing.verifying_key().to_bytes();
+        let signature = signing.sign(manifest).to_bytes();
+        let tar_path = scratch.join("duplicate-key.tar");
+        std::fs::write(
+            &tar_path,
+            build_sysupgrade_tar_bytes(manifest, Some(&signature), Some(&pubkey)),
+        )
+        .unwrap();
+        let pin_path = scratch.join("release_ed25519.pub");
+        std::fs::write(&pin_path, pubkey).unwrap();
+
+        let error = verify_sysupgrade_bundle(&tar_path, false, Some(&pin_path))
+            .expect_err("a signed manifest with duplicate JSON keys must fail closed");
+        std::fs::remove_dir_all(&scratch).ok();
+        error
+    }
+
+    #[test]
+    fn verified_artifact_contract_requires_explicit_install_authority() {
+        let valid = manifest_with_standard_payloads(
+            br#"{"board_target":"am1-s9","board":"am1-s9","version":"0.20.1"}"#,
+        );
+        let parsed = verified_artifact_contract(&valid, "sysupgrade-am1-s9")
+            .expect("complete typed sysupgrade manifest must parse");
+        assert_eq!(parsed.board_target, "am1-s9");
+        assert_eq!(parsed.artifact_kind, ArtifactKind::SysupgradeBundle);
+        assert_eq!(parsed.artifact_maturity, ArtifactMaturity::Experimental);
+        assert!(parsed.installable);
+
+        for (field, replacement, expected) in [
+            (
+                "manifest_profile",
+                serde_json::json!("legacy"),
+                "manifest_profile",
+            ),
+            (
+                "package_type",
+                serde_json::json!("offline_analysis"),
+                "not a persistent sysupgrade artifact",
+            ),
+            ("installable", serde_json::json!(false), "installable=false"),
+            (
+                "artifact_maturity",
+                serde_json::json!("not_implemented"),
+                "artifact_maturity",
+            ),
+            (
+                "artifact_maturity",
+                serde_json::json!("production"),
+                "current 'experimental' authority policy",
+            ),
+        ] {
+            let mut manifest: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+            manifest[field] = replacement;
+            let bytes = serde_json::to_vec(&manifest).unwrap();
+            let err = verified_artifact_contract(&bytes, "sysupgrade-am1-s9")
+                .expect_err("non-authorizing manifest must reject");
+            assert!(err.contains(expected), "{field}: {err}");
+        }
+
+        for missing in ["manifest_profile", "board"] {
+            let mut manifest: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+            manifest.as_object_mut().unwrap().remove(missing);
+            let bytes = serde_json::to_vec(&manifest).unwrap();
+            let err = verified_artifact_contract(&bytes, "sysupgrade-am1-s9")
+                .expect_err("required authority field must not be optional");
+            assert!(err.contains(missing), "{missing}: {err}");
+        }
+
+        for unsupported_chain_field in ["ota_intermediate_cert", "ota_revoked_intermediates"] {
+            let mut manifest: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+            manifest[unsupported_chain_field] =
+                if unsupported_chain_field == "ota_intermediate_cert" {
+                    serde_json::json!({})
+                } else {
+                    serde_json::json!([])
+                };
+            let bytes = serde_json::to_vec(&manifest).unwrap();
+            let err = verified_artifact_contract(&bytes, "sysupgrade-am1-s9").expect_err(
+                "authority-v1 must never derive mutation authority from wall-clock certificates",
+            );
+            assert!(
+                err.contains("direct release-root signature")
+                    && err.contains("trusted-time authority"),
+                "{unsupported_chain_field}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn verified_artifact_contract_binds_target_fields_and_prefix() {
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&manifest_with_standard_payloads(
+                br#"{"board_target":"am1-s9","board":"am1-s9","version":"0.20.1"}"#,
+            ))
+            .unwrap();
+        manifest["board"] = serde_json::json!("am2-s19j");
+        let conflict = serde_json::to_vec(&manifest).unwrap();
+        let err = verified_artifact_contract(&conflict, "sysupgrade-am1-s9")
+            .expect_err("conflicting board aliases must reject");
+        assert!(err.contains("conflicts with board_target"), "{err}");
+
+        manifest["board"] = serde_json::json!("am1-s9");
+        let exact = serde_json::to_vec(&manifest).unwrap();
+        let err = verified_artifact_contract(&exact, "sysupgrade-am2-s19j")
+            .expect_err("payload prefix must be derived from signed target");
+        assert!(
+            err.contains("signed target prefix 'sysupgrade-am1-s9'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn signed_manifest_rejects_duplicate_root_authority_keys_before_last_wins() {
+        let valid = String::from_utf8(manifest_with_standard_payloads(
+            br#"{"board_target":"am1-s9","board":"am1-s9","version":"0.20.1"}"#,
+        ))
+        .unwrap();
+        let needle = r#""board_target":"am1-s9""#;
+        assert!(
+            valid.contains(needle),
+            "fixture must contain exact target field"
+        );
+
+        for (label, first_value) in [("identical", "am1-s9"), ("conflicting", "am2-s19j")] {
+            // The final occurrence is deliberately the valid S9 value. Normal
+            // serde_json::Value parsing would silently keep it and authorize
+            // the package, masking the preceding contradictory claim.
+            let replacement = format!(r#""board_target":"{first_value}",{needle}"#);
+            let duplicate = valid.replacen(needle, &replacement, 1);
+            let error =
+                signed_manifest_rejection(duplicate.as_bytes(), &format!("duplicate-root-{label}"));
+            assert!(
+                error.contains("duplicate object key 'board_target'"),
+                "{label}: unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_manifest_rejects_duplicate_nested_payload_fields_before_last_wins() {
+        let valid = manifest_with_standard_payloads(
+            br#"{"board_target":"am1-s9","board":"am1-s9","version":"0.20.1"}"#,
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+        let kernel = serde_json::to_string(&parsed["payloads"]["kernel"]).unwrap();
+        let size = r#""size":6"#;
+        assert!(kernel.contains(size), "kernel fixture must declare size 6");
+
+        for (label, first_value) in [("identical", 6), ("conflicting", 999)] {
+            // This duplicate is three object levels deep. The last value again
+            // matches the archive, so last-wins parsing would incorrectly pass
+            // the signed payload binding check.
+            let replacement = format!(r#""size":{first_value},{size}"#);
+            let duplicate_kernel = kernel.replacen(size, &replacement, 1);
+            let manifest =
+                String::from_utf8(valid.clone())
+                    .unwrap()
+                    .replacen(&kernel, &duplicate_kernel, 1);
+            let error = signed_manifest_rejection(
+                manifest.as_bytes(),
+                &format!("duplicate-payload-{label}"),
+            );
+            assert!(
+                error.contains("duplicate object key 'size'"),
+                "{label}: unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_update_policy_is_exact_and_excludes_lab_and_offline_targets() {
+        assert_eq!(
+            require_public_update_policy("am1-s9")
+                .expect("S9 public beta policy")
+                .board_target,
+            "am1-s9"
+        );
+        let am2 = require_public_update_policy("am2-s19j").expect("AM2 S19j public update policy");
+        assert_eq!(am2.board_target, "am2-s19j");
+        assert!(
+            !am2.public_beta_install && !am2.product_install_allowed(),
+            "AM2 public update authority must not become vendor-source first-install authority"
+        );
+        for denied in ["am2-s19pro", "cv1835-s19jpro", "unknown"] {
+            assert!(
+                require_public_update_policy(denied).is_err(),
+                "{denied} must not acquire browser OTA authority"
+            );
+        }
+    }
+
+    #[test]
+    fn board_target_marker_parser_is_single_line_and_exact() {
+        assert_eq!(parse_board_target_marker(b"am1-s9\n").unwrap(), "am1-s9");
+        assert_eq!(
+            parse_board_target_marker(b"am2-s19j\r\n").unwrap(),
+            "am2-s19j"
+        );
+        for invalid in [
+            b"".as_slice(),
+            b" am1-s9\n".as_slice(),
+            b"am1-s9 \n".as_slice(),
+            b"am1-s9\ncv1835-s19jpro\n".as_slice(),
+            b"AM1-S9\n".as_slice(),
+        ] {
+            assert!(parse_board_target_marker(invalid).is_err());
+        }
     }
 
     #[test]
@@ -2850,6 +3820,77 @@ mod tests {
         bundle
             .require_authenticated_board_target("am1-s9")
             .expect("matching authenticated target must accept");
+        let authorized = bundle
+            .authorize_public_update("am1-s9")
+            .expect("verified S9 artifact must bind to public-beta policy");
+        assert_eq!(authorized.board_target(), "am1-s9");
+        assert_eq!(authorized.version(), "0.20.1");
+    }
+
+    #[test]
+    fn signed_authority_profile_requires_exact_verification_key_binding() {
+        let signing = make_key();
+        let pubkey = signing.verifying_key().to_bytes();
+        let base =
+            manifest_with_standard_payloads(br#"{"board_target":"am1-s9","version":"0.20.1"}"#);
+
+        for (label, mutate, expected) in [
+            (
+                "missing",
+                "missing",
+                "requires payload kind 'verification_key'",
+            ),
+            ("path", "path", "does not support archive leaf 'kernel'"),
+            (
+                "size",
+                "size",
+                "payload kind 'verification_key' size mismatch",
+            ),
+            (
+                "sha256",
+                "sha256",
+                "payload kind 'verification_key' sha256 mismatch",
+            ),
+        ] {
+            let scratch = ota_scratch_dir(&format!("verification-key-{label}"));
+            let mut manifest: serde_json::Value = serde_json::from_slice(&base).unwrap();
+            match mutate {
+                "missing" => {
+                    manifest["payloads"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("verification_key");
+                }
+                "path" => {
+                    manifest["payloads"]["verification_key"]["path"] =
+                        serde_json::json!("sysupgrade-am1-s9/kernel");
+                }
+                "size" => {
+                    manifest["payloads"]["verification_key"]["size"] =
+                        serde_json::json!(pubkey.len() - 1);
+                }
+                "sha256" => {
+                    manifest["payloads"]["verification_key"]["sha256"] =
+                        serde_json::json!("00".repeat(32));
+                }
+                _ => unreachable!(),
+            }
+            let manifest = serde_json::to_vec(&manifest).unwrap();
+            let signature = signing.sign(&manifest).to_bytes();
+            let tar_path = scratch.join("verification-key.tar");
+            std::fs::write(
+                &tar_path,
+                build_sysupgrade_tar_bytes(&manifest, Some(&signature), Some(&pubkey)),
+            )
+            .unwrap();
+            let pin_path = scratch.join("release_ed25519.pub");
+            std::fs::write(&pin_path, pubkey).unwrap();
+
+            let err = verify_sysupgrade_bundle(&tar_path, false, Some(&pin_path))
+                .expect_err("an unbound embedded verification key must reject");
+            std::fs::remove_dir_all(&scratch).ok();
+            assert!(err.contains(expected), "{label}: unexpected error: {err}");
+        }
     }
 
     #[test]
@@ -2885,7 +3926,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_legacy_manifest_without_board_target_is_exposed_as_absent() {
+    fn signed_legacy_manifest_without_board_target_is_rejected() {
         let scratch = ota_scratch_dir("board-target-legacy");
         let signing = make_key();
         let pubkey = signing.verifying_key().to_bytes();
@@ -2900,15 +3941,11 @@ mod tests {
         .unwrap();
         std::fs::write(&pin_path, pubkey).unwrap();
 
-        let bundle = verify_sysupgrade_bundle(&tar_path, false, Some(&pin_path))
-            .expect("genuinely absent legacy board_target remains inspectable");
-        let err = bundle
-            .require_authenticated_board_target("am1-s9")
-            .expect_err("a production lane must fail closed on missing target identity");
+        let err = verify_sysupgrade_bundle(&tar_path, false, Some(&pin_path))
+            .expect_err("a signed mutating artifact must declare exact board_target authority");
         std::fs::remove_dir_all(&scratch).ok();
 
-        assert_eq!(bundle.authenticated_board_target, None);
-        assert!(err.contains("does not declare board_target"), "{err}");
+        assert!(err.contains("must declare an exact board_target"), "{err}");
     }
 
     #[test]
@@ -2966,9 +4003,12 @@ mod tests {
         std::fs::remove_dir_all(&scratch).ok();
         assert_eq!(
             bundle.kernel_path,
-            PathBuf::from("sysupgrade-am1-s9/kernel")
+            PathBuf::from("sysupgrade-am2-s19j/kernel")
         );
-        assert_eq!(bundle.rootfs_path, PathBuf::from("sysupgrade-am1-s9/root"));
+        assert_eq!(
+            bundle.rootfs_path,
+            PathBuf::from("sysupgrade-am2-s19j/root")
+        );
     }
 
     #[test]
@@ -2982,7 +4022,7 @@ mod tests {
                 "unmanifested",
                 manifest_with_standard_payloads(br#"{"board_target":"am2-s19j"}"#),
                 &bitstream[..],
-                "unmanifested image payload",
+                "unmanifested payload",
             ),
             (
                 "mismatched",
@@ -3043,7 +4083,83 @@ mod tests {
     }
 
     #[test]
-    fn cv1835_structured_manifest_resolves_consumer_payload_names() {
+    fn signed_payload_contract_requires_metadata_and_exact_path_digest_text() {
+        let signing = make_key();
+        let pubkey = signing.verifying_key().to_bytes();
+        let canonical = manifest_with_standard_payloads_and_key(
+            br#"{"board_target":"am1-s9","status":"release"}"#,
+            &pubkey,
+        );
+        let canonical: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+
+        let mut missing_metadata = canonical.clone();
+        missing_metadata["payloads"]
+            .as_object_mut()
+            .unwrap()
+            .remove("metadata");
+
+        let mut padded_path = canonical.clone();
+        padded_path["payloads"]["kernel"]["path"] = serde_json::json!(" sysupgrade-am1-s9/kernel");
+
+        let mut uppercase_digest = canonical.clone();
+        let uppercase = uppercase_digest["payloads"]["kernel"]["sha256"]
+            .as_str()
+            .unwrap()
+            .to_ascii_uppercase();
+        uppercase_digest["payloads"]["kernel"]["sha256"] = serde_json::json!(uppercase);
+
+        let mut padded_digest = canonical;
+        let padded = format!(
+            "{} ",
+            padded_digest["payloads"]["kernel"]["sha256"]
+                .as_str()
+                .unwrap()
+        );
+        padded_digest["payloads"]["kernel"]["sha256"] = serde_json::json!(padded);
+
+        for (label, manifest, expected) in [
+            (
+                "missing-metadata",
+                missing_metadata,
+                "missing required payload kind 'metadata'",
+            ),
+            (
+                "padded-path",
+                padded_path,
+                "path must not contain surrounding whitespace",
+            ),
+            (
+                "uppercase-digest",
+                uppercase_digest,
+                "SHA-256 must be exact lowercase hexadecimal",
+            ),
+            (
+                "padded-digest",
+                padded_digest,
+                "SHA-256 must be exact lowercase hexadecimal",
+            ),
+        ] {
+            let scratch = ota_scratch_dir(label);
+            let manifest = serde_json::to_vec(&manifest).unwrap();
+            let signature = signing.sign(&manifest).to_bytes();
+            let tar_path = scratch.join("invalid-payload-contract.tar");
+            std::fs::write(
+                &tar_path,
+                build_sysupgrade_tar_bytes(&manifest, Some(&signature), Some(&pubkey)),
+            )
+            .unwrap();
+            let pin_path = scratch.join("release_ed25519.pub");
+            std::fs::write(&pin_path, pubkey).unwrap();
+
+            let error = verify_sysupgrade_bundle(&tar_path, false, Some(&pin_path))
+                .expect_err("non-canonical signed payload declaration must fail closed");
+            std::fs::remove_dir_all(&scratch).ok();
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn legacy_cv1835_install_shaped_payload_contract_is_rejected() {
         let prefix = "dcentos-cv1835-s19jpro-sysupgrade";
         let kernel = b"cv-uimage";
         let rootfs = b"cv-rootfs-gzip";
@@ -3083,15 +4199,11 @@ mod tests {
             ),
         ]);
 
-        let contract = verify_manifest_payload_contract(&manifest, prefix, &observed)
-            .expect("CV structured payload contract must resolve");
-        assert_eq!(
-            contract.kernel_path,
-            PathBuf::from(format!("{prefix}/uImage"))
-        );
-        assert_eq!(
-            contract.rootfs_path,
-            PathBuf::from(format!("{prefix}/rootfs.gz"))
+        let err = verify_manifest_payload_contract(&manifest, prefix, &observed)
+            .expect_err("historical CV install-shaped leaves must not regain write authority");
+        assert!(
+            err.contains("does not support archive leaf 'uImage'"),
+            "{err}"
         );
     }
 
@@ -3132,7 +4244,18 @@ mod tests {
         let scratch = ota_scratch_dir("payload-none");
         let signing = make_key();
         let pubkey = signing.verifying_key().to_bytes();
-        let manifest = br#"{"board_target":"am1-s9","version":"0.20.1"}"#;
+        let manifest = br#"{
+            "schema":1,
+            "manifest_profile":"dcentos.sysupgrade-authority/v1",
+            "product":"DCENT_OS",
+            "package_type":"sysupgrade",
+            "installable":true,
+            "artifact_maturity":"experimental",
+            "board":"am1-s9",
+            "board_target":"am1-s9",
+            "version":"0.20.1",
+            "status":"release"
+        }"#;
         let sig = signing.sign(manifest).to_bytes();
         let tar_bytes = build_sysupgrade_tar_bytes(manifest, Some(&sig), Some(&pubkey));
         let tar_path = scratch.join("none.tar");
@@ -3169,6 +4292,7 @@ mod tests {
         let sig = signing.sign(&manifest).to_bytes();
         std::fs::write(payload_dir.join("kernel"), b"kernel").unwrap();
         std::fs::write(payload_dir.join("root"), b"rootfs").unwrap();
+        std::fs::write(payload_dir.join("METADATA"), TEST_SYSUPGRADE_METADATA).unwrap();
         std::fs::write(payload_dir.join("MANIFEST.json"), &manifest).unwrap();
         std::fs::write(payload_dir.join("MANIFEST.sig"), sig).unwrap();
         std::fs::write(payload_dir.join("release_ed25519.pub"), pubkey).unwrap();
@@ -3194,7 +4318,7 @@ mod tests {
             ("extracted-am2-extra", false, false),
         ] {
             let scratch = ota_scratch_dir(label);
-            let payload_dir = scratch.join("sysupgrade-am1-s9");
+            let payload_dir = scratch.join("sysupgrade-am2-s19j");
             std::fs::create_dir_all(&payload_dir).unwrap();
             let manifest = manifest_with_standard_payloads(br#"{"board_target":"am2-s19j"}"#);
             let manifest = if declare_bitstream {
@@ -3205,6 +4329,7 @@ mod tests {
             let sig = signing.sign(&manifest).to_bytes();
             std::fs::write(payload_dir.join("kernel"), b"kernel").unwrap();
             std::fs::write(payload_dir.join("root"), b"rootfs").unwrap();
+            std::fs::write(payload_dir.join("METADATA"), TEST_SYSUPGRADE_METADATA).unwrap();
             std::fs::write(payload_dir.join("fpga_bitstream.bit"), bitstream).unwrap();
             std::fs::write(payload_dir.join("MANIFEST.json"), &manifest).unwrap();
             std::fs::write(payload_dir.join("MANIFEST.sig"), sig).unwrap();
@@ -3221,7 +4346,7 @@ mod tests {
                 );
             } else {
                 let err = result.expect_err("unmanifested extracted AM2 bitstream must reject");
-                assert!(err.contains("unmanifested image payload"), "err = {err}");
+                assert!(err.contains("unmanifested payload"), "err = {err}");
             }
             std::fs::remove_dir_all(&scratch).ok();
         }
@@ -3259,7 +4384,7 @@ mod tests {
         let scratch = ota_scratch_dir("extracted-symlink");
         let payload_dir = scratch.join("sysupgrade-am1-s9");
         std::fs::create_dir_all(&payload_dir).unwrap();
-        let manifest = manifest_with_standard_payloads(
+        let manifest = manifest_with_unsigned_lab_payloads(
             br#"{"board_target":"am1-s9","status":"lab_unsigned"}"#,
         );
         std::fs::write(payload_dir.join("MANIFEST.json"), &manifest).unwrap();
@@ -3343,16 +4468,16 @@ mod tests {
 
     #[test]
     fn bundle_unsigned_lab_status_still_accepted_with_allow_unsigned() {
-        // A genuine non-release lab bundle still works under allow_unsigned.
+        // A genuine unsigned-lab profile works only as an unauthenticated lab
+        // inspection result. It cannot cross the public write boundary.
         let scratch = ota_scratch_dir("ce183-lab");
-        let manifest = manifest_with_standard_payloads(
+        let manifest = manifest_with_unsigned_lab_payloads(
             br#"{"board_target":"am1-s9","status":"lab_unsigned"}"#,
         );
         let tar_bytes = build_sysupgrade_tar_bytes(&manifest, None, None);
         let tar_path = scratch.join("unsigned-lab.tar");
         std::fs::write(&tar_path, &tar_bytes).unwrap();
         let res = verify_sysupgrade_bundle(&tar_path, true, None);
-        std::fs::remove_dir_all(&scratch).ok();
         let bundle = res.unwrap_or_else(|err| {
             panic!("unsigned lab-status bundle must still accept with allow_unsigned: {err}")
         });
@@ -3360,6 +4485,138 @@ mod tests {
             bundle.authenticated_board_target, None,
             "an unsigned lab manifest must not mint authenticated target identity"
         );
+        assert_eq!(bundle.verified_artifact, None);
+        let error = bundle
+            .authorize_public_update("am1-s9")
+            .expect_err("unsigned lab validation must not mint public write authority");
+        std::fs::remove_dir_all(&scratch).ok();
+        assert!(error.contains("no authenticated board_target"), "{error}");
+    }
+
+    #[test]
+    fn extracted_unsigned_lab_profile_accepts_without_minting_authority() {
+        let scratch = ota_scratch_dir("unsigned-lab-extracted");
+        let payload_dir = scratch.join("sysupgrade-am1-s9");
+        std::fs::create_dir_all(&payload_dir).unwrap();
+        let manifest = manifest_with_unsigned_lab_payloads(
+            br#"{"board_target":"am1-s9","status":"lab_unsigned"}"#,
+        );
+        std::fs::write(payload_dir.join("MANIFEST.json"), manifest).unwrap();
+        std::fs::write(payload_dir.join("kernel"), b"kernel").unwrap();
+        std::fs::write(payload_dir.join("root"), b"rootfs").unwrap();
+        std::fs::write(payload_dir.join("METADATA"), TEST_SYSUPGRADE_METADATA).unwrap();
+
+        let bundle = verify_sysupgrade_bundle(&scratch, true, None)
+            .expect("canonical extracted unsigned-lab profile must validate");
+        assert_eq!(bundle.authenticated_board_target, None);
+        assert_eq!(bundle.verified_artifact, None);
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    #[test]
+    fn unsigned_lab_profile_rejects_authority_material_and_wrong_identity() {
+        let canonical = manifest_with_unsigned_lab_payloads(
+            br#"{"board_target":"am1-s9","status":"lab_unsigned"}"#,
+        );
+        let mut cases = Vec::new();
+
+        let mut authority_profile: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+        authority_profile["manifest_profile"] = serde_json::json!(SYSUPGRADE_AUTHORITY_PROFILE);
+        cases.push((
+            "authority profile",
+            serde_json::to_vec(&authority_profile).unwrap(),
+        ));
+
+        let mut wrong_status: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+        wrong_status["status"] = serde_json::json!("lab_signed");
+        cases.push(("wrong status", serde_json::to_vec(&wrong_status).unwrap()));
+
+        let mut certificate: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+        certificate["ota_intermediate_cert"] = serde_json::json!({});
+        cases.push((
+            "certificate field",
+            serde_json::to_vec(&certificate).unwrap(),
+        ));
+
+        let mut key_declaration: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+        key_declaration["payloads"]["verification_key"] = serde_json::json!({
+            "path": "sysupgrade-am1-s9/release_ed25519.pub",
+            "size": 32,
+            "sha256": "00".repeat(32),
+        });
+        cases.push((
+            "key declaration",
+            serde_json::to_vec(&key_declaration).unwrap(),
+        ));
+
+        for (label, manifest) in cases {
+            let scratch = ota_scratch_dir(label);
+            let tar_path = scratch.join("invalid-unsigned-lab.tar");
+            std::fs::write(&tar_path, build_sysupgrade_tar_bytes(&manifest, None, None)).unwrap();
+            let result = verify_sysupgrade_bundle(&tar_path, true, None);
+            std::fs::remove_dir_all(&scratch).ok();
+            assert!(result.is_err(), "{label} must fail closed");
+        }
+
+        let scratch = ota_scratch_dir("unsigned-lab-physical-key");
+        let tar_path = scratch.join("invalid-unsigned-lab-key.tar");
+        std::fs::write(
+            &tar_path,
+            build_sysupgrade_tar_bytes(&canonical, None, Some(&[7_u8; 32])),
+        )
+        .unwrap();
+        let error = verify_sysupgrade_bundle(&tar_path, true, None)
+            .expect_err("unsigned lab bundle must not carry a release key");
+        std::fs::remove_dir_all(&scratch).ok();
+        assert!(error.contains("release_ed25519.pub"), "{error}");
+    }
+
+    #[test]
+    fn signed_authority_profile_requires_canonical_non_lab_unsigned_status() {
+        let signing = make_key();
+        let pubkey = signing.verifying_key().to_bytes();
+        let canonical = manifest_with_standard_payloads_and_key(
+            br#"{"board_target":"am1-s9","status":"release"}"#,
+            &pubkey,
+        );
+        let invalid_statuses = [
+            ("missing", None),
+            ("non-string", Some(serde_json::json!(true))),
+            ("empty", Some(serde_json::json!(""))),
+            ("blank", Some(serde_json::json!(" "))),
+            ("leading-space", Some(serde_json::json!(" release"))),
+            ("trailing-space", Some(serde_json::json!("release "))),
+            ("lab-unsigned", Some(serde_json::json!("lab_unsigned"))),
+        ];
+
+        for (label, invalid_status) in invalid_statuses {
+            let scratch = ota_scratch_dir(&format!("signed-authority-status-{label}"));
+            let mut manifest: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+            match invalid_status {
+                Some(value) => manifest["status"] = value,
+                None => {
+                    manifest
+                        .as_object_mut()
+                        .expect("manifest object")
+                        .remove("status");
+                }
+            }
+            let manifest = serde_json::to_vec(&manifest).unwrap();
+            let signature = signing.sign(&manifest).to_bytes();
+            let tar_path = scratch.join("invalid-authority-status.tar");
+            std::fs::write(
+                &tar_path,
+                build_sysupgrade_tar_bytes(&manifest, Some(&signature), Some(&pubkey)),
+            )
+            .unwrap();
+            let pin_path = scratch.join("release_ed25519.pub");
+            std::fs::write(&pin_path, pubkey).unwrap();
+
+            let error = verify_sysupgrade_bundle(&tar_path, false, Some(&pin_path))
+                .expect_err("authority-v1 status must fail closed");
+            std::fs::remove_dir_all(&scratch).ok();
+            assert!(error.contains("status"), "{label}: {error}");
+        }
     }
 
     #[test]
@@ -3577,7 +4834,10 @@ mod tests {
         let manifest = format!(
             r#"{{"board_target":"am1-s9","version":"0.21.0","ota_intermediate_cert":{{"root_key_hex":"{root_hex}","intermediate_key_hex":"{inter_hex}","not_before":{not_before},"not_after":{not_after}{serial_json},"root_signature_hex":"{root_sig_hex}"}}{rev_json}}}"#
         );
-        manifest_with_standard_payloads(manifest.as_bytes())
+        manifest_with_standard_payloads_and_key(
+            manifest.as_bytes(),
+            root.verifying_key().as_bytes(),
+        )
     }
 
     #[test]
@@ -3645,11 +4905,11 @@ mod tests {
     }
 
     #[test]
-    fn full_bundle_with_two_level_chain_verifies() {
-        // End-to-end through verify_sysupgrade_bundle: the embedded
-        // release_ed25519.pub IS the root key; the on-disk pin matches it; the
-        // manifest carries a root-signed cert; the MANIFEST.sig is the
-        // intermediate's signature over the manifest.
+    fn full_authority_v1_bundle_with_two_level_chain_is_non_authorizing() {
+        // The low-level chain is cryptographically valid, but authority-v1 is
+        // direct-root-only because Zynq update admission has no authenticated
+        // clock for certificate validity. End-to-end verification must reject
+        // before producing a VerifiedArtifact/AuthorizedSysupgrade.
         let scratch = ota_scratch_dir("twolevel-bundle");
         let root = root_key();
         let inter = intermediate_key();
@@ -3676,11 +4936,13 @@ mod tests {
         let pin_path = scratch.join("release_ed25519.pub");
         std::fs::write(&pin_path, root.verifying_key().to_bytes()).unwrap();
 
-        let res = verify_sysupgrade_bundle(&tar_path, false, Some(&pin_path));
+        let err = verify_sysupgrade_bundle(&tar_path, false, Some(&pin_path)).expect_err(
+            "authority-v1 must reject even a cryptographically valid intermediate chain",
+        );
         std::fs::remove_dir_all(&scratch).ok();
         assert!(
-            res.is_ok(),
-            "valid two-level chain bundle must verify end-to-end: {res:?}"
+            err.contains("direct release-root signature") && err.contains("trusted-time authority"),
+            "unexpected authority-v1 chain rejection: {err}"
         );
     }
 

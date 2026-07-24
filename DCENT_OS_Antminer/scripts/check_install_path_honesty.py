@@ -192,8 +192,18 @@ def main() -> int:
         failures.append("INSTALL/README.md appears to claim S19j Pro SD install works")
 
     s19j = read(INSTALL_DOCS / "S19J_PRO_XILINX.md")
-    if "Blocked by Missing Artifact" not in s19j and "clean unit" not in s19j.lower() and "live" not in s19j.lower():
-        failures.append("INSTALL/S19J_PRO_XILINX.md must state live install residual / blocked facets")
+    for phrase in (
+        "Toolbox self-update",
+        "DCENT_OS-to-DCENT_OS",
+        "Vendor-source first install",
+        "Evidence gap",
+        "no persistent write",
+    ):
+        if phrase not in s19j:
+            failures.append(
+                "INSTALL/S19J_PRO_XILINX.md must distinguish guarded self-update "
+                f"from vendor-source first-install refusal: missing {phrase!r}"
+            )
     if "Experimental" not in s19j and "cold-boot" not in s19j.lower():
         failures.append("INSTALL/S19J_PRO_XILINX.md must classify AM2 SD as Experimental or cold-boot residual")
     if "upload_accepted" not in s19j:

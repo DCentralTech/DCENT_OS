@@ -136,10 +136,9 @@ BOOT_LABEL="${BOOT_LABEL:-ANTHILLOS}"
 # operator deliberately swaps in a different VNish boot.bin for RE work; the
 # manifest still records the actual hash either way.
 ACCEPT_BOOTBIN_MISMATCH=0
-# Optional Ed25519 sign-after-build step. When --sign is passed (or
-# DCENT_RELEASE_SIGNING_KEY is set in the environment), we invoke
-# sign_sd_image.sh to emit <img>.sig next to the SD image. Lab builds without
-# the key see a single WARN from that script and the build still succeeds.
+# This prototype is not release-signable while its vendor boot.bin remains
+# unaudited and its RSA payload-verification gate is open. --sign is retained
+# as a fail-closed diagnostic so old automation cannot silently downgrade.
 SIGN_IMAGE=0
 EXTRA_DTB_PATHS=()
 # Use the library's shared cleanup array under a local-friendly alias so
@@ -200,10 +199,8 @@ sweep-v2 §6.1 proof recipe uses VNish's carrier DTB, which passes.
                       Override the SHA256 fail-closed gate. Use only when
                       deliberately swapping in a different VNish drop for
                       RE work. The manifest still records the actual hash.
-  --sign              Invoke sign_sd_image.sh after build to emit a sibling
-                      <img>.sig (Ed25519). Lab builds without
-                      DCENT_RELEASE_SIGNING_KEY see a single WARN and the
-                      build still succeeds.
+  --sign              Request release signing. Currently fails closed while
+                      the vendor/RSA trust gates remain open.
   --extra-dtb <path>  Additional DTB to copy onto the SD as a fallback (may
                       be passed multiple times).
   --size-mb N         Override the total .img size in MiB. Defaults to the
@@ -335,6 +332,13 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+if [ "$SIGN_IMAGE" = "1" ] || [ -n "${DCENT_RELEASE_SIGNING_KEY:-}" ]; then
+    echo "ERROR: VNish prototype is not eligible for DCENT_OS release signing" >&2
+    echo "       vendor_blob_unaudited=true and boot_bin_rsa_verify_gate=OPEN" >&2
+    echo "       A future audited/closed design must use a new signing schema." >&2
+    exit 1
+fi
 
 sd_common::validate_fat_label BOOT_LABEL
 sd_common::refuse_block_device "$SD_OUTPUT_DIR"
@@ -820,6 +824,8 @@ fi
 
 cat > "$MANIFEST_TMP" <<EOF
 {
+  "schema": "dcentos.am3_bb_vnish_sd_image_manifest.v1",
+  "target": "am3-bb-s19jpro-vnish-bootbin-sd",
   "layout": "am3-bb-s19jpro-vnish-bootbin-50mib-3part",
   "variant": "vnish-bootbin-sd",
   "created_utc": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
@@ -865,6 +871,14 @@ cat > "$MANIFEST_TMP" <<EOF
     "devicetree.dtb": "$(sha256_file "$DTB_SRC")",
     "update.image.gz": "$(sha256_file "$RAMDISK_UIMAGE_TMP")"${ROOTFS_MANIFEST_LINE}${EXTRA_DTB_MANIFEST}
   },
+  "boot_artifacts_complete": true,
+  "artifacts": {
+    "boot.bin": true,
+    "uEnv.txt": true,
+    "uImage": true,
+    "devicetree.dtb": true,
+    "update.image.gz": true
+  },
   "boot_bin_sha256": "$BOOTBIN_SHA",
   "boot_bin_reference_sha256": "$BOOTBIN_REFERENCE_SHA256",
   "boot_bin_match_reference": $([ "$BOOTBIN_SHA" = "$BOOTBIN_REFERENCE_SHA256" ] && echo true || echo false),
@@ -902,10 +916,15 @@ for extra in "${EXTRA_DTB_PATHS[@]:-}"; do
 done
 
 sd_common::dd_write_partition "$BOOT_PART_TMP" "$IMG_FILE" "$P1_OFFSET_SECTORS"
-cp "$MANIFEST_TMP" "$SD_OUTPUT_DIR/dcentos-am3-bb-s19jpro-vnish-bootbin.manifest.json"
 
 IMG_BYTES=$(total_bytes "$IMG_FILE")
 IMG_SHA="$(sha256_file "$IMG_FILE")"
+SIGNING_MANIFEST="$SD_OUTPUT_DIR/dcentos-am3-bb-s19jpro-vnish-bootbin.manifest.json"
+SIGNING_MANIFEST_BODY="$(
+    sed '$d' "$MANIFEST_TMP"
+    printf ',\n  "image_sha256": "%s"\n}\n' "$IMG_SHA"
+)"
+sd_common::emit_manifest_json "$SIGNING_MANIFEST" "$SIGNING_MANIFEST_BODY"
 
 echo ""
 echo "=== Verification ==="
@@ -942,32 +961,15 @@ if mcopy -i "$IMG_FILE@@$P1_OFFSET_BYTES" -n ::boot.bin "$BOOTBIN_READBACK" 2>/d
         exit 1
     fi
 else
-    echo "[WARN] mcopy readback failed; boot.bin region verification skipped." >&2
+    echo "ERROR: mcopy readback failed; refusing an unverified image" >&2
+    exit 1
 fi
 
-# --- Optional Ed25519 sign-after-build --------------------------------------
-SIG_FILE=""
-if [ "$SIGN_IMAGE" = "1" ] || [ -n "${DCENT_RELEASE_SIGNING_KEY:-}" ]; then
-    echo ""
-    echo "=== Ed25519 sign-after-build ==="
-    if [ -x "$SCRIPT_DIR/sign_sd_image.sh" ]; then
-        "$SCRIPT_DIR/sign_sd_image.sh" "$IMG_FILE" || {
-            echo "ERROR: sign_sd_image.sh failed for $IMG_FILE" >&2
-            exit 1
-        }
-        if [ -f "$IMG_FILE.sig" ]; then
-            SIG_FILE="$IMG_FILE.sig"
-        fi
-    else
-        echo "[WARN] $SCRIPT_DIR/sign_sd_image.sh not found or not executable; skipping signing." >&2
-    fi
-fi
-
-# CE-204: stage the pinned trusted release pubkey next to the PROVEN .img so the
-# shipped artifact set is img + .sig + release_ed25519.pub (parity with the
-# canonical zynq/am3 sidecar set).
-if [ -n "${DCENT_RELEASE_PUBKEY_FILE:-}" ]; then
-    cp "${DCENT_RELEASE_PUBKEY_FILE}" "$SD_OUTPUT_DIR/release_ed25519.pub"
+# --- Unsigned prototype stale-state refusal ----------------------------------
+if [ -e "$IMG_FILE.sig" ] || [ -L "$IMG_FILE.sig" ]; then
+    echo "ERROR: unsigned build has stale signature path: $IMG_FILE.sig" >&2
+    echo "       Remove it explicitly before rebuilding." >&2
+    exit 1
 fi
 
 echo ""
@@ -975,9 +977,6 @@ echo "=== Done ==="
 echo "  Image:    $IMG_FILE ($((IMG_BYTES / 1024 / 1024)) MiB, $IMG_BYTES bytes)"
 echo "  SHA256:   $IMG_SHA"
 echo "  Manifest: $SD_OUTPUT_DIR/dcentos-am3-bb-s19jpro-vnish-bootbin.manifest.json"
-if [ -n "$SIG_FILE" ]; then
-    echo "  Signature: $SIG_FILE"
-fi
 echo ""
 echo "  Live-flash runbook:"
 echo "    docs/dev/2026-05-15-am3-bb-bootbin-proof/RUNBOOK.md"

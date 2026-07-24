@@ -65,6 +65,8 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use super::*;
 
     fn args(values: &[&str]) -> Vec<String> {

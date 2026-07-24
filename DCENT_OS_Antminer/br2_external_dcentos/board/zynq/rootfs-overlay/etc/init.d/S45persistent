@@ -20,23 +20,56 @@ case "$1" in
         ;;
 
     stop)
-        # Stop: save SSH keys and entropy before shutdown
-        if [ -d /data/keys ]; then
-            # Save SSH host keys to persistent storage
-            if [ -d /etc/dropbear ]; then
-                mkdir -p /data/keys/dropbear
-                cp /etc/dropbear/dropbear_*_host_key /data/keys/dropbear/ 2>/dev/null
-                echo "SSH keys saved to persistent storage"
-            fi
-            # Save entropy seed for faster SSH startup on next boot
-            dd if=/dev/urandom of=/data/keys/random-seed bs=512 count=1 2>/dev/null
-            echo "Entropy seed saved"
+        # Stop: save SSH keys and initialize first-boot entropy state.
+        if ! awk '
+            $2 == "/data" { mounts++ }
+            $1 == "ubi0:rootfs_data" && $2 == "/data" && $3 == "ubifs" {
+                backends++
+                count = split($4, options, ",")
+                for (i = 1; i <= count; i++)
+                    if (options[i] == "rw")
+                        writable = 1
+            }
+            END {
+                exit (mounts == 1 && backends == 1 && writable) ? 0 : 1
+            }
+        ' /proc/mounts; then
+            echo "ERROR: /data is not the writable persistent UBIFS volume" >&2
+            exit 1
+        fi
+        if [ ! -d /data/keys ] || [ -L /data/keys ]; then
+            echo "ERROR: persistent keys directory is absent or unsafe" >&2
+            exit 1
+        fi
+
+        # Save SSH host keys to persistent storage.
+        if [ -d /etc/dropbear ]; then
+            mkdir -p /data/keys/dropbear
+            cp /etc/dropbear/dropbear_*_host_key /data/keys/dropbear/ 2>/dev/null
+            echo "SSH keys saved to persistent storage"
+        fi
+
+        # Boot-time seed-entropy rotates an existing seed.  Shutdown may create
+        # the first seed when every lifecycle name is absent or finish a
+        # durably credited seed whose CRNG-ready successor was deferred.  The
+        # helper proves readiness, records the generating boot epoch, and must
+        # never overwrite, replay, or same-boot credit a generated seed.
+        if [ ! -x /usr/sbin/seed-entropy ]; then
+            echo "ERROR: secure entropy-seed helper is unavailable" >&2
+            exit 1
+        fi
+        if /usr/sbin/seed-entropy --initialize-if-missing \
+            /data/keys/random-seed; then
+            echo "Entropy seed is valid or its successor was initialized after CRNG readiness proof"
+        else
+            echo "ERROR: entropy seed was not initialized safely" >&2
+            exit 1
         fi
         ;;
 
     restart)
-        $0 stop
-        $0 start
+        "$0" stop || exit $?
+        exec "$0" start
         ;;
 
     *)

@@ -156,16 +156,13 @@ impl BlockReassembler {
             return self.ingest_existing(idx, frag, now_ms);
         }
 
-        // New id — ensure capacity.
-        if self.slots.len() >= self.capacity {
-            // Evict least-recently-updated.
-            if let Some((idx, _)) = self.slots.iter().enumerate().min_by_key(|(_, s)| s.last_ms) {
-                self.slots.remove(idx);
-            } else {
-                return ReassemblyOutcome::Rejected(RejectReason::Capacity);
-            }
-        }
-
+        // New id — build the slot and check for IMMEDIATE completion before any
+        // capacity eviction. A single-fragment block (total == 1) completes here
+        // and is never stored, so it must not evict a legitimate in-flight
+        // reassembly to make room it never uses — otherwise a near-zero-cost
+        // stream of valid single-fragment frames flushes every in-progress
+        // multi-fragment found-block reassembly (a cheap DoS on the gateway
+        // solo-block submitblock path).
         let mut slot = Slot::new(frag.id, frag.total, now_ms);
         if frag.bytes.len() > MAX_BLOCK_BYTES {
             return ReassemblyOutcome::Rejected(RejectReason::Oversize);
@@ -173,8 +170,18 @@ impl BlockReassembler {
         slot.bytes_so_far = frag.bytes.len();
         slot.parts[frag.seq as usize] = Some(frag.bytes.clone());
         if let Some(done) = slot.try_complete() {
-            // Single-fragment block.
+            // Completes without occupying a slot — return before eviction.
             return ReassemblyOutcome::Complete(done);
+        }
+
+        // The fragment must be retained — only NOW ensure capacity, evicting the
+        // least-recently-updated slot because we are actually storing this one.
+        if self.slots.len() >= self.capacity {
+            if let Some((idx, _)) = self.slots.iter().enumerate().min_by_key(|(_, s)| s.last_ms) {
+                self.slots.remove(idx);
+            } else {
+                return ReassemblyOutcome::Rejected(RejectReason::Capacity);
+            }
         }
         self.slots.push(slot);
         ReassemblyOutcome::Pending {
@@ -252,6 +259,40 @@ mod tests {
             seq,
             total,
             bytes: bytes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn single_fragment_block_must_not_evict_legit_reassembly() {
+        // At capacity with two legitimate in-flight (multi-fragment)
+        // reassemblies, a valid single-fragment block completes immediately and
+        // occupies no slot — it must NOT evict a stored reassembly. Before the
+        // fix the LRU eviction ran unconditionally on any new id, so a cheap
+        // stream of single-fragment frames flushed every in-progress found-block
+        // reassembly (lost submitblock / forfeited solo reward).
+        let mut r = BlockReassembler::with_capacity(2, 1_000_000);
+        assert!(matches!(
+            r.ingest(&frag(1, 0, 2, b"a"), 10),
+            ReassemblyOutcome::Pending { have: 1, total: 2 }
+        ));
+        assert!(matches!(
+            r.ingest(&frag(2, 0, 2, b"b"), 20),
+            ReassemblyOutcome::Pending { have: 1, total: 2 }
+        ));
+        assert_eq!(r.in_flight(), 2);
+        match r.ingest(&frag(99, 0, 1, b"z"), 30) {
+            ReassemblyOutcome::Complete(p) => assert_eq!(p, b"z"),
+            other => panic!("single-fragment block must complete, got {other:?}"),
+        }
+        assert_eq!(
+            r.in_flight(),
+            2,
+            "single-fragment completion must not evict in-flight reassemblies"
+        );
+        // And both stored reassemblies still complete correctly afterwards.
+        match r.ingest(&frag(1, 1, 2, b"a"), 40) {
+            ReassemblyOutcome::Complete(p) => assert_eq!(p, b"aa"),
+            other => panic!("reassembly 1 must survive, got {other:?}"),
         }
     }
 

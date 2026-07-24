@@ -35,9 +35,11 @@ class BuildDriverIdentityTests(unittest.TestCase):
     def test_cross_builder_executes_and_records_immutable_image_identity(self) -> None:
         driver = BUILD_DRIVER.read_text(encoding="utf-8")
         self.assertIn(
-            "DOCKER_IMAGE_ID=\"$(docker image inspect --format '{{.Id}}' \"$DOCKER_IMAGE\")\"",
+            "DOCKER_IMAGE_ID=\"$(\"$DOCKER_BIN\" image inspect --format '{{.Id}}' \"$DOCKER_IMAGE\")\"",
             driver,
         )
+        self.assertIn('DOCKER_BIN="${DCENT_DOCKER_BIN:-}"', driver)
+        self.assertIn('DOCKER_SPEC_ARGV[0]="$DOCKER_BIN"', driver)
         self.assertIn("'^sha256:[0-9a-f]{64}$'", driver)
         self.assertIn('"$DOCKER_IMAGE_ID" \\\n    bash -c', driver)
         self.assertNotIn('"$DOCKER_IMAGE" \\\n    bash -c', driver)
@@ -100,6 +102,10 @@ class ReceiptFixture(unittest.TestCase):
         (self.root / "DCENT_OS_Antminer/docs/architecture/install_matrix.tsv").write_text(
             "model\tcontrol_board\nfixture\tfixture-board\n", encoding="utf-8"
         )
+        (
+            self.root
+            / "DCENT_OS_Antminer/docs/architecture/hardware_enablement_matrix.json"
+        ).write_text('{"schema":1,"targets":[]}\n', encoding="utf-8")
         (self.root / "").write_text(
             '{"fixture":true}\n', encoding="utf-8"
         )
@@ -714,6 +720,10 @@ class ReceiptFixture(unittest.TestCase):
         paths = {entry["path"] for entry in receipt["source_inventory"]}
         self.assertIn("DCENT_OS_Antminer/scripts/hw-acceptance/skus.conf", paths)
         self.assertIn("DCENT_OS_Antminer/docs/architecture/install_matrix.tsv", paths)
+        self.assertIn(
+            "DCENT_OS_Antminer/docs/architecture/hardware_enablement_matrix.json",
+            paths,
+        )
         for relative in RECEIPT_MODULE.BAKED_INPUTS:
             self.assertIn(relative, paths)
         self.assertIn("DCENT_OS_Antminer/dcentrald/dcentrald_s21xp.toml", paths)
@@ -918,17 +928,259 @@ class ReceiptFixture(unittest.TestCase):
         output = self.root / "retained-race"
         output.mkdir()
         destination = output / "release.tar.prebuilt-rust.dcentrald.bin"
-        real_link = os.link
+        real_publish = RECEIPT_MODULE.publish_staged_file
 
-        def race_destination(source: Path, target: Path, **kwargs: object) -> None:
+        def race_destination(
+            source: Path,
+            target: Path,
+            *,
+            require_directory_sync: bool = False,
+            require_staged_cleanup: bool = False,
+            expected_staged_identity: tuple[int, int] | None = None,
+        ) -> tuple[str, str]:
+            self.assertTrue(require_directory_sync)
+            self.assertTrue(require_staged_cleanup)
+            self.assertEqual(
+                expected_staged_identity,
+                (source.stat().st_dev, source.stat().st_ino),
+            )
             Path(target).write_bytes(b"raced-operator-output")
-            real_link(source, target, **kwargs)
+            return real_publish(
+                source,
+                target,
+                require_directory_sync=require_directory_sync,
+                require_staged_cleanup=require_staged_cleanup,
+                expected_staged_identity=expected_staged_identity,
+            )
 
-        with mock.patch.object(RECEIPT_MODULE.os, "link", side_effect=race_destination):
+        with mock.patch.object(
+            RECEIPT_MODULE,
+            "publish_staged_file",
+            side_effect=race_destination,
+        ):
             with self.assertRaises(RECEIPT_MODULE.ReceiptError):
                 RECEIPT_MODULE._atomic_raw_write_new(destination, b"retained-bytes")
         self.assertEqual(destination.read_bytes(), b"raced-operator-output")
         self.assertEqual(sorted(path.name for path in output.iterdir()), [destination.name])
+
+    def test_atomic_retain_does_not_touch_reoccupied_staging_after_commit(self) -> None:
+        output = self.root / "retained-postcommit-staging"
+        output.mkdir()
+        destination = output / "release.tar.prebuilt-rust.dcentrald.bin"
+
+        def publish_then_reoccupy(
+            staging: Path,
+            target: Path,
+            *,
+            require_directory_sync: bool = False,
+            require_staged_cleanup: bool = False,
+            expected_staged_identity: tuple[int, int] | None = None,
+        ) -> tuple[str, str]:
+            self.assertTrue(require_directory_sync)
+            self.assertTrue(require_staged_cleanup)
+            self.assertEqual(
+                expected_staged_identity,
+                (staging.stat().st_dev, staging.stat().st_ino),
+            )
+            content = staging.read_bytes()
+            staging.unlink()
+            target.write_bytes(content)
+            staging.mkdir()
+            return "pass", "removed"
+
+        with mock.patch.object(
+            RECEIPT_MODULE,
+            "publish_staged_file",
+            side_effect=publish_then_reoccupy,
+        ):
+            RECEIPT_MODULE._atomic_raw_write_new(destination, b"retained-bytes")
+        self.assertEqual(destination.read_bytes(), b"retained-bytes")
+        pending = list(output.glob("*.publication-pending.*"))
+        self.assertEqual(len(pending), 1)
+        self.assertTrue(pending[0].is_dir())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal delivery regression")
+    def test_retain_signal_after_partial_publication_rolls_back_exact_set(
+        self,
+    ) -> None:
+        result = self.run_export()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stage = Path(result.stdout.strip())
+        output = self.root / "retained-partial-signal"
+        output.mkdir()
+        code = f"""
+import importlib.util
+import os
+from pathlib import Path
+import signal
+import sys
+
+script = Path({str(SCRIPT)!r})
+sys.path.insert(0, str(script.parent))
+spec = importlib.util.spec_from_file_location("binary_receipt_signal_test", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+real_publish = module.publish_staged_file
+publish_calls = 0
+
+def signal_after_first_commit(*args, **kwargs):
+    global publish_calls
+    result = real_publish(*args, **kwargs)
+    publish_calls += 1
+    if publish_calls == 1:
+        os.kill(os.getpid(), signal.SIGTERM)
+    return result
+
+module.publish_staged_file = signal_after_first_commit
+sys.argv = [
+    str(script),
+    "retain-export-snapshot-set",
+    "--stage",
+    {str(stage)!r},
+    "--output-dir",
+    {str(output)!r},
+    "--artifact-prefix",
+    "release.tar",
+]
+raise SystemExit(module.main())
+"""
+        retained = subprocess.run(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertNotEqual(retained.returncode, 0)
+        self.assertIn("before durable retained export-set publication", retained.stderr)
+        self.assertEqual(list(output.iterdir()), [])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal delivery regression")
+    def test_retain_signal_after_set_completion_cannot_revoke_commit(self) -> None:
+        result = self.run_export()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stage = Path(result.stdout.strip())
+        output = self.root / "retained-postcommit-signal"
+        output.mkdir()
+        code = f"""
+import importlib.util
+import os
+from pathlib import Path
+import signal
+import sys
+
+script = Path({str(SCRIPT)!r})
+sys.path.insert(0, str(script.parent))
+spec = importlib.util.spec_from_file_location("binary_receipt_signal_test", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+real_retain = module.retain_export_snapshot_set
+
+def signal_after_set(*args, **kwargs):
+    result = real_retain(*args, **kwargs)
+    os.kill(os.getpid(), signal.SIGTERM)
+    return result
+
+module.retain_export_snapshot_set = signal_after_set
+sys.argv = [
+    str(script),
+    "retain-export-snapshot-set",
+    "--stage",
+    {str(stage)!r},
+    "--output-dir",
+    {str(output)!r},
+    "--artifact-prefix",
+    "release.tar",
+]
+raise SystemExit(module.main())
+"""
+        retained = subprocess.run(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(retained.returncode, 0, retained.stderr)
+        self.assertIn("ignored signal", retained.stderr)
+        self.assertEqual(len(json.loads(retained.stdout)["artifacts"]), 1)
+        self.assertEqual(
+            sorted(path.name for path in output.iterdir()),
+            [
+                "release.tar.prebuilt-rust.dcentrald.bin",
+                "release.tar.prebuilt-rust.dcentrald.build-receipt.json",
+            ],
+        )
+
+    def test_retain_rollback_reports_cleanup_fault_and_still_syncs(self) -> None:
+        result = self.run_export()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stage = Path(result.stdout.strip())
+        output = self.root / "retained-rollback-fault"
+        output.mkdir()
+        first_destination = output / "release.tar.prebuilt-rust.dcentrald.bin"
+        real_publish = RECEIPT_MODULE._atomic_raw_write_new
+        publish_calls = 0
+
+        def publish_then_fail(path: Path, raw: bytes) -> tuple[int, int]:
+            nonlocal publish_calls
+            publish_calls += 1
+            if publish_calls == 2:
+                raise RECEIPT_MODULE.ReceiptError("injected second-file failure")
+            return real_publish(path, raw)
+
+        real_unlink = Path.unlink
+
+        def reject_first_rollback(path: Path, *args: object, **kwargs: object) -> None:
+            if path == first_destination:
+                raise PermissionError("injected rollback unlink failure")
+            real_unlink(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                RECEIPT_MODULE,
+                "_atomic_raw_write_new",
+                side_effect=publish_then_fail,
+            ),
+            mock.patch.object(Path, "unlink", new=reject_first_rollback),
+            mock.patch.object(RECEIPT_MODULE, "sync_directory") as sync,
+        ):
+            with self.assertRaisesRegex(
+                RECEIPT_MODULE.ReceiptError, "rollback was incomplete"
+            ):
+                RECEIPT_MODULE.retain_export_snapshot_set(
+                    stage, output, "release.tar"
+                )
+        self.assertEqual(first_destination.read_bytes(), self.binary.read_bytes())
+        sync.assert_called_once_with(output)
+
+    def test_retain_reporting_survives_closed_result_consumer(self) -> None:
+        result = self.run_export()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stage = Path(result.stdout.strip())
+        output = self.root / "retained-closed-consumer"
+        output.mkdir()
+        read_descriptor, write_descriptor = os.pipe()
+        os.close(read_descriptor)
+        try:
+            retained = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "retain-export-snapshot-set",
+                    "--stage",
+                    str(stage),
+                    "--output-dir",
+                    str(output),
+                    "--artifact-prefix",
+                    "release.tar",
+                ],
+                text=True,
+                stdout=write_descriptor,
+                stderr=subprocess.PIPE,
+            )
+        finally:
+            os.close(write_descriptor)
+        self.assertEqual(retained.returncode, 0, retained.stderr)
+        self.assertEqual(len(list(output.iterdir())), 2)
 
     def test_retain_rejects_symlinked_output_directory_and_leaf(self) -> None:
         result = self.run_export()

@@ -1,0 +1,73 @@
+# Pin the linux/amd64 manifest, not the mutable multi-architecture index. The
+# Zig archive below is likewise x86_64, so this pair is one reproducible host
+# toolchain even when the Docker daemon itself runs on another architecture.
+FROM rust@sha256:3f6e6f8d8725a65a2db964bb828850f888d430c68784d661f753144e5d787207
+
+LABEL org.dcentral.dcentos.zig.version="0.13.0" \
+      org.dcentral.dcentos.zig.sha256="d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea"
+
+# Zig supplies a real ARMv7 hard-float musl C compiler for build.rs crates.
+# The former arm-linux-gnueabihf GCC was a glibc compiler and therefore could
+# not safely build C objects for Rust's armv7-unknown-linux-musleabihf target.
+RUN set -eux; \
+    archive="/tmp/zig-linux-x86_64-0.13.0.tar.xz"; \
+    curl --fail --show-error --location \
+        "https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz" \
+        --output "$archive"; \
+    echo "d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea  ${archive}" \
+        | sha256sum --check --strict; \
+    mkdir -p /opt/zig; \
+    tar -xJf "$archive" -C /opt/zig --strip-components=1; \
+    rm -f "$archive"; \
+    /opt/zig/zig version; \
+    rustup target add \
+        armv7-unknown-linux-musleabihf \
+        aarch64-unknown-linux-musl; \
+    host_triple="$(rustc -vV | sed -n 's/^host: //p')"; \
+    rust_lld="$(rustc --print sysroot)/lib/rustlib/${host_triple}/bin/rust-lld"; \
+    test -x "$rust_lld"; \
+    ln -s "$rust_lld" /usr/local/bin/rust-lld; \
+    rust-lld -flavor gnu --version; \
+    printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'set -euo pipefail' \
+        'args=()' \
+        'for arg in "$@"; do' \
+        '  case "$arg" in' \
+        '    --target=*|-target=*|-march=*|-mcpu=*|-mfpu=*|-mfloat-abi=*) ;;' \
+        '    *) args+=("$arg") ;;' \
+        '  esac' \
+        'done' \
+        'exec /opt/zig/zig cc -target arm-linux-musleabihf -mfloat-abi=hard -mfpu=vfpv3 "${args[@]}"' \
+        > /usr/local/bin/zig-cc-armv7-musl; \
+    printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'set -euo pipefail' \
+        'args=()' \
+        'for arg in "$@"; do' \
+        '  case "$arg" in' \
+        '    --target=*|-target=*|-march=*|-mcpu=*) ;;' \
+        '    *) args+=("$arg") ;;' \
+        '  esac' \
+        'done' \
+        'exec /opt/zig/zig cc -target aarch64-linux-musl -mcpu=cortex_a53 "${args[@]}"' \
+        > /usr/local/bin/zig-cc-aarch64-musl; \
+    printf '%s\n' \
+        '#!/bin/sh' \
+        'exec /opt/zig/zig ar "$@"' \
+        > /usr/local/bin/zig-ar; \
+    chmod 0755 \
+        /usr/local/bin/zig-cc-armv7-musl \
+        /usr/local/bin/zig-cc-aarch64-musl \
+        /usr/local/bin/zig-ar; \
+    printf '#include <stdlib.h>\nint main(void) { void *p = malloc(8); free(p); return 0; }\n' \
+        | /usr/local/bin/zig-cc-armv7-musl -static -x c -o /tmp/armv7-musl-probe -; \
+    file /tmp/armv7-musl-probe \
+        | grep -E 'ELF 32-bit LSB.*ARM.*(statically linked|static-pie linked)'; \
+    printf '#include <stdlib.h>\nint main(void) { void *p = malloc(8); free(p); return 0; }\n' \
+        | /usr/local/bin/zig-cc-aarch64-musl -static -x c -o /tmp/aarch64-musl-probe -; \
+    file /tmp/aarch64-musl-probe \
+        | grep -E 'ELF 64-bit LSB.*ARM aarch64.*(statically linked|static-pie linked)'; \
+    rm -f /tmp/armv7-musl-probe /tmp/aarch64-musl-probe
+
+WORKDIR /repo/DCENT_OS_Antminer/dcentrald

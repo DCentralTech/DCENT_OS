@@ -115,6 +115,14 @@ BLOCKED_BUILD_INPUT_TARGETS = {
         "am3-s21 consumes an unpinned S21 Amlogic kernel; refusing all packaging, "
         "including lab builds, until that kernel is pinned"
     ),
+    "am3-s21pro": (
+        "am3-s21pro consumes an unpinned S21 Pro Amlogic kernel; refusing all "
+        "packaging, including lab builds, until that kernel is pinned"
+    ),
+    "am3-s21xp": (
+        "am3-s21xp consumes an unpinned S21 XP Amlogic kernel; refusing all "
+        "packaging, including lab builds, until that kernel is pinned"
+    ),
     "am3-s19jpro-aml": (
         "am3-s19jpro-aml consumes an unpinned s19j-aml/s21 kernel fallback; "
         "refusing all packaging, including lab builds, until the selected kernel is pinned"
@@ -134,11 +142,6 @@ BLOCKED_BUILD_INPUT_TARGETS = {
     "am3-bb-s19jpro-vnish": (
         "am3-bb-s19jpro-vnish consumes unpinned boot.bin, uImage, DTB, and "
         "initramfs inputs from output directories; refusing all packaging, including lab builds"
-    ),
-    "cv1835-s19jpro": (
-        "cv1835-s19jpro has no pinned kernel input or kernel producer; "
-        "refusing all packaging, including lab builds, before Cargo/Docker instead of consuming "
-        "a stale Buildroot uImage"
     ),
 }
 

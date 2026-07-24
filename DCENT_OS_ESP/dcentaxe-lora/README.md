@@ -10,19 +10,21 @@ Source dossier:
 - §1 (subcircuit, GPIO map, use-cases)
 - (SX1262 electricals)
 
-## Status: SCAFFOLD — NOT integrated (intentionally)
+## Status: INTEGRATED behind default-OFF `lora` (live RF unproven)
 
-This crate is an original driver + protocol **skeleton**. It is a workspace
-member but:
+This crate is the DCENT mesh / SX1262 driver. It is a workspace member and is
+**wired into the `dcentaxe` binary** when the orthogonal Cargo feature `lora` is
+selected (`dep:dcentaxe-lora` + HAL `pins-lora`):
 
-- the `dcentaxe` binary does **not** depend on it,
-- it registers **no** `/mcp` tools and adds **no** URI handlers,
-- it is behind a **default-OFF** Cargo feature so it never enters a SKU image
-  until a board explicitly selects it (per-board feature-gating, precedent
-  `--features bitaxe-gt`; protects the ~89%-full OTA slot).
-
-A non-functional "LoRa enabled" control would be a lying UI, so wiring is a
-deliberate follow-up (see **Integration — NOT done** below).
+- `dcentaxe` opens SPI3 + control GPIOs, spawns `lora_task`, registers MCP tools,
+  and injects an honesty-gated dashboard mesh panel (`#[cfg(feature = "lora")]`).
+- **Default features and public board features do NOT enable `lora`** — stock
+  images stay radio-dark so a non-functional "LoRa enabled" UI cannot ship.
+- Combine explicitly, e.g. `--features dcent-axe-bm1397,lora` (check OTA slot /
+  `updateFitsSlot` before shipping that image).
+- Host tests pass; pin map is **netlist-locked 9/9** on DCENT_axe BM1397.
+- **Live SX1262 TX/RX and multi-node relay are unproven** — no product mesh claim
+  until first-article RF bring-up.
 
 ## What's here
 
@@ -59,11 +61,10 @@ access-class contract. `cargo clippy -- -D warnings` is clean.
 > `dcent-schema` path dep is `../../dcent-schema` from the new
 > `DCENT_OS_ESP/` workspace root.
 
-## Provisional GPIO map — ⚠️ NEEDS-NETLIST-LOCK
+## GPIO map — ✅ LOCKED (BM1397 netlist 9/9, 2026-07-11)
 
-From doc 05 §1.3 (the fork-plan worked example collided MOSI with the stock
-fan-tach pin; these are the corrected provisional pins). **Lock against the real
-DCENT_axe KiCad netlist before routing.**
+Authoritative constants live in `dcentaxe-hal::lora_pins` (table-tested). MOSI is
+**not** on GPIO14 (fan tach). TXEN/RXEN are host-driven on the E22 module.
 
 | Signal | GPIO | Notes |
 |--------|------|-------|
@@ -73,7 +74,9 @@ DCENT_axe KiCad netlist before routing.**
 | LORA_NSS | 15 | active-low CS |
 | LORA_BUSY | 16 | readable GPIO, polled before every command |
 | LORA_DIO1 | 21 | IRQ-capable (TxDone/RxDone) |
-| LORA_NRESET | 8 | or a shared RC power-on reset to save a pin |
+| LORA_NRESET | 8 | active-low reset |
+| LORA_TXEN | 2 | E22 RF-switch TX enable (host-driven) |
+| LORA_RXEN | 9 | E22 RF-switch RX enable (host-driven) |
 
 SX1262 electricals (doc 08): SPI ≤ 16 MHz (ESP32-S3 ≤ 40 MHz clears it >2×); TCXO
 enabled via DIO3 (`SetDIO3AsTcxoCtrl`, mandatory or RF is dead; 1.8 V on the E22);
@@ -108,37 +111,30 @@ map is different (above) and constrained by the stock Bitaxe pin usage. Raven
 also runs **Meshtastic**; DCENT_axe ships the **custom DCENT mesh** for v1 with a
 feature-gated Meshtastic-interop stub for Phase 2.
 
-## Integration — NOT done (the follow-up)
+## Integration status
 
-The following are deliberately out of scope for this scaffold:
+### Done (binary path under `feature = "lora"`)
 
-1. **HAL SPI3/HSPI bus** — add the SPI3 device + BUSY/DIO1/NRESET pins in
-   `dcentaxe-hal`; lock the GPIO map against the real netlist.
-2. **Own FreeRTOS task** — run the radio on its own stack (never blocking the
-   mining/safety loops); wire `esp_hal::EspSpiBus` + `EspInputPin`/`EspOutputPin`
-   into `Sx1262`.
-3. **MCP registration** — fold `mcp::tools` into the binary's `/mcp` registry;
-   route `lora_send_beacon` through `authorize_mcp_control` (owner auth) and the
-   per-board operating-point clamp.
-4. **Dashboard surface** — an MCP-tool-backed inline panel (NOT a 9th page —
-   `MAX_URI_HANDLERS`/≤8-page budget).
-5. **Per-board Cargo feature** — add `dcentaxe-lora` as an optional dep behind a
-   `lora` feature in the `dcentaxe` binary so only boards that select it pay the
-   image size; verify against the `updateFitsSlot` OTA-slot gate.
-6. **Region duty-cycle/dwell clamp** — enforce the EU 1% / NA dwell envelope as a
-   firmware policy (the driver only does a coarse legal-band reject today).
-7. **Mesh peer table + live telemetry** — back `get_mesh_peers` / `lora_status`
-   with a real RX peer table and live `Sx1262` state.
-8. ~~**Constant-time owner-auth MAC**~~ — ✅ DONE (`src/auth.rs`): `MeshCommand::authorize`
-   now runs an HMAC-SHA256 verify (`subtle`-backed constant-time) bound to
-   `src`/`seq`/`verb`/`param`/`value`, with a `ReplayGuard` anti-replay window and
-   the combined `MeshAuthenticator`. The integrator still routes an authorized
-   command through the host operating-point clamp before any write.
+1. ~~**HAL SPI3/HSPI bus + pin map**~~ — ✅ `dcentaxe-hal::lora_pins` (netlist-locked 9/9).
+2. ~~**Own FreeRTOS task**~~ — ✅ `dcentaxe::lora_task` (fail-soft if bus init fails).
+3. ~~**MCP registration**~~ — ✅ tools registered under `cfg(feature = "lora")`.
+4. ~~**Dashboard surface**~~ — ✅ honesty-gated panel (no "live" claim until `present`).
+5. ~~**Orthogonal `lora` Cargo feature**~~ — ✅ default-OFF; not pulled by public board features.
+6. ~~**Constant-time owner-auth MAC**~~ — ✅ `src/auth.rs` HMAC-SHA256 + `ReplayGuard`.
+
+### Still open (first-article / product)
+
+1. **Live RF bring-up** — SPI WHOAMI, antenna TX/RX, multi-node `$DCM` relay on silicon.
+2. **Enable on a board feature** (optional product decision) — e.g. fold `lora` into
+   `dcent-axe-bm1397` only after RF proof + OTA size check.
+3. **Region duty-cycle/dwell clamp** — EU 1% / NA dwell policy hardening.
+4. **Mesh peer table + live telemetry depth** — back MCP/dashboard with long-run peer state.
+5. **esp-idf-hal SPI transport NEEDS-VERIFY** on target (integration seam).
 
 ## Guardrails honored
 
-- Standalone crate + default-OFF feature; **no** URI handlers, **no** changes to
-  the `dcentaxe` binary's wiring.
+- Standalone crate + **default-OFF** orthogonal `lora` feature on the binary.
+- Stock board images do not register LoRa MCP tools or mesh UI surfaces.
 - Zero new *lock* entries — `log` / `serde` / `serde_json` (dev) and the owner-auth
   `hmac` / `sha2` crates were all already in the workspace lock (via
   dcentaxe-stratum / -v2), so the `--locked` reproducibility discipline is

@@ -22,16 +22,11 @@
 //!   JUMP_FROM_LOADER: 0x06  (exit bootloader — use byte-by-byte I2C)
 //!   RESET_PIC:        0x07  (BraiinsOS only — reboot PIC to bootloader)
 //!
-//! CRITICAL (BLACKLIST, RE review 2026-03-24 — see `pic_needs_jump`): only JUMP
-//! when the raw SSPBUF pre-detect read is a CONFIRMED bootloader/unresponsive
-//! state — 0xCC (bootloader ISR default), 0x00 (SSPBUF uninitialized on cold
-//! power-on), or 0xFF (unresponsive / devmem RX-FIFO-empty after a watchdog).
-//! EVERY other value is APP mode and must NOT be JUMP'd: an app-mode PIC's SSPBUF
-//! holds the last command byte (0x20, 0x40, 0x48, 0x60, ...), and JUMP'ing a
-//! confirmed-app-mode PIC pushes it BACK into the bootloader and breaks voltage
-//! control. Do NOT invert this to a whitelist ("JUMP for any non-app value") —
-//! that older whitelist broke on 0x48 (post-watchdog app state) and is exactly
-//! the regression `pic_needs_jump` + its test now guard against.
+//! CRITICAL (fail-closed RE review 2026-07-13 — see `pic_needs_jump`): exact
+//! `0xCC` is the sole raw-state authority for JUMP. `0x00`, `0xFF`, transport
+//! errors, short reads, and arbitrary SSPBUF residues are ambiguous: they must
+//! neither transition nor energize a controller. Known application evidence is
+//! separately classified before the heartbeat/voltage admission sequence.
 //!
 //! PIC I2C addresses (S9, verified):
 //!   0x55 - Chain 6 (J6) voltage controller
@@ -100,19 +95,12 @@ pub const S9_FACTORY_CHIPS: usize = 63;
 /// Whether a PIC whose raw SSPBUF pre-detect read is `raw_state` must be JUMP'd
 /// out of the bootloader before app-mode commands.
 ///
-/// BLACKLIST (RE review 2026-03-24 — LOAD-BEARING, do NOT invert to a whitelist):
-/// only the three CONFIRMED bootloader/unresponsive states JUMP —
-///   * `0xCC` — bootloader ISR default,
-///   * `0x00` — SSPBUF uninitialized on cold power-on,
-///   * `0xFF` — unresponsive / devmem RX-FIFO-empty after a watchdog.
-/// EVERY other value is APP mode and must NOT be JUMP'd: an app-mode PIC's SSPBUF
-/// holds the last command byte (0x20, 0x40, 0x48, 0x60, ...), and JUMP'ing a
-/// confirmed-app-mode PIC pushes it BACK into the bootloader and breaks voltage
-/// control. The older whitelist ("JUMP for any value not in a known-app set")
-/// broke on 0x48 (post-watchdog app state); `pic_needs_jump_blacklist_not_whitelist`
-/// pins the correct behavior so a "cleanup" toward the stale doc can't re-break it.
+/// Exact-match rule (RE review 2026-07-13 — LOAD-BEARING): `0xCC` is the only
+/// confirmed PIC16 bootloader observation. Every other byte is non-authorizing.
+/// This helper says only whether JUMP is permitted; it does not claim that any
+/// non-`0xCC` byte is application evidence or eligible for energization.
 pub const fn pic_needs_jump(raw_state: u8) -> bool {
-    raw_state == 0xCC || raw_state == 0x00 || raw_state == 0xFF
+    raw_state == 0xCC
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -320,6 +308,32 @@ fn classify_pic_raw_state(raw: u8) -> PicFirmware {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pic16ApplicationEvidence {
+    Stock(u8),
+    BraiinsOs,
+    AppModeUnknown,
+}
+
+impl Pic16ApplicationEvidence {
+    const fn from_raw_state(raw: u8) -> Option<Self> {
+        match raw {
+            0x56 | 0x5A | 0x5E => Some(Self::Stock(raw)),
+            0x03 => Some(Self::BraiinsOs),
+            0x60 => Some(Self::AppModeUnknown),
+            _ => None,
+        }
+    }
+
+    const fn firmware(self) -> PicFirmware {
+        match self {
+            Self::Stock(version) => PicFirmware::Stock(version),
+            Self::BraiinsOs => PicFirmware::BraiinsOs,
+            Self::AppModeUnknown => PicFirmware::Unknown,
+        }
+    }
+}
+
 /// PIC microcontroller controller for one hash board.
 pub struct PicController<'a> {
     /// I2C bus reference.
@@ -395,438 +409,20 @@ impl<'a> PicController<'a> {
         Ok(detected)
     }
 
-    /// Initialize PIC for mining — bosminer-matched sequence with firmware auto-detection.
+    /// Reject direct-bus PIC16 cold-boot initialization.
     ///
-    /// Detects PIC firmware type (Stock Bitmain vs BraiinsOS) and uses the
-    /// correct command set automatically. BraiinsOS PICs (version 0x03) use
-    /// completely different command IDs than stock (0x56/0x5A/0x5E).
-    ///
-    /// Sequence (matches bosminer reset_and_start_app):
-    /// 1. detect_firmware() — probe 0x17 then 0x04 to determine firmware type
-    /// 2. If already in app mode: heartbeat immediately (warm boot path)
-    /// 3. If bootloader/unknown: RESET(0x07) → clear parser → JUMP(0x06) → re-detect
-    /// 4. Set voltage (stock: 0x03, BraiinsOS: 0x10)
-    /// 5. Enable voltage output (stock: 0x02, BraiinsOS: 0x15)
-    ///
-    /// IMPORTANT: RESET(0x07) only exists on BraiinsOS PICs. Stock PICs ignore it.
-    /// JUMP(0x06) must ONLY be sent to PICs in bootloader mode (0xCC). Sending JUMP
-    /// to a PIC already in app mode (0x60) pushes it BACK into bootloader!
-    pub fn cold_boot_init(&mut self, initial_pic_value: u8) -> Result<()> {
-        let voltage_v = Self::pic_to_voltage(initial_pic_value);
-        tracing::info!(
-            addr = format_args!("0x{:02X}", self.address),
-            target_voltage = format_args!("{:.2}V", voltage_v),
-            pic_value = initial_pic_value,
-            "PIC init starting (auto-detecting firmware type)",
-        );
-
-        // Step 0: Read raw PIC state BEFORE detect_firmware().
-        // CRITICAL FIX (2026-03-18): detect_firmware() uses I2C_RDWR which
-        // corrupts the PIC's I2C parser. After I2C_RDWR, raw read returns
-        // garbage (0x00) instead of the real state (0xCC=bootloader, 0x60=app).
-        // Reading raw FIRST gives us the true PIC state for JUMP decision.
-        // I2C RELIABILITY FIX (Agent 1, 2026-03-24): Retry raw read 5 times.
-        // On cold boot, the first 1-2 I2C transactions may fail due to bus not
-        // yet settled (SDA stuck low, xiic driver initializing). A single failed
-        // read returns 0xFF ("unresponsive") and writes off a working PIC.
-        // BraiinsOS retries 15x per byte with 100ms delay; we retry 5x.
-        let pre_detect_raw = {
-            let _ = self.i2c.set_slave(self.address);
-            let mut raw_val = 0xFF_u8;
-            for attempt in 0..5u8 {
-                let mut buf = [0u8; 1];
-                match self.i2c.read(&mut buf) {
-                    Ok(_) => {
-                        raw_val = buf[0];
-                        break;
-                    }
-                    Err(e) => {
-                        if attempt < 4 {
-                            tracing::debug!(
-                                addr = format_args!("0x{:02X}", self.address),
-                                attempt = attempt + 1,
-                                error = %e,
-                                "PIC raw read attempt {}/5 failed — retrying in 100ms",
-                                attempt + 1,
-                            );
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        }
-                    }
-                }
-            }
-            raw_val
-        };
-        tracing::info!(
-            addr = format_args!("0x{:02X}", self.address),
-            raw = format_args!("0x{:02X}", pre_detect_raw),
-            "PIC raw state (BEFORE detect_firmware): 0x{:02X} ({})",
-            pre_detect_raw,
-            if pre_detect_raw == 0xCC {
-                "BOOTLOADER — will JUMP"
-            } else if pre_detect_raw == 0x60 {
-                "BraiinsOS app"
-            } else if pre_detect_raw == 0xFF {
-                "unresponsive"
-            } else {
-                "stock app or unknown"
-            },
-        );
-
-        // Step 1: Classify firmware type from raw app-mode state.
-        let detected = self.detect_firmware()?;
-
-        // Step 1b: Reset PIC I2C parser state after detect_firmware().
-        //
-        // CRITICAL FIX (2026-03-14, expert team review):
-        // detect_firmware() uses I2C_RDWR (combined write+read with Repeated START).
-        // The stock PIC's I2C state machine does NOT handle Repeated START correctly —
-        // it leaves the command parser in a corrupted state where subsequent write-only
-        // commands (set_voltage, enable_voltage) are silently ignored.
-        //
-        // BraiinsOS documents this exact bug (braiins_power.rs line 483):
-        //   "The I2C state machine in PIC controller is broken"
-        //
-        // CRITICAL FIX (2026-03-24): Flush MUST be byte-by-byte, NOT a single I2C
-        // transaction. The PIC16F1704's MSSP hardware buffer is 1 byte deep. Sending
-        // 16 bytes in one transaction causes SSPOV overflow — the PIC firmware only
-        // processes byte 0; bytes 1-15 are lost. The parser state machine advances by
-        // only 1 step, not 16, so it is NOT reliably returned to idle.
-        //
-        // BraiinsOS braiins_power.rs:176-183 confirms: their write() sends each byte
-        // as a separate I2C transaction via write_retry() (one START+addr+byte+STOP
-        // per byte). The 16-zero flush in BraiinsOS is therefore 16 separate
-        // transactions, not one 16-byte transaction.
-        //
-        // Fix: Use write_byte_by_byte() so each zero byte is its own I2C transaction,
-        // giving the PIC ISR time to clear SSPBUF between each byte.
-        // The flush payload is [0x55, 0xAA, 0x00, 0x00...×13] — starts with the
-        // preamble so the parser advances to cmd-byte state, then 13 zeros keep it
-        // cycling until it falls back to idle (no valid command follows 0x00).
-        let _ = self.i2c.set_slave(self.address);
-        if let Err(e) = self.i2c.write_byte_by_byte(&[
-            0x55, 0xAA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00,
-        ]) {
-            tracing::debug!(
-                addr = format_args!("0x{:02X}", self.address),
-                "I2C parser reset (byte-by-byte 16 bytes) failed: {} — continuing",
-                e,
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        // Step 2: Use the pre-detect raw state (read BEFORE I2C_RDWR corruption).
-        //
-        // CRITICAL FIX (2026-03-18): The raw read AFTER detect_firmware() returns
-        // garbage because I2C_RDWR corrupts the PIC's I2C parser. We use the raw
-        // state captured in Step 0 (before any I2C_RDWR) for the JUMP decision.
-        //
-        // Raw I2C probe values:
-        //   0xCC = bootloader mode (needs JUMP to enter app)
-        //   0x60 = BraiinsOS app mode (do NOT JUMP — it pushes back to bootloader!)
-        //   0x56/0x5A/0x5E = stock app mode (version bytes returned by raw read in app mode)
-        //   0x03 = BraiinsOS version (sometimes returned as raw state)
-        //   0x00 = SSPBUF uninitialized on cold boot — PIC is in BOOTLOADER, not app mode!
-        //          (Expert team review 2026-03-24: 0x00 was incorrectly treated as app mode.
-        //           Stock PIC16F1704 returns 0x00 when SSPBUF has never been written by the
-        //           bootloader ISR. This is NOT app mode — must trigger JUMP.)
-        //   0xFF = unresponsive (no hash board connected)
-        let raw_state = pre_detect_raw;
-        // BLACKLIST approach (RE review fix 2026-03-24): Only JUMP for CONFIRMED bootloader states.
-        // The previous whitelist broke on 0x48 (post-watchdog app state) — JUMP pushed
-        // app-mode PICs back to bootloader unnecessarily. The PIC SSPBUF can contain
-        // any value in app mode (0x20, 0x40, 0x48, 0x60, etc. — depends on last command).
-        // Only 0xCC (bootloader ISR default) and 0x00 (SSPBUF uninitialized on cold power-on)
-        // are confirmed bootloader indicators. Everything else = app mode → DO NOT JUMP.
-        // v0.8.4.2: Also JUMP on 0xFF. With devmem I2C, the read path returns 0xFF
-        // when the RX FIFO is empty (read bug). This does NOT mean "no board" — the
-        // PIC IS responding to writes (heartbeats succeed). After a watchdog timeout,
-        // PICs need a full RESET+JUMP cycle to unlock the voltage controller.
-        // BraiinsOS always sends RESET regardless of raw state.
-        let needs_jump = pic_needs_jump(raw_state);
-
-        tracing::info!(
-            addr = format_args!("0x{:02X}", self.address),
-            raw_state = format_args!("0x{:02X}", raw_state),
-            needs_jump,
-            firmware = %detected,
-            "PIC raw state probe: 0x{:02X} ({}), firmware detected: {}",
-            raw_state,
-            if raw_state == 0xCC { "BOOTLOADER — needs JUMP" }
-            else if raw_state == 0x60 { "BraiinsOS app mode" }
-            else if raw_state == 0xFF { "unresponsive" }
-            else { "stock app mode" },
-            detected,
-        );
-
-        // Step 3: Warm-app path must NEVER issue RESET/JUMP.
-        if !needs_jump {
-            if matches!(detected, PicFirmware::Unknown) {
-                tracing::info!(
-                    addr = format_args!("0x{:02X}", self.address),
-                    raw_state = format_args!("0x{:02X}", raw_state),
-                    "PIC raw state is app-like but firmware is ambiguous — using unified app commands without RESET/JUMP",
-                );
-            }
-            if !matches!(detected, PicFirmware::Unknown) {
-                tracing::info!(
-                    addr = format_args!("0x{:02X}", self.address),
-                    firmware = %self.firmware,
-                    "PIC already in app mode — skipping RESET/JUMP on warm boot",
-                );
-            }
-
-            self.send_heartbeat()?;
-            tracing::info!(
-                addr = format_args!("0x{:02X}", self.address),
-                firmware = %self.firmware,
-                "Immediate heartbeat sent to prevent watchdog timeout",
-            );
-
-            self.set_voltage(initial_pic_value)?;
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            match self.enable_voltage() {
-                Ok(()) => tracing::info!(
-                    addr = format_args!("0x{:02X}", self.address),
-                    "Voltage restored (warm boot — may have been disabled by watchdog)",
-                ),
-                Err(e) => tracing::warn!(
-                    addr = format_args!("0x{:02X}", self.address),
-                    error = %e,
-                    "enable_voltage failed on warm boot — voltage may already be active",
-                ),
-            }
-        } else {
-            // COLD BOOT PATH: PIC is in bootloader or unresponsive.
-            // Use the full bosminer-matched sequence:
-            //   1. Send 16 zero bytes (clear I2C parser state machine)
-            //   2. RESET (0x07) — forces clean reboot into bootloader
-            //   3. Wait 500ms (PIC NAK window during reboot)
-            //   4. JUMP (0x06) — transition from bootloader to app mode
-            //   5. Wait for app to start, re-detect firmware
-            //
-            // NOTE: RESET (0x07) only works on BraiinsOS PICs (v0x03).
-            // Stock PICs ignore unknown commands. Either way, it's safe to send.
-
-            // Step 2a: Clear I2C parser state (bosminer workaround).
-            // Use write_byte_by_byte directly — send_command() routes Unknown
-            // firmware to write() (single transaction), which causes SSPOV overflow
-            // on the PIC's 1-byte MSSP buffer. See Step 1b comment for full explanation.
-            tracing::info!(
-                addr = format_args!("0x{:02X}", self.address),
-                "PIC in bootloader/unknown — starting full RESET sequence (bosminer-matched)",
-            );
-            let _ = self.i2c.set_slave(self.address);
-            let _ = self.i2c.write_byte_by_byte(&[
-                0x55, 0xAA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00,
-            ]);
-            std::thread::sleep(std::time::Duration::from_millis(100));
-
-            // Step 2b: Send RESET (0x07) for clean bootloader entry
-            // This clears any stuck PIC state from a previous watchdog timeout
-            // or partial command. BraiinsOS braiins_power.rs:479-498 does this.
-            match self.reset_pic() {
-                Ok(()) => {
-                    tracing::info!(
-                        addr = format_args!("0x{:02X}", self.address),
-                        "PIC RESET (0x07) sent — waiting 500ms for reboot",
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                }
-                Err(e) => {
-                    tracing::info!(
-                        addr = format_args!("0x{:02X}", self.address),
-                        error = %e,
-                        "PIC RESET failed (may be stock PIC that ignores 0x07) — continuing with JUMP",
-                    );
-                }
-            }
-
-            // Step 2c: Send JUMP to transition from bootloader to app
-            match self.jump_to_app() {
-                Ok(()) => {
-                    // RE REVIEW: bosminer waits only 100ms after JUMP (braiins_power.rs:501).
-                    // We use 500ms as a conservative compromise — enough for PIC to
-                    // transition to app mode even on slower boards. 2200ms was excessive.
-                    tracing::info!(
-                        addr = format_args!("0x{:02X}", self.address),
-                        "JUMP sent — waiting 500ms for app start"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                }
-                Err(e) => tracing::warn!(
-                    addr = format_args!("0x{:02X}", self.address),
-                    error = %e,
-                    "JUMP failed — continuing",
-                ),
-            }
-
-            // Re-detect firmware after RESET + JUMP
-            for attempt in 1..=3 {
-                match self.detect_firmware() {
-                    Ok(PicFirmware::BraiinsOs) | Ok(PicFirmware::Stock(_)) => {
-                        tracing::info!(
-                            addr = format_args!("0x{:02X}", self.address),
-                            firmware = %self.firmware,
-                            attempt,
-                            "PIC transitioned to app mode after RESET+JUMP",
-                        );
-                        self.send_heartbeat()?;
-                        break;
-                    }
-                    Ok(PicFirmware::Unknown) => {
-                        if attempt < 3 {
-                            tracing::warn!(
-                                    addr = format_args!("0x{:02X}", self.address),
-                                    attempt,
-                                    "PIC still unresponsive after RESET+JUMP — retrying in 500ms ({}/3)",
-                                    attempt,
-                                );
-                            std::thread::sleep(std::time::Duration::from_millis(500));
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            addr = format_args!("0x{:02X}", self.address),
-                            error = %e,
-                            attempt,
-                            "PIC detect_firmware failed after RESET+JUMP (attempt {}/3)",
-                            attempt,
-                        );
-                        if attempt < 3 {
-                            std::thread::sleep(std::time::Duration::from_millis(500));
-                        }
-                    }
-                }
-            }
-
-            if self.firmware == PicFirmware::Unknown {
-                tracing::error!(
-                    addr = format_args!("0x{:02X}", self.address),
-                    "PIC stuck in bootloader after RESET+JUMP — continuing with stock command set",
-                );
-                // Default to stock for voltage setup attempt
-                self.firmware = PicFirmware::Stock(0x00);
-            }
-
-            // CRITICAL FIX (2026-03-14, expert team review):
-            // The re-detect loop above called detect_firmware() up to 3 times,
-            // each using I2C_RDWR which corrupts the stock PIC's I2C parser.
-            // Must flush the parser AGAIN before set_voltage/enable_voltage,
-            // or those commands will be silently ignored by the corrupted parser.
-            //
-            // CRITICAL FIX (2026-03-24): Must use write_byte_by_byte — see
-            // Step 1b comment above for the full SSPOV/MSSP explanation.
-            let _ = self.i2c.set_slave(self.address);
-            if let Err(e) = self.i2c.write_byte_by_byte(&[
-                0x55, 0xAA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00,
-            ]) {
-                tracing::debug!(
-                        addr = format_args!("0x{:02X}", self.address),
-                        "I2C parser reset (byte-by-byte 16 bytes) after re-detect loop failed: {} — continuing",
-                        e,
-                    );
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-
-        // Step 4: Set initial voltage (dispatches to correct cmd based on firmware)
-        self.set_voltage(initial_pic_value)?;
-        tracing::info!(
-            addr = format_args!("0x{:02X}", self.address),
-            firmware = %self.firmware,
-            pic_value = initial_pic_value,
-            voltage = format_args!("{:.2}V", voltage_v),
-            "Voltage set to {:.2}V (PIC value {})",
-            voltage_v, initial_pic_value,
-        );
-
-        // BraiinsOS PIC needs a short delay between commands — the PIC's I2C state
-        // machine processes one command at a time. BraiinsOS sends bytes individually
-        // with implicit inter-byte delays; we batch commands, so we need explicit delays.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        // Step 5: Enable voltage output (dispatches to correct cmd based on firmware)
-        // NOTE: enable_voltage can fail on BraiinsOS PICs even when other commands work.
-        // BraiinsOS sends commands byte-by-byte; the PIC may NAK batched writes for
-        // enable_voltage specifically. If it fails, we continue anyway — the PIC may
-        // already have voltage enabled from its previous state (PIC RESET doesn't
-        // necessarily disable the DC-DC converter).
-        match self.enable_voltage() {
-            Ok(()) => {
-                tracing::info!(
-                    addr = format_args!("0x{:02X}", self.address),
-                    firmware = %self.firmware,
-                    "Voltage OUTPUT ENABLED",
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    addr = format_args!("0x{:02X}", self.address),
-                    firmware = %self.firmware,
-                    error = %e,
-                    "enable_voltage failed — continuing (voltage may already be enabled from previous state)",
-                );
-            }
-        }
-
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        // Step 6: Send heartbeat to keep PIC alive regardless of enable_voltage result
-        self.send_heartbeat()?;
-        tracing::info!(
-            addr = format_args!("0x{:02X}", self.address),
-            firmware = %self.firmware,
-            "Initial heartbeat sent — must continue every 1s",
-        );
-
-        Ok(())
-    }
-
-    /// Send PIC RESET command (0x07) — forces PIC into bootloader.
-    ///
-    /// BraiinsOS-only command (stock PICs ignore unknown commands — safe to send).
-    /// After RESET, PIC reboots into bootloader mode. Must send JUMP (0x06)
-    /// afterward to return to app mode.
-    ///
-    /// Matches bosminer's braiins_power.rs:479-498 reset() implementation:
-    ///   1. Send 16 zero bytes (clear I2C parser state) — caller should do this first
-    ///   2. Send [0x55, 0xAA, 0x07] (RESET_PIC command)
-    ///   3. Wait 500ms (PIC NAK window during reboot)
-    pub fn reset_pic(&mut self) -> Result<()> {
-        self.send_command(&[PIC_PREAMBLE[0], PIC_PREAMBLE[1], BRAIINS_CMD_RESET_PIC])
-    }
-
-    /// Send the JUMP_FROM_LOADER_TO_APP command (0x06).
-    ///
-    /// CRITICAL: Only send this if PIC is in bootloader mode (raw read = 0xCC
-    /// or firmware detection returned Unknown). Sending JUMP to a PIC already
-    /// in app mode (0x60) puts it BACK into bootloader!
-    ///
-    /// CRITICAL FIX (2026-03-18): JUMP is sent to PICs in BOOTLOADER mode (0xCC).
-    /// The bootloader's I2C parser expects byte-by-byte writes (each byte as a
-    /// separate I2C transaction). send_command() dispatches Unknown firmware to
-    /// single-transaction write(), but bootloader PICs need byte-by-byte.
-    /// Use write_byte_by_byte() directly here — JUMP only targets bootloader PICs.
-    pub fn jump_to_app(&mut self) -> Result<()> {
-        let data = [PIC_PREAMBLE[0], PIC_PREAMBLE[1], CMD_JUMP_FROM_LOADER];
-        self.i2c
-            .set_slave(self.address)
-            .map_err(|e| crate::AsicError::Pic {
-                addr: self.address,
-                detail: format!("I2C set_slave failed: {}", e),
-            })?;
-        // Always use byte-by-byte for JUMP — bootloader PICs require it.
-        // This is safe for both stock and BraiinsOS bootloaders.
-        self.i2c
-            .write_byte_by_byte(&data)
-            .map_err(|e| crate::AsicError::Pic {
-                addr: self.address,
-                detail: format!("I2C write (JUMP) failed: {}", e),
-            })?;
-        Ok(())
+    /// Cold-boot admission requires an opaque, discovery-bound endpoint so the
+    /// worker can observe the raw state and conditionally issue JUMP without a
+    /// command from another client interleaving between those operations. Use
+    /// `Pic16EndpointSession::cold_boot_init` instead.
+    #[deprecated(
+        note = "direct-bus PIC16 cold boot is quarantined; use a discovery-bound Pic16EndpointSession"
+    )]
+    pub fn cold_boot_init(&mut self, _initial_pic_value: u8) -> Result<()> {
+        Err(crate::AsicError::InvalidParameter(
+            "direct-bus PIC16 cold boot is not an admission authority; use Pic16EndpointSession"
+                .into(),
+        ))
     }
 
     /// Read raw PIC state via plain I2C read (no command).
@@ -1466,8 +1062,9 @@ pub fn parse_pic_firmware(path: &str) -> Option<Vec<u8>> {
 }
 
 // v0.13.0: PicServiceController -- PIC operations via I2C service thread
-use dcentrald_hal::i2c::{I2cMutationLabel, I2cPicFirmware, I2cServiceHandle};
+use dcentrald_hal::i2c::{I2cMutationLabel, I2cPic16JumpOutcome, I2cPicFirmware, I2cServiceHandle};
 use dcentrald_hal::platform::{VoltageControllerEndpoint, VoltageControllerKind};
+use std::sync::Arc;
 
 /// Durable construction authority for one discovery-bound PIC16 service.
 ///
@@ -1486,7 +1083,7 @@ use dcentrald_hal::platform::{VoltageControllerEndpoint, VoltageControllerKind};
 /// ```
 pub struct Pic16EndpointSession {
     i2c: I2cServiceHandle,
-    address: u8,
+    endpoint: Arc<VoltageControllerEndpoint>,
 }
 
 impl Pic16EndpointSession {
@@ -1506,22 +1103,22 @@ impl Pic16EndpointSession {
         }
         Ok(Self {
             i2c,
-            address: endpoint.address(),
+            endpoint: Arc::new(endpoint),
         })
     }
 
     pub fn address(&self) -> u8 {
-        self.address
+        self.endpoint.address()
     }
 
     pub fn service(&self) -> PicServiceController {
-        PicServiceController::new_legacy_parts(self.i2c.clone(), self.address)
+        PicServiceController::new_bound_parts(self.i2c.clone(), Arc::clone(&self.endpoint))
     }
 
     pub fn service_with_firmware(&self, firmware: PicFirmware) -> PicServiceController {
-        PicServiceController::new_legacy_parts_with_firmware(
+        PicServiceController::new_bound_parts_with_firmware(
             self.i2c.clone(),
-            self.address,
+            Arc::clone(&self.endpoint),
             firmware,
         )
     }
@@ -1530,6 +1127,7 @@ impl Pic16EndpointSession {
 pub struct PicServiceController {
     i2c: I2cServiceHandle,
     address: u8,
+    endpoint: Option<Arc<VoltageControllerEndpoint>>,
     firmware: PicFirmware,
     current_voltage_pic: u8,
 }
@@ -1546,6 +1144,7 @@ impl PicServiceController {
         Self {
             i2c,
             address,
+            endpoint: None,
             firmware: PicFirmware::Unknown,
             current_voltage_pic: 0,
         }
@@ -1566,6 +1165,25 @@ impl PicServiceController {
         Self {
             i2c,
             address,
+            endpoint: None,
+            firmware,
+            current_voltage_pic: 0,
+        }
+    }
+
+    fn new_bound_parts(i2c: I2cServiceHandle, endpoint: Arc<VoltageControllerEndpoint>) -> Self {
+        Self::new_bound_parts_with_firmware(i2c, endpoint, PicFirmware::Unknown)
+    }
+
+    fn new_bound_parts_with_firmware(
+        i2c: I2cServiceHandle,
+        endpoint: Arc<VoltageControllerEndpoint>,
+        firmware: PicFirmware,
+    ) -> Self {
+        Self {
+            address: endpoint.address(),
+            i2c,
+            endpoint: Some(endpoint),
             firmware,
             current_voltage_pic: 0,
         }
@@ -1594,10 +1212,6 @@ impl PicServiceController {
         Ok(detected)
     }
 
-    fn send_command(&self, data: &[u8]) -> Result<()> {
-        self.send_mutating_command(I2cMutationLabel::Unclassified, data)
-    }
-
     fn send_mutating_command(&self, label: I2cMutationLabel, data: &[u8]) -> Result<()> {
         self.i2c
             .write_byte_by_byte_mutating(label, self.address, data)
@@ -1608,6 +1222,15 @@ impl PicServiceController {
     }
 
     pub fn read_raw(&self) -> Result<u8> {
+        if let Some(endpoint) = self.endpoint.as_deref() {
+            return self
+                .i2c
+                .pic16_read_raw_exact(endpoint)
+                .map_err(|e| crate::AsicError::Pic {
+                    addr: self.address,
+                    detail: format!("exact service read: {e}"),
+                });
+        }
         let buf = self
             .i2c
             .read_bytes(self.address, 1)
@@ -1615,7 +1238,16 @@ impl PicServiceController {
                 addr: self.address,
                 detail: format!("svc read: {}", e),
             })?;
-        Ok(buf[0])
+        match buf.as_slice() {
+            [raw_state] => Ok(*raw_state),
+            _ => Err(crate::AsicError::Pic {
+                addr: self.address,
+                detail: format!(
+                    "service raw read returned {} byte(s); exact one-byte evidence is required",
+                    buf.len()
+                ),
+            }),
+        }
     }
 
     /// Send a single heartbeat (service-handle path).
@@ -1624,6 +1256,15 @@ impl PicServiceController {
     /// for the per-`(Platform, PicFw)` interval table. Callers must
     /// tick this at `cfg.interval_ms`, never slower.
     pub fn send_heartbeat(&self) -> Result<()> {
+        if let Some(endpoint) = self.endpoint.as_deref() {
+            return self
+                .i2c
+                .pic16_heartbeat(endpoint)
+                .map_err(|e| crate::AsicError::Pic {
+                    addr: self.address,
+                    detail: format!("typed heartbeat: {e}"),
+                });
+        }
         self.send_mutating_command(
             I2cMutationLabel::KeepAlive,
             &[PIC_PREAMBLE[0], PIC_PREAMBLE[1], BRAIINS_CMD_SEND_HEARTBEAT],
@@ -1680,96 +1321,82 @@ impl PicServiceController {
                     addr: self.address,
                     detail: format!("write_read: {}", e),
                 })?;
-        Ok(buf[0])
+        match buf.as_slice() {
+            [voltage] => Ok(*voltage),
+            _ => Err(crate::AsicError::Pic {
+                addr: self.address,
+                detail: format!(
+                    "voltage read returned {} byte(s); exact one-byte response is required",
+                    buf.len()
+                ),
+            }),
+        }
     }
 
-    pub fn reset_pic(&self) -> Result<()> {
-        self.send_command(&[PIC_PREAMBLE[0], PIC_PREAMBLE[1], BRAIINS_CMD_RESET_PIC])
-    }
-
-    pub fn jump_to_app(&self) -> Result<()> {
-        self.send_command(&[PIC_PREAMBLE[0], PIC_PREAMBLE[1], CMD_JUMP_FROM_LOADER])
-    }
-
-    pub fn flush_parser(&self) {
-        let _ = self.i2c.write_byte_by_byte(
-            self.address,
-            &[
-                0x55, 0xAA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00,
-            ],
-        );
-    }
-
-    pub fn write_raw(&self, data: &[u8]) -> Result<()> {
-        self.i2c
-            .write_bytes(self.address, data)
+    /// Fail-closed cold-boot admission via the discovery-bound service.
+    ///
+    /// The worker atomically owns raw observation, the exact-`0xCC` JUMP
+    /// decision, the fixed transition frame, and the post-JUMP observation.
+    /// Only evidence-backed application states proceed. Five consecutive
+    /// one-second heartbeat ticks must then succeed before one combined
+    /// SET_VOLTAGE + ENABLE request and a final heartbeat.
+    pub fn cold_boot_init(&mut self, initial_pic_value: u8) -> Result<()> {
+        let endpoint = self.endpoint.as_ref().cloned().ok_or_else(|| {
+            crate::AsicError::InvalidParameter(
+                "PIC16 cold boot requires a discovery-bound endpoint session".into(),
+            )
+        })?;
+        let observed_raw = match self
+            .i2c
+            .pic16_jump_if_exact_bootloader(endpoint.as_ref())
             .map_err(|e| crate::AsicError::Pic {
                 addr: self.address,
-                detail: format!("raw write: {}", e),
-            })
-    }
-
-    /// Full cold boot init via service thread.
-    pub fn cold_boot_init(&mut self, initial_pic_value: u8) -> Result<()> {
-        let pre_detect_raw = {
-            let mut raw_val = 0xFF_u8;
-            for _attempt in 0..5u8 {
-                if let Ok(v) = self.read_raw() {
-                    raw_val = v;
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            raw_val
+                detail: format!("atomic boot observation/transition: {e}"),
+            })? {
+            I2cPic16JumpOutcome::ObservedNoJump { raw_state } => raw_state,
+            I2cPic16JumpOutcome::JumpSentFromExactBootloader {
+                post_jump_raw_state,
+            } => post_jump_raw_state,
         };
-        let detected = self.detect_firmware()?;
-        self.flush_parser();
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let needs_jump = pre_detect_raw == 0xCC || pre_detect_raw == 0x00 || pre_detect_raw == 0xFF;
-        if !needs_jump {
-            self.send_heartbeat()?;
-            self.set_voltage(initial_pic_value)?;
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            let _ = self.enable_voltage();
-        } else if matches!(detected, PicFirmware::BraiinsOs | PicFirmware::Stock(_)) && needs_jump {
-            let _ = self.jump_to_app();
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let _ = self.detect_firmware();
-            self.flush_parser();
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            self.send_heartbeat()?;
-        } else {
-            self.flush_parser();
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            let _ = self.reset_pic();
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let _ = self.jump_to_app();
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            for attempt in 1..=3 {
-                match self.detect_firmware() {
-                    Ok(PicFirmware::BraiinsOs) | Ok(PicFirmware::Stock(_)) => {
-                        let _ = self.send_heartbeat();
-                        break;
-                    }
-                    _ => {
-                        if attempt < 3 {
-                            std::thread::sleep(std::time::Duration::from_millis(500));
-                        }
-                    }
-                }
+
+        let evidence = Pic16ApplicationEvidence::from_raw_state(observed_raw).ok_or_else(|| {
+            crate::AsicError::Pic {
+                addr: self.address,
+                detail: format!(
+                    "raw state 0x{observed_raw:02X} is not positive PIC16 application evidence; refusing heartbeat/voltage admission"
+                ),
             }
-            if self.firmware == PicFirmware::Unknown {
-                self.firmware = PicFirmware::Stock(0x00);
+        })?;
+        self.firmware = evidence.firmware();
+
+        for stable_tick in 1..=5_u8 {
+            self.i2c
+                .pic16_heartbeat(endpoint.as_ref())
+                .map_err(|e| crate::AsicError::Pic {
+                    addr: self.address,
+                    detail: format!(
+                        "pre-voltage heartbeat {stable_tick}/5 failed; stability credit discarded: {e}"
+                    ),
+                })?;
+            if stable_tick < 5 {
+                std::thread::sleep(std::time::Duration::from_secs(1));
             }
-            self.flush_parser();
-            std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        self.set_voltage(initial_pic_value)?;
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let _ = self.enable_voltage();
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        self.send_heartbeat()?;
+
+        let clamped = initial_pic_value.max(PicController::MIN_SAFE_PIC_VALUE);
+        self.i2c
+            .pic16_set_and_enable(endpoint.as_ref(), clamped)
+            .map_err(|e| crate::AsicError::Pic {
+                addr: self.address,
+                detail: format!("post-stability SET_VOLTAGE/ENABLE failed: {e}"),
+            })?;
+        self.current_voltage_pic = clamped;
+        self.i2c
+            .pic16_heartbeat(endpoint.as_ref())
+            .map_err(|e| crate::AsicError::Pic {
+                addr: self.address,
+                detail: format!("final post-enable heartbeat failed: {e}"),
+            })?;
         Ok(())
     }
 }
@@ -1777,8 +1404,8 @@ impl PicServiceController {
 #[cfg(test)]
 mod tests {
     use super::{
-        pic_needs_jump, S9FactoryBadCore, S9FactoryFreq, S9_BADCORE_FLASH_BYTES, S9_FACTORY_CHIPS,
-        S9_FREQ_FLASH_BYTES,
+        pic_needs_jump, Pic16ApplicationEvidence, PicFirmware, S9FactoryBadCore, S9FactoryFreq,
+        S9_BADCORE_FLASH_BYTES, S9_FACTORY_CHIPS, S9_FREQ_FLASH_BYTES,
     };
     use proptest::prelude::*;
 
@@ -1794,28 +1421,38 @@ mod tests {
         }
     }
 
-    /// LOAD-BEARING S9 rule: JUMP only on CONFIRMED bootloader/unresponsive
-    /// states (blacklist), never on app-mode SSPBUF values. JUMP'ing an app-mode
-    /// PIC pushes it back to the bootloader and breaks voltage control. The old
-    /// whitelist broke on 0x48 (post-watchdog app state); pin the blacklist so a
-    /// "cleanup" toward the previously-stale module header can't re-introduce it.
+    /// LOAD-BEARING S9 rule: exact `0xCC` is the sole JUMP authority.
     #[test]
-    fn pic_needs_jump_blacklist_not_whitelist() {
-        // Confirmed bootloader / unresponsive -> JUMP.
-        assert!(
-            pic_needs_jump(0xCC),
-            "0xCC bootloader ISR default must JUMP"
-        );
-        assert!(pic_needs_jump(0x00), "0x00 SSPBUF-uninitialized must JUMP");
-        assert!(pic_needs_jump(0xFF), "0xFF unresponsive/RX-empty must JUMP");
-        // App-mode SSPBUF values (last-command residue) must NOT JUMP.
-        for app in [
-            0x48u8, 0x60, 0x20, 0x40, 0x56, 0x5A, 0x5E, 0x03, 0x80, 0x31, 0xA8,
-        ] {
-            assert!(
-                !pic_needs_jump(app),
-                "0x{app:02X} is app mode and must NOT be JUMP'd (would brick voltage control)"
+    fn pic_needs_jump_only_for_exact_bootloader_byte() {
+        for raw_state in u8::MIN..=u8::MAX {
+            assert_eq!(
+                pic_needs_jump(raw_state),
+                raw_state == 0xCC,
+                "raw state 0x{raw_state:02X} has the wrong JUMP authority"
             );
+        }
+    }
+
+    #[test]
+    fn pic16_application_evidence_is_an_exhaustive_allowlist() {
+        for raw_state in u8::MIN..=u8::MAX {
+            let expected = match raw_state {
+                0x56 | 0x5A | 0x5E => Some(Pic16ApplicationEvidence::Stock(raw_state)),
+                0x03 => Some(Pic16ApplicationEvidence::BraiinsOs),
+                0x60 => Some(Pic16ApplicationEvidence::AppModeUnknown),
+                _ => None,
+            };
+            let observed = Pic16ApplicationEvidence::from_raw_state(raw_state);
+            assert_eq!(observed, expected, "raw state 0x{raw_state:02X}");
+            if let Some(evidence) = observed {
+                let firmware = evidence.firmware();
+                assert!(matches!(
+                    (raw_state, firmware),
+                    (0x56 | 0x5A | 0x5E, PicFirmware::Stock(_))
+                        | (0x03, PicFirmware::BraiinsOs)
+                        | (0x60, PicFirmware::Unknown)
+                ));
+            }
         }
     }
 

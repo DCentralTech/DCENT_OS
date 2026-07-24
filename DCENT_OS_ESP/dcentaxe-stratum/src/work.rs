@@ -128,13 +128,7 @@ impl WorkBuilder {
         self.extranonce2_counter += 1;
 
         // Cap extranonce2 to max value for the configured byte size
-        let max_en2 = match self.extranonce2_size {
-            1 => 0xFF_u64,
-            2 => 0xFFFF,
-            3 => 0xFFFFFF,
-            4 => 0xFFFFFFFF,
-            _ => u64::MAX,
-        };
+        let max_en2 = max_extranonce2_value(self.extranonce2_size);
         if self.extranonce2_counter > max_en2 {
             warn!(
                 "WorkBuilder: extranonce2 counter wrapped (size={}), resetting",
@@ -195,11 +189,28 @@ impl WorkBuilder {
         // Midstate 0: original version
         midstates.push(compute_midstate(&header_prefix));
 
-        // If version rolling is active, compute additional midstates
+        // If version rolling is active, compute up to 3 additional midstates for
+        // DISTINCT rolled versions. `increment_bitmask` advances the masked bits
+        // like a counter, so a mask with fewer than 2 free bits in the roll
+        // region cycles with a short period (a 1-bit mask has period 2). Emitting
+        // the duplicate rolls anyway wasted ASICBoost midstate slots hashing an
+        // identical search space AND caused duplicate-share rejects (a nonce
+        // found under one slot is re-found under its clone). Stop at the first
+        // repeat so only distinct midstates are sent: the BM1397 driver honors
+        // `midstates.len()` (num_midstates) and the dispatcher reconstructs the
+        // version by midstate index via this same `increment_bitmask` chain, so
+        // the reduced count stays exactly consistent end-to-end.
         if self.version_mask != 0 {
             let mut rolled_version = version;
+            let mut seen = [version, 0, 0, 0];
+            let mut distinct = 1usize;
             for _ in 0..3 {
                 rolled_version = increment_bitmask(rolled_version, self.version_mask);
+                if seen[..distinct].contains(&rolled_version) {
+                    break;
+                }
+                seen[distinct] = rolled_version;
+                distinct += 1;
                 header_prefix[0..4].copy_from_slice(&rolled_version.to_le_bytes());
                 midstates.push(compute_midstate(&header_prefix));
             }
@@ -600,10 +611,20 @@ pub fn compute_multiple_midstates(
     header_prefix[0..4].copy_from_slice(&version.to_le_bytes());
     midstates.push(compute_midstate(header_prefix));
 
-    // Additional midstates with rolled versions
+    // Additional midstates with rolled versions — DISTINCT only. Like
+    // `WorkBuilder::next_work`, stop once the rolled version repeats: a mask with
+    // fewer than log2(count) free bits cycles, and duplicate midstates waste
+    // ASICBoost slots + cause duplicate-share rejects. Callers use the returned
+    // length (`num_midstates`), so a reduced distinct count stays consistent.
     let mut rolled = version;
+    let mut seen = Vec::with_capacity(count);
+    seen.push(version);
     for _ in 1..count {
         rolled = increment_bitmask(rolled, version_mask);
+        if seen.contains(&rolled) {
+            break;
+        }
+        seen.push(rolled);
         header_prefix[0..4].copy_from_slice(&rolled.to_le_bytes());
         midstates.push(compute_midstate(header_prefix));
     }
@@ -886,6 +907,26 @@ pub fn increment_bitmask(value: u32, mask: u32) -> u32 {
     (value & !mask) | carry
 }
 
+/// Largest extranonce2 counter value representable in `byte_count`
+/// little-endian bytes.
+///
+/// `format_extranonce2` truncates the counter to the low `byte_count` bytes, so
+/// any value above this cap aliases to an already-emitted extranonce2 (e.g.
+/// `2^40` folds back to `0` at `byte_count == 5`). The `next_work` wrap guard
+/// resets the counter at this cap to avoid silently reusing a coinbase.
+///
+/// The earlier inline table only handled sizes 1-4 and let 5/6/7 fall through
+/// to `u64::MAX`, so the wrap guard never fired for those sizes. Computed here
+/// so it stays exhaustive; `>= 8` returns `u64::MAX` (a shift of `8*8` would
+/// overflow).
+fn max_extranonce2_value(byte_count: usize) -> u64 {
+    match byte_count {
+        0 => 0,
+        n if n >= 8 => u64::MAX,
+        n => (1u64 << (8 * n)) - 1,
+    }
+}
+
 /// Format a u64 counter as a hex string of the required byte length.
 ///
 /// extranonce2 is transmitted as a hex string with exactly
@@ -938,6 +979,63 @@ mod tests {
     }
 
     #[test]
+    fn max_extranonce2_value_covers_all_byte_sizes() {
+        assert_eq!(max_extranonce2_value(1), 0xFF);
+        assert_eq!(max_extranonce2_value(2), 0xFFFF);
+        assert_eq!(max_extranonce2_value(3), 0xFF_FFFF);
+        assert_eq!(max_extranonce2_value(4), 0xFFFF_FFFF);
+        // Regression: sizes 5-7 previously fell through to u64::MAX, so the
+        // wrap guard never fired and the counter aliased to a reused value.
+        assert_eq!(max_extranonce2_value(5), 0xFF_FFFF_FFFF);
+        assert_eq!(max_extranonce2_value(6), 0xFFFF_FFFF_FFFF);
+        assert_eq!(max_extranonce2_value(7), 0xFF_FFFF_FFFF_FFFF);
+        assert_eq!(max_extranonce2_value(8), u64::MAX);
+        assert_eq!(max_extranonce2_value(0), 0);
+
+        // The cap is EXACTLY the largest value format_extranonce2 can emit
+        // without aliasing: cap yields all-0xFF bytes, and cap+1 truncates back
+        // to the all-zero extranonce2 (the reused value the wrap guard prevents).
+        for n in 1..=7usize {
+            let cap = max_extranonce2_value(n);
+            assert_ne!(
+                format_extranonce2(cap, n),
+                format_extranonce2(0, n),
+                "cap must not already alias to the zero extranonce2 (size {n})"
+            );
+            assert_eq!(
+                format_extranonce2(cap.wrapping_add(1), n),
+                format_extranonce2(0, n),
+                "cap+1 must fold back to the zero extranonce2 (size {n})"
+            );
+        }
+    }
+
+    #[test]
+    fn next_work_resets_extranonce2_counter_at_cap_for_large_sizes() {
+        // size 5: at the cap (2^40 - 1) the next increment must wrap-reset,
+        // instead of climbing past it and silently reusing extranonce2 values.
+        let job = StratumJob {
+            job_id: "j".into(),
+            prev_hash: "0".repeat(64),
+            coinbase1: "01".into(),
+            coinbase2: "02".into(),
+            merkle_branches: vec![],
+            version: "20000000".into(),
+            nbits: "1d00ffff".into(),
+            block_height: 0,
+            ntime: "5dbe6c00".into(),
+            clean_jobs: false,
+        };
+        let mut wb = WorkBuilder::new("aabbccdd", 5);
+        wb.extranonce2_counter = max_extranonce2_value(5); // 2^40 - 1
+        let _ = wb.next_work(&job);
+        assert_eq!(
+            wb.extranonce2_counter, 0,
+            "counter must reset at the size-5 cap (regression: stayed at 2^40)"
+        );
+    }
+
+    #[test]
     fn test_increment_bitmask() {
         let mask = 0x1fffe000_u32;
         let v0 = 0x20000000_u32;
@@ -945,6 +1043,68 @@ mod tests {
         assert_eq!(v1, 0x20002000);
         let v2 = increment_bitmask(v1, mask);
         assert_eq!(v2, 0x20004000);
+    }
+
+    fn dedup_test_job() -> StratumJob {
+        StratumJob {
+            job_id: "j".into(),
+            prev_hash: "0".repeat(64),
+            coinbase1: "01".into(),
+            coinbase2: "02".into(),
+            merkle_branches: vec![],
+            version: "20000000".into(),
+            nbits: "1d00ffff".into(),
+            block_height: 0,
+            ntime: "5dbe6c00".into(),
+            clean_jobs: false,
+        }
+    }
+
+    #[test]
+    fn next_work_emits_only_distinct_midstates() {
+        let job = dedup_test_job();
+        // A 1-bit roll mask can only produce 2 distinct rolled versions, so
+        // next_work must emit 2 midstates — NOT 4 with two duplicate pairs (which
+        // wasted ASICBoost slots and caused duplicate-share rejects).
+        let mut wb = WorkBuilder::new("aabbccdd", 4);
+        wb.set_version_mask(0x0000_2000);
+        let work = wb.next_work(&job);
+        assert_eq!(
+            work.midstates.len(),
+            2,
+            "a 1-bit mask yields 2 distinct midstates, not 4 duplicates"
+        );
+        assert_ne!(work.midstates[0], work.midstates[1]);
+
+        // A mask with >= 2 free bits fills all 4 with distinct midstates.
+        let mut wb2 = WorkBuilder::new("aabbccdd", 4);
+        wb2.set_version_mask(0x0000_6000);
+        let work2 = wb2.next_work(&job);
+        assert_eq!(
+            work2.midstates.len(),
+            4,
+            "a 2-bit mask fills 4 distinct midstates"
+        );
+        for i in 0..4 {
+            for j in (i + 1)..4 {
+                assert_ne!(
+                    work2.midstates[i], work2.midstates[j],
+                    "midstates {i},{j} duplicate"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compute_multiple_midstates_dedups_a_low_bit_mask() {
+        let mut hp = [0u8; 64];
+        // Request 4 with a 1-bit mask -> only 2 distinct are emitted.
+        let ms = compute_multiple_midstates(&mut hp, 0x2000_0000, 0x0000_2000, 4);
+        assert_eq!(ms.len(), 2);
+        assert_ne!(ms[0], ms[1]);
+        // A 2-bit mask fills all 4.
+        let ms2 = compute_multiple_midstates(&mut hp, 0x2000_0000, 0x0000_6000, 4);
+        assert_eq!(ms2.len(), 4);
     }
 
     #[test]

@@ -20,16 +20,27 @@ mod chip_profiles_bitaxe;
 mod config;
 mod dashboard;
 mod derived_metrics;
+// W5500 SPI-Ethernet "DCENT LAN Mod" (PLAN-E Phase 1). DEFAULT-OFF — compiled
+// only when a board opts into the `eth-w5500` feature (byte-identical image
+// otherwise). `eth_w5500` is the esp-idf `esp_eth` bring-up seam; `net` is the
+// pure Wi-Fi⇄Ethernet failover FSM (host-tested via the dcentaxe-core
+// re-include). Activation is fail-closed through the existing
+// `AccessoryMode::W5500Lan` guard (LAN xor BAP-Touch — shared GPIO39/40).
+#[cfg(feature = "eth-w5500")]
+mod eth_w5500;
+#[cfg(feature = "eth-w5500")]
+mod net;
 // On-board SX1262 LoRa radio task + $DCM mesh integration. DEFAULT-OFF — compiled
 // only when a board opts into the `lora` feature (byte-identical image otherwise).
 #[cfg(feature = "lora")]
 mod lora_task;
+mod mcp;
 #[cfg(feature = "lora")]
 mod mesh_solo_runtime;
-mod mcp;
 mod metrics_render;
 mod mqtt;
 mod mqtt_ha;
+mod notifications;
 mod nvs_config;
 mod ota_signature;
 mod power_measurement;
@@ -968,6 +979,7 @@ fn spawn_stratum_thread(
     name: &str,
     config: dcentaxe_stratum::StratumConfig,
     fallback_pool: Option<dcentaxe_stratum::StratumConfig>,
+    donation: Option<dcentaxe_stratum::DonationDirective>,
     event_tx: mpsc::Sender<StratumEvent>,
     share_rx: mpsc::Receiver<MiningEvent>,
     status: dcentaxe_stratum::SharedStratumStatus,
@@ -995,6 +1007,9 @@ fn spawn_stratum_thread(
                         crate::shared::sanitize_pool_url(&fb.url),
                         fb.port
                     );
+                }
+                if let Some(directive) = donation {
+                    client.set_donation(directive);
                 }
                 client.run();
             }
@@ -1167,15 +1182,13 @@ fn main() {
     let peripherals = Peripherals::take().expect("Failed to take peripherals");
     let sysloop = EspSystemEventLoop::take().expect("Failed to take event loop");
 
-    // On-board SX1262 LoRa radio bus (DEFAULT-OFF). Acquire the dedicated SPI3/HSPI
-    // host + the 9 control GPIOs (5/6/7/15/16/21/8 + the R-24 E22 RF-switch
-    // enables TXEN=2/RXEN=9) up front, before the rest of main consumes
-    // `peripherals` (none of the LoRa pins/SPI3 are touched by any other
-    // subsystem — the provisional map is dedicated). Fail-soft: a bus-init
-    // error leaves `lora_bus=None`, the task never spawns, mining is unaffected.
-    // ⚠️ Integration seam — NEEDS-VERIFY (esp-idf-hal 0.46) at wire-up; the pins are
-    // PROVISIONAL (NEEDS-NETLIST-LOCK, doc 05 §1.3) except TXEN/RXEN, which the
-    // dcent-axe-BM1397 schematic locks to GPIO2/GPIO9 (PREFAB review R-24).
+    // On-board SX1262 LoRa radio bus (DEFAULT-OFF `lora` feature). Acquire the
+    // dedicated SPI3/HSPI host + the 9 control GPIOs (netlist-locked 9/9 on
+    // DCENT_axe BM1397: 5/6/7/15/16/21/8 + TXEN=2/RXEN=9) up front, before the
+    // rest of main consumes `peripherals`. Fail-soft: a bus-init error leaves
+    // `lora_bus=None`, the task never spawns, mining is unaffected.
+    // ⚠️ Integration seam — SPI transport NEEDS-VERIFY on silicon (esp-idf-hal);
+    // pin map is LOCKED vs the BM1397 netlist (FULL_PREFAB_REVIEW 2026-07-11).
     #[cfg(feature = "lora")]
     let lora_bus = match dcentaxe_hal::lora_pins::open_lora_bus(
         peripherals.spi3,
@@ -1495,6 +1508,61 @@ fn main() {
         Err(e) => {
             warn!("SNTP: unavailable ({:?}) — schedules will use uptime fallback until clock is valid", e);
             None
+        }
+    };
+
+    // ======================================================================
+    // W5500 SPI-Ethernet bring-up — "DCENT LAN Mod" (PLAN-E Phase 1)
+    // ======================================================================
+    // DEFAULT-OFF twice over: requires the `eth-w5500` build feature AND the
+    // operator's `config.network.eth_enabled` opt-in. Activation is
+    // fail-closed through the existing AccessoryMode guard (W5500 SPI rides
+    // the BAP-UART pins GPIO39/40 — LAN xor BAP-Touch), and consumes ONLY
+    // the 4 BAP/J4 SPI pins + the free SPI2 host (LoRa keeps SPI3; RST is an
+    // on-board RC POR; INT is unwired → polling). Fail-soft like LoRa: any
+    // bring-up error leaves Ethernet dark and mining unaffected.
+    // ⚠️ Integration seam — NEEDS-VERIFY on silicon; live link + accepted
+    // share over Ethernet are bench-gated (PLAN-E Phase 3).
+    #[cfg(feature = "eth-w5500")]
+    let eth_net_mode = config.network.mode;
+    #[cfg(feature = "eth-w5500")]
+    let eth_link = match config.eth_lan_activation() {
+        Ok(false) => {
+            info!(
+                "ETH: eth-w5500 firmware but network.eth_enabled=false (or mode=wifi-only) — \
+                 Ethernet stays dark"
+            );
+            None
+        }
+        Err(guard) => {
+            warn!(
+                "ETH: W5500 LAN refused by accessory guard: {guard} — Wi-Fi only, \
+                 mining unaffected"
+            );
+            None
+        }
+        Ok(true) => {
+            if eth_net_mode == config::NetworkMode::EthOnly {
+                warn!(
+                    "ETH: mode=eth-only — Wi-Fi STA stays up as management fallback in this \
+                     build (Wi-Fi teardown under eth-only is a documented follow-up)"
+                );
+            }
+            match eth_w5500::EthLink::bring_up(
+                peripherals.spi2,
+                peripherals.pins.gpio41.into(), // SCLK (J4 pin 5) — dcentaxe_hal::eth::W5500_SCLK_GPIO
+                peripherals.pins.gpio40.into(), // MOSI (J4 pin 4) — W5500_MOSI_GPIO
+                peripherals.pins.gpio39.into(), // MISO (J4 pin 3) — W5500_MISO_GPIO
+                peripherals.pins.gpio42.into(), // CS   (J4 pin 6) — W5500_CS_GPIO
+                sysloop.clone(),
+                eth_net_mode,
+            ) {
+                Ok(link) => Some(link),
+                Err(e) => {
+                    warn!("ETH: W5500 bring-up failed ({e}) — Wi-Fi only, mining unaffected");
+                    None
+                }
+            }
         }
     };
 
@@ -2406,14 +2474,14 @@ fn main() {
     //
     // Registered-handler accounting (re-verified 2026-06-14 after WF-E dashboard
     // route changes — counts of `.fn_handler(` / `register_static(`):
-    //   api.rs              53  (`.fn_handler(`)
+    //   api.rs              54  (`.fn_handler(`; includes donation disclosure)
     //   auth.rs              5
     //   mcp.rs               2
     //   dashboard.rs        12  (/, /index.html + 10 register_static /dashboard/*)
     //   ─────────────────  ─────
-    //   total               72  (cgminer_tcp is a TCP listener, not a URI handler)
+    //   total               73  (cgminer_tcp is a TCP listener, not a URI handler)
     const MAX_URI_HANDLERS: usize = 96;
-    const REGISTERED_HANDLER_ESTIMATE: usize = 72;
+    const REGISTERED_HANDLER_ESTIMATE: usize = 73;
     // Compile-time floor guard: the estimate must always stay under the cap.
     const _: () = assert!(REGISTERED_HANDLER_ESTIMATE < MAX_URI_HANDLERS);
     // Runtime tripwire if a future edit pushes the count near the cap.
@@ -2458,6 +2526,17 @@ fn main() {
         // Primary stratum thread
         let stratum_config = config.stratum.clone();
         let fallback_pool = config.fallback_pool.clone();
+        let donation_directive = match config.donation.to_directive(config.stratum.version_rolling)
+        {
+            Ok(directive) => Some(directive),
+            Err(error) => {
+                warn!(
+                    "Donation configuration rejected; donation disabled: {}",
+                    error
+                );
+                None
+            }
+        };
         let primary_status = dcentaxe_stratum::new_shared_stratum_status(&stratum_config, 0);
         {
             let mut statuses = state
@@ -2470,6 +2549,7 @@ fn main() {
             "stratum",
             stratum_config,
             fallback_pool,
+            donation_directive,
             event_tx,
             share_rx,
             primary_status,
@@ -2502,6 +2582,7 @@ fn main() {
             let _stratum_b = spawn_stratum_thread(
                 "stratum-b",
                 split_config,
+                None,
                 None,
                 event_tx_b,
                 share_rx_b,
@@ -2702,6 +2783,9 @@ fn main() {
     let mut prev_best_diff: f64 = 0.0;
     let mut prev_clean_jobs: u64 = 0;
     let mut prev_streak: u32 = 0;
+    let mut last_notified_share_milestone: u64 = 0;
+    let mut previous_failover_active = false;
+    let mut thermal_notification_active = false;
     let mut diary_tick: u32 = 0; // counts up for mining diary rotation
     let mut last_transition_flash: bool = false; // alternate to trigger flash on page change
 
@@ -2732,6 +2816,12 @@ fn main() {
     // a flaky AP would starve the device until the WDT tripped (3 trips →
     // safe-mode), forcing the user to reboot to recover.
     let mut wifi_reconnect_state = wifi::ReconnectState::new();
+
+    // Wi-Fi⇄Ethernet failover observer (PLAN-E Phase 1). Pure FSM — the
+    // outbound steering itself is lwIP route-priority (see eth_w5500.rs);
+    // this reports/logs the active link and counts flaps.
+    #[cfg(feature = "eth-w5500")]
+    let mut eth_failover = net::FailoverState::new();
 
     // Subscribe the main task to the task watchdog. With
     // CONFIG_ESP_TASK_WDT_PANIC=n this turns a wedged main loop into a reset
@@ -3433,6 +3523,38 @@ fn main() {
             }
         }
 
+        // ── W5500 LAN link health + Wi-Fi⇄Ethernet failover observer ───
+        // Poll once per tick (~5 s), same cadence as the Wi-Fi reconnect.
+        // lwIP already steers outbound traffic by netif route priority; this
+        // block derives the honest "active link" label (Ethernet only with
+        // link + IP) and logs every transition with the raw link state.
+        #[cfg(feature = "eth-w5500")]
+        if let Some(ref eth) = eth_link {
+            let wifi_up = {
+                let wifi_guard = state.wifi.lock().unwrap_or_else(|e| e.into_inner());
+                wifi_guard
+                    .as_ref()
+                    .map(|w| w.is_connected().unwrap_or(false))
+                    .unwrap_or(false)
+            };
+            let snap = eth.snapshot(wifi_up);
+            if let Some((from, to)) = eth_failover.tick(eth_net_mode, snap) {
+                let ip = eth
+                    .ip()
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_else(|| "none".into());
+                info!(
+                    "NET: active link {} -> {} (wifi_up={} eth_link={} eth_ip={} transitions={})",
+                    from.as_str(),
+                    to.as_str(),
+                    snap.wifi_up,
+                    snap.eth_link_up,
+                    ip,
+                    eth_failover.transitions(),
+                );
+            }
+        }
+
         {
             let snap = state
                 .stats
@@ -4114,6 +4236,55 @@ fn main() {
             let telem = state.telemetry.lock().unwrap_or_else(|e| e.into_inner());
             telem.best_diff_ever
         };
+        let notification_config = state
+            .config
+            .lock()
+            .map(|config| config.notifications.clone())
+            .unwrap_or_default();
+        if notification_config.enabled {
+            let failover_active = shared::stratum_status_snapshots(&state)
+                .first()
+                .map(|status| status.failover_active)
+                .unwrap_or(false);
+            if failover_active != previous_failover_active {
+                notifications::spawn_event(
+                    notification_config.clone(),
+                    notifications::NotificationKind::Failover,
+                    if failover_active {
+                        "Pool failover active"
+                    } else {
+                        "Primary pool restored"
+                    },
+                    format!("Miner: {}", device_ip),
+                );
+                previous_failover_active = failover_active;
+            }
+
+            let thermal_now = max_temp > WARNING_TEMP_C;
+            if thermal_now && !thermal_notification_active {
+                notifications::spawn_event(
+                    notification_config.clone(),
+                    notifications::NotificationKind::Thermal,
+                    "Thermal warning",
+                    format!("Maximum reported temperature: {:.1} C", max_temp),
+                );
+            }
+            thermal_notification_active = thermal_now;
+
+            let milestone = notification_config.share_milestone;
+            if milestone > 0 {
+                let reached = accepted / milestone * milestone;
+                if reached > last_notified_share_milestone {
+                    notifications::spawn_event(
+                        notification_config,
+                        notifications::NotificationKind::ShareMilestone,
+                        "Share milestone",
+                        format!("{} accepted shares", reached),
+                    );
+                    last_notified_share_milestone = reached;
+                }
+            }
+        }
         // ── NVS dirty flags for batched writes (1 open per tick max) ──
         let mut nvs_save_best_diff = false;
         let mut nvs_save_achievements = false;

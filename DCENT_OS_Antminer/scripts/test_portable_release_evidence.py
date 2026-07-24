@@ -6,12 +6,14 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import io
 import json
 from pathlib import Path
 import shutil
 import subprocess
 import tarfile
 import tempfile
+from typing import Any
 import unittest
 from unittest import mock
 
@@ -106,7 +108,9 @@ class PortableReleaseEvidenceTests(unittest.TestCase):
         )
         self.invocation = release_invocation.create_invocation(invocation_parent, "s9")
         self.result = release_result_stage.create_result_stage(
-            result_parent, self.invocation.stage
+            result_parent,
+            self.invocation.stage,
+            result_output=self.root / "result-stage-create.json",
         )
         sealed = release_result_stage.seal_result_stage(
             self.result.stage, self.result.capability, self.invocation.stage
@@ -237,22 +241,48 @@ class PortableReleaseEvidenceTests(unittest.TestCase):
         if package.exists():
             shutil.rmtree(package)
         package.mkdir()
+        payload_bytes = {
+            "kernel": b"kernel fixture\n",
+            "root": b"rootfs fixture\n",
+            "METADATA": b"metadata fixture\n",
+        }
+        for name, raw in payload_bytes.items():
+            (package / name).write_bytes(raw)
+        shutil.copyfile(self.public_key, package / "release_ed25519.pub")
+
+        prefix = f"sysupgrade-{package_board}"
+        payload_specs = {
+            "kernel": "kernel",
+            "rootfs": "root",
+            "metadata": "METADATA",
+            "verification_key": "release_ed25519.pub",
+        }
         manifest = {
             "schema": 1,
+            "manifest_profile": "dcentos.sysupgrade-authority/v1",
             "product": "DCENT_OS",
             "package_type": "sysupgrade",
+            "installable": True,
+            "artifact_maturity": "experimental",
             "board": package_board,
             "board_target": package_board,
+            "version": "test",
+            "status": "release",
+            "payloads": {
+                kind: {
+                    "path": f"{prefix}/{leaf}",
+                    "size": (package / leaf).stat().st_size,
+                    "sha256": hashlib.sha256((package / leaf).read_bytes()).hexdigest(),
+                }
+                for kind, leaf in payload_specs.items()
+            },
             "provenance": {"build_target": target},
         }
         manifest_path = package / "MANIFEST.json"
         manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n")
         self._sign(manifest_path, package / "MANIFEST.sig")
-        shutil.copyfile(self.public_key, package / "release_ed25519.pub")
-        (package / "kernel").write_bytes(b"kernel fixture\n")
-        (package / "root").write_bytes(b"rootfs fixture\n")
         with tarfile.open(output, "w", format=tarfile.USTAR_FORMAT) as archive:
-            prefix = f"sysupgrade-{package_board}"
+            archive.add(package, arcname=prefix, recursive=False)
             for path in sorted(package.iterdir(), key=lambda item: item.name):
                 archive.add(path, arcname=f"{prefix}/{path.name}", recursive=False)
 
@@ -471,6 +501,143 @@ class PortableReleaseEvidenceTests(unittest.TestCase):
                 {"target": "s9"},
                 {"build": "s9"},
             )
+
+    def test_signed_manifest_json_rejects_duplicate_keys_recursively(self) -> None:
+        for label, raw, duplicated_key in (
+            (
+                "root authority",
+                b'{"product":"DCENT_OS","product":"attacker"}',
+                "product",
+            ),
+            (
+                "nested payload",
+                b'{"payloads":{"kernel":{"path":"a","path":"b"}}}',
+                "path",
+            ),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    portable.PortableEvidenceError,
+                    rf"duplicate object key '{duplicated_key}'",
+                ):
+                    portable.load_unique_json(raw, "target primary artifact manifest")
+
+    def test_manifest_payload_binding_rejects_retained_byte_mismatch(self) -> None:
+        prefix = "sysupgrade-am1-s9/"
+        members = [
+            {"path": f"{prefix}{leaf}", "size": 1, "sha256": "0" * 64}
+            for leaf in ("kernel", "root", "METADATA", "release_ed25519.pub")
+        ]
+        manifest = {
+            "payloads": {
+                kind: {"path": f"{prefix}{leaf}", "size": 1, "sha256": "0" * 64}
+                for kind, leaf in {
+                    "kernel": "kernel",
+                    "rootfs": "root",
+                    "metadata": "METADATA",
+                    "verification_key": "release_ed25519.pub",
+                }.items()
+            }
+        }
+        manifest["payloads"]["rootfs"]["sha256"] = "1" * 64
+        with self.assertRaisesRegex(
+            portable.PortableEvidenceError,
+            "rootfs payload binding disagrees with retained bytes",
+        ):
+            portable.verify_manifest_payload_bindings(manifest, members, prefix)
+
+    def test_current_authority_contract_requires_exact_experimental_maturity(self) -> None:
+        manifest = {
+            "schema": 1,
+            "manifest_profile": "dcentos.sysupgrade-authority/v1",
+            "installable": True,
+            "artifact_maturity": "production",
+            "version": "test",
+            "status": "release",
+        }
+        with self.assertRaisesRegex(
+            portable.PortableEvidenceError,
+            "typed sysupgrade authority contract",
+        ):
+            portable.verify_current_authority_contract(manifest)
+
+    def test_manifest_payload_bindings_require_metadata_lowercase_digest_and_exact_path(
+        self,
+    ) -> None:
+        prefix = "sysupgrade-am1-s9/"
+        leaves = {
+            "kernel": "kernel",
+            "rootfs": "root",
+            "metadata": "METADATA",
+            "verification_key": "release_ed25519.pub",
+        }
+        members = [
+            {"path": f"{prefix}{leaf}", "size": 1, "sha256": "a" * 64}
+            for leaf in leaves.values()
+        ]
+
+        def manifest() -> dict[str, Any]:
+            return {
+                "payloads": {
+                    kind: {
+                        "path": f"{prefix}{leaf}",
+                        "size": 1,
+                        "sha256": "a" * 64,
+                    }
+                    for kind, leaf in leaves.items()
+                }
+            }
+
+        missing_metadata = manifest()
+        del missing_metadata["payloads"]["metadata"]
+        with self.assertRaisesRegex(
+            portable.PortableEvidenceError, "unsupported payload registry"
+        ):
+            portable.verify_manifest_payload_bindings(missing_metadata, members, prefix)
+
+        uppercase_digest = manifest()
+        uppercase_digest["payloads"]["kernel"]["sha256"] = "A" * 64
+        with self.assertRaisesRegex(
+            portable.PortableEvidenceError, "kernel payload binding disagrees"
+        ):
+            portable.verify_manifest_payload_bindings(uppercase_digest, members, prefix)
+
+        for padding in (" leading", "trailing "):
+            padded_path = manifest()
+            canonical = f"{prefix}kernel"
+            padded_path["payloads"]["kernel"]["path"] = (
+                f" {canonical}" if padding == " leading" else f"{canonical} "
+            )
+            with self.subTest(padding=padding), self.assertRaisesRegex(
+                portable.PortableEvidenceError, "kernel payload binding disagrees"
+            ):
+                portable.verify_manifest_payload_bindings(padded_path, members, prefix)
+
+    def test_sysupgrade_archive_requires_one_canonical_directory_member(self) -> None:
+        prefix = "sysupgrade-am1-s9/"
+
+        def archive_with_directories(*names: str) -> tarfile.TarFile:
+            raw = io.BytesIO()
+            with tarfile.open(
+                fileobj=raw, mode="w", format=tarfile.USTAR_FORMAT
+            ) as archive:
+                for name in names:
+                    member = tarfile.TarInfo(name)
+                    member.type = tarfile.DIRTYPE
+                    archive.addfile(member)
+            raw.seek(0)
+            return tarfile.open(fileobj=raw, mode="r:*")
+
+        with archive_with_directories(prefix) as archive:
+            portable.verify_canonical_sysupgrade_directory(archive, prefix)
+        for directories in ((), (prefix, prefix), ("sysupgrade-am2-s19j/",)):
+            with self.subTest(directories=directories):
+                with archive_with_directories(*directories) as archive:
+                    with self.assertRaisesRegex(
+                        portable.PortableEvidenceError,
+                        "exactly one canonical sysupgrade-am1-s9/ directory member",
+                    ):
+                        portable.verify_canonical_sysupgrade_directory(archive, prefix)
 
     def test_closure_packaging_artifact_alias_is_rejected(self) -> None:
         closure_path = self.release / "firmware.source-closure.json"

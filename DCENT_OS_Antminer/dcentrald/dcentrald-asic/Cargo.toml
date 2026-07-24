@@ -26,7 +26,7 @@ sim-hal = ["dcentrald-hal/sim-hal"]
 # recovery executor must use discovered endpoints, manifested artifacts,
 # target-bound single-use permits, readback verification, and fault injection
 # before this feature can gain a runtime consumer.
-recovery-tool = []
+recovery-tool = ["dcentrald-hal/recovery-tool"]
 # `scrypt-l7` compiles the ScryptL7 (L7 / BM1489 Litecoin **Scrypt**) chip driver
 # — DCENT_OS's first non-SHA256 driver (W3-B kickoff). DEFAULT-OFF so production
 # SHA256 builds are byte-unchanged. When enabled, chip-id 0x1489 dispatches to

@@ -86,7 +86,7 @@
 #![cfg(feature = "recovery-tool")]
 
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dcentrald_hal::i2c::{I2cMutationLabel, I2cServiceHandle, I2cTransactionStep};
@@ -425,9 +425,13 @@ pub const PATH_C_LOG_FILENAME: &str = "pic_recovery_path_c.log";
 /// Resolve the on-disk path for the Path C invocation log. Honors
 /// `$DCENT_PIC_RECOVERY_LOG_DIR` for test redirection.
 pub fn path_c_log_path() -> PathBuf {
-    let dir = std::env::var("DCENT_PIC_RECOVERY_LOG_DIR")
-        .unwrap_or_else(|_| DEFAULT_PATH_C_LOG_DIR.to_string());
-    PathBuf::from(dir).join(PATH_C_LOG_FILENAME)
+    let dir = std::env::var("DCENT_PIC_RECOVERY_LOG_DIR").ok();
+    path_c_log_path_from_dir(dir.as_deref().map(Path::new))
+}
+
+fn path_c_log_path_from_dir(dir: Option<&Path>) -> PathBuf {
+    dir.unwrap_or_else(|| Path::new(DEFAULT_PATH_C_LOG_DIR))
+        .join(PATH_C_LOG_FILENAME)
 }
 
 /// Append a single Path C invocation record to the persistent log.
@@ -452,6 +456,17 @@ pub fn append_path_c_invocation_log(
     serial: &str,
     outcome: &str,
 ) {
+    let path = path_c_log_path();
+    append_path_c_invocation_log_to(&path, addr, platform, serial, outcome);
+}
+
+fn append_path_c_invocation_log_to(
+    path: &Path,
+    addr: u8,
+    platform: RecoveryPlatform,
+    serial: &str,
+    outcome: &str,
+) {
     let unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -464,7 +479,6 @@ pub fn append_path_c_invocation_log(
         serial,
         outcome,
     );
-    let path = path_c_log_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -1046,15 +1060,12 @@ mod tests {
 
     #[test]
     fn path_c_log_path_honors_env_override() {
-        // Use a unique env value so concurrent tests don't collide.
         let dir = std::env::temp_dir().join("dcent_recovery_path_c_test_pin");
-        std::env::set_var("DCENT_PIC_RECOVERY_LOG_DIR", &dir);
-        let p = path_c_log_path();
+        let p = path_c_log_path_from_dir(Some(&dir));
         assert_eq!(p, dir.join(PATH_C_LOG_FILENAME));
-        std::env::remove_var("DCENT_PIC_RECOVERY_LOG_DIR");
 
-        // With env unset, the retained historical default path applies.
-        let p = path_c_log_path();
+        // Without an override, the retained historical default path applies.
+        let p = path_c_log_path_from_dir(None);
         assert_eq!(
             p,
             std::path::PathBuf::from(DEFAULT_PATH_C_LOG_DIR).join(PATH_C_LOG_FILENAME)
@@ -1063,21 +1074,20 @@ mod tests {
 
     #[test]
     fn append_path_c_invocation_log_writes_record() {
-        // Redirect to a temp dir so the test never touches /var/log.
         let dir = std::env::temp_dir()
             .join(format!("dcent_recovery_path_c_test_{}", std::process::id(),));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("DCENT_PIC_RECOVERY_LOG_DIR", &dir);
+        let path = dir.join(PATH_C_LOG_FILENAME);
 
-        append_path_c_invocation_log(
+        append_path_c_invocation_log_to(
+            &path,
             0x21,
             RecoveryPlatform::Am2S19jProZynq,
             "ABC123",
             "partial_bail_60pct",
         );
 
-        let log = std::fs::read_to_string(dir.join(PATH_C_LOG_FILENAME))
-            .expect("log file must exist after append");
+        let log = std::fs::read_to_string(path).expect("log file must exist after append");
         assert!(
             log.contains("path_c"),
             "log line missing path_c tag: {:?}",
@@ -1103,8 +1113,6 @@ mod tests {
             "log line missing outcome: {:?}",
             log,
         );
-
-        std::env::remove_var("DCENT_PIC_RECOVERY_LOG_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

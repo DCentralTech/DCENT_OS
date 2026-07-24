@@ -1045,13 +1045,14 @@ mod tests {
                 desc.board_target
             );
         }
-        // Sanity: only the two XIL beta packages.
+        // Sanity: only S9 has a public first-install route. AM2 public-beta
+        // authorization is scoped to self-update on an existing DCENT_OS image.
         let beta: Vec<_> = dcentrald_common::BoardDesc::all_registered()
             .iter()
             .filter(|d| d.public_beta_install)
             .map(|d| d.board_target)
             .collect();
-        assert_eq!(beta, vec!["am1-s9", "am2-s19j"]);
+        assert_eq!(beta, vec!["am1-s9"]);
     }
 
     #[test]

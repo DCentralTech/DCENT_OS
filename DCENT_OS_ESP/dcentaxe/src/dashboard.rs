@@ -1244,6 +1244,14 @@ body.col .crumbs .crumb-root,body.col .crumbs .crumb-sep{display:none}
    </div>
   </div>
   <div class="card">
+   <div class="card-title">Voluntary Donation <span id="donationLive" class="status-badge">USER POOL</span></div>
+   <div style="font-size:11px;color:var(--dim);margin-bottom:8px">Default ON at 2%, matching DCENT_OS. Time-sliced, never a mandatory fee, subordinate to your pool failover, and one toggle away from OFF.</div>
+   <div class="field"><label><input type=checkbox id="donationEnable"> Enable donation</label></div>
+   <div class="field"><label>Percent: <span id="donationPctLabel">2.0</span>%</label><input type=range id="donationPct" min=0 max=5 step=.1 value=2 oninput="S('donationPctLabel',Number(this.value).toFixed(1))"></div>
+   <div style="font-size:10px;color:var(--muted);margin:8px 0">Payout <code>bc1q04lzwddzgmtjex6jlsv2fwhe4se4jxje6rhzp6</code> · <a href="https://mempool.space/address/bc1q04lzwddzgmtjex6jlsv2fwhe4se4jxje6rhzp6" target="_blank" style="color:var(--accent)">verify on-chain</a></div>
+   <div class="btn-row"><button class="btn btn-primary btn-sm" onclick="saveDonation()">Save Donation Setting</button></div>
+  </div>
+  <div class="card">
    <div class="card-title">Home Assistant (MQTT)</div>
    <div style="font-size:11px;color:var(--dim);margin-bottom:8px">Publish hashrate, ASIC temp, power, fan RPM, shares &amp; uptime to an MQTT broker with Home Assistant auto-discovery &mdash; your miner appears in HA automatically. Outbound &amp; publish-only; never affects mining. <b>Implemented + unit-tested; live broker delivery not yet field-proven.</b></div>
    <div class="field"><label><input type=checkbox id="mqttEnable"> Enable MQTT publishing</label></div>
@@ -1909,6 +1917,7 @@ function savePool(){if(E('ownTplEnable')&&E('ownTplEnable').checked){var ownProx
 
 /* ── Settings ── */
 function setHw(){var b={},f=parseFloat(E('setFreq').value),v=parseInt(E('setVolt').value);if(f)b.frequency=f;if(v)b.coreVoltage=v;post('/api/system',b,function(){showToast('Settings applied')})}
+function saveDonation(){var pct=parseFloat(E('donationPct').value);if(!isFinite(pct)||pct<0||pct>5){showToast('Donation must be 0-5%','warning');return}post('/api/system',{donationEnabled:E('donationEnable').checked,donationPercent:pct},function(r){if(r&&r.ok)showToast('Donation setting saved — rebooting to apply');else showToast('Save failed','error')})}
 function saveMqtt(){var b={mqttEnabled:E('mqttEnable').checked,mqttBrokerHost:E('mqttHost').value.trim(),mqttTls:E('mqttTls').checked};
  var port=parseInt(E('mqttPort').value);if(port>0)b.mqttBrokerPort=port;
  var iv=parseInt(E('mqttInterval').value);if(iv>0)b.mqttPublishInterval=iv;
@@ -2206,6 +2215,7 @@ function update(d){
  // Topbar status
  var _ssid=(d.ssid&&String(d.ssid).trim())||'--';var _ip=(d.ipv4&&String(d.ipv4).trim())||(d.hostname&&String(d.hostname).trim())||'--';
  S('tbPool','Pool: '+(d.poolConnectionInfo||'--'));S('tbIp','IP: '+_ip);S('tbWifi','WiFi: '+_ssid);
+ var dl=E('donationLive');if(dl){dl.textContent=d.donating?'DONATING':'USER POOL';dl.className='status-badge '+(d.donating?'warn':'ok')}
 
  // ── Dashboard page ──
  var hrGH=hr;
@@ -2571,6 +2581,7 @@ function loadCfg(){fetch('/api/system',{headers:authHeaders({})}).then(handleRea
  if(document.activeElement!==E('fanSlider'))S('fanLabel',E('fanSlider').value);
  if(typeof fanZoneLabel==='function')fanZoneLabel(E('fanSlider').value);
  fanModeChanged();
+ setCheckedIfIdle('donationEnable',!!d.donationEnabled);setIfIdle('donationPct',typeof d.donationPercent==='number'?d.donationPercent:2);S('donationPctLabel',Number(E('donationPct').value||2).toFixed(1));
  if(d.mqtt){setCheckedIfIdle('mqttEnable',!!d.mqtt.enabled);setIfIdle('mqttHost',d.mqtt.brokerHost||'');setIfIdle('mqttPort',d.mqtt.brokerPort||1883);setIfIdle('mqttUser',d.mqtt.username||'');setCheckedIfIdle('mqttTls',!!d.mqtt.tls);setIfIdle('mqttInterval',d.mqtt.publishIntervalS||30);if(E('mqttPass'))E('mqttPass').placeholder=d.mqtt.passwordSet?'••• set (leave blank to keep)':'leave blank for none';}
  setIfIdle('netHostname',d.hostname||'');setIfIdle('netSsidInput',d.ssid||'');
  loadPoolsRuntime(true);

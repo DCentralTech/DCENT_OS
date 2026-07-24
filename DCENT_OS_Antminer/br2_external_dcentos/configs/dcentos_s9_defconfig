@@ -70,7 +70,7 @@ BR2_TARGET_GENERIC_ISSUE="DCENTos Hacker Shell v0.1 — D-Central Technologies"
 # Overlay and Scripts — single overlay (no overlay-on-overlay; S9 ships its
 # zynq overlay direct).
 # =============================================================================
-BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/rootfs-overlay"
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/common/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/rootfs-overlay"
 BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/post-build.sh $(BR2_EXTERNAL_DCENTOS_PATH)/board/common/prune-runtime-research-tools.sh"
 BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/post-image-ramdisk.sh"
 

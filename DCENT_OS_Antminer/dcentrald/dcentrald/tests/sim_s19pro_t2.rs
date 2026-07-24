@@ -200,7 +200,7 @@ async fn s9_reaches_headless_t2_through_legacy_fpga_fifo() {
         .expect("valid S9 open-core nonce policy");
     assert_eq!(
         driver
-            .send_open_core_work(&mut hash_chain.fpga, chip_count)
+            .send_open_core_work(&mut hash_chain.fpga, enumeration.chip_count())
             .expect("production BM1387 open-core sequence"),
         114
     );

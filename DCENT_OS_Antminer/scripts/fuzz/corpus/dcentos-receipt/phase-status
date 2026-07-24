@@ -1,0 +1,14 @@
+schema=dcentos-sysupgrade-transaction-phase-status-abi2
+binding_sha256=0000000000000000000000000000000000000000000000000000000000000000
+transaction_id=Tx-1
+phase=env-commit-armed
+revision=1
+ledger_generation=1
+previous_status_sha256=-
+actor_kind=owner
+actor_id=Tx-1
+evidence_type=transaction-env-commit-armed-v1
+evidence_size=28
+evidence_sha256=cf1fbd3ca5dd9a82a3d9341e3a4c69854147fbeb1bf51eae8ef41972b35adee7
+
+environment_digest=verified

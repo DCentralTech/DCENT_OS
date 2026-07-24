@@ -282,11 +282,24 @@ pub fn classify_chain(chain_id: u8, eeprom_bytes: Option<&[u8]>) -> ChainProbe {
     let Some(data) = eeprom_bytes else {
         return ChainProbe::ReadError { chain_id };
     };
-    if data.len() < 2 {
+    if data.is_empty() {
+        // Read returned nothing — an absent / missing node; skip, don't refuse.
         return ChainProbe::ReadError { chain_id };
     }
     if data.iter().all(|&b| b == 0x00) || data.iter().all(|&b| b == 0xff) {
         return ChainProbe::Unpopulated { chain_id };
+    }
+    if data.len() < 2 {
+        // Present but TRUNCATED: a single non-blank byte is too short to carry a
+        // 2-byte preamble. This is the .74-corruption class — an electrically
+        // present EEPROM returning a garbled header — and MUST be refuse-eligible,
+        // exactly like a >=2-byte unknown preamble (both are MalformedPreamble),
+        // NOT silently skipped as ReadError. (None / empty stay ReadError: a
+        // genuinely absent read. The second preamble byte is marked 0x00 = absent.)
+        return ChainProbe::MalformedPreamble {
+            chain_id,
+            preamble: [data[0], 0x00],
+        };
     }
     let preamble = [data[0], data[1]];
     match classify_by_eeprom_preamble(preamble) {
@@ -458,6 +471,79 @@ pub fn accept_degraded_hardware_enabled() -> bool {
 mod tests {
     use super::*;
 
+    // ---- fail-closed energization property tests ----
+    // EEPROM is provably corruptible (`a lab unit`'s 0x51 is untrusted; the `a lab unit`
+    // incident corrupted an EEPROM), so board energization must never be
+    // authorized by a garbage or wiped EEPROM. These properties pin the
+    // fail-closed structure of `classify_chain` + `gate_chains_for_energize`
+    // against arbitrary bytes.
+    mod fail_closed_properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            // A chain is only ever `Classified` (energization-eligible) when its
+            // preamble is an EXACT known family preamble — never for arbitrary bytes.
+            #[test]
+            fn classified_only_on_known_preamble(
+                data in proptest::collection::vec(any::<u8>(), 0usize..40),
+            ) {
+                if let ChainProbe::Classified { preamble, .. } = classify_chain(0, Some(&data)) {
+                    prop_assert!(
+                        classify_by_eeprom_preamble(preamble).is_some(),
+                        "classify_chain accepted preamble {preamble:?} the classifier rejects"
+                    );
+                    prop_assert!(!data.iter().all(|&b| b == 0x00) && !data.iter().all(|&b| b == 0xff));
+                }
+            }
+
+            // A wiped EEPROM (all 0x00 or all 0xFF) is `Unpopulated`, never Classified.
+            #[test]
+            fn wiped_eeprom_is_unpopulated_never_classified(
+                len in 2usize..40,
+                fill in prop_oneof![Just(0x00u8), Just(0xffu8)],
+            ) {
+                let data = vec![fill; len];
+                let is_unpopulated =
+                    matches!(classify_chain(7, Some(&data)), ChainProbe::Unpopulated { chain_id: 7 });
+                prop_assert!(is_unpopulated, "wiped EEPROM (len {len}) must be Unpopulated");
+            }
+
+            // Fail-closed: a garbage/unknown preamble (the `a lab unit` corruption class)
+            // can NEVER energize the rail in strict mode.
+            #[test]
+            fn strict_gate_refuses_malformed_preamble(
+                data in proptest::collection::vec(any::<u8>(), 2usize..40),
+            ) {
+                let probe = classify_chain(0, Some(&data));
+                if matches!(probe, ChainProbe::MalformedPreamble { .. }) {
+                    prop_assert!(gate_chains_for_energize(&[probe], true).is_err());
+                }
+            }
+        }
+
+        // Positive: an exact known preamble classifies AND a single such chain is
+        // energize-safe in strict mode.
+        #[test]
+        fn known_preamble_classifies_and_energizes() {
+            for preamble in [[0x04u8, 0x11u8], [0x05u8, 0x11u8]] {
+                let mut data = vec![0u8; 32];
+                data[0] = preamble[0];
+                data[1] = preamble[1];
+                data[2] = 0xAB; // ensure not a wiped-fill pattern
+                let probe = classify_chain(0, Some(&data));
+                assert!(
+                    matches!(probe, ChainProbe::Classified { .. }),
+                    "known preamble {preamble:?} must classify"
+                );
+                assert!(
+                    gate_chains_for_energize(&[probe], true).is_ok(),
+                    "a single classified chain is energize-safe"
+                );
+            }
+        }
+    }
+
     // ---- classify_chain ----
 
     #[test]
@@ -469,10 +555,31 @@ mod tests {
     }
 
     #[test]
-    fn classify_chain_short_buffer_is_read_error() {
+    fn classify_chain_truncated_one_byte_is_malformed_not_skipped() {
+        // D1: a present-but-truncated 1-byte read (electrically present EEPROM with
+        // a garbled header — the .74-corruption class) must be REFUSE-eligible
+        // (MalformedPreamble), not silently skipped like an absent node. This
+        // inverts the prior `short_buffer_is_read_error` test, which pinned the
+        // fail-open bug (a 1-byte garble was skipped while a 2-byte garble refused).
         assert!(matches!(
             classify_chain(1, Some(&[0x04])),
+            ChainProbe::MalformedPreamble { chain_id: 1, .. }
+        ));
+        // The strict gate must refuse it — including am3-bb's timeout_is_skip mode
+        // (timeout_is_skip relaxes only Timeout, never a malformed/garbled header).
+        let probe = classify_chain(1, Some(&[0xDE]));
+        assert!(gate_chains_for_energize(&[probe.clone()], true).is_err());
+        assert!(gate_chains_for_energize_with_opts(&[probe], true, true).is_err());
+        // None / empty read stay ReadError (a genuinely absent node → skip), and a
+        // 1-byte blank stays Unpopulated — C6-pinned behaviors untouched.
+        assert!(matches!(
+            classify_chain(1, Some(&[])),
             ChainProbe::ReadError { chain_id: 1 }
+        ));
+        assert!(matches!(classify_chain(1, None), ChainProbe::ReadError { .. }));
+        assert!(matches!(
+            classify_chain(1, Some(&[0x00])),
+            ChainProbe::Unpopulated { chain_id: 1 }
         ));
     }
 

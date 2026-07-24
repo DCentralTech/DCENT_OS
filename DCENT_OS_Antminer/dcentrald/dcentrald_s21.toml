@@ -1,7 +1,7 @@
 # DCENT_OS dcentrald config for Antminer S21 (Amlogic A113D)
 # Unit: 203.0.113.135, BraiinsOS 25.11, 1x108 BM1368 (chain 2 only)
 # Platform: Amlogic A113D (aarch64), NoPic (TAS5782M DAC, kernel-managed)
-# PSU: GPIO 437 (PSU_nEN active LOW) plus APW I2C/PMBus enable at bus 1 addr 0x1f
+# PSU: GPIO 437 PWR_EN active HIGH (1=ON, 0=OFF) plus APW I2C/PMBus at bus 1 addr 0x1f
 # Verified: GPIO 2026-04-12; APW preboot sequence extracted 2026-04-29
 
 [general]

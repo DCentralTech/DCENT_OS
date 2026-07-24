@@ -1,21 +1,19 @@
 #!/bin/sh
 #
-# Compatibility entry point for stock Bitmain/LuxOS naming.
+# Compatibility marker for stock Bitmain/LuxOS naming.
 #
-# DCENT_OS keeps the real Amlogic pinmux in S37board_setup. Some extracted
-# stock/LuxOS trees refer to S37bitmainer_setup, so this wrapper delegates to
-# the canonical script when called manually or by an init runner.
+# This file remains present because external recovery tooling may check for
+# the stock path.  It MUST NOT delegate during the SysV pass: dcentos-init
+# independently executes S37board_setup immediately afterward, and delegation
+# used to run every GPIO/PWM/pinmux mutation twice.  Manual callers must invoke
+# the canonical checked owner directly.
 
 case "$1" in
     start|"")
-        if [ -x /etc/init.d/S37board_setup ]; then
-            /etc/init.d/S37board_setup start
-        fi
+        echo "  [INFO] S37bitmainer_setup is a compatibility marker; S37board_setup owns initialization"
         ;;
     stop)
-        if [ -x /etc/init.d/S37board_setup ]; then
-            /etc/init.d/S37board_setup stop
-        fi
+        :
         ;;
     *)
         echo "Usage: $0 {start|stop}" >&2

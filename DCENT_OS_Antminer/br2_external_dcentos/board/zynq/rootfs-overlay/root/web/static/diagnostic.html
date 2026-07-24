@@ -83,7 +83,7 @@
 </div>
 
 <div class="row">
-  <button onclick="restartDaemon()">Restart dcentrald</button>
+  <button onclick="restartDaemon()">Run guarded restart</button>
   <button class="ghost" onclick="reportIp()">Report IP (broadcast)</button>
   <button class="ghost" onclick="refresh()">Refresh now</button>
   <span class="key" style="margin-left:auto">Auto-refresh: every 5s</span>
@@ -197,11 +197,11 @@ async function refresh() {
   }
 }
 async function restartDaemon() {
-  if (!confirm("Restart dcentrald? Mining will pause for ~5-30s.")) return;
+  if (!confirm("Run guarded dcentrald restart? Unresolved hardware state will be refused.")) return;
   try {
     const r = await fetch("/api/dashboard/restart-dcentrald", { method: "POST" });
     const d = await r.json();
-    notify("Restart initiated · " + (d.status || "ok"));
+    notify((r.ok ? "Guarded action complete · " : "Guarded action refused · ") + (d.status || d.error || "unknown"));
     setTimeout(refresh, 3000);
   } catch (e) { notify("Error: " + e.message); }
 }

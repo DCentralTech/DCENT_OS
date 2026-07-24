@@ -44,8 +44,21 @@ S99_VERIFY_COPIES = (
 PRUNE = (
     ROOT / "br2_external_dcentos/board/common/prune-runtime-research-tools.sh"
 )
+TARGET_SWITCH_FIRMWARE = (
+    ROOT
+    / "br2_external_dcentos/board/zynq/rootfs-overlay/usr/sbin/switch_firmware.py"
+)
+TARGET_SWITCH_FIRMWARE_SH = TARGET_SWITCH_FIRMWARE.with_suffix(".sh")
+HOST_SWITCH_FIRMWARE = ROOT / "scripts/switch_firmware.py"
+HOST_SWITCH_FIRMWARE_SH = ROOT / "scripts/switch_firmware.sh"
 REST_LATE = ROOT / "dcentrald/dcentrald-api/src/rest/late.rs"
 REST_ROUTES = ROOT / "dcentrald/dcentrald-api/src/rest.rs"
+HAL_I2C = ROOT / "dcentrald/dcentrald-hal/src/i2c.rs"
+HARDWARE_INFO = ROOT / "dcentrald/dcentrald/src/runtime/hardware_info.rs"
+S19J_HYBRID = ROOT / "dcentrald/dcentrald/src/s19j_hybrid_mining.rs"
+AMLOGIC_HAL = ROOT / "dcentrald/dcentrald-hal/src/platform/amlogic/mod.rs"
+SERIAL_MINING = ROOT / "dcentrald/dcentrald/src/serial_mining.rs"
+DAEMON = ROOT / "dcentrald/dcentrald/src/daemon.rs"
 
 
 def read(path: Path) -> str:
@@ -84,6 +97,108 @@ def rust_function(source: str, name: str) -> tuple[str, int, int]:
 
 
 class RuntimeHardwareOwnershipTests(unittest.TestCase):
+    def test_amlogic_power_and_thermal_share_one_retained_bus1_owner(self) -> None:
+        hal = read(AMLOGIC_HAL)
+        serial = read(SERIAL_MINING)
+        daemon = read(DAEMON)
+        rest = read(REST_LATE)
+
+        self.assertIn("pub struct AmlogicPowerThermalService", hal)
+        self.assertIn(
+            "spawn_i2c_service_no_register_touch_with_denylist_and_reserved_preparation",
+            hal,
+        )
+        self.assertIn("read_lm75_temperature_register_at", hal)
+        self.assertNotIn("pub fn read_board_temps(", hal)
+        self.assertNotIn("pub fn enable_psu_pmbus(", hal)
+        self.assertNotIn("I2cBus::open(APW_PMBUS", hal)
+        self.assertNotIn("classify_with_probe", hal)
+        self.assertIn("generic Platform construction is refused", hal)
+        self.assertIn("pub struct AmlogicNoPicAdmission", hal)
+        self.assertIn("nopic_profile_for_bosminer_toml", hal)
+        self.assertIn("nopic_profile_for_dcentos_marker", hal)
+        self.assertIn('nopic_profile_for_dcentos_marker("am3-aml"), None', hal)
+        self.assertIsNone(re.search(r"(?m)^pub fn open_fan_controller\(\)", hal))
+        self.assertIsNone(re.search(r"(?m)^pub fn spawn\(\) -> Result<Self>", hal))
+
+        admission = serial.index("AmlogicNoPicAdmission::detect(")
+        bm1366_refusal = serial.index("native BM1366 NoPic mining is refused")
+        service = serial.index(".spawn_power_thermal_service()")
+        fan = serial.index(".open_fan_controller()")
+        watchdog = serial.index("SafetyWatchdogOwner::start_before_energizing")
+        enable = serial.index(
+            "tokio::task::spawn_blocking(move || power_enable_owner.enable_psu())"
+        )
+        self.assertLess(bm1366_refusal, admission)
+        self.assertLess(admission, service)
+        self.assertLess(service, fan)
+        self.assertLess(fan, watchdog)
+        self.assertLess(watchdog, enable)
+        self.assertIn("power_thermal.terminal_fence()", serial)
+        self.assertIn("power_receipt.management_fabric()", serial)
+        self.assertIn("WatchdogDisarmPermit::from_evidence_set", serial)
+        self.assertIn("fence.latch_terminal_safe_off();", serial)
+        self.assertNotIn("amlogic::read_board_temps(", serial)
+        self.assertNotIn("amlogic::AmlogicPlatform::new()", serial)
+
+        self.assertNotIn("platform::amlogic::enable_psu()", daemon)
+        self.assertIn("does not own the retained Amlogic power/thermal service", daemon)
+        recovery_psu, _, _ = rust_function(rest, "post_debug_psu_control_recovery")
+        self.assertNotIn("platform::amlogic::enable_psu()", recovery_psu)
+        self.assertNotIn("platform::amlogic::disable_psu()", recovery_psu)
+        self.assertIn("retained power/thermal owner", recovery_psu)
+
+    def test_hybrid_eeprom_gate_stays_inside_owned_i2c_service(self) -> None:
+        hal = read(HAL_I2C)
+        hardware_info = read(HARDWARE_INFO)
+        hybrid = read(S19J_HYBRID)
+
+        service_reader, _, _ = rust_function(
+            hardware_info,
+            "read_hashboard_eeprom_prefix_via_service_for_energize_gate",
+        )
+        hal_reader, _, _ = rust_function(
+            hal, "read_protected_hashboard_eeprom_prefix"
+        )
+        self.assertIn("0x50u8", service_reader)
+        self.assertIn(
+            "service.read_hashboard_eeprom_prefix_at(addr, deadline)", service_reader
+        )
+        self.assertIn("is_retryable_owned_eeprom_readiness_error", service_reader)
+        self.assertIn("OwnedEepromReadinessError::Terminal", service_reader)
+        self.assertIn("HalError::I2cEndpointNotReady", hardware_info)
+        self.assertNotIn("std::fs", service_reader)
+        self.assertNotIn("/sys/bus/i2c", service_reader)
+        self.assertIn("if !self.is_write_denied(addr)", hal_reader)
+        self.assertIn("fs::File::open(&path)", hal_reader)
+        self.assertNotIn("set_slave", hal_reader)
+        self.assertNotIn("I2C_SLAVE", hal_reader)
+
+        run = hybrid.split("pub async fn run(&mut self)", 1)[1]
+        run = run.split("fn log_am2_planned_chain_contexts", 1)[0]
+        self.assertEqual(
+            run.count("read_hashboard_eeprom_prefix_via_service_for_energize_gate("),
+            1,
+        )
+        self.assertEqual(run.count("read_hashboard_eeprom_prefix_at("), 1)
+        self.assertNotIn("read_bytes(0x50", run)
+        self.assertNotIn("read_hashboard_eeprom_for_energize_gate(", run)
+        self.assertIn("HalError::I2cEndpointNotReady", run)
+        self.assertIn(
+            "AM2 hashboard EEPROM bootstrap service failed terminally", run
+        )
+        self.assertIn("OwnedEepromReadinessError::Terminal", run)
+        self.assertIn("am2-hashboard-eeprom-service-terminal", run)
+        self.assertIn(
+            'context("AM2 I2C service missing for serialized hashboard identity reads")',
+            run,
+        )
+
+        self.assertIn("pub fn read_hashboard_eeprom_prefix_at(", hal)
+        self.assertIn("I2cRequest::ReadHashboardEepromPrefix", hal)
+        self.assertIn("read_protected_hashboard_eeprom_prefix", hal)
+        self.assertNotIn("WriteReadProtection", hal)
+
     def test_web_adapters_have_no_raw_hardware_command_path(self) -> None:
         for path in WEB_ADAPTERS:
             with self.subTest(path=path):
@@ -219,12 +334,16 @@ class RuntimeHardwareOwnershipTests(unittest.TestCase):
                 )
 
         common = read(ROOT / "br2_external_dcentos/configs/dcentos-common.fragment")
-        cv = read(
+        cv_defconfig = (
             ROOT
             / "br2_external_dcentos/configs/dcentos_cv1835_s19jpro_defconfig"
         )
         self.assertIn("# BR2_PACKAGE_I2C_TOOLS is not set", common)
-        self.assertNotIn("BR2_PACKAGE_I2C_TOOLS=y", common + cv)
+        self.assertNotIn("BR2_PACKAGE_I2C_TOOLS=y", common)
+        self.assertFalse(
+            cv_defconfig.exists(),
+            "CV1835 must not regain a Buildroot product lane before its exact toolchain and containment contract are admitted",
+        )
 
         prune = read(PRUNE)
         self.assertIn('TARGET_DIR=$(CDPATH= cd "$TARGET_DIR" && pwd -P)', prune)
@@ -232,6 +351,23 @@ class RuntimeHardwareOwnershipTests(unittest.TestCase):
         self.assertIn("symlinked delete-path component", prune)
         self.assertIn('rm -rf "$TARGET_DIR/root/tools"', prune)
         self.assertIn('rm -f "$TARGET_DIR/usr/bin/dcent-shell"', prune)
+        self.assertIn("root usr usr/bin usr/sbin", prune)
+        self.assertIn('"$TARGET_DIR/usr/sbin/switch_firmware.py"', prune)
+        self.assertIn('"$TARGET_DIR/usr/sbin/switch_firmware.sh"', prune)
+
+    def test_raw_boot_environment_transformers_are_host_only(self) -> None:
+        self.assertFalse(TARGET_SWITCH_FIRMWARE.exists())
+        self.assertFalse(TARGET_SWITCH_FIRMWARE_SH.exists())
+        self.assertTrue(HOST_SWITCH_FIRMWARE.is_file())
+        self.assertTrue(HOST_SWITCH_FIRMWARE_SH.is_file())
+
+        post_builds = sorted(
+            (ROOT / "br2_external_dcentos/board").rglob("post-build.sh")
+        )
+        self.assertTrue(post_builds)
+        for post_build in post_builds:
+            with self.subTest(post_build=post_build):
+                self.assertNotIn("switch_firmware", read(post_build))
 
     @unittest.skipUnless(os.name == "posix" and shutil.which("sh"), "requires POSIX sh")
     def test_prune_composes_a_safe_rootfs_and_rejects_symlink_escape(self) -> None:
@@ -243,17 +379,22 @@ class RuntimeHardwareOwnershipTests(unittest.TestCase):
                 target / "etc",
                 target / "bin",
                 target / "usr/bin",
+                target / "usr/sbin",
                 target / "root/tools/__pycache__",
             ):
                 directory.mkdir(parents=True, exist_ok=True)
             (target / "root/tools/future_raw_executor").write_text("raw\n")
             (target / "root/tools/__pycache__/raw.pyc").write_bytes(b"bytecode")
             (target / "usr/bin/dcent-shell").write_text("shell\n")
+            (target / "usr/sbin/switch_firmware.py").write_text("raw\n")
+            (target / "usr/sbin/switch_firmware.sh").write_text("raw\n")
             (target / "etc/preserved").write_text("safe\n")
 
             subprocess.run(["sh", str(PRUNE), str(target)], check=True)
             self.assertFalse((target / "root/tools").exists())
             self.assertFalse((target / "usr/bin/dcent-shell").exists())
+            self.assertFalse((target / "usr/sbin/switch_firmware.py").exists())
+            self.assertFalse((target / "usr/sbin/switch_firmware.sh").exists())
             self.assertEqual((target / "etc/preserved").read_text(), "safe\n")
 
             root_result = subprocess.run(

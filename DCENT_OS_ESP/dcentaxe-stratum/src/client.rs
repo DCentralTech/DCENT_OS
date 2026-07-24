@@ -75,6 +75,29 @@ const PRIMARY_REPROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const PRIMARY_REPROBE_SUBSCRIBE_DEADLINE: Duration = Duration::from_secs(3);
 const PRIMARY_REPROBE_AUTHORIZE_DEADLINE: Duration = Duration::from_secs(3);
 
+/// Pure cycle decision used by the live reconnect loop and host tests.
+/// Donation is always subordinate to user-pool failover and in-flight submits.
+pub fn donation_phase_due(
+    elapsed: Duration,
+    directive: &DonationDirective,
+    donating: bool,
+    failover_active: bool,
+    pending_submits: usize,
+) -> bool {
+    let window = directive.window_secs();
+    if !directive.enabled
+        || window == 0
+        || directive.cycle_duration_s == 0
+        || failover_active
+        || pending_submits != 0
+    {
+        return false;
+    }
+    let cycle = directive.cycle_duration_s;
+    let desired = elapsed.as_secs() % cycle >= cycle.saturating_sub(window);
+    desired != donating
+}
+
 /// Default (live-connection) handshake budget. Preserves the historic timeouts:
 /// 10s connect, 15s subscribe wait, 10s authorize wait.
 const DEFAULT_SUBSCRIBE_DEADLINE: Duration = Duration::from_secs(15);
@@ -157,6 +180,7 @@ struct EvictedSubmit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MessageLoopExit {
     PrimaryFailback,
+    DonationSwitch,
 }
 
 /// The Stratum V1 client.
@@ -169,6 +193,21 @@ pub struct StratumClient {
 
     /// Original primary pool configuration used for explicit failback reprobes.
     primary_config: StratumConfig,
+
+    /// Immutable user pool restored after every donation window.
+    user_config: StratumConfig,
+
+    /// Optional donation directive, kept separate from user failover/split pool.
+    donation_config: Option<DonationDirective>,
+
+    /// True only while the active config is a donation endpoint.
+    donating: bool,
+
+    /// True when the donation fallback rather than primary endpoint is active.
+    donation_using_fallback: bool,
+
+    /// Monotonic anchor for the current donation cycle.
+    donation_cycle_started_at: std::time::Instant,
 
     /// TCP stream to the pool (None when disconnected).
     /// Used for both reading and writing — no clone needed on ESP-IDF.
@@ -245,7 +284,12 @@ impl StratumClient {
     ) -> Self {
         Self {
             primary_config: config.clone(),
+            user_config: config.clone(),
             config,
+            donation_config: None,
+            donating: false,
+            donation_using_fallback: false,
+            donation_cycle_started_at: std::time::Instant::now(),
             stream: None,
             session: SessionState::default(),
             next_submit_id: ID_SUBMIT_BASE,
@@ -274,6 +318,24 @@ impl StratumClient {
     pub fn set_status_handle(&mut self, status: SharedStratumStatus) {
         self.status = Some(status);
         self.sync_status(None);
+    }
+
+    /// Configure voluntary time-sliced donation routing. This never mutates the
+    /// user fallback pool and never uses `split_pool` semantics.
+    pub fn set_donation(&mut self, directive: DonationDirective) {
+        self.donation_cycle_started_at = std::time::Instant::now();
+        self.donating = false;
+        self.donation_using_fallback = false;
+        self.config = self.user_config.clone();
+        self.with_status_mut(|status| {
+            status.donating = false;
+            status.donation_percent = if directive.enabled {
+                directive.percent
+            } else {
+                0.0
+            };
+        });
+        self.donation_config = Some(directive);
     }
 
     fn drain_pending_share_queue(&mut self) {
@@ -364,6 +426,13 @@ impl StratumClient {
             status.extranonce_subscribe_requested = self.session.extranonce_subscribe_requested;
             status.extranonce_subscribe_accepted = self.session.extranonce_subscribe_accepted;
             status.failover_active = self.failover_active;
+            status.donating = self.donating;
+            status.donation_percent = self
+                .donation_config
+                .as_ref()
+                .filter(|directive| directive.enabled)
+                .map(|directive| directive.percent)
+                .unwrap_or(0.0);
             status.active_url = self.config.url.clone();
             status.active_port = self.config.port;
             status.shares_submitted = self.shares_submitted;
@@ -461,6 +530,72 @@ impl StratumClient {
             ),
         }
         self.fallback_config = Some(config);
+    }
+
+    fn restore_user_pool_after_donation(&mut self, detail: &str) {
+        self.config = self.user_config.clone();
+        self.donating = false;
+        self.donation_using_fallback = false;
+        self.record_status_event(StratumEventKind::DonationExited, detail.to_string());
+        self.sync_status(None);
+    }
+
+    fn maybe_switch_donation_phase(&mut self, now: std::time::Instant) -> bool {
+        let Some(directive) = self.donation_config.clone() else {
+            return false;
+        };
+        let elapsed = now.saturating_duration_since(self.donation_cycle_started_at);
+        if !donation_phase_due(
+            elapsed,
+            &directive,
+            self.donating,
+            self.failover_active,
+            self.pending_submits.len(),
+        ) {
+            return false;
+        }
+
+        if self.donating {
+            self.restore_user_pool_after_donation(
+                "donation window complete; returning to user pool",
+            );
+            return true;
+        }
+
+        let selected =
+            if Self::check_pool_reachable(&directive.primary.url, directive.primary.port).is_ok() {
+                self.donation_using_fallback = false;
+                Some(directive.primary.clone())
+            } else if let Some(fallback) = directive
+                .fallback
+                .as_ref()
+                .filter(|fallback| Self::check_pool_reachable(&fallback.url, fallback.port).is_ok())
+            {
+                self.donation_using_fallback = true;
+                Some(fallback.clone())
+            } else {
+                None
+            };
+
+        let Some(selected) = selected else {
+            warn!("Stratum: donation endpoints unavailable; preserving user pool");
+            self.donation_cycle_started_at = now;
+            self.sync_status(None);
+            return false;
+        };
+        self.config = selected;
+        self.donating = true;
+        self.record_status_event(
+            StratumEventKind::DonationEntered,
+            format!(
+                "entered {:.1}% donation window via {}:{}",
+                directive.percent,
+                sanitize_pool_url(&self.config.url),
+                self.config.port
+            ),
+        );
+        self.sync_status(None);
+        true
     }
 
     /// Quick reachability test: DNS resolve + TCP connect with 5s timeout.
@@ -585,6 +720,35 @@ impl StratumClient {
                     self.sync_status(None);
                 }
                 Err(e) => {
+                    if self.donating {
+                        if !self.donation_using_fallback {
+                            if let Some(fallback) = self
+                                .donation_config
+                                .as_ref()
+                                .and_then(|directive| directive.fallback.clone())
+                                .filter(|fallback| {
+                                    Self::check_pool_reachable(&fallback.url, fallback.port).is_ok()
+                                })
+                            {
+                                warn!(
+                                    "Stratum: primary donation endpoint failed; trying donation fallback"
+                                );
+                                self.config = fallback;
+                                self.donation_using_fallback = true;
+                                self.stream = None;
+                                continue;
+                            }
+                        }
+                        warn!(
+                            "Stratum: donation endpoint unavailable; aborting window back to user pool"
+                        );
+                        self.restore_user_pool_after_donation(
+                            "donation endpoint unavailable; returned to user pool",
+                        );
+                        self.donation_cycle_started_at = std::time::Instant::now();
+                        self.stream = None;
+                        continue;
+                    }
                     error!("Stratum: connection failed: {}", e);
                     self.consecutive_failures += 1;
                     self.with_status_mut(|status| {
@@ -602,6 +766,10 @@ impl StratumClient {
             match self.message_loop() {
                 Ok(MessageLoopExit::PrimaryFailback) => {
                     info!("Stratum: reconnecting immediately for primary failback");
+                    immediate_reconnect = true;
+                }
+                Ok(MessageLoopExit::DonationSwitch) => {
+                    info!("Stratum: reconnecting immediately for donation phase transition");
                     immediate_reconnect = true;
                 }
                 Err(e) => {
@@ -1411,10 +1579,17 @@ impl StratumClient {
             }
         }
 
-        self.session.extranonce1 = arr[1]
+        let extranonce1 = arr[1]
             .as_str()
             .ok_or("subscribe: extranonce1 not string")?
             .to_string();
+        if !is_valid_hex_extranonce1(&extranonce1) {
+            return Err(format!(
+                "subscribe: extranonce1 is not valid hex (len={})",
+                extranonce1.len()
+            ));
+        }
+        self.session.extranonce1 = extranonce1;
 
         let extranonce2_size_u64 = arr[2]
             .as_u64()
@@ -1588,6 +1763,10 @@ impl StratumClient {
 
             if self.maybe_enter_primary_failback() {
                 return Ok(MessageLoopExit::PrimaryFailback);
+            }
+
+            if self.maybe_switch_donation_phase(std::time::Instant::now()) {
+                return Ok(MessageLoopExit::DonationSwitch);
             }
 
             match self.recv_line() {
@@ -1798,6 +1977,15 @@ impl StratumClient {
             warn!(
                 "Stratum: ignored {} extranonce update with invalid extranonce2_size={} (valid range 1..={})",
                 phase, extranonce2_size, MAX_EXTRANONCE2_SIZE
+            );
+            return;
+        }
+
+        if !is_valid_hex_extranonce1(&extranonce1) {
+            warn!(
+                "Stratum: ignored {} extranonce update with non-hex extranonce1 (len={})",
+                phase,
+                extranonce1.len()
             );
             return;
         }
@@ -2226,6 +2414,16 @@ fn extract_block_height(coinbase1_hex: &str) -> u32 {
     0 // couldn't extract
 }
 
+/// A Stratum extranonce1 is a hex byte string: even length, all hex digits. An
+/// EMPTY string is valid (the pool assigns the whole extranonce space to
+/// extranonce2). Invalid hex must be REFUSED here rather than silently coerced
+/// to empty by `WorkBuilder`'s `hex::decode(..).unwrap_or_default()` — an empty
+/// extranonce1 builds a coinbase the pool never expects, so every share is
+/// rejected while local stats keep climbing.
+fn is_valid_hex_extranonce1(s: &str) -> bool {
+    s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn parse_notify(params: Value) -> StratumMessage {
     let arr = match params.as_array() {
         Some(a) if a.len() >= 9 => a,
@@ -2235,37 +2433,103 @@ fn parse_notify(params: Value) -> StratumMessage {
         }
     };
 
-    let coinbase1 = arr[2].as_str().unwrap_or("").to_string();
+    // Structural validation: a malformed notify must be DROPPED (fail closed),
+    // never coerced into empty/default fields. Coercing (the old `unwrap_or("")`
+    // path) silently produces work whose EVERY share the pool rejects — an empty
+    // prev_hash / wrong-length version / dropped merkle branch yields a header the
+    // pool never accepts, while local stats keep climbing. Silent 100% hashrate
+    // burn instead of a visible refused job.
+    fn bad(params: &Value, why: &str) -> StratumMessage {
+        warn!("Stratum: rejecting malformed mining.notify ({why})");
+        StratumMessage::Unknown(format!("bad notify ({why}): {params}"))
+    }
+    // Exactly `n` lowercase/uppercase hex chars.
+    fn hex_len(v: Option<&str>, n: usize) -> Option<String> {
+        let s = v?;
+        (s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_string())
+    }
+    // Non-empty, even-length, all-hex (a byte string like coinbase1/2).
+    fn hex_bytes(v: Option<&str>) -> Option<String> {
+        let s = v?;
+        (!s.is_empty() && s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| s.to_string())
+    }
+
+    let Some(job_id) = arr[0].as_str().filter(|s| !s.is_empty()).map(String::from) else {
+        return bad(&params, "job_id");
+    };
+    let Some(prev_hash) = hex_len(arr[1].as_str(), 64) else {
+        return bad(&params, "prev_hash");
+    };
+    let Some(coinbase1) = hex_bytes(arr[2].as_str()) else {
+        return bad(&params, "coinbase1");
+    };
+    let Some(coinbase2) = hex_bytes(arr[3].as_str()) else {
+        return bad(&params, "coinbase2");
+    };
+    // Every merkle branch must be a 32-byte (64-hex) hash. A non-string or
+    // wrong-length element (silently dropped by the old filter_map) changes the
+    // merkle root → 100% rejects, so reject the whole job instead. An EMPTY
+    // branch array is valid (coinbase-only block template).
+    let Some(branch_arr) = arr[4].as_array() else {
+        return bad(&params, "merkle_branches");
+    };
+    let mut merkle_branches = Vec::with_capacity(branch_arr.len());
+    for b in branch_arr {
+        match hex_len(b.as_str(), 64) {
+            Some(h) => merkle_branches.push(h),
+            None => return bad(&params, "merkle_branch"),
+        }
+    }
+    let Some(version) = hex_len(arr[5].as_str(), 8) else {
+        return bad(&params, "version");
+    };
+    let Some(nbits) = hex_len(arr[6].as_str(), 8) else {
+        return bad(&params, "nbits");
+    };
+    let Some(ntime) = hex_len(arr[7].as_str(), 8) else {
+        return bad(&params, "ntime");
+    };
+    let Some(clean_jobs) = arr[8].as_bool() else {
+        return bad(&params, "clean_jobs");
+    };
+
     let block_height = extract_block_height(&coinbase1);
 
     StratumMessage::Notify(StratumJob {
-        job_id: arr[0].as_str().unwrap_or("").to_string(),
-        prev_hash: arr[1].as_str().unwrap_or("").to_string(),
+        job_id,
+        prev_hash,
         coinbase1,
-        coinbase2: arr[3].as_str().unwrap_or("").to_string(),
-        merkle_branches: arr[4]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        version: arr[5].as_str().unwrap_or("").to_string(),
-        nbits: arr[6].as_str().unwrap_or("").to_string(),
-        ntime: arr[7].as_str().unwrap_or("").to_string(),
-        clean_jobs: arr[8].as_bool().unwrap_or(false),
+        coinbase2,
+        merkle_branches,
+        version,
+        nbits,
+        ntime,
+        clean_jobs,
         block_height,
     })
 }
 
 fn parse_set_difficulty(params: Value) -> StratumMessage {
-    let diff = params
-        .as_array()
-        .and_then(|a| a.first())
-        .and_then(|v| v.as_f64())
-        .unwrap_or(1.0);
-    StratumMessage::SetDifficulty(diff)
+    // Accept a JSON number OR a numeric string (loose-JSON pools/proxies stringify it),
+    // guarded finite & positive. NEVER coerce a malformed value to a live default: the old
+    // `unwrap_or(1.0)` silently dropped to diff-1, so mid-session at a real pool difficulty the
+    // device flooded the pool with sub-target "low difficulty" rejects at full power (zero
+    // credit + likely ban). Drop-don't-coerce keeps the current difficulty/target in force,
+    // matching parse_notify's fail-closed posture.
+    let first = params.as_array().and_then(|a| a.first());
+    let diff = first.and_then(|v| v.as_f64()).or_else(|| {
+        first
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.trim().parse::<f64>().ok())
+    });
+    match diff {
+        Some(d) if d.is_finite() && d > 0.0 => StratumMessage::SetDifficulty(d),
+        _ => {
+            warn!("Stratum: rejecting malformed mining.set_difficulty ({})", params);
+            StratumMessage::Unknown(format!("bad set_difficulty: {}", params))
+        }
+    }
 }
 
 fn parse_set_version_mask(params: Value) -> StratumMessage {
@@ -2291,9 +2555,19 @@ fn parse_set_extranonce(params: Value) -> StratumMessage {
 }
 
 fn parse_extranonce2_size_param(value: Option<&Value>) -> usize {
-    match value.and_then(|v| v.as_u64()) {
-        Some(raw) => usize::try_from(raw).unwrap_or(0),
+    match value {
+        // Genuinely absent → the protocol default.
         None => DEFAULT_EXTRANONCE2_SIZE,
+        // Present: accept a JSON integer or a numeric string; map anything else to the invalid
+        // sentinel 0 so stage_extranonce()'s fail-closed size gate DROPS the update and keeps
+        // the current session's extranonce2 size. Never coerce a malformed size to the default
+        // 4 — that silently defeated the size gate (a valid-looking 4) → wrong-width coinbase
+        // extranonce2 → 100% share rejects until reconnect.
+        Some(v) => v
+            .as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+            .and_then(|raw| usize::try_from(raw).ok())
+            .unwrap_or(0),
     }
 }
 
@@ -2328,9 +2602,86 @@ fn clamp_reconnect_wait(raw: u64) -> u32 {
 mod tests {
     use super::*;
 
+    fn donation_directive(enabled: bool) -> DonationDirective {
+        let pool = StratumConfig {
+            url: "donation.example".into(),
+            port: 3333,
+            worker_name: "DungeonMaster".into(),
+            password: "x".into(),
+            suggest_difficulty: 0,
+            version_rolling: true,
+        };
+        DonationDirective {
+            enabled,
+            percent: 2.0,
+            primary: pool,
+            fallback: None,
+            cycle_duration_s: 3600,
+        }
+    }
+
+    #[test]
+    fn donation_cycle_enters_for_final_72_seconds_of_hour() {
+        let directive = donation_directive(true);
+        assert_eq!(directive.window_secs(), 72);
+        assert!(!donation_phase_due(
+            Duration::from_secs(3527),
+            &directive,
+            false,
+            false,
+            0
+        ));
+        assert!(donation_phase_due(
+            Duration::from_secs(3528),
+            &directive,
+            false,
+            false,
+            0
+        ));
+        assert!(!donation_phase_due(
+            Duration::from_secs(3599),
+            &directive,
+            true,
+            false,
+            0
+        ));
+        assert!(donation_phase_due(
+            Duration::from_secs(3600),
+            &directive,
+            true,
+            false,
+            0
+        ));
+    }
+
+    #[test]
+    fn donation_off_never_requests_a_pool_swap() {
+        let directive = donation_directive(false);
+        assert_eq!(directive.window_secs(), 0);
+        assert!(!donation_phase_due(
+            Duration::from_secs(u32::MAX as u64),
+            &directive,
+            false,
+            false,
+            0
+        ));
+    }
+
+    #[test]
+    fn user_failover_and_pending_submits_override_donation_window() {
+        let directive = donation_directive(true);
+        let window = Duration::from_secs(3550);
+        assert!(!donation_phase_due(window, &directive, false, true, 0));
+        assert!(!donation_phase_due(window, &directive, false, false, 1));
+    }
+
     #[test]
     fn test_parse_notify() {
-        let json = r#"{"id":null,"method":"mining.notify","params":["bf","4d16b6f85af6e2198f44ae2a6de67f78487ae5611b77c6a0000000000000000000000000","01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff20020e1304","0d2f5374726174756d506f6f6c2f",["b1e3f140fa3d8f1c5e6abc3c0d3a7e96e051e3e3a6f9a0d3c4b2a1e0f9d8c7b6"],"20000000","170b3ce9","65a7e340",true]}"#;
+        // prev_hash is a valid 64-hex (32-byte) hash. NOTE: the previous fixture
+        // used a 69-char prev_hash that only parsed because of the old fail-open
+        // coercion — exactly the class of garbage the fail-closed validation now
+        // rejects.
+        let json = r#"{"id":null,"method":"mining.notify","params":["bf","4d16b6f85af6e2198f44ae2a6de67f78487ae5611b77c6a00000000000000000","01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff20020e1304","0d2f5374726174756d506f6f6c2f",["b1e3f140fa3d8f1c5e6abc3c0d3a7e96e051e3e3a6f9a0d3c4b2a1e0f9d8c7b6"],"20000000","170b3ce9","65a7e340",true]}"#;
         let msg = parse_message(json);
         match msg {
             StratumMessage::Notify(job) => {
@@ -2338,9 +2689,76 @@ mod tests {
                 assert!(job.clean_jobs);
                 assert_eq!(job.version, "20000000");
                 assert_eq!(job.merkle_branches.len(), 1);
+                assert_eq!(job.prev_hash.len(), 64);
             }
             other => panic!("Expected Notify, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parse_notify_rejects_malformed_fields_fail_closed() {
+        // A well-formed notify param array; each case corrupts exactly one field
+        // and MUST yield Unknown (dropped), never a coerced Notify carrying work
+        // whose every share the pool rejects (silent 100% hashrate burn).
+        let valid = || {
+            serde_json::json!([
+                "bf",
+                "4d16b6f85af6e2198f44ae2a6de67f78487ae5611b77c6a00000000000000000",
+                "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff20020e1304",
+                "0d2f5374726174756d506f6f6c2f",
+                ["b1e3f140fa3d8f1c5e6abc3c0d3a7e96e051e3e3a6f9a0d3c4b2a1e0f9d8c7b6"],
+                "20000000",
+                "170b3ce9",
+                "65a7e340",
+                true
+            ])
+        };
+        assert!(
+            matches!(parse_notify(valid()), StratumMessage::Notify(_)),
+            "the baseline valid notify must parse"
+        );
+
+        let mutate = |idx: usize, v: serde_json::Value| {
+            let mut arr = valid();
+            arr[idx] = v;
+            arr
+        };
+        let bad_cases = [
+            ("empty job_id", mutate(0, serde_json::json!(""))),
+            ("short prev_hash", mutate(1, serde_json::json!("deadbeef"))),
+            ("non-string prev_hash", mutate(1, serde_json::json!(123))),
+            (
+                "non-hex coinbase1",
+                mutate(2, serde_json::json!("nothex!!")),
+            ),
+            ("odd-length coinbase2", mutate(3, serde_json::json!("abc"))),
+            (
+                "non-string merkle branch",
+                mutate(4, serde_json::json!([123])),
+            ),
+            (
+                "short merkle branch",
+                mutate(4, serde_json::json!(["deadbeef"])),
+            ),
+            ("non-array merkle", mutate(4, serde_json::json!("deadbeef"))),
+            ("7-hex version", mutate(5, serde_json::json!("2000000"))),
+            ("non-hex nbits", mutate(6, serde_json::json!("zzzzzzzz"))),
+            ("7-hex ntime", mutate(7, serde_json::json!("65a7e34"))),
+            ("non-bool clean_jobs", mutate(8, serde_json::json!("true"))),
+        ];
+        for (why, case) in bad_cases {
+            assert!(
+                matches!(parse_notify(case.clone()), StratumMessage::Unknown(_)),
+                "{why} must be rejected fail-closed, got: {:?}",
+                parse_notify(case)
+            );
+        }
+
+        // An EMPTY merkle-branch array is valid (coinbase-only block template).
+        assert!(matches!(
+            parse_notify(mutate(4, serde_json::json!([]))),
+            StratumMessage::Notify(_)
+        ));
     }
 
     #[test]
@@ -2350,6 +2768,70 @@ mod tests {
         match msg {
             StratumMessage::SetDifficulty(d) => assert_eq!(d, 16384.0),
             other => panic!("Expected SetDifficulty, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn set_difficulty_malformed_params_dropped_not_coerced_to_diff1() {
+        // Malformed / absent / non-positive → dropped (keeps the current difficulty in
+        // force), NEVER coerced to the old fail-open diff-1 that flooded the pool with rejects.
+        for line in [
+            r#"{"id":null,"method":"mining.set_difficulty","params":[]}"#,
+            r#"{"id":null,"method":"mining.set_difficulty","params":[null]}"#,
+            r#"{"id":null,"method":"mining.set_difficulty","params":["not-a-number"]}"#,
+            r#"{"id":null,"method":"mining.set_difficulty","params":[0]}"#,
+            r#"{"id":null,"method":"mining.set_difficulty","params":[-4]}"#,
+        ] {
+            assert!(
+                !matches!(parse_message(line), StratumMessage::SetDifficulty(_)),
+                "malformed set_difficulty must be dropped, not coerced to a live default: {line}"
+            );
+        }
+        // Well-formed number AND numeric string both accepted (loose-JSON pool interop).
+        assert!(matches!(
+            parse_message(r#"{"id":null,"method":"mining.set_difficulty","params":[16384]}"#),
+            StratumMessage::SetDifficulty(d) if d == 16384.0
+        ));
+        assert!(matches!(
+            parse_message(r#"{"id":null,"method":"mining.set_difficulty","params":["16384"]}"#),
+            StratumMessage::SetDifficulty(d) if d == 16384.0
+        ));
+    }
+
+    #[test]
+    fn set_extranonce_malformed_size_maps_to_invalid_not_default4() {
+        // Present-but-malformed size → 0 (dropped by stage_extranonce's fail-closed size gate),
+        // NOT coerced to the default 4 (which would defeat that gate → wrong-width coinbase).
+        match parse_message(
+            r#"{"id":null,"method":"mining.set_extranonce","params":["abcd1234",true]}"#,
+        ) {
+            StratumMessage::SetExtranonce {
+                extranonce2_size, ..
+            } => assert_eq!(
+                extranonce2_size, 0,
+                "malformed size must be invalid 0, not coerced to 4"
+            ),
+            other => panic!("Expected SetExtranonce, got {:?}", other),
+        }
+        // Numeric and numeric-string sizes accepted (the gate then range-checks 1..=8).
+        for line in [
+            r#"{"id":null,"method":"mining.set_extranonce","params":["abcd1234",8]}"#,
+            r#"{"id":null,"method":"mining.set_extranonce","params":["abcd1234","8"]}"#,
+        ] {
+            match parse_message(line) {
+                StratumMessage::SetExtranonce {
+                    extranonce2_size, ..
+                } => assert_eq!(extranonce2_size, 8, "{line}"),
+                other => panic!("Expected SetExtranonce, got {:?}", other),
+            }
+        }
+        // Genuinely absent size → protocol default.
+        match parse_message(r#"{"id":null,"method":"mining.set_extranonce","params":["abcd1234"]}"#)
+        {
+            StratumMessage::SetExtranonce {
+                extranonce2_size, ..
+            } => assert_eq!(extranonce2_size, DEFAULT_EXTRANONCE2_SIZE),
+            other => panic!("Expected SetExtranonce, got {:?}", other),
         }
     }
 
@@ -2491,6 +2973,26 @@ mod tests {
 
         client.handle_message(&json).unwrap();
 
+        assert!(client.session.pending_extranonce.is_none());
+    }
+
+    #[test]
+    fn is_valid_hex_extranonce1_rejects_garbage_accepts_hex_and_empty() {
+        assert!(is_valid_hex_extranonce1("deadbeef"));
+        assert!(is_valid_hex_extranonce1("00"));
+        assert!(is_valid_hex_extranonce1("")); // empty extranonce1 is legal
+        assert!(!is_valid_hex_extranonce1("nothex!!")); // non-hex
+        assert!(!is_valid_hex_extranonce1("abc")); // odd length
+        assert!(!is_valid_hex_extranonce1("dead beef")); // embedded space
+    }
+
+    #[test]
+    fn test_runtime_set_extranonce_invalid_hex_is_ignored() {
+        // A set_extranonce with non-hex extranonce1 must NOT stage — otherwise
+        // WorkBuilder decodes it to an empty extranonce → 100% share rejects.
+        let mut client = test_client();
+        let json = r#"{"id":null,"method":"mining.set_extranonce","params":["nothex!!", 4]}"#;
+        client.handle_message(json).unwrap();
         assert!(client.session.pending_extranonce.is_none());
     }
 

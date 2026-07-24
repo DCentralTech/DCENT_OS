@@ -182,25 +182,21 @@ fi
 # and the release collector must require, export, and source-closure-bind it.
 for post_image in \
     "$SCRIPT_DIR/../br2_external_dcentos/board/zynq/post-image-ramdisk.sh" \
-    "$SCRIPT_DIR/../br2_external_dcentos/board/zynq/am2-s19jpro/post-image.sh" \
-    "$SCRIPT_DIR/../br2_external_dcentos/board/cvitek/cv1835-s19jpro/post-image.sh"
+    "$SCRIPT_DIR/../br2_external_dcentos/board/zynq/am2-s19jpro/post-image.sh"
 do
     grep -F 'scripts/lib/rootfs_ownership_ledger.sh' "$post_image" >/dev/null
     grep -F 'dcent_emit_rootfs_ownership_ledger' "$post_image" >/dev/null
     grep -F 'board/common/prune-runtime-research-tools.sh' "$post_image" >/dev/null
 done
-grep -F 's9|am2-s19jpro|cv1835-s19jpro)' "$SCRIPT_DIR/build_in_docker.sh" >/dev/null
+grep -F 's9|am2-s19jpro)' "$SCRIPT_DIR/build_in_docker.sh" >/dev/null
 grep -F 'integrated final-rootfs ownership ledger missing' "$SCRIPT_DIR/build_in_docker.sh" >/dev/null
 grep -F 'rm -f buildroot/output/images/rootfs-ownership.json' "$SCRIPT_DIR/build_in_docker.sh" >/dev/null
 grep -F 'SOURCE_CLOSURE_ARTIFACT_ARGS+=(--artifact "$ROOTFS_OWNERSHIP_LEDGER_PATH")' \
     "$SCRIPT_DIR/build_in_docker.sh" >/dev/null
-grep -F 'BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/rootfs-overlay"' \
+grep -F 'BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/common/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/rootfs-overlay"' \
     "$SCRIPT_DIR/../br2_external_dcentos/configs/dcentos_s9_defconfig" >/dev/null
-grep -F 'BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/am2-s19jpro/rootfs-overlay"' \
+grep -F 'BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/common/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/am2-s19jpro/rootfs-overlay"' \
     "$SCRIPT_DIR/../br2_external_dcentos/configs/dcentos_am2_s19jpro_defconfig" >/dev/null
-grep -F 'BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/cvitek/cv1835-s19jpro/rootfs-overlay"' \
-    "$SCRIPT_DIR/../br2_external_dcentos/configs/dcentos_cv1835_s19jpro_defconfig" >/dev/null
-
 printf 'package-a,../../escape\n' >> "$BUILD/package-a/.files-list.txt"
 if python3 "$ANALYZER" "${COMMON_ARGS[@]}" --output "$TMPDIR_TEST/unsafe.json" >/dev/null 2>&1; then
     echo "ERROR: ledger accepted an unsafe package path claim" >&2

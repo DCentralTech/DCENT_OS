@@ -23,10 +23,13 @@ pub const FAN_PWM_ABSOLUTE_MAX: u8 = 100;
 /// Ordered emergency / teardown intent (cut hash before noise).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SafetyAction {
-    /// Disable hashboard voltage / rails only (fans unchanged).
-    PowerCutOnly,
-    /// Cut power, then command fans to a capped PWM.
-    PowerCutThenFan(FanCommand),
+    /// Disable hashboard voltage / rails only (fans unchanged). Carries the
+    /// PowerCut so its forensic reason survives into `steps()`.
+    PowerCutOnly(PowerCut),
+    /// Cut power, then command fans to a capped PWM. Carries the PowerCut so
+    /// `steps()` emits the ACTUAL cut reason (e.g. PanicTeardown vs
+    /// ThermalEmergency) instead of a hardcoded one.
+    PowerCutThenFan(PowerCut, FanCommand),
     /// Fan-only (immersion may zero fans without power cut — rare).
     FanOnly(FanCommand),
 }
@@ -112,7 +115,7 @@ impl PowerCut {
     /// Compose the canonical home emergency sequence.
     pub fn with_emergency_fans(self, profile_max_pwm: u8) -> SafetyAction {
         debug_assert!(self.cut_hash_before_noise);
-        SafetyAction::PowerCutThenFan(FanCommand::emergency_cap(profile_max_pwm))
+        SafetyAction::PowerCutThenFan(self, FanCommand::emergency_cap(profile_max_pwm))
     }
 }
 
@@ -137,17 +140,10 @@ impl SafetyAction {
     /// Expand into ordered adapter steps.
     pub fn steps(self) -> Vec<SafetyStep> {
         match self {
-            Self::PowerCutOnly => vec![SafetyStep::CutPower(PowerCut {
-                reason: PowerCutReason::Other,
-                cut_hash_before_noise: true,
-            })],
-            Self::PowerCutThenFan(fan) => vec![
-                SafetyStep::CutPower(PowerCut {
-                    reason: PowerCutReason::ThermalEmergency,
-                    cut_hash_before_noise: true,
-                }),
-                SafetyStep::CommandFans(fan),
-            ],
+            Self::PowerCutOnly(cut) => vec![SafetyStep::CutPower(cut)],
+            Self::PowerCutThenFan(cut, fan) => {
+                vec![SafetyStep::CutPower(cut), SafetyStep::CommandFans(fan)]
+            }
             Self::FanOnly(fan) => vec![SafetyStep::CommandFans(fan)],
         }
     }
@@ -161,7 +157,10 @@ impl PowerCut {
 
     /// Canonical panic park after power cut: quiet idle (not the louder cap).
     pub fn home_panic_park_action(profile_max_pwm: u8) -> SafetyAction {
-        SafetyAction::PowerCutThenFan(FanCommand::home_quiet_park(profile_max_pwm))
+        SafetyAction::PowerCutThenFan(
+            Self::panic_teardown(),
+            FanCommand::home_quiet_park(profile_max_pwm),
+        )
     }
 }
 
@@ -202,11 +201,34 @@ mod tests {
     fn thermal_sequence_is_cut_then_fan() {
         let action = PowerCut::thermal_emergency().with_emergency_fans(30);
         match action {
-            SafetyAction::PowerCutThenFan(fan) => {
+            SafetyAction::PowerCutThenFan(cut, fan) => {
                 assert_eq!(fan.effective_pwm(), 30);
+                // The cut's real reason is carried (not hardcoded in steps()).
+                assert_eq!(cut.reason, PowerCutReason::ThermalEmergency);
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn panic_park_steps_report_panic_teardown_not_thermal() {
+        // D2: steps() must emit the CARRIED PowerCut reason, not a hardcoded one.
+        // home_panic_park is a PanicTeardown — steps() previously mislabeled it
+        // ThermalEmergency (the stable forensic reason was lost).
+        let steps = PowerCut::home_panic_park_action(30).steps();
+        match steps[0] {
+            SafetyStep::CutPower(cut) => assert_eq!(cut.reason, PowerCutReason::PanicTeardown),
+            other => panic!("expected CutPower first, got {other:?}"),
+        }
+        // Thermal hard-stop still reports ThermalEmergency (carried, not hardcoded).
+        let steps = PowerCut::home_thermal_hard_stop_action(30).steps();
+        assert!(matches!(
+            steps[0],
+            SafetyStep::CutPower(PowerCut {
+                reason: PowerCutReason::ThermalEmergency,
+                ..
+            })
+        ));
     }
 
     #[test]

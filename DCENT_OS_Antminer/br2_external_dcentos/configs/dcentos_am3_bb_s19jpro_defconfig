@@ -107,7 +107,7 @@ BR2_TARGET_GENERIC_ISSUE="DCENTos for S19j Pro AM335x BeagleBone (am3-bb-s19jpro
 #   3. beaglebone/am3-bb-s19jpro/rootfs-overlay -- variant identity:
 #      board_target=am3-bb-s19jpro, dcentrald.toml override,
 #      hostname/platform stamps, S82dcentrald copy.
-BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/beaglebone/am3-bb/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/beaglebone/am3-bb-s19jpro/rootfs-overlay"
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/common/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/beaglebone/am3-bb/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/beaglebone/am3-bb-s19jpro/rootfs-overlay"
 BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/beaglebone/am3-bb-s19jpro/post-build.sh $(BR2_EXTERNAL_DCENTOS_PATH)/board/common/prune-runtime-research-tools.sh"
 BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/beaglebone/am3-bb-s19jpro/post-image.sh"
 

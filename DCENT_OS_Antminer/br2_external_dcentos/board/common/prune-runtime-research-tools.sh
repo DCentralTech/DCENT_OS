@@ -1,5 +1,6 @@
 #!/bin/sh
-# Remove standalone hardware research executors from normal runtime images.
+# Remove standalone hardware and boot-state research executors from normal
+# runtime images.
 #
 # These sources remain in the repository for offline protocol research, but
 # they open I2C/UART/UIO/devmem independently and therefore cannot coexist with
@@ -30,7 +31,7 @@ fi
 # Never traverse an intermediate symlink while deleting. A malformed staging
 # tree with root -> /somewhere or usr -> /somewhere could otherwise turn a
 # bounded prune into a host-filesystem mutation outside TARGET_DIR.
-for component in root usr usr/bin; do
+for component in root usr usr/bin usr/sbin; do
     if [ -L "$TARGET_DIR/$component" ]; then
         echo "refusing TARGET_DIR with symlinked delete-path component: '$component'" >&2
         exit 1
@@ -42,3 +43,10 @@ done
 # artifacts, and future executors copied by Buildroot's overlay merge.
 rm -rf "$TARGET_DIR/root/tools"
 rm -f "$TARGET_DIR/usr/bin/dcent-shell"
+
+# switch_firmware.{py,sh} are offline U-Boot environment-image transformers,
+# not target-side recovery authorities.  Remove both names after every overlay
+# and package has run so a warm Buildroot tree or future package cannot restore
+# the former raw-environment patcher to a production image.
+rm -f "$TARGET_DIR/usr/sbin/switch_firmware.py" \
+    "$TARGET_DIR/usr/sbin/switch_firmware.sh"

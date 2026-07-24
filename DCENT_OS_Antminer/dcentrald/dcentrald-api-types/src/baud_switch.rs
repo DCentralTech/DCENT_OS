@@ -99,7 +99,12 @@ pub struct BaudPlan {
 pub const fn target_baud(family: BaudChipFamily) -> u32 {
     match family {
         BaudChipFamily::Bm1387 => 1_562_500,
-        BaudChipFamily::Bm1397 | BaudChipFamily::Bm1398 => 6_250_000,
+        BaudChipFamily::Bm1397 => 6_250_000,
+        // The held corpus describes a PLL3-derived 6.25 Mbaud candidate, but
+        // DCENT_OS has no admitted composition recipe that proves the source
+        // clock + FPGA divider transition. The production BM1398 paths omit
+        // PLL3 and are bounded at the conservative 3.125 Mbaud CLKI rate.
+        BaudChipFamily::Bm1398 => 3_125_000,
         BaudChipFamily::Bm1362
         | BaudChipFamily::Bm1366
         | BaudChipFamily::Bm1368
@@ -145,7 +150,9 @@ pub const fn register_value(family: BaudChipFamily) -> u32 {
         // exact value is composed by the runtime; surface the canonical
         // 0x4020_0180 anchor pinned by the S9 75-s cliff fix.
         BaudChipFamily::Bm1387 => 0x4020_0180,
-        // BM1397 / BM1398 — verified 6.25 Mbaud value
+        // BM1397 uses this with its admitted PLL3 clock for 6.25 Mbaud.
+        // BM1398 production uses the same field value on 25 MHz CLKI for
+        // 3.125 Mbaud; register bits alone do not prove the source clock.
         BaudChipFamily::Bm1397 | BaudChipFamily::Bm1398 => 0x0000_6031,
         // BM1362 — verified live .139: `0x18 = 0x00C100B0`
         BaudChipFamily::Bm1362 => 0x00C1_00B0,
@@ -230,7 +237,7 @@ mod tests {
     fn target_baud_matches_re_doc_per_family() {
         assert_eq!(target_baud(BaudChipFamily::Bm1387), 1_562_500);
         assert_eq!(target_baud(BaudChipFamily::Bm1397), 6_250_000);
-        assert_eq!(target_baud(BaudChipFamily::Bm1398), 6_250_000);
+        assert_eq!(target_baud(BaudChipFamily::Bm1398), 3_125_000);
         assert_eq!(target_baud(BaudChipFamily::Bm1362), 3_125_000);
         assert_eq!(target_baud(BaudChipFamily::Bm1366), 3_125_000);
         assert_eq!(target_baud(BaudChipFamily::Bm1368), 3_125_000);

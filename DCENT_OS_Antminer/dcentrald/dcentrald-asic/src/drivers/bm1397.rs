@@ -18,8 +18,8 @@
 //!     `single_BM1397_open_core` right before mining: per-core
 //!     `BM1397_enable_core_clock` (×84) + dummy TW work + `OpenCoreGap`.
 //!     DCENT does broadcast CoreRegCtrl (0x3C) clock config but SKIPS the
-//!     per-core open-core sweep. There is NO live S17 unit to have validated
-//!     this assumption — it is the #1 pre-live standalone risk for S17
+//!     per-core open-core sweep. DCENT_OS has not validated that path on an
+//!     S17, so it remains the #1 standalone-execution risk for this driver
 //!     (zero/reduced nonces if BM1397 actually needs open-core). A/B the gated
 //!     open-core on the first live S17. (Sibling BM1398/S19 Pro DID produce
 //!     146K nonces without it — so it is not a hard zero-nonce there, but may be
@@ -436,14 +436,15 @@ impl ChipDriver for Bm1397Driver {
 
         // --- Step 7: Set Ticket Mask (difficulty filter) ---
         // ESP-Miner Step 9. Set before frequency ramp.
-        let mask = self.ticket_mask(256);
+        let difficulty = 256;
+        let mask = self.ticket_mask(difficulty);
         let (w0, w1) = fifo_bm1397_write_reg_bcast(regs::TICKET_MASK, mask);
         tracing::info!(
             reg = format_args!("0x{:02X}", regs::TICKET_MASK),
             mask = format_args!("0x{:08X}", mask),
             "TicketMask write -- difficulty {} (only 1 in {} hashes reported)",
-            mask + 1,
-            mask + 1,
+            difficulty,
+            difficulty,
         );
         chain.write_cmd(w0);
         chain.write_cmd(w1);
@@ -462,8 +463,10 @@ impl ChipDriver for Bm1397Driver {
         // PLL0 Divider (0x70) = 0x0F0F0F00 sets all PLLDIV to max to prevent glitches.
         // Both PLL0 Divider and PLL0 Parameter are sent TWICE with 10ms delays.
         //
-        // ESP-Miner ramps in 6.25 MHz steps from 50 MHz. We do a simplified version:
-        // set the target directly with the pre-frequency glitch protection.
+        // The S17 factory jig ramps in 25 MHz steps from 50 MHz. This
+        // Experimental driver still sets the target directly with the proven
+        // pre-frequency glitch protection; the complete bounded ramp belongs
+        // to the exact BHB07601 composition plan.
 
         // Step 9a: Pre-configure PLL0 Divider (send twice).
         const PLL0_DIV_PRECONFIG: u32 = 0x0F0F_0F00;
@@ -948,33 +951,12 @@ impl ChipDriver for Bm1397Driver {
     }
 
     fn ticket_mask(&self, difficulty: u32) -> u32 {
-        // Returns the raw `difficulty - 1`, CONSISTENT with the live-proven BM13xx
-        // siblings BM1362/BM1366/BM1368 (their tests pin `ticket_mask(128) == 0x7F`).
-        // See the flagged cross-chip encoding question below before changing this.
-        //
-        // GAP CLOSED (data) 2026-06-10 (goldmine ranks-40-50, live Ghidra bridge): the
-        // S17 jig `BM1397_set_TM@26DA4` (S17/single-board-test) runs each TICKET_MASK
-        // byte through `bit_swap_table @ 0x00030b3c` before writing reg 0x14. All 256
-        // bytes were read out of `.data`: it is the canonical 8-bit bit-reversal LUT
-        // (`bit_swap_table[b] == b.reverse_bits()`, verified for every entry — see the
-        // `bm1397_bit_swap_table_is_bit_reversal` test). The jig caller passes the RAW
-        // mask (`BM1397_set_TM(chain, addr, 63, 1)`), so the jig writes the bit-reversed
-        // form. ESP-Miner `bm1397.c` `_reverse_bits` agrees. BM1387 also bit-reverses
-        // (`reverse_bits().swap_bytes()`).
-        //
-        // ⚠️ OPEN, cross-chip (DCENT_Protocol + a live S17/T17 to resolve — NOT flipped
-        // here): the S17 jig + ESP-Miner BIT-REVERSE the TM, but DCENT's nearest
-        // live-proven siblings (BM1362/66/68) write it RAW. We deliberately did NOT
-        // flip BM1397 in isolation because (a) there is no live S17/T17 on the fleet to
-        // validate against, (b) flipping one chip would make it inconsistent with its
-        // closest siblings, and (c) it makes ZERO functional difference at the only
-        // difficulty live inits use: for diff 256 both encodings collapse to 0x000000FF
-        // (the value written in `init_chain`). The discrepancy only appears at non-byte-
-        // boundary difficulties (e.g. 64), which no path currently exercises. When a
-        // live S17/T17 lands, decide the whole family at once — `reverse_bits().swap_bytes()`
-        // is the ready bit-reversed form (matches BM1387).
-        // Source: goldmine `deliverables/RANKS_40_50_DESK_RE.md` (rank 49 / C02).
-        difficulty.saturating_sub(1)
+        // The S17 factory jig `BM1397_set_TM@26DA4` applies its canonical
+        // 8-bit bit-reversal table independently to every byte of
+        // `difficulty - 1` before writing register 0x14. The u32 operation
+        // below is exactly that byte-wise transform: reverse all bits, then
+        // restore byte order. ESP-Miner's BM1397 implementation agrees.
+        difficulty.saturating_sub(1).reverse_bits().swap_bytes()
     }
 
     fn pll_params(&self, freq_mhz: u16) -> PllConfig {
@@ -1065,16 +1047,14 @@ mod ranks_40_50_desk_re_tests {
         assert_eq!(S17_JIG_BIT_SWAP_TABLE[0xFF], 0xFF);
     }
 
-    /// Rank 49 — the live TICKET_MASK value DCENT writes (diff 256) is invariant
-    /// under raw-vs-bit-reversed encoding: both collapse to 0x000000FF. This is why
-    /// the documented jig/ESP-Miner bit-reversal was NOT flipped in isolation (it
-    /// changes nothing on any exercised path; the cross-chip decision is deferred to
-    /// a live S17/T17 per the `ticket_mask` doc comment).
+    /// Rank 49 — the default init TICKET_MASK (diff 256) is invariant under
+    /// raw-vs-bit-reversed encoding, while a non-byte-boundary difficulty pins
+    /// the vendor's byte-wise reversal.
     #[test]
     fn bm1397_ticket_mask_diff256_encoding_invariant() {
         let drv = Bm1397Driver;
-        let raw = drv.ticket_mask(256);
-        assert_eq!(raw, 0x0000_00FF, "current (raw) encoding for diff 256");
+        let encoded = drv.ticket_mask(256);
+        assert_eq!(encoded, 0x0000_00FF, "vendor encoding for diff 256");
         // Bit-reversed form of the same value is identical at 256.
         assert_eq!(
             256u32.saturating_sub(1).reverse_bits().swap_bytes(),
@@ -1083,6 +1063,7 @@ mod ranks_40_50_desk_re_tests {
         // They diverge only off byte boundaries (documented, not exercised live):
         assert_eq!(64u32.saturating_sub(1), 0x3F);
         assert_eq!(64u32.saturating_sub(1).reverse_bits().swap_bytes(), 0xFC);
+        assert_eq!(drv.ticket_mask(64), 0xFC);
     }
 
     /// Rank 49 — `gChain_Asic_Interval` is `256 / chips_per_chain`. The S17 jig

@@ -41,16 +41,17 @@ fn parse_vector(contents: &str) -> (Value, Vec<TraceEvent>) {
     (header, events)
 }
 
-fn assert_exact_init_vector(
+fn assert_init_vector_with_strictness(
     vector: &str,
     slug: &str,
     model: SimModel,
     expected_open_core_writes: Option<u32>,
+    expected_strictness: &str,
 ) {
     let (header, expected) = parse_vector(vector);
     assert_eq!(header["schema"], "dcent-init-trace-v1");
     assert_eq!(header["model"], slug);
-    assert_eq!(header["strictness"], "exact");
+    assert_eq!(header["strictness"], expected_strictness);
 
     let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../..");
     let provenance = header["provenance"].as_array().expect("provenance array");
@@ -91,9 +92,29 @@ fn assert_exact_init_vector(
     assert_eq!(actual, expected, "ordered init byte trace drifted");
 }
 
+fn assert_exact_init_vector(
+    vector: &str,
+    slug: &str,
+    model: SimModel,
+    expected_open_core_writes: Option<u32>,
+) {
+    assert_init_vector_with_strictness(vector, slug, model, expected_open_core_writes, "exact");
+}
+
 #[test]
-fn s19pro_init_is_an_exact_ordered_byte_match() {
-    assert_exact_init_vector(S19PRO_VECTOR, "s19pro", SimModel::S19Pro, Some(0));
+fn s19pro_init_snapshot_tracks_the_simulator_without_claiming_vendor_exactness() {
+    let (header, _) = parse_vector(S19PRO_VECTOR);
+    assert_eq!(header["maturity"], "experimental");
+    assert!(header["evidence_boundary"]
+        .as_str()
+        .is_some_and(|boundary| boundary.contains("not a vendor-exact")));
+    assert_init_vector_with_strictness(
+        S19PRO_VECTOR,
+        "s19pro",
+        SimModel::S19Pro,
+        Some(0),
+        "implementation_snapshot",
+    );
 }
 
 #[test]

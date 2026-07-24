@@ -20,10 +20,11 @@
 //!   `interval_ms = 0` and `watchdog_timeout_ms = 0` as sentinels meaning
 //!   "no heartbeat thread runs". Consumers MUST check `cfg.nopic` first
 //!   and short-circuit; do NOT spin a 0-ms tokio interval.
-//! - `S17AmStock` is marked load-bearing-but-unproven: code-only 4
-//!   plumbing landed `ZynqVariant::S17`, but no live S17 is on the fleet.
-//!   Every value on that row carries an `// XXX: confirm against live
-//!   S17` comment in the source matrix.
+//! - `S17Am1` has binary-backed vendor cadence and wire-protocol evidence,
+//!   but no configured DCENT runtime cadence or watchdog timeout. The held
+//!   factory jig cannot prove the controller's hardware watchdog window, and
+//!   no live S17 is on the fleet. Keep the runtime row refused until bench
+//!   evidence establishes a safe operating margin.
 
 use serde::{Deserialize, Serialize};
 
@@ -90,14 +91,20 @@ pub enum PicFw {
 /// runs" — only valid when `nopic == true`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeartbeatConfig {
-    /// How often the heartbeat thread MUST send a keepalive. The PIC
-    /// watchdog cuts the rail if no heartbeat arrives within
-    /// `watchdog_timeout_ms`; we tick faster to leave margin.
+    /// DCENT's configured runtime cadence. This is deliberately separate
+    /// from [`Self::observed_vendor_cadence_ms`]: observing a vendor host
+    /// sleep does not prove that cadence leaves a safe watchdog margin.
+    /// Zero means the tuple has no admitted runtime heartbeat cadence.
     pub interval_ms: u32,
 
-    /// Hardware-side watchdog timeout. Documents the upper bound only;
-    /// runtime code MUST tick at `interval_ms`, not at this value.
+    /// Evidence-backed hardware-side watchdog timeout. Zero means unknown
+    /// (or not applicable on NoPic); callers MUST NOT infer a timeout from a
+    /// vendor heartbeat cadence.
     pub watchdog_timeout_ms: u32,
+
+    /// Cadence observed in vendor host software, when independently pinned.
+    /// This is evidence metadata, never runtime authority by itself.
+    pub observed_vendor_cadence_ms: Option<u32>,
 
     /// Whether the voltage controller responds to telemetry reads
     /// (GET_VOLTAGE / GET_CURRENT / GET_VERSION beyond fw echo). Drives
@@ -138,6 +145,27 @@ impl HeartbeatConfig {
     }
 }
 
+/// S17 factory-jig heartbeat cadence observed in `pic_heart_beat_func`.
+///
+/// The BHB07601/BM1397 branch calls `heart_beat_dsPIC33EP16GS202` and then
+/// sleeps for 10 seconds. This proves vendor host behavior, not the dsPIC's
+/// hardware watchdog timeout.
+pub const S17_STOCK_OBSERVED_VENDOR_CADENCE_MS: u32 = 10_000;
+
+/// Exact S17 factory-jig dsPIC heartbeat request.
+///
+/// Source: held pre-decompilation
+/// `S17/single-board-test.dec/heart_beat_dsPIC33EP16GS202@24190.c`.
+pub const S17_STOCK_HEARTBEAT_FRAME: [u8; 6] = [0x55, 0xAA, 0x04, 0x16, 0x00, 0x1A];
+
+/// Apply the S17 factory jig's heartbeat acknowledgement predicate.
+///
+/// The jig reads six bytes but declares success solely when response bytes
+/// one and two are `[0x16, 0x01]`. Short replies are always refused.
+pub fn s17_stock_heartbeat_acknowledged(reply: &[u8]) -> bool {
+    reply.len() >= 3 && reply[1] == 0x16 && reply[2] == 0x01
+}
+
 /// Look up the heartbeat configuration for a `(platform, fw)` tuple.
 ///
 /// Compile-time exhaustive over `(Platform, PicFw)`. Tuples that don't
@@ -155,6 +183,7 @@ pub const fn pic_heartbeat_config(platform: Platform, fw: PicFw) -> HeartbeatCon
         (S9Am1, Stock) => HeartbeatConfig {
             interval_ms: 1_000,
             watchdog_timeout_ms: 60_000,
+            observed_vendor_cadence_ms: None,
             telemetry_capable: true,
             flush_after_nack_bytes: 16,
             voltage_stability_ticks: 5,
@@ -163,22 +192,25 @@ pub const fn pic_heartbeat_config(platform: Platform, fw: PicFw) -> HeartbeatCon
         (S9Am1, Braiins) => HeartbeatConfig {
             interval_ms: 1_000,
             watchdog_timeout_ms: 10_000,
+            observed_vendor_cadence_ms: None,
             telemetry_capable: true,
             flush_after_nack_bytes: 16,
             voltage_stability_ticks: 5,
             nopic: false,
         },
 
-        // ---------- S17 am1-s17 (dsPIC33EP — code-only) ----------
-        // XXX: confirm against live S17 — every value on this row is a
-        // code-only assumption per 4. NEVER ship live mining
-        // against an S17 without re-pinning these from a hardware probe.
+        // ---------- S17 am1-s17 (dsPIC33EP; evidence-only) ----------
+        // The held factory jig proves the 10 s vendor cadence and exact
+        // frame/ACK contract, but not the hardware watchdog timeout. Do not
+        // turn observed cadence into runtime authority: the native S17 route
+        // stays unconfigured and voltage-refused until live validation.
         (S17Am1, Dspic33epHealthy) => HeartbeatConfig {
-            interval_ms: 1_000,
-            watchdog_timeout_ms: 10_000,
-            telemetry_capable: true,
-            flush_after_nack_bytes: 16,
-            voltage_stability_ticks: 5,
+            interval_ms: 0,
+            watchdog_timeout_ms: 0,
+            observed_vendor_cadence_ms: Some(S17_STOCK_OBSERVED_VENDOR_CADENCE_MS),
+            telemetry_capable: false,
+            flush_after_nack_bytes: 0,
+            voltage_stability_ticks: 0,
             nopic: false,
         },
 
@@ -186,6 +218,7 @@ pub const fn pic_heartbeat_config(platform: Platform, fw: PicFw) -> HeartbeatCon
         (S19Am2, Dspic33epHealthy) => HeartbeatConfig {
             interval_ms: 1_000,
             watchdog_timeout_ms: 10_000,
+            observed_vendor_cadence_ms: None,
             telemetry_capable: true,
             flush_after_nack_bytes: 16,
             voltage_stability_ticks: 5,
@@ -197,6 +230,7 @@ pub const fn pic_heartbeat_config(platform: Platform, fw: PicFw) -> HeartbeatCon
             // voltage commands fire.
             interval_ms: 1_000,
             watchdog_timeout_ms: 10_000,
+            observed_vendor_cadence_ms: None,
             telemetry_capable: false,
             flush_after_nack_bytes: 16,
             voltage_stability_ticks: 0,
@@ -207,6 +241,7 @@ pub const fn pic_heartbeat_config(platform: Platform, fw: PicFw) -> HeartbeatCon
         (S19jProAm2, Dspic33epHealthy) => HeartbeatConfig {
             interval_ms: 1_000,
             watchdog_timeout_ms: 10_000,
+            observed_vendor_cadence_ms: None,
             telemetry_capable: true,
             flush_after_nack_bytes: 16,
             voltage_stability_ticks: 5,
@@ -217,6 +252,7 @@ pub const fn pic_heartbeat_config(platform: Platform, fw: PicFw) -> HeartbeatCon
             // Voltage refused unless DCENT_AM2_TRUST_DEGRADED_FW=1.
             interval_ms: 1_000,
             watchdog_timeout_ms: 10_000,
+            observed_vendor_cadence_ms: None,
             telemetry_capable: false,
             flush_after_nack_bytes: 16,
             voltage_stability_ticks: 0,
@@ -227,6 +263,7 @@ pub const fn pic_heartbeat_config(platform: Platform, fw: PicFw) -> HeartbeatCon
         (S21Am3Aml, NoPic) | (S19kProAm3Aml, NoPic) | (S19jProAmlogic, NoPic) => HeartbeatConfig {
             interval_ms: 0,
             watchdog_timeout_ms: 0,
+            observed_vendor_cadence_ms: None,
             telemetry_capable: false,
             flush_after_nack_bytes: 0,
             voltage_stability_ticks: 0,
@@ -242,6 +279,7 @@ pub const fn pic_heartbeat_config(platform: Platform, fw: PicFw) -> HeartbeatCon
             // operator authorization.
             interval_ms: 1_000,
             watchdog_timeout_ms: 10_000,
+            observed_vendor_cadence_ms: None,
             telemetry_capable: false,
             flush_after_nack_bytes: 0,
             voltage_stability_ticks: 0,
@@ -256,6 +294,7 @@ pub const fn pic_heartbeat_config(platform: Platform, fw: PicFw) -> HeartbeatCon
         _ => HeartbeatConfig {
             interval_ms: 0,
             watchdog_timeout_ms: 0,
+            observed_vendor_cadence_ms: None,
             telemetry_capable: false,
             flush_after_nack_bytes: 0,
             voltage_stability_ticks: 0,
@@ -296,7 +335,8 @@ pub fn all_platform_fw_pairs() -> impl Iterator<Item = (Platform, PicFw)> {
 
 /// Real-world `(Platform, PicFw)` pairs that map to actual hardware.
 /// Used by the exhaustiveness test to assert that every legitimate
-/// combination has a non-default entry in `pic_heartbeat_config`.
+/// combination has either configured runtime policy or explicit evidence
+/// metadata in `pic_heartbeat_config`.
 pub const REAL_WORLD_PAIRS: &[(Platform, PicFw)] = &[
     (Platform::S9Am1, PicFw::Stock),
     (Platform::S9Am1, PicFw::Braiins),
@@ -334,6 +374,11 @@ mod tests {
                 assert_eq!(
                     cfg.watchdog_timeout_ms, 0,
                     "nopic platforms must have watchdog_timeout_ms=0; ({:?}, {:?})",
+                    p, fw
+                );
+                assert_eq!(
+                    cfg.observed_vendor_cadence_ms, None,
+                    "nopic platforms cannot have a controller heartbeat cadence; ({:?}, {:?})",
                     p, fw
                 );
             }
@@ -376,13 +421,13 @@ mod tests {
 
     #[test]
     fn real_world_pairs_have_nondefault_entries() {
-        // Every entry in REAL_WORLD_PAIRS must be a hand-pinned row
-        // (not the catch-all defensive default). We detect catch-all
-        // by checking that at least ONE field is non-default-zero.
+        // Every entry in REAL_WORLD_PAIRS must be a hand-pinned policy or
+        // evidence row (not the catch-all defensive default).
         for (p, fw) in REAL_WORLD_PAIRS {
             let cfg = pic_heartbeat_config(*p, *fw);
             let is_catch_all = cfg.interval_ms == 0
                 && cfg.watchdog_timeout_ms == 0
+                && cfg.observed_vendor_cadence_ms.is_none()
                 && cfg.flush_after_nack_bytes == 0
                 && cfg.voltage_stability_ticks == 0
                 && !cfg.nopic
@@ -414,6 +459,35 @@ mod tests {
         let cfg = pic_heartbeat_config(Platform::S9Am1, PicFw::Braiins);
         assert_eq!(cfg.interval_ms, 1_000);
         assert_eq!(cfg.watchdog_timeout_ms, 10_000);
+    }
+
+    #[test]
+    fn s17_vendor_evidence_does_not_mint_runtime_authority() {
+        let cfg = pic_heartbeat_config(Platform::S17Am1, PicFw::Dspic33epHealthy);
+
+        assert_eq!(
+            cfg.observed_vendor_cadence_ms,
+            Some(S17_STOCK_OBSERVED_VENDOR_CADENCE_MS)
+        );
+        assert_eq!(cfg.interval_ms, 0, "S17 has no admitted DCENT cadence");
+        assert_eq!(
+            cfg.watchdog_timeout_ms, 0,
+            "the held host binary does not prove the dsPIC watchdog timeout"
+        );
+        assert!(!cfg.needs_heartbeat_thread());
+        assert!(!cfg.voltage_allowed());
+
+        assert_eq!(
+            S17_STOCK_HEARTBEAT_FRAME,
+            [0x55, 0xAA, 0x04, 0x16, 0x00, 0x1A]
+        );
+        assert!(s17_stock_heartbeat_acknowledged(&[
+            0x00, 0x16, 0x01, 0x00, 0x00, 0x00
+        ]));
+        assert!(!s17_stock_heartbeat_acknowledged(&[0x00, 0x16]));
+        assert!(!s17_stock_heartbeat_acknowledged(&[
+            0x00, 0x16, 0x00, 0x00, 0x00, 0x00
+        ]));
     }
 
     #[test]

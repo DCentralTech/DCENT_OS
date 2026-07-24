@@ -467,10 +467,17 @@ pub const STRACE_READ_CONFIG_LATCH_SETTLE_MS: u64 = 500;
 /// back to bootloader. The handoff launchers (`run_wave54_25_PROVEN_MINING.sh`,
 /// `run_wave55i_25_HANDOFF.sh`) defensively `unset` this var for that
 /// reason ( QA-Q3 cross-launcher safety pattern).
+fn parse_enabled_flag(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+fn read_enabled_env(name: &str) -> bool {
+    let value = std::env::var(name).ok();
+    parse_enabled_flag(value.as_deref())
+}
+
 pub fn am2_dspic_read_config_latch_enabled() -> bool {
-    std::env::var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH")
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false)
+    read_enabled_env("DCENT_AM2_DSPIC_READ_CONFIG_LATCH")
 }
 
 /// Returns the strace-derived prelude transaction list.
@@ -508,7 +515,14 @@ pub fn am2_dspic_read_config_latch_enabled() -> bool {
 /// recipe. Standalone cold-cold launchers opt in; handoff launchers
 /// defensively unset the env var.
 pub fn build_strace_derived_prelude_transactions() -> Vec<Vec<I2cTransactionStep>> {
-    let read_config_latch_enabled = am2_dspic_read_config_latch_enabled();
+    build_strace_derived_prelude_transactions_with_read_config_latch(
+        am2_dspic_read_config_latch_enabled(),
+    )
+}
+
+fn build_strace_derived_prelude_transactions_with_read_config_latch(
+    read_config_latch_enabled: bool,
+) -> Vec<Vec<I2cTransactionStep>> {
     let mut txs: Vec<Vec<I2cTransactionStep>> = Vec::with_capacity(
         STRACE_SYNC_HEARTBEAT_COUNT + 2 + if read_config_latch_enabled { 1 } else { 0 },
     );
@@ -616,7 +630,15 @@ pub fn build_strace_derived_prelude_transactions() -> Vec<Vec<I2cTransactionStep
 /// bit-identical — and one slave-select is in fact MORE bosminer-faithful
 /// (bosminer issues exactly one `I2C_SLAVE` ioctl for the whole warmup).
 pub fn build_strace_derived_prelude_single_transaction() -> Vec<I2cTransactionStep> {
-    build_strace_derived_prelude_transactions()
+    build_strace_derived_prelude_single_transaction_with_read_config_latch(
+        am2_dspic_read_config_latch_enabled(),
+    )
+}
+
+fn build_strace_derived_prelude_single_transaction_with_read_config_latch(
+    read_config_latch_enabled: bool,
+) -> Vec<I2cTransactionStep> {
+    build_strace_derived_prelude_transactions_with_read_config_latch(read_config_latch_enabled)
         .into_iter()
         .flatten()
         .collect()
@@ -717,9 +739,10 @@ pub fn am2_pic_reset_and_start_app_strace_derived(i2c: &I2cServiceHandle, addr: 
         }
     }
 
-    let transactions = build_strace_derived_prelude_transactions();
-    let total_txs = transactions.len();
     let read_config_latch_active = am2_dspic_read_config_latch_enabled();
+    let transactions =
+        build_strace_derived_prelude_transactions_with_read_config_latch(read_config_latch_active);
+    let total_txs = transactions.len();
 
     for (idx, steps) in transactions.into_iter().enumerate() {
         let label = if idx < STRACE_SYNC_HEARTBEAT_COUNT {
@@ -901,8 +924,10 @@ pub fn am2_pic_reset_and_start_app_strace_derived_exclusive(
 
     // The ENTIRE warmup as ONE step list → ONE service request → atomic on the
     // single-owner i2c-0 worker. No interleave point for foreign producers.
-    let steps = build_strace_derived_prelude_single_transaction();
     let read_config_latch_active = am2_dspic_read_config_latch_enabled();
+    let steps = build_strace_derived_prelude_single_transaction_with_read_config_latch(
+        read_config_latch_active,
+    );
     let total_steps = steps.len();
 
     tracing::info!(
@@ -1453,9 +1478,7 @@ pub fn build_lm75_passthrough_transactions() -> Vec<Vec<I2cTransactionStep>> {
 /// Default-OFF — when unset, the warmup is not emitted and the chain
 /// behavior is byte-identical to the pre- path.
 pub fn am2_dspic_lm75_passthrough_enabled() -> bool {
-    std::env::var("DCENT_AM2_DSPIC_BOSMINER_LM75_PASSTHROUGH")
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false)
+    read_enabled_env("DCENT_AM2_DSPIC_BOSMINER_LM75_PASSTHROUGH")
 }
 
 // ===========================================================================
@@ -1502,9 +1525,7 @@ pub fn am2_dspic_lm75_passthrough_enabled() -> bool {
 ///
 /// Source: .
 pub fn am2_dspic_sensor_only_enabled() -> bool {
-    std::env::var("DCENT_AM2_DSPIC_SENSOR_ONLY")
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false)
+    read_enabled_env("DCENT_AM2_DSPIC_SENSOR_ONLY")
 }
 
 /// **Post-JUMP heartbeat keep-alive opt-in env helper** (2026-06-07,
@@ -1544,9 +1565,7 @@ pub fn am2_dspic_sensor_only_enabled() -> bool {
 /// Source:
 /// fallback rung 3 ("Heartbeat keep-alive immediately post-JUMP").
 pub fn am2_dspic_postjump_heartbeat_keepalive_enabled() -> bool {
-    std::env::var("DCENT_AM2_DSPIC_POSTJUMP_HEARTBEAT_KEEPALIVE")
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false)
+    read_enabled_env("DCENT_AM2_DSPIC_POSTJUMP_HEARTBEAT_KEEPALIVE")
 }
 
 /// **Post-JUMP keep-alive heartbeat interval (ms)** (2026-06-07, `a lab unit`
@@ -1567,9 +1586,13 @@ pub fn am2_dspic_postjump_heartbeat_keepalive_enabled() -> bool {
 /// helper is ONLY consulted when the keep-alive is already active, so the
 /// default-OFF byte-identical contract is unaffected.
 pub fn am2_dspic_keepalive_interval_ms() -> u64 {
-    std::env::var("DCENT_AM2_DSPIC_KEEPALIVE_INTERVAL_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
+    let value = std::env::var("DCENT_AM2_DSPIC_KEEPALIVE_INTERVAL_MS").ok();
+    parse_keepalive_interval_ms(value.as_deref())
+}
+
+fn parse_keepalive_interval_ms(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|&v| v > 0)
         .map(|v| v.clamp(50, 1000))
         .unwrap_or(300)
@@ -1616,9 +1639,7 @@ pub fn am2_dspic_keepalive_interval_ms() -> u64 {
 /// fallback rung 3 (re-JUMP immediately pre-ENABLE — supersedes the rung-3
 /// keep-alive).
 pub fn am2_dspic_rejump_before_enable_enabled() -> bool {
-    std::env::var("DCENT_AM2_DSPIC_REJUMP_BEFORE_ENABLE")
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false)
+    read_enabled_env("DCENT_AM2_DSPIC_REJUMP_BEFORE_ENABLE")
 }
 
 /// **Skip-SetVoltage-keep-ENABLE opt-in env helper** (2026-06-07, `a lab unit`
@@ -1665,9 +1686,7 @@ pub fn am2_dspic_rejump_before_enable_enabled() -> bool {
 /// Source:
 /// (Fix A — "skip the dsPIC SetVoltage (0x10) but KEEP the ENABLE (0x15)").
 pub fn am2_dspic_skip_setvoltage_keep_enable_enabled() -> bool {
-    std::env::var("DCENT_AM2_DSPIC_SKIP_SETVOLTAGE_KEEP_ENABLE")
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false)
+    read_enabled_env("DCENT_AM2_DSPIC_SKIP_SETVOLTAGE_KEEP_ENABLE")
 }
 
 /// **Bosminer-minimal ENABLE opt-in env helper** (2026-06-07, `a lab unit` standalone
@@ -1725,9 +1744,7 @@ pub fn am2_dspic_skip_setvoltage_keep_enable_enabled() -> bool {
 /// Source:
 /// (the consolidated bosminer-minimal GET_VERSION→ENABLE window).
 pub fn am2_dspic_bosminer_minimal_enable_enabled() -> bool {
-    std::env::var("DCENT_AM2_DSPIC_BOSMINER_MINIMAL_ENABLE")
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false)
+    read_enabled_env("DCENT_AM2_DSPIC_BOSMINER_MINIMAL_ENABLE")
 }
 
 /// ** (2026-05-25)** — emit the 17-transaction LM75A
@@ -1925,9 +1942,13 @@ pub fn am2_dspic_lm75_passthrough_warmup(i2c: &I2cServiceHandle, addr: u8) -> Re
 /// Source:
 /// fallback rung 2.
 pub fn am2_dspic_jump_reverify_max() -> u32 {
-    std::env::var("DCENT_AM2_DSPIC_JUMP_REVERIFY_MAX")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
+    let value = std::env::var("DCENT_AM2_DSPIC_JUMP_REVERIFY_MAX").ok();
+    parse_reverify_max(value.as_deref())
+}
+
+fn parse_reverify_max(value: Option<&str>) -> u32 {
+    value
+        .and_then(|value| value.trim().parse::<u32>().ok())
         .unwrap_or(0)
 }
 
@@ -2162,9 +2183,13 @@ pub const RESET_JUMP_REVERIFY_DEFAULT_DWELL_MS: u64 = 1000;
 /// `a lab unit`-fingerprinted RESET→JUMP path; the fleet/handoff/legacy paths never call
 /// it.
 pub fn am2_dspic_reset_dwell_ms() -> u64 {
-    std::env::var("DCENT_AM2_DSPIC_RESET_DWELL_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
+    let value = std::env::var("DCENT_AM2_DSPIC_RESET_DWELL_MS").ok();
+    parse_reset_dwell_ms(value.as_deref())
+}
+
+fn parse_reset_dwell_ms(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(RESET_JUMP_REVERIFY_DEFAULT_DWELL_MS)
         .clamp(100, 5000)
 }
@@ -2192,10 +2217,8 @@ pub fn am2_dspic_reset_dwell_ms() -> u64 {
 ///
 /// Source: .
 pub fn am2_dspic_reset_jump_reverify_max() -> u32 {
-    std::env::var("DCENT_AM2_DSPIC_RESET_JUMP_REVERIFY_MAX")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .unwrap_or(0)
+    let value = std::env::var("DCENT_AM2_DSPIC_RESET_JUMP_REVERIFY_MAX").ok();
+    parse_reverify_max(value.as_deref())
 }
 
 /// Build the full RESET→JUMP re-verify transaction list (rung 2, RESET→JUMP
@@ -2606,10 +2629,7 @@ mod tests {
     /// separately in `wave55k_read_config_latch_inserts_between_reset_and_start_app`.
     #[test]
     fn wave28_build_strace_derived_emits_10_transactions() {
-        // Defensive: the  Part 2 env gate could be leaked into
-        // the test process from a prior test or shell. Ensure default-OFF.
-        std::env::remove_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH");
-        let txs = build_strace_derived_prelude_transactions();
+        let txs = build_strace_derived_prelude_transactions_with_read_config_latch(false);
         assert_eq!(
             txs.len(),
             10,
@@ -2630,8 +2650,7 @@ mod tests {
     /// had dropped a leading byte.)
     #[test]
     fn wave28_sync_heartbeats_are_eight_separate_single_byte_writes() {
-        std::env::remove_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH");
-        let txs = build_strace_derived_prelude_transactions();
+        let txs = build_strace_derived_prelude_transactions_with_read_config_latch(false);
         for (i, tx) in txs.iter().enumerate().take(STRACE_SYNC_HEARTBEAT_COUNT) {
             // Each heartbeat transaction is SetTimeout + WriteByteByByte([0x00]).
             assert!(
@@ -2679,8 +2698,7 @@ mod tests {
     /// pre-Read settle to match the strace's 66 ms write-to-ACK gap.)
     #[test]
     fn wave28_step_8_is_framed_reset_with_ack_and_500ms() {
-        std::env::remove_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH");
-        let txs = build_strace_derived_prelude_transactions();
+        let txs = build_strace_derived_prelude_transactions_with_read_config_latch(false);
         let reset_tx = &txs[STRACE_SYNC_HEARTBEAT_COUNT];
 
         // Verify the exact wire bytes against the constant + strace.
@@ -2750,8 +2768,7 @@ mod tests {
     /// the 70 ms pre-Read settle.)
     #[test]
     fn wave28_step_9_is_framed_start_app_with_ack_and_500ms() {
-        std::env::remove_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH");
-        let txs = build_strace_derived_prelude_transactions();
+        let txs = build_strace_derived_prelude_transactions_with_read_config_latch(false);
         let start_tx = &txs[STRACE_SYNC_HEARTBEAT_COUNT + 1];
 
         let mut saw_write = false;
@@ -2834,15 +2851,10 @@ mod tests {
     #[test]
     fn cold_byte_diff_single_transaction_equals_flattened_multi_transaction() {
         for latch in [false, true] {
-            if latch {
-                std::env::set_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH", "1");
-            } else {
-                std::env::remove_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH");
-            }
-
-            let multi = build_strace_derived_prelude_transactions();
+            let multi = build_strace_derived_prelude_transactions_with_read_config_latch(latch);
             let flattened: Vec<I2cTransactionStep> = multi.into_iter().flatten().collect();
-            let single = build_strace_derived_prelude_single_transaction();
+            let single =
+                build_strace_derived_prelude_single_transaction_with_read_config_latch(latch);
 
             assert_eq!(
                 single.len(),
@@ -2863,7 +2875,6 @@ mod tests {
                 latch
             );
         }
-        std::env::remove_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH");
     }
 
     /// Pin that the single-transaction warmup still carries the exact framed
@@ -2872,8 +2883,7 @@ mod tests {
     /// equality helper changed).
     #[test]
     fn cold_byte_diff_single_transaction_carries_reset_and_start_app_bytes() {
-        std::env::remove_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH");
-        let single = build_strace_derived_prelude_single_transaction();
+        let single = build_strace_derived_prelude_single_transaction_with_read_config_latch(false);
 
         let writes: Vec<&Vec<u8>> = single
             .iter()
@@ -3293,25 +3303,13 @@ mod tests {
     /// a never-live-tested warmup on every `a lab unit`-class boot.
     #[test]
     fn wave55f_lm75_passthrough_env_helper_default_off() {
-        // Save + clear in case the test environment has it set.
-        let prev = std::env::var("DCENT_AM2_DSPIC_BOSMINER_LM75_PASSTHROUGH").ok();
-        std::env::remove_var("DCENT_AM2_DSPIC_BOSMINER_LM75_PASSTHROUGH");
         assert!(
-            !am2_dspic_lm75_passthrough_enabled(),
+            !parse_enabled_flag(None),
             "Wave-55f safety regression: env helper must return false when \
              DCENT_AM2_DSPIC_BOSMINER_LM75_PASSTHROUGH is unset"
         );
-        // Set to "1" and confirm.
-        std::env::set_var("DCENT_AM2_DSPIC_BOSMINER_LM75_PASSTHROUGH", "1");
-        assert!(am2_dspic_lm75_passthrough_enabled());
-        // Set to "0" and confirm.
-        std::env::set_var("DCENT_AM2_DSPIC_BOSMINER_LM75_PASSTHROUGH", "0");
-        assert!(!am2_dspic_lm75_passthrough_enabled());
-        // Restore.
-        match prev {
-            Some(v) => std::env::set_var("DCENT_AM2_DSPIC_BOSMINER_LM75_PASSTHROUGH", v),
-            None => std::env::remove_var("DCENT_AM2_DSPIC_BOSMINER_LM75_PASSTHROUGH"),
-        }
+        assert!(parse_enabled_flag(Some("1")));
+        assert!(!parse_enabled_flag(Some("0")));
     }
 
     // =======================================================================
@@ -3334,25 +3332,17 @@ mod tests {
         );
     }
 
-    /// Pin the env helper's default-OFF safety contract.
+    /// Pin the env value parser's exact, default-OFF safety contract without
+    /// mutating the process-global environment used by parallel tests.
     #[test]
-    fn wave55k_read_config_latch_env_helper_default_off() {
-        let prev = std::env::var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH").ok();
-        std::env::remove_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH");
-        assert!(
-            !am2_dspic_read_config_latch_enabled(),
-            "Wave-55k Part 2 safety regression: env helper must return false \
-             when DCENT_AM2_DSPIC_READ_CONFIG_LATCH is unset — default behavior \
-             MUST be byte-identical to the pre-Wave-55k bosminer-handoff path."
-        );
-        std::env::set_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH", "1");
-        assert!(am2_dspic_read_config_latch_enabled());
-        std::env::set_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH", "0");
-        assert!(!am2_dspic_read_config_latch_enabled());
-        match prev {
-            Some(v) => std::env::set_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH", v),
-            None => std::env::remove_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH"),
-        }
+    fn wave55k_read_config_latch_value_parser_is_exact_and_default_off() {
+        assert!(!parse_enabled_flag(None));
+        assert!(!parse_enabled_flag(Some("")));
+        assert!(!parse_enabled_flag(Some("0")));
+        assert!(!parse_enabled_flag(Some("true")));
+        assert!(!parse_enabled_flag(Some("01")));
+        assert!(parse_enabled_flag(Some("1")));
+        assert!(parse_enabled_flag(Some("  1\t")));
     }
 
     /// Post-JUMP heartbeat keep-alive (2026-06-07, `a lab unit` standalone
@@ -3363,18 +3353,14 @@ mod tests {
     /// primary default-OFF guarantee.
     #[test]
     fn postjump_keepalive_env_helper_default_off() {
-        let prev = std::env::var("DCENT_AM2_DSPIC_POSTJUMP_HEARTBEAT_KEEPALIVE").ok();
-        std::env::remove_var("DCENT_AM2_DSPIC_POSTJUMP_HEARTBEAT_KEEPALIVE");
         assert!(
-            !am2_dspic_postjump_heartbeat_keepalive_enabled(),
+            !parse_enabled_flag(None),
             "post-JUMP keep-alive safety regression: env helper must return false \
              when DCENT_AM2_DSPIC_POSTJUMP_HEARTBEAT_KEEPALIVE is unset — default \
              behavior MUST be byte-identical to the fleet/handoff/legacy path."
         );
-        std::env::set_var("DCENT_AM2_DSPIC_POSTJUMP_HEARTBEAT_KEEPALIVE", "1");
-        assert!(am2_dspic_postjump_heartbeat_keepalive_enabled());
-        std::env::set_var("DCENT_AM2_DSPIC_POSTJUMP_HEARTBEAT_KEEPALIVE", "0");
-        assert!(!am2_dspic_postjump_heartbeat_keepalive_enabled());
+        assert!(parse_enabled_flag(Some("1")));
+        assert!(!parse_enabled_flag(Some("0")));
         // The new env is NOT one of the 4 forbidden `a lab unit` env vars, so it must
         // never collide with them.
         for forbidden in [
@@ -3384,10 +3370,6 @@ mod tests {
             "DCENT_AM2_PSU_CALIBRATION_PROBE_WAKE",
         ] {
             assert_ne!(forbidden, "DCENT_AM2_DSPIC_POSTJUMP_HEARTBEAT_KEEPALIVE");
-        }
-        match prev {
-            Some(v) => std::env::set_var("DCENT_AM2_DSPIC_POSTJUMP_HEARTBEAT_KEEPALIVE", v),
-            None => std::env::remove_var("DCENT_AM2_DSPIC_POSTJUMP_HEARTBEAT_KEEPALIVE"),
         }
     }
 
@@ -3399,18 +3381,14 @@ mod tests {
     /// the primary default-OFF guarantee.
     #[test]
     fn rejump_before_enable_env_helper_default_off() {
-        let prev = std::env::var("DCENT_AM2_DSPIC_REJUMP_BEFORE_ENABLE").ok();
-        std::env::remove_var("DCENT_AM2_DSPIC_REJUMP_BEFORE_ENABLE");
         assert!(
-            !am2_dspic_rejump_before_enable_enabled(),
+            !parse_enabled_flag(None),
             "re-JUMP-before-ENABLE safety regression: env helper must return false \
              when DCENT_AM2_DSPIC_REJUMP_BEFORE_ENABLE is unset — default behavior \
              MUST be byte-identical to the fleet/handoff/legacy path."
         );
-        std::env::set_var("DCENT_AM2_DSPIC_REJUMP_BEFORE_ENABLE", "1");
-        assert!(am2_dspic_rejump_before_enable_enabled());
-        std::env::set_var("DCENT_AM2_DSPIC_REJUMP_BEFORE_ENABLE", "0");
-        assert!(!am2_dspic_rejump_before_enable_enabled());
+        assert!(parse_enabled_flag(Some("1")));
+        assert!(!parse_enabled_flag(Some("0")));
         // The new env is NOT one of the 4 forbidden `a lab unit` env vars.
         for forbidden in [
             "DCENT_AM2_PIC_RESET_AND_START_APP",
@@ -3419,10 +3397,6 @@ mod tests {
             "DCENT_AM2_PSU_CALIBRATION_PROBE_WAKE",
         ] {
             assert_ne!(forbidden, "DCENT_AM2_DSPIC_REJUMP_BEFORE_ENABLE");
-        }
-        match prev {
-            Some(v) => std::env::set_var("DCENT_AM2_DSPIC_REJUMP_BEFORE_ENABLE", v),
-            None => std::env::remove_var("DCENT_AM2_DSPIC_REJUMP_BEFORE_ENABLE"),
         }
     }
 
@@ -3434,19 +3408,15 @@ mod tests {
     /// the primary default-OFF guarantee.
     #[test]
     fn skip_setvoltage_keep_enable_env_helper_default_off() {
-        let prev = std::env::var("DCENT_AM2_DSPIC_SKIP_SETVOLTAGE_KEEP_ENABLE").ok();
-        std::env::remove_var("DCENT_AM2_DSPIC_SKIP_SETVOLTAGE_KEEP_ENABLE");
         assert!(
-            !am2_dspic_skip_setvoltage_keep_enable_enabled(),
+            !parse_enabled_flag(None),
             "skip-SetVoltage-keep-ENABLE safety regression: env helper must return \
              false when DCENT_AM2_DSPIC_SKIP_SETVOLTAGE_KEEP_ENABLE is unset — default \
              behavior MUST be byte-identical to the fleet/handoff/legacy path (the 0x10 \
              SetVoltage still fires)."
         );
-        std::env::set_var("DCENT_AM2_DSPIC_SKIP_SETVOLTAGE_KEEP_ENABLE", "1");
-        assert!(am2_dspic_skip_setvoltage_keep_enable_enabled());
-        std::env::set_var("DCENT_AM2_DSPIC_SKIP_SETVOLTAGE_KEEP_ENABLE", "0");
-        assert!(!am2_dspic_skip_setvoltage_keep_enable_enabled());
+        assert!(parse_enabled_flag(Some("1")));
+        assert!(!parse_enabled_flag(Some("0")));
         // The new env is NOT one of the 4 forbidden `a lab unit` env vars, and it is
         // explicitly DISTINCT from the SENSOR_ONLY gate (which wrongly skips the
         // ENABLE too — ENABLE-DRIFT-DIFF.md proves bosminer DOES send 0x15).
@@ -3459,10 +3429,6 @@ mod tests {
         ] {
             assert_ne!(forbidden, "DCENT_AM2_DSPIC_SKIP_SETVOLTAGE_KEEP_ENABLE");
         }
-        match prev {
-            Some(v) => std::env::set_var("DCENT_AM2_DSPIC_SKIP_SETVOLTAGE_KEEP_ENABLE", v),
-            None => std::env::remove_var("DCENT_AM2_DSPIC_SKIP_SETVOLTAGE_KEEP_ENABLE"),
-        }
     }
 
     /// Bosminer-minimal ENABLE (2026-06-07, `a lab unit` standalone cold-engage): the
@@ -3474,19 +3440,15 @@ mod tests {
     /// guarantee.
     #[test]
     fn bosminer_minimal_enable_env_helper_default_off() {
-        let prev = std::env::var("DCENT_AM2_DSPIC_BOSMINER_MINIMAL_ENABLE").ok();
-        std::env::remove_var("DCENT_AM2_DSPIC_BOSMINER_MINIMAL_ENABLE");
         assert!(
-            !am2_dspic_bosminer_minimal_enable_enabled(),
+            !parse_enabled_flag(None),
             "bosminer-minimal-ENABLE safety regression: env helper must return false \
              when DCENT_AM2_DSPIC_BOSMINER_MINIMAL_ENABLE is unset — default behavior \
              MUST be byte-identical to the fleet/handoff/legacy path (flush + heartbeat \
              + LM75A + re-JUMP + SetVoltage all still fire)."
         );
-        std::env::set_var("DCENT_AM2_DSPIC_BOSMINER_MINIMAL_ENABLE", "1");
-        assert!(am2_dspic_bosminer_minimal_enable_enabled());
-        std::env::set_var("DCENT_AM2_DSPIC_BOSMINER_MINIMAL_ENABLE", "0");
-        assert!(!am2_dspic_bosminer_minimal_enable_enabled());
+        assert!(parse_enabled_flag(Some("1")));
+        assert!(!parse_enabled_flag(Some("0")));
         // The new env is NOT one of the 4 forbidden `a lab unit` env vars, and it is
         // explicitly DISTINCT from the SENSOR_ONLY gate (which wrongly skips the
         // ENABLE too — the bosminer-minimal window KEEPS the byte-identical 0x15).
@@ -3499,10 +3461,6 @@ mod tests {
         ] {
             assert_ne!(forbidden, "DCENT_AM2_DSPIC_BOSMINER_MINIMAL_ENABLE");
         }
-        match prev {
-            Some(v) => std::env::set_var("DCENT_AM2_DSPIC_BOSMINER_MINIMAL_ENABLE", v),
-            None => std::env::remove_var("DCENT_AM2_DSPIC_BOSMINER_MINIMAL_ENABLE"),
-        }
     }
 
     /// The keep-alive heartbeat interval defaults to 300 ms (well under the
@@ -3510,54 +3468,42 @@ mod tests {
     /// garbage/out-of-range values to a sane `[50, 1000]` cadence.
     #[test]
     fn postjump_keepalive_interval_default_clamp_and_tunable() {
-        let prev = std::env::var("DCENT_AM2_DSPIC_KEEPALIVE_INTERVAL_MS").ok();
-
-        std::env::remove_var("DCENT_AM2_DSPIC_KEEPALIVE_INTERVAL_MS");
         assert_eq!(
-            am2_dspic_keepalive_interval_ms(),
+            parse_keepalive_interval_ms(None),
             300,
             "keep-alive interval must default to 300 ms when the env is unset"
         );
 
-        std::env::set_var("DCENT_AM2_DSPIC_KEEPALIVE_INTERVAL_MS", "150");
         assert_eq!(
-            am2_dspic_keepalive_interval_ms(),
+            parse_keepalive_interval_ms(Some("150")),
             150,
             "tunable value honoured"
         );
 
         // 0 / garbage / negatives fall back to the default (no busy-loop).
-        std::env::set_var("DCENT_AM2_DSPIC_KEEPALIVE_INTERVAL_MS", "0");
         assert_eq!(
-            am2_dspic_keepalive_interval_ms(),
+            parse_keepalive_interval_ms(Some("0")),
             300,
             "0 falls back to default"
         );
-        std::env::set_var("DCENT_AM2_DSPIC_KEEPALIVE_INTERVAL_MS", "nope");
         assert_eq!(
-            am2_dspic_keepalive_interval_ms(),
+            parse_keepalive_interval_ms(Some("nope")),
             300,
             "garbage falls back to default"
         );
+        assert_eq!(parse_keepalive_interval_ms(Some("-1")), 300);
 
         // Out-of-range clamps into [50, 1000].
-        std::env::set_var("DCENT_AM2_DSPIC_KEEPALIVE_INTERVAL_MS", "5");
         assert_eq!(
-            am2_dspic_keepalive_interval_ms(),
+            parse_keepalive_interval_ms(Some("5")),
             50,
             "too-small clamps up to 50"
         );
-        std::env::set_var("DCENT_AM2_DSPIC_KEEPALIVE_INTERVAL_MS", "9999");
         assert_eq!(
-            am2_dspic_keepalive_interval_ms(),
+            parse_keepalive_interval_ms(Some("9999")),
             1000,
             "too-large clamps down to 1000"
         );
-
-        match prev {
-            Some(v) => std::env::set_var("DCENT_AM2_DSPIC_KEEPALIVE_INTERVAL_MS", v),
-            None => std::env::remove_var("DCENT_AM2_DSPIC_KEEPALIVE_INTERVAL_MS"),
-        }
     }
 
     /// Pin the gated chain emission order: when `DCENT_AM2_DSPIC_READ_CONFIG_LATCH=1`
@@ -3571,10 +3517,7 @@ mod tests {
     /// chip-rail-not-engaged failure observed in  LIVE.
     #[test]
     fn wave55k_read_config_latch_inserts_between_reset_and_start_app() {
-        let prev = std::env::var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH").ok();
-        std::env::set_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH", "1");
-
-        let txs = build_strace_derived_prelude_transactions();
+        let txs = build_strace_derived_prelude_transactions_with_read_config_latch(true);
         assert_eq!(
             txs.len(),
             11,
@@ -3654,12 +3597,6 @@ mod tests {
             &[0x55, 0xAA, 0x04, 0x06, 0x00, 0x0A],
             "step 10 must be framed START_APP (unchanged byte-form)"
         );
-
-        // Restore env.
-        match prev {
-            Some(v) => std::env::set_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH", v),
-            None => std::env::remove_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH"),
-        }
     }
 
     /// Pin the gated transaction shape for READ-CONFIG-LATCH:
@@ -3668,10 +3605,7 @@ mod tests {
     /// post-Read settle.
     #[test]
     fn wave55k_read_config_latch_tx_shape_is_canonical() {
-        let prev = std::env::var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH").ok();
-        std::env::set_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH", "1");
-
-        let txs = build_strace_derived_prelude_transactions();
+        let txs = build_strace_derived_prelude_transactions_with_read_config_latch(true);
         let read_config_tx = &txs[STRACE_SYNC_HEARTBEAT_COUNT + 1];
 
         let mut saw_set_timeout = false;
@@ -3733,11 +3667,6 @@ mod tests {
             saw_post_read_sleep,
             "READ-CONFIG-LATCH tx must contain SleepMs(500) post-Read settle"
         );
-
-        match prev {
-            Some(v) => std::env::set_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH", v),
-            None => std::env::remove_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH"),
-        }
     }
 
     /// Pin the post-Read settle constant. The strace-measured wait between
@@ -3790,32 +3719,25 @@ mod tests {
     /// when `DCENT_AM2_DSPIC_JUMP_REVERIFY_MAX` is unset, so the cold-engage
     /// path is byte-identical to today for the fleet/handoff/legacy paths.
     #[test]
-    fn jump_reverify_max_env_helper_default_disabled() {
-        let prev = std::env::var("DCENT_AM2_DSPIC_JUMP_REVERIFY_MAX").ok();
-        std::env::remove_var("DCENT_AM2_DSPIC_JUMP_REVERIFY_MAX");
+    fn jump_reverify_max_value_parser_default_disabled() {
         assert_eq!(
-            am2_dspic_jump_reverify_max(),
+            parse_reverify_max(None),
             0,
             "rung 2 safety regression: env helper must return 0 (disabled) when \
              DCENT_AM2_DSPIC_JUMP_REVERIFY_MAX is unset — default behavior MUST be \
              byte-identical to the fleet/handoff/legacy cold-engage path."
         );
-        std::env::set_var("DCENT_AM2_DSPIC_JUMP_REVERIFY_MAX", "6");
-        assert_eq!(am2_dspic_jump_reverify_max(), 6);
-        std::env::set_var("DCENT_AM2_DSPIC_JUMP_REVERIFY_MAX", "0");
+        assert_eq!(parse_reverify_max(Some("6")), 6);
         assert_eq!(
-            am2_dspic_jump_reverify_max(),
+            parse_reverify_max(Some("0")),
             0,
             "explicit 0 must also disable"
         );
         // Garbage / empty must fail-safe to 0 (disabled), never panic.
-        std::env::set_var("DCENT_AM2_DSPIC_JUMP_REVERIFY_MAX", "not-a-number");
-        assert_eq!(am2_dspic_jump_reverify_max(), 0);
-        std::env::set_var("DCENT_AM2_DSPIC_JUMP_REVERIFY_MAX", "");
-        assert_eq!(am2_dspic_jump_reverify_max(), 0);
-        std::env::set_var("DCENT_AM2_DSPIC_JUMP_REVERIFY_MAX", "  4  ");
+        assert_eq!(parse_reverify_max(Some("not-a-number")), 0);
+        assert_eq!(parse_reverify_max(Some("")), 0);
         assert_eq!(
-            am2_dspic_jump_reverify_max(),
+            parse_reverify_max(Some("  4  ")),
             4,
             "trimmed whitespace parses"
         );
@@ -3827,10 +3749,6 @@ mod tests {
             "DCENT_AM2_PSU_CALIBRATION_PROBE_WAKE",
         ] {
             assert_ne!(forbidden, "DCENT_AM2_DSPIC_JUMP_REVERIFY_MAX");
-        }
-        match prev {
-            Some(v) => std::env::set_var("DCENT_AM2_DSPIC_JUMP_REVERIFY_MAX", v),
-            None => std::env::remove_var("DCENT_AM2_DSPIC_JUMP_REVERIFY_MAX"),
         }
     }
 
@@ -3984,10 +3902,7 @@ mod tests {
             (writes, reads, sleeps, timeouts)
         }
 
-        let prev = std::env::var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH").ok();
-        std::env::remove_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH");
-
-        let warmup = build_strace_derived_prelude_transactions();
+        let warmup = build_strace_derived_prelude_transactions_with_read_config_latch(false);
         let reverify = build_jump_only_reverify_transactions();
 
         // Flush heartbeats are the first STRACE_SYNC_HEARTBEAT_COUNT txs in both.
@@ -4009,11 +3924,6 @@ mod tests {
             summarize(reverify_jump),
             "rung 2 JUMP step must be byte-identical to the warmup START_APP step"
         );
-
-        match prev {
-            Some(v) => std::env::set_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH", v),
-            None => std::env::remove_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH"),
-        }
     }
 
     /// EEPROM denylist fail-closed: `am2_pic_jump_only_reverify` must refuse any
@@ -4050,33 +3960,26 @@ mod tests {
     /// fleet/handoff/legacy paths. With the env unset → helper returns 0 → the
     /// caller's loop is never entered → behavior unchanged.
     #[test]
-    fn reset_jump_reverify_max_env_helper_default_disabled() {
-        let prev = std::env::var("DCENT_AM2_DSPIC_RESET_JUMP_REVERIFY_MAX").ok();
-        std::env::remove_var("DCENT_AM2_DSPIC_RESET_JUMP_REVERIFY_MAX");
+    fn reset_jump_reverify_max_value_parser_default_disabled() {
         assert_eq!(
-            am2_dspic_reset_jump_reverify_max(),
+            parse_reverify_max(None),
             0,
             "RESET→JUMP re-verify safety regression: env helper must return 0 \
              (disabled) when DCENT_AM2_DSPIC_RESET_JUMP_REVERIFY_MAX is unset — \
              default behavior MUST be byte-identical to the fleet/handoff/legacy \
              cold-engage path."
         );
-        std::env::set_var("DCENT_AM2_DSPIC_RESET_JUMP_REVERIFY_MAX", "4");
-        assert_eq!(am2_dspic_reset_jump_reverify_max(), 4);
-        std::env::set_var("DCENT_AM2_DSPIC_RESET_JUMP_REVERIFY_MAX", "0");
+        assert_eq!(parse_reverify_max(Some("4")), 4);
         assert_eq!(
-            am2_dspic_reset_jump_reverify_max(),
+            parse_reverify_max(Some("0")),
             0,
             "explicit 0 must also disable"
         );
         // Garbage / empty must fail-safe to 0 (disabled), never panic.
-        std::env::set_var("DCENT_AM2_DSPIC_RESET_JUMP_REVERIFY_MAX", "not-a-number");
-        assert_eq!(am2_dspic_reset_jump_reverify_max(), 0);
-        std::env::set_var("DCENT_AM2_DSPIC_RESET_JUMP_REVERIFY_MAX", "");
-        assert_eq!(am2_dspic_reset_jump_reverify_max(), 0);
-        std::env::set_var("DCENT_AM2_DSPIC_RESET_JUMP_REVERIFY_MAX", "  4  ");
+        assert_eq!(parse_reverify_max(Some("not-a-number")), 0);
+        assert_eq!(parse_reverify_max(Some("")), 0);
         assert_eq!(
-            am2_dspic_reset_jump_reverify_max(),
+            parse_reverify_max(Some("  4  ")),
             4,
             "trimmed whitespace parses"
         );
@@ -4089,52 +3992,36 @@ mod tests {
         ] {
             assert_ne!(forbidden, "DCENT_AM2_DSPIC_RESET_JUMP_REVERIFY_MAX");
         }
-        match prev {
-            Some(v) => std::env::set_var("DCENT_AM2_DSPIC_RESET_JUMP_REVERIFY_MAX", v),
-            None => std::env::remove_var("DCENT_AM2_DSPIC_RESET_JUMP_REVERIFY_MAX"),
-        }
     }
 
     /// Post-RESET dwell env helper: default 1000 ms (the jig value), clamped to
     /// `[100, 5000]`, fail-safe to default on garbage/empty/unset.
     #[test]
-    fn reset_dwell_ms_env_helper_default_1000_and_clamped() {
-        let prev = std::env::var("DCENT_AM2_DSPIC_RESET_DWELL_MS").ok();
-        std::env::remove_var("DCENT_AM2_DSPIC_RESET_DWELL_MS");
+    fn reset_dwell_ms_value_parser_default_1000_and_clamped() {
         assert_eq!(
-            am2_dspic_reset_dwell_ms(),
+            parse_reset_dwell_ms(None),
             1000,
             "default post-RESET dwell must be 1000 ms (the jig's ~1 s value; the \
              warmup's 500 ms may be too short to fully reset the cold chip)"
         );
         assert_eq!(RESET_JUMP_REVERIFY_DEFAULT_DWELL_MS, 1000);
         // Explicit values parse.
-        std::env::set_var("DCENT_AM2_DSPIC_RESET_DWELL_MS", "1500");
-        assert_eq!(am2_dspic_reset_dwell_ms(), 1500);
-        std::env::set_var("DCENT_AM2_DSPIC_RESET_DWELL_MS", "500");
-        assert_eq!(am2_dspic_reset_dwell_ms(), 500);
+        assert_eq!(parse_reset_dwell_ms(Some("1500")), 1500);
+        assert_eq!(parse_reset_dwell_ms(Some("500")), 500);
         // Clamp: below 100 → 100; above 5000 → 5000.
-        std::env::set_var("DCENT_AM2_DSPIC_RESET_DWELL_MS", "10");
         assert_eq!(
-            am2_dspic_reset_dwell_ms(),
+            parse_reset_dwell_ms(Some("10")),
             100,
             "under-dwell clamps up to 100"
         );
-        std::env::set_var("DCENT_AM2_DSPIC_RESET_DWELL_MS", "999999");
         assert_eq!(
-            am2_dspic_reset_dwell_ms(),
+            parse_reset_dwell_ms(Some("999999")),
             5000,
             "over-dwell clamps down to 5000 (don't stall the bus for minutes)"
         );
         // Garbage / empty fail-safe to the default 1000.
-        std::env::set_var("DCENT_AM2_DSPIC_RESET_DWELL_MS", "not-a-number");
-        assert_eq!(am2_dspic_reset_dwell_ms(), 1000);
-        std::env::set_var("DCENT_AM2_DSPIC_RESET_DWELL_MS", "");
-        assert_eq!(am2_dspic_reset_dwell_ms(), 1000);
-        match prev {
-            Some(v) => std::env::set_var("DCENT_AM2_DSPIC_RESET_DWELL_MS", v),
-            None => std::env::remove_var("DCENT_AM2_DSPIC_RESET_DWELL_MS"),
-        }
+        assert_eq!(parse_reset_dwell_ms(Some("not-a-number")), 1000);
+        assert_eq!(parse_reset_dwell_ms(Some("")), 1000);
     }
 
     /// The RESET→JUMP re-verify chain MUST be `STRACE_SYNC_HEARTBEAT_COUNT`
@@ -4352,10 +4239,7 @@ mod tests {
             (writes, reads, sleeps, timeouts)
         }
 
-        let prev = std::env::var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH").ok();
-        std::env::remove_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH");
-
-        let warmup = build_strace_derived_prelude_transactions();
+        let warmup = build_strace_derived_prelude_transactions_with_read_config_latch(false);
         let reset_jump = build_reset_jump_reverify_transactions(STRACE_RESET_TO_START_APP_DELAY_MS);
 
         assert_eq!(
@@ -4372,11 +4256,6 @@ mod tests {
                  chain when reset_dwell_ms == 500 (the warmup's hard-coded value)",
                 i
             );
-        }
-
-        match prev {
-            Some(v) => std::env::set_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH", v),
-            None => std::env::remove_var("DCENT_AM2_DSPIC_READ_CONFIG_LATCH"),
         }
     }
 

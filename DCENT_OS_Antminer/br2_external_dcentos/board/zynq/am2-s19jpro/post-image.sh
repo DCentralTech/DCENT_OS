@@ -73,6 +73,16 @@ echo "  SHA256: ${ROOTFS_SHA256}"
 PROJECT_ROOT="$(cd "${BR2_EXTERNAL_DCENTOS_PATH}/.." && pwd)"
 REPO_ROOT="$(cd "${PROJECT_ROOT}/../.." && pwd)"
 . "${PROJECT_ROOT}/scripts/lib/sysupgrade_package_common.sh"
+. "${PROJECT_ROOT}/scripts/lib/sysupgrade_archive_admission.sh"
+ZYNQ_GEOMETRY_HELPER="${PROJECT_ROOT}/scripts/lib/sysupgrade_zynq_geometry.sh"
+[ -r "$ZYNQ_GEOMETRY_HELPER" ] || {
+    echo "ERROR: canonical Zynq geometry helper is missing: $ZYNQ_GEOMETRY_HELPER" >&2
+    exit 1
+}
+# shellcheck source=/dev/null
+. "$ZYNQ_GEOMETRY_HELPER"
+dcent_zynq_geometry_require_payload_fit "$BOARD_NAME" rootfs "$ROOTFS_SIZE" || exit 1
+echo "Geometry: $(dcent_zynq_geometry_receipt "$BOARD_NAME")"
 
 read_first_nonempty_line() {
     sed -n 's/^[[:space:]]*//;s/[[:space:]]*$//;/^$/!{p;q;}' "$1"
@@ -153,6 +163,7 @@ fi
 cp "$KERNEL" "${BINARIES_DIR}/kernel"
 KERNEL_SIZE=$(stat -c%s "${BINARIES_DIR}/kernel")
 KERNEL_SHA256=$(sha256sum "${BINARIES_DIR}/kernel" | awk '{print $1}')
+dcent_zynq_geometry_require_payload_fit "$BOARD_NAME" kernel "$KERNEL_SIZE" || exit 1
 echo "Kernel:  kernel ($((KERNEL_SIZE / 1024)) KB) from ${KERNEL_SRC}"
 echo "  SHA256: ${KERNEL_SHA256}"
 
@@ -247,35 +258,14 @@ cat > "$SUP_DIR/MANIFEST.json" << EOF
     }${BITSTREAM_BLOCK}
   },
   "toolbox": {
-    "install_command": "dcent install <ip> -f dcentos-sysupgrade-am2-s19jpro.tar",
-    "update_command": "dcent install <ip> -f dcentos-sysupgrade-am2-s19jpro.tar",
+    "install_command": "dcent install <ip> -f dcentos-sysupgrade-am2-s19jpro.tar --artifact-dir <restore_verified_dir> --accept-am2-persistent-lab --i-have-recovery",
+    "update_command": "dcent install <ip> -f dcentos-sysupgrade-am2-s19jpro.tar --artifact-dir <restore_verified_dir> --accept-am2-persistent-lab --i-have-recovery",
     "upload_endpoint": null,
     "board_target_header": null,
     "requires_inactive_slot": true
   }
 }
 EOF
-
-# Optional signing (mirrors package_sysupgrade.sh)
-if [ -n "${DCENT_RELEASE_SIGNING_KEY:-}" ] && [ -f "${DCENT_RELEASE_SIGNING_KEY}" ]; then
-    if command -v openssl >/dev/null 2>&1; then
-        PUBKEY="$STAGING/release_ed25519.pub"
-        openssl pkey -in "${DCENT_RELEASE_SIGNING_KEY}" -pubout -out "$PUBKEY" >/dev/null 2>&1 || true
-        if [ -f "$PUBKEY" ]; then
-            cp "$PUBKEY" "$SUP_DIR/release_ed25519.pub"
-            openssl pkeyutl -sign -rawin \
-                -inkey "${DCENT_RELEASE_SIGNING_KEY}" \
-                -in "$SUP_DIR/MANIFEST.json" \
-                -out "$SUP_DIR/MANIFEST.sig" \
-                && echo "Signed MANIFEST.json" \
-                || echo "WARNING: failed to sign MANIFEST.json (package will be unsigned)"
-        fi
-    else
-        echo "WARNING: openssl not available — package will be unsigned"
-    fi
-else
-    echo "WARNING: no signing key configured — package is unsigned (lab-only)"
-fi
 
 # Final manifest/signature rewrite through shared AM2/AM3 helper. This keeps
 # the emitted package schema aligned even if the legacy scaffold above changes.
@@ -288,7 +278,7 @@ if [ -n "$BITSTREAM" ]; then
       \"sha256\": \"${BITSTREAM_SHA256}\"
     }"
 fi
-DCENT_TOOLBOX_INSTALL_COMMAND="dcent install <ip> -f dcentos-sysupgrade-am2-s19jpro.tar"
+DCENT_TOOLBOX_INSTALL_COMMAND="dcent install <ip> -f dcentos-sysupgrade-am2-s19jpro.tar --artifact-dir <restore_verified_dir> --accept-am2-persistent-lab --i-have-recovery"
 DCENT_TOOLBOX_UPDATE_COMMAND="$DCENT_TOOLBOX_INSTALL_COMMAND"
 DCENT_TOOLBOX_REQUIRES_INACTIVE_SLOT=true
 DCENT_TOOLBOX_INSTALL_MODE=target_sysupgrade
@@ -312,7 +302,13 @@ dcent_write_sysupgrade_manifest
 dcent_sign_sysupgrade_manifest
 
 # Build tarball
-dcent_create_deterministic_tar "$OUTPUT_TAR" "$STAGING" "sysupgrade-${BOARD_NAME}"
+dcent_create_deterministic_tar \
+    "$OUTPUT_TAR" "$STAGING" "sysupgrade-${BOARD_NAME}" \
+    "${PROJECT_ROOT}/scripts/release_envelope_archive.py"
+dcent_sysupgrade_archive_admit "$OUTPUT_TAR" "$BOARD_NAME" "$STAGING" || {
+    echo "ERROR: generated sysupgrade archive failed canonical admission" >&2
+    exit 1
+}
 OUTPUT_SIZE=$(stat -c%s "$OUTPUT_TAR")
 OUTPUT_SHA256=$(sha256sum "$OUTPUT_TAR" | awk '{print $1}')
 

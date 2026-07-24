@@ -36,21 +36,19 @@
 //!     dashboard stays reachable and the bring-up error is reported; the daemon
 //!     never hangs and never crashes on a failed bring-up.
 //!
-//! ## Why source-parse instead of a runtime test
-//!
-//! `daemon.rs` needs a live HAL (real `/dev/mem`, `/dev/i2c-*`, UIO) to execute
-//! `run_lifecycle` / `init` / `run_api_only`, so a host-safe runtime test
-//! cannot drive a real `init() → hang/Err`. These are STRUCTURAL source-order
-//! assertions (the same technique the `main.rs` F1/F5 tests use) so a future
-//! edit that re-introduces the unbounded/locked-out class fails CI.
+//! The hardware-independent coordinator in `daemon_lifecycle.rs` now owns and
+//! runtime-tests the deadline and recovery ordering. This integration test only
+//! pins the concrete daemon's delegation into that coordinator and the API-only
+//! adapter; it deliberately does not duplicate implementation spelling.
 
 const DAEMON_RS: &str = include_str!("../src/daemon.rs");
+const DAEMON_LIFECYCLE_RS: &str = include_str!("../src/daemon_lifecycle.rs");
 
 /// (A) The `init()` await must be BOUNDED by a timeout — never a bare
 /// `self.init().await?` that can hang forever. Pin that the bring-up is raced
 /// against `resolve_init_timeout()` via `tokio::time::timeout`.
 #[test]
-fn bug9_init_is_bounded_by_a_timeout() {
+fn bug9_standard_daemon_delegates_init_to_bounded_lifecycle_coordinator() {
     assert!(
         DAEMON_RS.contains("fn resolve_init_timeout()"),
         "BUG-9 (A): resolve_init_timeout() helper is missing — the hardware \
@@ -60,12 +58,12 @@ fn bug9_init_is_bounded_by_a_timeout() {
         DAEMON_RS.contains("const DEFAULT_INIT_TIMEOUT_SECS"),
         "BUG-9 (A): DEFAULT_INIT_TIMEOUT_SECS constant is missing"
     );
-    assert!(
-        DAEMON_RS.contains("tokio::time::timeout(init_timeout, self.init())"),
-        "BUG-9 (A) REGRESSION: `init()` is no longer raced against a timeout — \
-         a hung cold-boot (AXI-IIC stuck / dead-PIC heartbeat budget / chain-UART \
-         wedge) would again take the :8080 API down with no recovery"
-    );
+    assert!(DAEMON_RS.contains("crate::daemon_lifecycle::initialize_or_recover("));
+    assert!(DAEMON_RS.contains("&crate::daemon_lifecycle::TokioLifecycleClock"));
+    assert!(DAEMON_RS.contains("init_timeout,"));
+    assert!(DAEMON_LIFECYCLE_RS
+        .contains(".within(init_timeout, platform.initialize_platform(identity))"));
+    assert!(DAEMON_LIFECYCLE_RS.contains("tokio::time::timeout(duration, future)"));
 
     // The OLD unbounded shape `self.init().await?` (a `?` directly on the await)
     // must NOT come back. We allow `self.init()` to appear (it is the argument to
@@ -103,51 +101,6 @@ fn bug9_init_timeout_env_override_is_floored() {
         body.contains(".max(10)"),
         "BUG-9 (A): resolve_init_timeout must floor the env override (e.g. .max(10)) \
          so a too-small value can't false-trip on a healthy unit"
-    );
-}
-
-/// (B) On bring-up failure the lifecycle must FALL BACK to `run_api_only()`
-/// (which spawns the management API + parks) — NOT propagate the error straight
-/// out (which on the standard daemon arm would park in `enter_management_only`
-/// with NO API server, locking the operator out).
-#[test]
-fn bug9_bringup_failure_falls_back_to_run_api_only() {
-    // Find the bounded-init match and its Err arm.
-    let timeout_site = DAEMON_RS
-        .find("tokio::time::timeout(init_timeout, self.init())")
-        .expect("BUG-9: bounded init() site missing");
-    // The fall-back call must appear AFTER the bounded-init site.
-    let fallback = DAEMON_RS[timeout_site..].find("return self.run_api_only().await;");
-    assert!(
-        fallback.is_some(),
-        "BUG-9 (B) REGRESSION: the init-failure path no longer falls back to \
-         run_api_only() — a failed/hung bring-up would leave the standard daemon \
-         arm in management-only WITHOUT an API (operator locked out of the \
-         dashboard/wizard/re-flash plane)"
-    );
-}
-
-/// (B) The hardware-safe-off teardown (`self.shutdown()`) must run BEFORE the
-/// management-only fall-back parks — the boards must be de-energized / fans
-/// idled / watchdog disarmed before we sit idle (the same hardware-already-off
-/// contract the no-brick #6 `Daemon::run()` wrapper guarantees).
-#[test]
-fn bug9_teardown_precedes_management_only_fallback() {
-    let timeout_site = DAEMON_RS
-        .find("tokio::time::timeout(init_timeout, self.init())")
-        .expect("BUG-9: bounded init() site missing");
-    let window = &DAEMON_RS[timeout_site..];
-    let teardown = window
-        .find("self.shutdown().await")
-        .expect("BUG-9 (B) SAFETY: the init-failure path must run self.shutdown() teardown");
-    let fallback = window
-        .find("return self.run_api_only().await;")
-        .expect("BUG-9 (B): run_api_only fall-back missing");
-    assert!(
-        teardown < fallback,
-        "BUG-9 (B) SAFETY VIOLATION: self.shutdown() (hardware-safe-off) must run \
-         BEFORE the run_api_only() management-only park — boards must be \
-         de-energized before the daemon idles"
     );
 }
 

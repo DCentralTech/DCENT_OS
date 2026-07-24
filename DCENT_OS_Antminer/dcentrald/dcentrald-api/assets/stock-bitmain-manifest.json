@@ -4,10 +4,10 @@
   "wave": 12,
   "notes": [
     "Stock-Bitmain SHA-256 manifest. Daemon preflight matches the staged tarball SHA against this list and emits a SafetyFinding at one of four severities:",
-    "  - DCENT-2026-016 Info     (matched + revertable + platform_signature matches)",
+    "  - DCENT-2026-016 Info     (exact SHA + revertable:true + exact platform_signature; the only destructive image verdict that may be admitted)",
     "  - DCENT-2026-017 Critical (matched + platform mismatch — no_override:true)",
-    "  - DCENT-2026-018 High     (matched + dcentos_revertable:false — require ack)",
-    "  - DCENT-2026-019 Medium   (no SHA match — informational)",
+    "  - DCENT-2026-018 High     (matched + dcentos_revertable:false — destructive no-override blocker)",
+    "  - DCENT-2026-019 Medium   (no SHA match — diagnostic, destructive no-override blocker)",
     "platform_signature is a coarse fingerprint matched against /proc/cpuinfo + future board-detect output.",
     "Wave 12 W12-B added 4 new entries for the office fleet (S19j Pro BB / S19k Pro / S21 / S19j Pro Amlogic). These mirror PROFILE_TABLE entries in `dcentrald-api/src/routes/restore_to_stock.rs` — `dcentos_revertable: \"live-test-required\"` until W13 runs the full preflight + NAND backup + flash + reboot loop on real hardware.",
     "Entries with sha256:`UNKNOWN` are placeholder rows for models we do not have a confirmed stock image for in the local archive — they let the operator see what the daemon WOULD recognize once a hash lands. The lookup helper treats UNKNOWN entries as not-found.",
@@ -23,8 +23,8 @@
       "local_path": "",
       "sha256": "21ff390e9b0f61f34853823db153475f6ab33b095a61c2fb7133e605dd2b7d81",
       "size_bytes": 63667414,
-      "dcentos_revertable": true,
-      "revert_notes": "Pre-July-2019 stock S9 firmware (550MHz autofreq). UNSIGNED — slot-flip via `fw_setenv firmware <inactive>` works clean and DCENT_OS can be flashed back over it without signing-oracle dependency. Recommended default for S9 home-test revert. + .",
+      "dcentos_revertable": false,
+      "revert_notes": "INVALIDATED 2026-07-15: the baked image hash remains evidence-backed, but the former restore route's selector safety claim does not. Local U-Boot inspection and live DCENT_OS evidence identify `firmware=1|2`; the old helper inferred authority from absent `bootslot` / `active_slot` keys and could target the running slot. Keep destructive restore disabled until a new evidence-backed transaction is implemented and validated end-to-end. This invalidation supersedes the earlier 'recommended default' claim; no new manifest schema field is introduced.",
       "added_by_wave": 10
     },
     {

@@ -20,6 +20,8 @@ use std::os::unix::io::RawFd;
 use std::path::Path;
 use std::process::ExitCode;
 
+use dcentrald_fabric_lease::{I2cLeasePurpose, OsI2cFabricLease, PhysicalI2cFabricId};
+
 const BOARD_TARGET_PATH: &str = "/etc/dcentos/board_target";
 const SUBTYPE_PATH: &str = "/etc/subtype";
 const I2C_PATH: &str = "/dev/i2c-0";
@@ -81,8 +83,8 @@ fn parse_inspect(arguments: &[String]) -> Result<Command, String> {
     let mut verbose = false;
     let mut index = 0;
 
-    while index < arguments.len() {
-        match arguments[index].as_str() {
+    while let Some(argument) = arguments.get(index) {
+        match argument.as_str() {
             "--all" if !all => all = true,
             "--all" => return Err("duplicate --all".into()),
             "--addr" if address.is_none() => {
@@ -210,21 +212,37 @@ fn require_exclusive_i2c_ownership() -> Result<(), String> {
 }
 
 struct I2cBus {
+    _fabric_lease: OsI2cFabricLease,
     fd: RawFd,
 }
 
 impl I2cBus {
     fn open() -> io::Result<Self> {
+        // This lease closes the /proc-scan-to-device-open race with every
+        // cooperating DCENT_OS daemon/tool. It must precede even the read-only
+        // device open because selecting and reading a slave consumes the whole
+        // physical adapter.
+        let fabric_lease = OsI2cFabricLease::acquire(
+            PhysicalI2cFabricId::linux_adapter(0),
+            I2cLeasePurpose::RecoveryInspection,
+        )
+        .map_err(|error| error.into_io_error())?;
         let path = b"/dev/i2c-0\0";
         let fd = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd < 0 {
             Err(io::Error::last_os_error())
         } else {
-            Ok(Self { fd })
+            Ok(Self {
+                _fabric_lease: fabric_lease,
+                fd,
+            })
         }
     }
 
     fn read_exact_byte(&self, address: S9PicAddress) -> io::Result<u8> {
+        self._fabric_lease
+            .validate_current_process()
+            .map_err(|error| error.into_io_error())?;
         let selected = unsafe {
             #[cfg(target_env = "musl")]
             {
@@ -374,8 +392,9 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use super::*;
-    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn args(values: &[&str]) -> Vec<String> {
@@ -467,6 +486,6 @@ mod tests {
         fs::write(second.join("cmdline"), b"/usr/sbin/dcentrald\0--flag\0").expect("cmdline");
 
         assert_eq!(dcentrald_processes(&root).expect("scan"), vec![123, 456]);
-        fs::remove_dir_all(PathBuf::from(root)).expect("cleanup");
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }

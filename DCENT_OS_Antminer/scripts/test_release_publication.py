@@ -30,14 +30,14 @@ class PublicationTests(unittest.TestCase):
         self, output: Path | None = None, expected_sha256: str | None = None
     ) -> subprocess.CompletedProcess[str]:
         command = [
-                sys.executable,
-                str(SCRIPT),
-                "copy",
-                "--source",
-                str(self.source),
-                "--output",
-                str(output or self.output),
-            ]
+            sys.executable,
+            str(SCRIPT),
+            "copy",
+            "--source",
+            str(self.source),
+            "--output",
+            str(output or self.output),
+        ]
         if expected_sha256 is not None:
             command.extend(["--expected-sha256", expected_sha256])
         return subprocess.run(
@@ -136,6 +136,158 @@ class PublicationTests(unittest.TestCase):
         )
         self.assertNotEqual(oversized.returncode, 0)
         self.assertFalse((self.root / "oversized.txt").exists())
+
+    def test_committed_copy_survives_closed_result_consumer(self) -> None:
+        read_descriptor, write_descriptor = os.pipe()
+        os.close(read_descriptor)
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "copy",
+                    "--source",
+                    str(self.source),
+                    "--output",
+                    str(self.output),
+                ],
+                stdout=write_descriptor,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        finally:
+            os.close(write_descriptor)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_bytes(), self.source.read_bytes())
+
+    def test_committed_copy_survives_closed_stdout_descriptor(self) -> None:
+        program = (
+            "import os, runpy, sys; "
+            "script = sys.argv[1]; sys.path.insert(0, os.path.dirname(script)); "
+            "sys.argv = sys.argv[1:]; "
+            "os.close(sys.stdout.fileno()); "
+            "runpy.run_path(script, run_name='__main__')"
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                program,
+                str(SCRIPT),
+                "copy",
+                "--source",
+                str(self.source),
+                "--output",
+                str(self.output),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_bytes(), self.source.read_bytes())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal delivery regression")
+    def test_signal_before_linearization_cleans_staging_and_publishes_nothing(
+        self,
+    ) -> None:
+        code = f"""
+import argparse
+import importlib.util
+import os
+from pathlib import Path
+import signal
+import sys
+
+script = Path({str(SCRIPT)!r})
+sys.path.insert(0, str(script.parent))
+spec = importlib.util.spec_from_file_location("release_publication_signal_test", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+real_publish = module.publish_staged_file
+
+def signal_before_commit(*args, **kwargs):
+    refuse_pending = kwargs["_after_staged_open"]
+    def inject_signal():
+        os.kill(os.getpid(), signal.SIGTERM)
+        refuse_pending()
+    kwargs["_after_staged_open"] = inject_signal
+    return real_publish(*args, **kwargs)
+
+module.publish_staged_file = signal_before_commit
+module.publish(argparse.Namespace(
+    command="copy",
+    source={str(self.source)!r},
+    output={str(self.output)!r},
+    expected_sha256=None,
+))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("before durable release publication", result.stderr)
+        self.assertFalse(self.output.exists())
+        self.assertEqual(
+            list(self.root.glob(f".{self.output.name}.publication-pending.*")), []
+        )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal delivery regression")
+    def test_signal_after_linearization_cannot_revoke_commit(self) -> None:
+        code = f"""
+import argparse
+import importlib.util
+import os
+from pathlib import Path
+import signal
+import sys
+
+script = Path({str(SCRIPT)!r})
+sys.path.insert(0, str(script.parent))
+spec = importlib.util.spec_from_file_location("release_publication_signal_test", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+real_publish = module.publish_staged_file
+
+def signal_after_commit(*args, **kwargs):
+    result = real_publish(*args, **kwargs)
+    os.kill(os.getpid(), signal.SIGTERM)
+    return result
+
+module.publish_staged_file = signal_after_commit
+module.publish(argparse.Namespace(
+    command="copy",
+    source={str(self.source)!r},
+    output={str(self.output)!r},
+    expected_sha256=None,
+))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ignored signal", result.stderr)
+        self.assertEqual(self.output.read_bytes(), self.source.read_bytes())
+        self.assertEqual(
+            list(self.root.glob(f".{self.output.name}.publication-pending.*")), []
+        )
+
+    def test_copy_uses_shared_strict_no_clobber_publication(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("publish_staged_file(", source)
+        self.assertIn("require_directory_sync=True", source)
+        self.assertIn("require_staged_cleanup=True", source)
+        self.assertIn("expected_staged_identity=temporary_identity", source)
+        self.assertIn(
+            "_after_staged_open=termination.refuse_pending_before_commit", source
+        )
+        self.assertNotIn("os.link(", source)
 
     @unittest.skipUnless(os.name == "nt", "NTFS junction regression is Windows-only")
     def test_windows_junction_parent_is_rejected(self) -> None:

@@ -123,8 +123,17 @@ impl BapFrame {
 
     /// Encode this frame to an on-the-wire byte sequence with the NMEA XOR
     /// checksum + `\r\n` terminator.
+    ///
+    /// `param`/`value` are caller-supplied and may carry arbitrary octets (an
+    /// SSID legally can contain CR/LF). CR/LF are the frame terminator, so an
+    /// embedded `\r\n` would emit a premature terminator mid-frame and produce
+    /// an unparseable / desynchronising wire frame at the accessory. Strip them
+    /// here (commas, `$` and `*` are legal inside values and are handled by the
+    /// parser's resync, so they are left intact).
     pub fn encode(&self) -> Vec<u8> {
-        let body = format!("BAP,{},{},{}", self.cmd.as_str(), self.param, self.value);
+        let param = strip_framing_bytes(&self.param);
+        let value = strip_framing_bytes(&self.value);
+        let body = format!("BAP,{},{},{}", self.cmd.as_str(), param, value);
         let checksum = nmea_xor(body.as_bytes());
         let mut out = Vec::with_capacity(body.len() + 8);
         out.push(b'$');
@@ -140,6 +149,13 @@ impl BapFrame {
 /// XOR of every byte of `bytes`. Matches NMEA-0183 / ESP-Miner's checksum.
 pub fn nmea_xor(bytes: &[u8]) -> u8 {
     bytes.iter().fold(0u8, |acc, b| acc ^ b)
+}
+
+/// Remove the CR/LF frame-terminator bytes from a caller-supplied field so it
+/// cannot prematurely terminate the encoded frame. Only `\r`/`\n` are removed;
+/// all other bytes (including commas, `$`, `*`) are preserved verbatim.
+fn strip_framing_bytes(s: &str) -> String {
+    s.chars().filter(|&c| c != '\r' && c != '\n').collect()
 }
 
 /// Protocol-layer safety envelope for mutating `SET` commands (BAP-2).
@@ -408,6 +424,32 @@ mod tests {
         assert_eq!(frame.cmd, BapCommand::Req);
         assert_eq!(frame.param, "hashrate");
         assert_eq!(frame.value, "");
+    }
+
+    #[test]
+    fn encode_strips_crlf_so_frame_stays_single_and_parseable() {
+        // A value carrying an embedded CR/LF (SSIDs are arbitrary octets and may
+        // legally contain them) must not emit a premature terminator: the
+        // encoded frame stays a single, fully parseable frame.
+        let wire = BapFrame::new(BapCommand::Res, "wifi", "My\r\nSSID").encode();
+        // Exactly one CR and one LF remain — the terminator, at the very end.
+        assert_eq!(wire.iter().filter(|&&b| b == b'\n').count(), 1);
+        assert_eq!(wire.iter().filter(|&&b| b == b'\r').count(), 1);
+        assert!(wire.ends_with(b"\r\n"));
+        // Round-trips as ONE complete frame with CR/LF stripped from the value
+        // (before the fix the embedded terminator split it into two fragments).
+        match next_frame_scan(&wire) {
+            FrameScan::Frame { frame, consumed } => {
+                assert_eq!(consumed, wire.len());
+                assert_eq!(frame.param, "wifi");
+                assert_eq!(frame.value, "MySSID");
+            }
+            other => panic!("expected a single complete frame, got {other:?}"),
+        }
+        // param is sanitized on the same path.
+        let wire2 = BapFrame::new(BapCommand::Ack, "a\rb\n", "").encode();
+        assert_eq!(wire2.iter().filter(|&&b| b == b'\n').count(), 1);
+        assert_eq!(wire2.iter().filter(|&&b| b == b'\r').count(), 1);
     }
 
     #[test]

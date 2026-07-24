@@ -159,6 +159,7 @@ pub(crate) fn check_csrf(
 pub fn register_api(server: &mut EspHttpServer, state: SharedState) {
     auth::register_auth_api(server, state.clone());
     register_system_info(server, state.clone());
+    register_donation_info(server, state.clone());
     register_capabilities(server, state.clone());
     register_system_asic(server, state.clone());
     register_system_statistics(server, state.clone());
@@ -1085,6 +1086,7 @@ fn register_system_info(server: &mut EspHttpServer, state: SharedState) {
         let is_using_fallback = primary_status
             .map(|status| status.failover_active as u8)
             .unwrap_or(0);
+        let donating = primary_status.map(|status| status.donating).unwrap_or(false);
         let response_time_ms = active_status
             .map(|status| status.last_share_response_ms)
             .unwrap_or(0.0);
@@ -1317,6 +1319,9 @@ fn register_system_info(server: &mut EspHttpServer, state: SharedState) {
             pool_connected,
             is_using_fallback_stratum: is_using_fallback,
             pool_connection_info: pool_connection_info.as_str(),
+            donation_set: config.donation.enabled,
+            donating,
+            donation_percent: config.donation.percent,
 
             // ---- Memory (ESP-Miner: esp_get_free_heap_size) ----
             is_psram_available: psram_available,
@@ -1373,6 +1378,8 @@ fn register_system_info(server: &mut EspHttpServer, state: SharedState) {
             stratum_v2_available: cfg!(feature = "stratum-v2"),
             // ESP-5: SV2 is mock-validated/experimental, not live-proven.
             stratum_v2_experimental: true,
+            stratum_v2_status: "implemented + unit-tested; live delivery pending",
+            mining_mode: config.mining_mode.as_str(),
 
             // ---- Fallback stratum config ----
             fallback_stratum_url: fallback_url_masked.as_str(),
@@ -1577,6 +1584,47 @@ fn register_system_info(server: &mut EspHttpServer, state: SharedState) {
         serde_json::to_writer(&mut StdJsonWriter(&mut resp), &info)?;
         Ok(())
     }).expect("Failed to register GET /api/system/info");
+}
+
+/// Public, read-only trust-but-verify disclosure. No credentials are returned;
+/// the payout address is firmware-baked and auditable on-chain.
+fn register_donation_info(server: &mut EspHttpServer, state: SharedState) {
+    server
+        .fn_handler(
+            "/api/donation/info",
+            Method::Get,
+            move |req| -> Result<(), Box<dyn std::error::Error>> {
+                let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
+                let statuses = stratum_status_snapshots(&state);
+                let donating = statuses.first().map(|status| status.donating).unwrap_or(false);
+                let pool_url = crate::shared::sanitize_pool_url(&config.donation.pool_url);
+                let pool_host = pool_url
+                    .strip_prefix("stratum+tcp://")
+                    .unwrap_or(pool_url.as_str());
+                let explorer_url = format!(
+                    "https://mempool.space/address/{}",
+                    crate::config::DONATION_PAYOUT_ADDRESS
+                );
+                let body = json!({
+                    "pool_url": pool_url,
+                    "pool_host": pool_host,
+                    "worker": config.donation.worker,
+                    "payout_address": crate::config::DONATION_PAYOUT_ADDRESS,
+                    "explorer_url": explorer_url,
+                    "explorer_name": "mempool.space",
+                    "verify_label": "View on-chain payout history",
+                    "trust_model": "trust_but_verify",
+                    "disclosure": "Donation slice flows to the address above. Verify on the block explorer.",
+                    "enabled": config.donation.enabled,
+                    "donating": donating,
+                    "percent": config.donation.percent,
+                });
+                let mut resp = req.into_response(200, None, &JSON_HEADERS)?;
+                serde_json::to_writer(&mut StdJsonWriter(&mut resp), &body)?;
+                Ok(())
+            },
+        )
+        .expect("Failed to register GET /api/donation/info");
 }
 
 /// GET /api/v1/capabilities -- shared DCENT_OS capability descriptor.
@@ -2077,6 +2125,8 @@ fn register_system_config(server: &mut EspHttpServer, state: SharedState) {
             "stratumProtocol": stratum_protocol_short(&config.stratum),
             "stratumV2Available": cfg!(feature = "stratum-v2"),
             "stratumV2Experimental": true,
+            "stratumV2Status": "implemented + unit-tested; live delivery pending",
+            "miningMode": config.mining_mode.as_str(),
             "sv2OwnTemplatesEnabled": config.sv2_own_templates.enabled,
             "sv2TemplateProxyURL": config.sv2_own_templates.mining_proxy_url,
             "sv2TemplateProviderURL": config.sv2_own_templates.template_provider_url,
@@ -2107,6 +2157,28 @@ fn register_system_config(server: &mut EspHttpServer, state: SharedState) {
             "splitPoolUser": config.split_pool.as_ref().map(|s| crate::shared::mask_wallet(&s.pool.worker_name)).unwrap_or_default(),
             "splitPoolProtocol": config.split_pool.as_ref().map(|s| stratum_protocol_short(&s.pool)).unwrap_or("v1"),
             "splitPoolPct": config.split_pool.as_ref().map(|s| s.hashrate_pct).unwrap_or(0),
+
+            // Voluntary time-sliced donation. Passwords are never returned.
+            "donationEnabled": config.donation.enabled,
+            "donationPercent": config.donation.percent,
+            "donationPoolURL": crate::shared::sanitize_pool_url(&config.donation.pool_url),
+            "donationWorker": config.donation.worker,
+            "donationPasswordSet": !config.donation.password.is_empty(),
+            "donationFallbackEnabled": config.donation.fallback_enabled,
+            "donationFallbackPoolURL": crate::shared::sanitize_pool_url(&config.donation.fallback_pool_url),
+            "donationFallbackWorker": config.donation.fallback_worker,
+            "donationFallbackPasswordSet": !config.donation.fallback_password.is_empty(),
+            "donationCycleDuration": config.donation.cycle_duration_s,
+
+            // Outbound notifications. Secrets/webhook URLs are never returned.
+            "notificationsEnabled": config.notifications.enabled,
+            "telegramConfigured": !config.notifications.telegram_bot_token.is_empty() && !config.notifications.telegram_chat_id.is_empty(),
+            "discordConfigured": !config.notifications.discord_webhook_url.is_empty(),
+            "slackConfigured": !config.notifications.slack_webhook_url.is_empty(),
+            "notificationShareMilestone": config.notifications.share_milestone,
+            "notificationThermalAlerts": config.notifications.thermal_alerts,
+            "notificationFailoverAlerts": config.notifications.failover_alerts,
+            "notificationOtaAlerts": config.notifications.ota_alerts,
 
             // Device identity
             "hostname": hostname_str,
@@ -2766,6 +2838,158 @@ fn apply_config_updates(state: &SharedState, body: &[u8]) -> Result<(), String> 
             info!("API: WiFi password changed (redacted)");
             config.wifi_password = v.to_string();
             wifi_changed = true;
+        }
+
+        // ---- Voluntary donation routing ----
+        // Stage then validate so a rejected PATCH never mutates live config.
+        let donation_keys = [
+            "donationEnabled",
+            "donationPercent",
+            "donationPoolURL",
+            "donationWorker",
+            "donationPassword",
+            "donationFallbackEnabled",
+            "donationFallbackPoolURL",
+            "donationFallbackWorker",
+            "donationFallbackPassword",
+            "donationCycleDuration",
+        ];
+        if donation_keys.iter().any(|key| updates.get(*key).is_some()) {
+            let mut donation = config.donation.clone();
+            if let Some(value) = updates
+                .get("donationEnabled")
+                .and_then(|value| value.as_bool().or_else(|| value.as_u64().map(|n| n != 0)))
+            {
+                donation.enabled = value;
+            }
+            if let Some(value) = updates
+                .get("donationPercent")
+                .and_then(|value| value.as_f64())
+            {
+                donation.percent = value as f32;
+            }
+            if let Some(value) = updates
+                .get("donationPoolURL")
+                .and_then(|value| value.as_str())
+            {
+                donation.pool_url = value.trim().to_string();
+            }
+            if let Some(value) = updates
+                .get("donationWorker")
+                .and_then(|value| value.as_str())
+            {
+                donation.worker = value.trim().to_string();
+            }
+            if let Some(value) = updates
+                .get("donationPassword")
+                .and_then(|value| value.as_str())
+            {
+                if !value.is_empty() && value != "***" {
+                    info!("API: donation password changed (redacted)");
+                    donation.password = value.to_string();
+                }
+            }
+            if let Some(value) = updates
+                .get("donationFallbackEnabled")
+                .and_then(|value| value.as_bool().or_else(|| value.as_u64().map(|n| n != 0)))
+            {
+                donation.fallback_enabled = value;
+            }
+            if let Some(value) = updates
+                .get("donationFallbackPoolURL")
+                .and_then(|value| value.as_str())
+            {
+                donation.fallback_pool_url = value.trim().to_string();
+            }
+            if let Some(value) = updates
+                .get("donationFallbackWorker")
+                .and_then(|value| value.as_str())
+            {
+                donation.fallback_worker = value.trim().to_string();
+            }
+            if let Some(value) = updates
+                .get("donationFallbackPassword")
+                .and_then(|value| value.as_str())
+            {
+                if !value.is_empty() && value != "***" {
+                    info!("API: donation fallback password changed (redacted)");
+                    donation.fallback_password = value.to_string();
+                }
+            }
+            if let Some(value) = updates
+                .get("donationCycleDuration")
+                .and_then(|value| value.as_u64())
+            {
+                donation.cycle_duration_s = value;
+            }
+            donation.validate()?;
+            config.donation = donation;
+            pool_changed = true;
+        }
+
+        // ---- Outbound notifications ----
+        if let Some(value) = updates
+            .get("notificationsEnabled")
+            .and_then(|value| value.as_bool().or_else(|| value.as_u64().map(|n| n != 0)))
+        {
+            config.notifications.enabled = value;
+        }
+        if let Some(value) = updates
+            .get("telegramBotToken")
+            .and_then(|value| value.as_str())
+        {
+            if !value.is_empty() && value != "***" {
+                info!("API: Telegram bot token changed (redacted)");
+                config.notifications.telegram_bot_token = value.to_string();
+            }
+        }
+        if let Some(value) = updates
+            .get("telegramChatId")
+            .and_then(|value| value.as_str())
+        {
+            config.notifications.telegram_chat_id = value.trim().to_string();
+        }
+        if let Some(value) = updates
+            .get("discordWebhookURL")
+            .and_then(|value| value.as_str())
+        {
+            if !value.is_empty() && value != "***" {
+                info!("API: Discord webhook changed (redacted)");
+                config.notifications.discord_webhook_url = value.to_string();
+            }
+        }
+        if let Some(value) = updates
+            .get("slackWebhookURL")
+            .and_then(|value| value.as_str())
+        {
+            if !value.is_empty() && value != "***" {
+                info!("API: Slack webhook changed (redacted)");
+                config.notifications.slack_webhook_url = value.to_string();
+            }
+        }
+        if let Some(value) = updates
+            .get("notificationShareMilestone")
+            .and_then(|value| value.as_u64())
+        {
+            config.notifications.share_milestone = value;
+        }
+        if let Some(value) = updates
+            .get("notificationThermalAlerts")
+            .and_then(|value| value.as_bool().or_else(|| value.as_u64().map(|n| n != 0)))
+        {
+            config.notifications.thermal_alerts = value;
+        }
+        if let Some(value) = updates
+            .get("notificationFailoverAlerts")
+            .and_then(|value| value.as_bool().or_else(|| value.as_u64().map(|n| n != 0)))
+        {
+            config.notifications.failover_alerts = value;
+        }
+        if let Some(value) = updates
+            .get("notificationOtaAlerts")
+            .and_then(|value| value.as_bool().or_else(|| value.as_u64().map(|n| n != 0)))
+        {
+            config.notifications.ota_alerts = value;
         }
 
         // ---- MQTT + Home Assistant auto-discovery ----
@@ -4141,6 +4365,14 @@ fn register_ota(server: &mut EspHttpServer, state: SharedState) {
             "API: OTA accepted and boot partition scheduled. {} bytes written; rebooting...",
             total_received
         );
+        if let Ok(config) = state_post.config.lock() {
+            crate::notifications::spawn_event(
+                config.notifications.clone(),
+                crate::notifications::NotificationKind::Ota,
+                "Firmware update accepted",
+                format!("{} bytes written; reboot pending", total_received),
+            );
+        }
 
         let msg = serde_json::json!({
             "success": true,

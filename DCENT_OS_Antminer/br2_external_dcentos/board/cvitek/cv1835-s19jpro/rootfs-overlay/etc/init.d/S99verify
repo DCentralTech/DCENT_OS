@@ -22,7 +22,7 @@
 #   V2  mcp-reachable          : MCP HTTP /health on :3000.
 #   V3  dashboard-served       : Dashboard HTTP root on :80 or :8080.
 #   V4  dcentrald-running      : pgrep dcentrald + process age > 30 s
-#                                (rules out crash-loops).
+#                                (proves stable ownership during this window).
 #   V5  psu-engaged            : per-family rail-enable GPIO asserted (HIGH)
 #                                when mining is enabled; de-asserted (LOW) is
 #                                valid for management-only quiet idle.
@@ -62,12 +62,14 @@
 #                                  am3-bb: am3_bb_no_nonce_stall.
 #                                  am3-aml: am3_aml_no_nonce_stall.
 #                                  cv1835: cv1835_no_nonce_stall.
-#   V14 upgrade-commit-state   : report the platform upgrader's commit state.
-#                                S99verify is a proof consumer and never
-#                                mutates U-Boot environment state.
+#   V14 upgrade-commit-state   : report the platform updater's maturity or
+#                                commit state. On CV1835 this remains red:
+#                                persistent update is NOT IMPLEMENTED for the
+#                                BuiltInVolatile/p2-selector fingerprints.
 #
-# CONTRACT: failures are logged loudly to syslog. S99verify does NOT
-# auto-revert -- that authority belongs to S99upgrade / U-Boot bootcount.
+# CONTRACT: failures are logged loudly to syslog. S99verify never mutates
+# storage or performs recovery. CV1835 has no implemented persistent updater,
+# automatic revert, persistent boot count, or p2 marker-write transaction.
 # The JSON output is the contract; downstream consumers decide.
 #
 # D-Central Technologies - DCENT_OS Phase 4F + 4A multi-family port
@@ -438,9 +440,9 @@ check_dcentrald_running() {
         return
     fi
     pid=$(pidof dcentrald 2>/dev/null | awk '{print $1}')
-    # Age check: if the process is younger than 30 s it might be a crash-loop
-    # restart from S82dcentrald's wrapper. We surface this so the operator
-    # knows to look at the wrapper restart counter.
+    # Age check: a newly started process has not yet supplied a stability proof.
+    # S82dcentrald does not automatically readmit after an abnormal exit, but an
+    # explicit operator or upgrade replacement can still occur during this gate.
     if [ -r /proc/$pid/stat ]; then
         proc_uptime=$(awk '{print $22}' /proc/$pid/stat 2>/dev/null)
         sys_uptime_hz=$(awk '{print $1 * 100}' /proc/uptime 2>/dev/null | awk -F. '{print $1}')
@@ -839,8 +841,12 @@ check_upgrade_stage_cleared() {
             emit_check V14 true "commit authority delegated to Amlogic S99upgrade (firstboot); S99verify is report-only"
             return
             ;;
-        am3-bb|cv1835)
+        am3-bb)
             emit_check V14 true "platform upgrade verifier is report-only; S99verify performs no U-Boot env mutation"
+            return
+            ;;
+        cv1835)
+            emit_check V14 false "CV1835 persistent update NOT IMPLEMENTED: BuiltInVolatile environment is mutation-denied and no p2 marker-write transaction exists"
             return
             ;;
         am2)
@@ -952,8 +958,7 @@ EOF
     else
         logline "PROOF MATRIX FAILED (one or more V1..V14 red); JSON: $OUT_JSON"
         # Loud syslog event for the dashboard event log to pick up. S99verify
-        # does NOT auto-revert -- that authority belongs to S99upgrade /
-        # U-Boot bootcount per QA report Q2 contract.
+        # is report-only and never performs update commit or automatic revert.
         logger -t S99verify -p user.warning -- "post-flash proof matrix FAILED -- see $OUT_JSON and $LOGFILE" 2>/dev/null || true
     fi
 }

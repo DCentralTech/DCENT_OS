@@ -15,7 +15,7 @@ Core features:
 - All existing AxeOS features preserved (web UI, REST API, OTA, swarm)
 - Hex multi-chip management, swarm coordination
 - D-Central pool as default, space heater integration
-- Zero dev fee, fully open source (GPL-3.0)
+- Transparent voluntary donation (default ON at 2%, one-toggle OFF), fully open source (GPL-3.0)
 
 ## Base: ESP-Miner / AxeOS
 - **URL**: https://github.com/bitaxeorg/ESP-Miner

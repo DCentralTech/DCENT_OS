@@ -6,6 +6,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DRIVER="$SCRIPT_DIR/build_in_docker.sh"
 CARGO_DRIVER="$SCRIPT_DIR/build-dcentrald.sh"
+NON_S9_REBUILD="$SCRIPT_DIR/rebuild_all_non_s9.sh"
+SIGNING_REHEARSAL="$SCRIPT_DIR/sign_release_dry_run.sh"
 SOURCE_CLOSURE="$SCRIPT_DIR/source_closure.py"
 WORKFLOW="$SCRIPT_DIR/../../../.github/workflows/dcentos-image-smoke.yml"
 
@@ -52,6 +54,7 @@ assert driver_targets == policy.BUILD_DRIVER_TARGETS, (
 )
 assert not (set(policy.BUILD_TARGET_POLICIES) & set(policy.BLOCKED_BUILD_INPUT_TARGETS))
 assert set(policy.BUILD_TARGET_POLICIES) | set(policy.BLOCKED_BUILD_INPUT_TARGETS) == driver_targets
+assert "cv1835-s19jpro" not in policy.BUILD_DRIVER_TARGETS
 assert policy.TARGET_BUILD_INPUTS["cargo-workspace"] == ()
 for target in policy.BUILD_TARGET_POLICIES:
     selected = policy.TARGET_BUILD_INPUTS[target]
@@ -87,6 +90,61 @@ assert tuple(sorted(policy.PREBUILT_RUST_INPUTS_BY_TARGET["s9"])) == (
 assert "target: am2-s19jpro" not in workflow
 assert "bash scripts/build_in_docker.sh" not in workflow
 assert "bash scripts/build-dcentrald.sh" not in workflow
+
+# Current board guides must not advertise the deliberately disabled mutable
+# packaging lane. The target arms in the inner driver are future capsule
+# recipes, not operator entrypoints.
+board_docs = repo_root / "DCENT_OS_Antminer/br2_external_dcentos/board"
+for readme_path in board_docs.glob("**/README.md"):
+    readme = readme_path.read_text(encoding="utf-8")
+    assert not re.search(
+        r"(?m)^\s*(?:bash\s+)?(?:DCENT_OS_Antminer/)?scripts/build_in_docker\.sh\b",
+        readme,
+    ), readme_path
+    assert not re.search(r"(?m)^\s*make\s+dev(?:\s|$)", readme), readme_path
+    assert not re.search(r"(?m)^\s*make\s+release(?:\s|$)", readme), readme_path
+
+# The inner packaging driver is capability-bound. Only its authenticated S9
+# capsule may execute it; other build helpers may describe it but cannot use it
+# as a mutable fallback.
+scripts_dir = repo_root / "DCENT_OS_Antminer/scripts"
+direct_inner_driver = re.compile(
+    r"""^\s*(?:bash\s+)?["']?(?:\$[A-Z_]+/)?build_in_docker\.sh["']?(?:\s|$)"""
+)
+for wrapper_path in scripts_dir.glob("build*.sh"):
+    if wrapper_path.name in {"build_in_docker.sh", "build_s9_release_capsule.sh"}:
+        continue
+    for line_number, line in enumerate(
+        wrapper_path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        assert not direct_inner_driver.search(line), (wrapper_path, line_number, line)
+
+signing_rehearsal = (scripts_dir / "sign_release_dry_run.sh").read_text(encoding="utf-8")
+assert "bash DCENT_OS_Antminer/scripts/build_in_docker.sh --target" not in signing_rehearsal
+assert "make -C DCENT_OS_Antminer release RELEASE_TARGET=s9" in signing_rehearsal
+assert "has no authenticated real-key packaging capsule" in signing_rehearsal
+
+makefile = (repo_root / "DCENT_OS_Antminer/Makefile").read_text(encoding="utf-8")
+assert "RELEASE_TARGET=s9|am2" not in makefile
+assert "DEV_TARGET=s9|am2" not in makefile
+assert "Production S9 capsule only" in makefile
+assert "Image packaging disabled until a separate lab capsule exists" in makefile
+
+xil25_runbook = (
+    repo_root
+    / "DCENT_OS_Antminer/docs/dev/2026-06-14-xil25-production-readiness/NAND_BAKE_RUNBOOK.md"
+).read_text(encoding="utf-8")
+assert "bash DCENT_OS_Antminer/scripts/build_in_docker.sh --target" not in xil25_runbook
+assert "A new AM2 build requires a" in xil25_runbook
+assert "target-specific capsule; none is currently admitted" in xil25_runbook
+
+release_readme = (repo_root / "DCENT_OS_Antminer/release/README.md").read_text(
+    encoding="utf-8"
+)
+assert "make dev` / `--lab-unsigned" not in release_readme
+assert "no lab package is produced" in release_readme
+assert "does not grant packaging authority" in release_readme
+
 for required in (
     "bash scripts/build_s9_release_capsule.sh",
     "python3 scripts/portable_release_evidence.py verify",
@@ -102,8 +160,7 @@ PY
 
 # Direct packaging has no invocation/source/result authority and must stop
 # before even scanning provenance or probing Docker. Target-policy assertions
-# above independently keep CV blocked for a future capsule port until its
-# kernel producer is pinned.
+# above deliberately exclude CV: it has no artifact lane to preflight.
 TMPDIR_TEST="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR_TEST"' EXIT
 mkdir -p "$TMPDIR_TEST/bin"
@@ -120,11 +177,47 @@ if PATH="$TMPDIR_TEST/bin:$PATH" \
     echo "ERROR: CV build-input preflight accepted a target with no pinned kernel" >&2
     exit 1
 fi
-grep -Fq 'direct Buildroot packaging is disabled until a separate lab capsule exists' \
+grep -Fq 'cv1835-s19jpro has no firmware, sysupgrade, or supported artifact build lane' \
     "$TMPDIR_TEST/stderr"
 if [ -e "$TMPDIR_TEST/docker-called" ]; then
     echo "ERROR: CV refusal occurred after Docker was invoked" >&2
     exit 1
 fi
+
+# The legacy non-S9 sweep must not loop through a driver that rejects every
+# direct invocation or leave partial digest evidence behind.
+if bash "$NON_S9_REBUILD" >"$TMPDIR_TEST/rebuild-stdout" 2>"$TMPDIR_TEST/rebuild-stderr"; then
+    echo "ERROR: non-S9 rebuild helper claimed an admitted build path" >&2
+    exit 1
+fi
+grep -Fq 'non-S9 image rebuilding is unavailable' "$TMPDIR_TEST/rebuild-stderr"
+grep -Fq 'no build, digest, partial pin, or publication files were written' \
+    "$TMPDIR_TEST/rebuild-stderr"
+if grep -Fq 'bash "$SCRIPT_DIR/build_in_docker.sh"' "$NON_S9_REBUILD"; then
+    echo "ERROR: non-S9 inventory still invokes the disabled direct driver" >&2
+    exit 1
+fi
+bash "$NON_S9_REBUILD" --list >"$TMPDIR_TEST/rebuild-list"
+grep -Fq 'am3-s21pro|dcentos-sysupgrade-am3-s21pro.tar' \
+    "$TMPDIR_TEST/rebuild-list"
+grep -Fq 'am3-bb-s19jpro|dcentos-am3-bb-s19jpro-sdcard.tar' \
+    "$TMPDIR_TEST/rebuild-list"
+
+if DCENT_RELEASE_SIGNING_KEY=sentinel \
+    sh "$SIGNING_REHEARSAL" --target s9 \
+    >"$TMPDIR_TEST/sign-s9-stdout" 2>"$TMPDIR_TEST/sign-s9-stderr"; then
+    echo "ERROR: signing rehearsal accepted a configured real key" >&2
+    exit 1
+fi
+grep -Fq 'make -C DCENT_OS_Antminer release RELEASE_TARGET=s9' \
+    "$TMPDIR_TEST/sign-s9-stderr"
+if DCENT_RELEASE_SIGNING_KEY=sentinel \
+    sh "$SIGNING_REHEARSAL" --target am3-s21 \
+    >"$TMPDIR_TEST/sign-am3-stdout" 2>"$TMPDIR_TEST/sign-am3-stderr"; then
+    echo "ERROR: signing rehearsal accepted a configured real key" >&2
+    exit 1
+fi
+grep -Fq 'No real-key packaging command is admitted for target am3-s21' \
+    "$TMPDIR_TEST/sign-am3-stderr"
 
 echo "build-input preflight: PASS"

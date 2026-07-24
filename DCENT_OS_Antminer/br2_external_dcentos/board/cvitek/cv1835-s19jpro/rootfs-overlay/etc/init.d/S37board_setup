@@ -1,0 +1,18 @@
+#!/bin/sh
+# CV1835 shadow for the inherited Amlogic GPIO/PWM board initializer.
+# No CV1835 pre-userspace power or cooling mutation sequence is validated.
+
+case "$1" in
+    start|restart)
+        printf '%s\n' 'S37board_setup cv1835-s19jpro: hardware mutation NOT IMPLEMENTED; preserving bootloader/kernel state'
+        ;;
+    stop)
+        :
+        ;;
+    *)
+        printf 'Usage: %s {start|stop|restart}\n' "$0" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

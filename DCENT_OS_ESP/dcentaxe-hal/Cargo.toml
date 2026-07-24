@@ -25,6 +25,15 @@ pins-nerd = []         # I2C SDA=43, SCL=44
 # non-LoRa SKU pays zero bytes. Pins LOCKED — netlist-confirmed 9/9
 # (dcent-axe-BM1397 FULL_PREFAB_REVIEW_2026-07-11).
 pins-lora = []
+# W5500 SPI-Ethernet (DCENT LAN Mod, PLAN-E) pin map + MAC-derivation rule —
+# BAP/J4 lines 39/40/41/42 on SPI2, ESP-Miner-LAN parity. DEFAULT-OFF, selected
+# transitively by the `dcentaxe` binary's default-OFF `eth-w5500` feature; a
+# non-LAN SKU pays zero bytes. This HAL module is PURE (host-testable pin map +
+# constants only); the esp-idf `esp_eth` bring-up seam lives in the `dcentaxe`
+# binary (`eth_w5500.rs`) because it needs ESP-IDF cfg propagation (build.rs)
+# this crate does not have. W5500-LAN excludes BAP-Touch (shared GPIO39/40 —
+# `board::validate_accessory_mode`) but coexists with LoRa (own SPI3 bus).
+eth-w5500 = []
 # Display hardware
 display-ssd1306 = []   # 128x32 I2C OLED (BitAxe)
 display-none = []      # Headless (NerdNOS, or web-dashboard-only)

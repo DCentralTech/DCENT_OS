@@ -22,23 +22,20 @@
 //! ttyS1 reads zero, FAN PWM pin still in SPI mode → fans never spin)
 //! becomes a class of debug nightmares. By encoding the table here:
 //!
-//! - The replay is a hard precondition for `CViTekPlatform::new()`,
-//!   so any code path that builds the platform sees the same CV1835
-//!   register state the dev-kit boot proved at hand-off.
-//! - Idempotent compare-then-write keeps it safe in passthrough
-//!   scenarios where another agent (recovery shell, a previous
-//!   dcentrald instance) already programmed pinmux.
+//! - Replay is retained as crate-private reverse-engineering code and is not
+//!   called by an admitted production constructor.
+//! - Compare-then-write makes a future explicitly reviewed experiment
+//!   idempotent when the observed state already matches the evidence table.
 //! - Host tests can pin the table contents without touching `/dev/mem`.
 //!
 //! ## Safety
 //!
 //! `replay_pinmux()` opens `/dev/mem` and mmaps each register page
 //! (4 KB on aarch64) at the cost of one mmap+munmap per address.
-//! `/dev/mem` open failures are propagated unchanged — there is NO
-//! fallback path. If `/dev/mem` is unavailable the platform refuses
-//! to construct, which is the correct fail-closed posture: every
-//! downstream subsystem (DevmemUart, fan PWM sysfs writes, GPIO
-//! direction sets) assumes pinmux is in the canonical state.
+//! `/dev/mem` open failures are propagated unchanged and there is no fallback.
+//! No production constructor calls this function; a future admitted caller
+//! must preserve that fail-closed result before enabling any dependent UART,
+//! fan, or GPIO operation.
 
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
@@ -252,13 +249,11 @@ pub const CV1835_PINMUX_TABLE: &[PinmuxEntry] = &[
 /// safe in passthrough scenarios where another process (recovery shell,
 /// crashed daemon) already programmed pinmux.
 ///
-/// Fail-fast on `/dev/mem` open failure — there is NO fallback. Per the
-/// module-level safety doc: pinmux MUST be in the canonical state before
-/// any UART / I²C / GPIO code touches CV1835.
+/// Fail-fast on `/dev/mem` open failure — there is no fallback. This is a
+/// dormant crate-private experiment, not construction authority.
 ///
-/// On non-Linux hosts this is a no-op: the test harness has no `/dev/mem`
-/// and shouldn't try to mmap. This keeps the platform constructor unit-
-/// testable on Windows.
+/// On non-Linux hosts this is a no-op so tests can inspect the evidence table
+/// without attempting an mmap.
 pub fn replay_pinmux() -> Result<()> {
     #[cfg(target_os = "linux")]
     {

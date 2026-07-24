@@ -1,0 +1,13 @@
+schema=dcentos-sysupgrade-reconcile-status-abi1
+claim_intent_sha256=0000000000000000000000000000000000000000000000000000000000000000
+phase=quiescent
+revision=2
+ledger_generation=2
+previous_status_sha256=0000000000000000000000000000000000000000000000000000000000000000
+actor_id=Claim-1
+quiescence_sha256=dc6973596f5b6adb0fc1169fe60c926161eeb502bab2a6c3417765453125bd62
+evidence_type=maintenance-quiescence-v1
+evidence_size=15
+evidence_sha256=dc6973596f5b6adb0fc1169fe60c926161eeb502bab2a6c3417765453125bd62
+
+quiescent=true

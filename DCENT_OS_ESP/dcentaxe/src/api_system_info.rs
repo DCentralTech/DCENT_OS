@@ -82,6 +82,10 @@ pub struct SystemInfoResponse<'a> {
     pub pool_connected: bool,
     pub is_using_fallback_stratum: u8,
     pub pool_connection_info: &'a str,
+    /// Voluntary donation disclosure and live phase state.
+    pub donation_set: bool,
+    pub donating: bool,
+    pub donation_percent: f32,
 
     // ── Memory ──
     #[serde(rename = "isPSRAMAvailable")]
@@ -140,6 +144,8 @@ pub struct SystemInfoResponse<'a> {
     pub stratum_protocol: &'static str,
     pub stratum_v2_available: bool,
     pub stratum_v2_experimental: bool,
+    pub stratum_v2_status: &'static str,
+    pub mining_mode: &'static str,
 
     // ── Fallback stratum ──
     #[serde(rename = "fallbackStratumURL")]

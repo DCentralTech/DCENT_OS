@@ -383,13 +383,20 @@ function Test-ServiceSupervision {
         Test-Pattern $text 'start-stop-daemon\s+-S\s+-b\s+-m\s+-p\s+"\$PIDFILE"' ("{0} wrapper start" -f $service.Name) 'service starts under a tracked wrapper process' 'service does not visibly start under a tracked wrapper process' $service.Path
         Test-Pattern $text 'CHILD_PIDFILE=' ("{0} child pidfile" -f $service.Name) 'service tracks the child process PID' 'service does not track the child process PID' $service.Path
         Test-Pattern $text 'EXPECTFILE=' ("{0} expected exit marker" -f $service.Name) 'service marks expected exits before stop/replacement' 'service does not mark expected exits' $service.Path
-        Test-Pattern $text 'MAX_CRASH_RESTARTS=\d+' ("{0} restart bound" -f $service.Name) 'service has a bounded crash restart limit' 'service lacks a bounded crash restart limit' $service.Path
         Test-Pattern $text 'wait\s+\\?\$CHILD_PID' ("{0} child wait" -f $service.Name) 'service supervisor waits on the child process' 'service does not visibly wait on the child process' $service.Path
-        Test-Pattern $text 'restart limit reached' ("{0} restart cutoff" -f $service.Name) 'service logs and stops after restart limit' 'service lacks a visible restart cutoff' $service.Path
 
         if ($service.NeedsFanSafety) {
+            Test-Pattern $text 'automatic restart disabled until a durable hardware-disposition resolver is active' ("{0} fail-closed crash policy" -f $service.Name) 'dcentrald stops after one abnormal exit pending disposition resolution' 'dcentrald does not visibly refuse automatic crash readmission' $service.Path
+            if ($null -ne $text -and $text -notmatch 'MAX_CRASH_RESTARTS|RESTART_DELAY|CRASH_COUNT') {
+                Add-Result PASS ("{0} no crash loop" -f $service.Name) 'dcentrald has no automatic crash-restart state' $service.Path
+            } else {
+                Add-Result FAIL ("{0} no crash loop" -f $service.Name) 'dcentrald retains automatic crash-restart state' $service.Path
+            }
             Test-Pattern $text 'fan_safety_override' ("{0} fan safety" -f $service.Name) 'dcentrald crash/timeout path leaves fans in safety mode' 'dcentrald service lacks fan safety override' $service.Path
             Test-Pattern $text '(?m)^\s+safety\)' ("{0} safety action" -f $service.Name) 'dcentrald service exposes a safety action for supervisor calls' 'dcentrald service lacks a safety action for supervisor calls' $service.Path
+        } else {
+            Test-Pattern $text 'MAX_CRASH_RESTARTS=\d+' ("{0} restart bound" -f $service.Name) 'non-hardware service has a bounded crash restart limit' 'non-hardware service lacks a bounded crash restart limit' $service.Path
+            Test-Pattern $text 'restart limit reached' ("{0} restart cutoff" -f $service.Name) 'non-hardware service logs and stops after restart limit' 'non-hardware service lacks a visible restart cutoff' $service.Path
         }
     }
 }

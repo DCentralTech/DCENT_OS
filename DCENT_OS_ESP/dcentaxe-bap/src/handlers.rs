@@ -13,12 +13,21 @@ use crate::BapAppState;
 use crate::AppSnapshot;
 
 /// Dispatch one frame. Returns the reply frame to send (if any).
+///
+/// `now_ms` is supplied by the caller so that keepalive/subscription timing uses
+/// the SAME clock domain as `BapServer::tick_subscriptions` / `emit_due`. dispatch
+/// previously read its own `now_ms()` (esp_timer boot-relative on device,
+/// unix-epoch on host), which — if the tick loop drove a different clock base —
+/// made `now.saturating_sub(last_activity)` saturate to 0 so the AUX-9 idle drop
+/// never fired (subscriptions emitted forever to a disconnected accessory), or
+/// caused spurious drops on the opposite mismatch. One caller-owned clock removes
+/// the hazard.
 pub fn dispatch<S: BapAppState>(
     app: &S,
     subs: &mut SubscriptionManager,
     frame: &BapFrame,
+    now_ms: u64,
 ) -> Result<Option<BapFrame>, BapError> {
-    let now_ms = now_ms();
     subs.refresh_keepalive(now_ms);
 
     match frame.cmd {
@@ -120,19 +129,6 @@ fn apply_cmd<S: BapAppState>(
     Ok(Some(BapFrame::ack(cmd)))
 }
 
-#[cfg(target_os = "espidf")]
-fn now_ms() -> u64 {
-    unsafe { (esp_idf_hal::sys::esp_timer_get_time() / 1000) as u64 }
-}
-
-#[cfg(not(target_os = "espidf"))]
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,7 +194,7 @@ mod tests {
         let app = MockApp::default();
         let mut subs = SubscriptionManager::new();
         let frame = BapFrame::new(BapCommand::Req, "hashrate", "");
-        let reply = dispatch(&app, &mut subs, &frame).unwrap().unwrap();
+        let reply = dispatch(&app, &mut subs, &frame, 0).unwrap().unwrap();
         assert_eq!(reply.cmd, BapCommand::Res);
         assert_eq!(reply.param, "hashrate");
     }
@@ -208,7 +204,7 @@ mod tests {
         let app = MockApp::default();
         let mut subs = SubscriptionManager::new();
         let frame = BapFrame::new(BapCommand::Set, "frequency", "600");
-        let reply = dispatch(&app, &mut subs, &frame).unwrap().unwrap();
+        let reply = dispatch(&app, &mut subs, &frame, 0).unwrap().unwrap();
         assert_eq!(reply.cmd, BapCommand::Ack);
         assert_eq!(app.freq.get(), 600.0);
     }
@@ -218,7 +214,7 @@ mod tests {
         let app = MockApp::default();
         let mut subs = SubscriptionManager::new();
         let frame = BapFrame::new(BapCommand::Cmd, "restart_mining", "");
-        let reply = dispatch(&app, &mut subs, &frame).unwrap().unwrap();
+        let reply = dispatch(&app, &mut subs, &frame, 0).unwrap().unwrap();
         assert_eq!(reply.cmd, BapCommand::Ack);
         assert_eq!(app.restart_count.get(), 1);
     }
@@ -231,6 +227,7 @@ mod tests {
             &app,
             &mut subs,
             &BapFrame::new(BapCommand::Sub, "hashrate", "500"),
+            0,
         )
         .unwrap();
         assert_eq!(subs.len(), 1);
@@ -238,6 +235,7 @@ mod tests {
             &app,
             &mut subs,
             &BapFrame::new(BapCommand::Unsub, "hashrate", ""),
+            0,
         )
         .unwrap();
         assert_eq!(subs.len(), 0);
@@ -290,7 +288,7 @@ mod tests {
         // 2000 mV is above MAX_ASIC_VOLTAGE_MV (1600) → rejected, handler untouched.
         let over = BapFrame::new(BapCommand::Set, "asic_voltage", "2000");
         assert!(matches!(
-            dispatch(&app, &mut subs, &over),
+            dispatch(&app, &mut subs, &over, 0),
             Err(BapError::InvalidValue)
         ));
         assert_eq!(
@@ -301,19 +299,19 @@ mod tests {
 
         // A legal voltage passes through to the host handler.
         let ok = BapFrame::new(BapCommand::Set, "asic_voltage", "1200");
-        let reply = dispatch(&app, &mut subs, &ok).unwrap().unwrap();
+        let reply = dispatch(&app, &mut subs, &ok, 0).unwrap().unwrap();
         assert_eq!(reply.cmd, BapCommand::Ack);
         assert_eq!(app.applied_voltage.get(), Some(1200));
 
         // An over-100% fan and a NaN/garbage frequency are also rejected.
         let bad_fan = BapFrame::new(BapCommand::Set, "fan_speed", "200");
         assert!(matches!(
-            dispatch(&app, &mut subs, &bad_fan),
+            dispatch(&app, &mut subs, &bad_fan, 0),
             Err(BapError::InvalidValue)
         ));
         let bad_freq = BapFrame::new(BapCommand::Set, "frequency", "5000");
         assert!(matches!(
-            dispatch(&app, &mut subs, &bad_freq),
+            dispatch(&app, &mut subs, &bad_freq, 0),
             Err(BapError::InvalidValue)
         ));
     }
@@ -324,7 +322,7 @@ mod tests {
         let mut subs = SubscriptionManager::new();
         let frame = BapFrame::new(BapCommand::Req, "nonsense", "");
         assert!(matches!(
-            dispatch(&app, &mut subs, &frame),
+            dispatch(&app, &mut subs, &frame, 0),
             Err(BapError::UnknownParam)
         ));
     }

@@ -1,0 +1,12 @@
+[package]
+name = "dcentrald-fabric-lease"
+version.workspace = true
+edition = "2021"
+description = "Crash-released cross-process ownership for DCENT_OS hardware fabrics"
+license = "GPL-3.0"
+
+[dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

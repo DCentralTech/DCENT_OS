@@ -299,11 +299,9 @@ impl Bm1366Driver {
     ///
     /// The FPGA work_time counter runs at 100 MHz (200 MHz fabric clock / 2).
     pub fn calculate_work_time(freq_mhz: u16, midstate_count: u32) -> u32 {
-        const FPGA_WORK_CLK: f64 = 100_000_000.0;
-        let freq_hz = freq_mhz as f64 * 1_000_000.0;
-        let nonce_range = midstate_count as f64 * 524_288.0; // 2^19
-        let work_time = (0.9 * nonce_range / freq_hz * FPGA_WORK_CLK) as u32;
-        work_time.max(1)
+        // Delegate to the shared BM139x helper (this body was byte-identical to
+        // it). Matches the bm1397/bm1398 pattern; removes a duplicated copy.
+        crate::drivers::bm139x::calculate_work_time(freq_mhz, midstate_count)
     }
 
     fn read_pll_register(chain: &mut FpgaChain, chip_addr: u8) -> Result<Option<u32>> {

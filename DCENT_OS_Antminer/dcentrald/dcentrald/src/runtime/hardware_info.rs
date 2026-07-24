@@ -106,6 +106,94 @@ pub fn read_hashboard_eeprom_for_energize_gate(
     }
 }
 
+/// Read one hashboard identity prefix through the already-owned I2C service.
+///
+/// Unlike the legacy bootstrap/sysfs helper above, this operation never
+/// guesses between buses and never escapes the service queue. The handle binds
+/// the exact physical adapter; this AM2 topology helper resolves address
+/// `0x50+slot`, while the HAL requires that address to be admitted by the
+/// service's protected-endpoint policy and fixes the read to the 32-byte
+/// offset-zero identity prefix. Only the explicit kernel-endpoint readiness
+/// error is retried. Ownership, safety, policy, queue, and worker failures are
+/// returned immediately and must fail the energize path closed.
+pub fn read_hashboard_eeprom_prefix_via_service_for_energize_gate(
+    service: &dcentrald_hal::i2c::I2cServiceHandle,
+    slot: usize,
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>, OwnedEepromReadinessError> {
+    let slot_u8 = u8::try_from(slot)
+        .ok()
+        .filter(|slot| *slot <= 7)
+        .ok_or(OwnedEepromReadinessError::InvalidSlot { slot })?;
+    let addr = 0x50u8
+        .checked_add(slot_u8)
+        .ok_or(OwnedEepromReadinessError::InvalidSlot { slot })?;
+
+    loop {
+        match service.read_hashboard_eeprom_prefix_at(addr, deadline) {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) if is_retryable_owned_eeprom_readiness_error(&error) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(OwnedEepromReadinessError::Timeout { slot });
+                }
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(50)));
+            }
+            Err(source) => {
+                return Err(OwnedEepromReadinessError::Terminal { slot, source });
+            }
+        }
+    }
+}
+
+fn is_retryable_owned_eeprom_readiness_error(error: &dcentrald_hal::HalError) -> bool {
+    matches!(error, dcentrald_hal::HalError::I2cEndpointNotReady { .. })
+}
+
+/// Errors from a service-owned hashboard identity read.
+#[derive(Debug)]
+pub enum OwnedEepromReadinessError {
+    InvalidSlot {
+        slot: usize,
+    },
+    Timeout {
+        slot: usize,
+    },
+    /// A non-readiness error must not be retried or downgraded into telemetry.
+    Terminal {
+        slot: usize,
+        source: dcentrald_hal::HalError,
+    },
+}
+
+impl std::fmt::Display for OwnedEepromReadinessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSlot { slot } => {
+                write!(f, "invalid chain slot {slot} (must be 0..=7)")
+            }
+            Self::Timeout { slot } => {
+                write!(f, "EEPROM readiness timeout on chain slot {slot}")
+            }
+            Self::Terminal { slot, source } => {
+                write!(
+                    f,
+                    "terminal EEPROM service failure on chain slot {slot}: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for OwnedEepromReadinessError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Terminal { source, .. } => Some(source),
+            Self::InvalidSlot { .. } | Self::Timeout { .. } => None,
+        }
+    }
+}
+
 /// Errors surfaced by `read_hashboard_eeprom_for_energize_gate`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EepromReadinessError {
@@ -661,29 +749,16 @@ pub fn detect_control_board() -> String {
 
 /// Read miner serial number from EEPROM at I2C 0x51, fallback to MAC-derived.
 pub fn read_miner_serial() -> Option<String> {
-    // Try EEPROM (24C02 at addr 0x51) on available I2C buses.
-    // Zynq: EEPROM on bus 1. Amlogic S21: EEPROM on bus 1 (verified at .135).
-    // Try bus 1 first, then bus 0 as fallback.
-    let eeprom_buses: &[u8] = if std::path::Path::new("/dev/uio0").exists() {
-        &[1] // Zynq: bus 1 only (bus 0 is AXI IIC for PICs)
-    } else {
-        &[1, 0] // Amlogic: try bus 1 then bus 0
-    };
-    for &bus in eeprom_buses {
-        // Identity-only EEPROM read — uses HAL-public read-only helper
-        // (W11 fix: I2cBus::open is pub(crate); read_eeprom_bytes is the
-        // sanctioned daemon-side path for one-shot identity reads before
-        // the main I²C service starts).
-        if let Ok(buf) = dcentrald_hal::i2c::read_eeprom_bytes(bus, 0x51, 0x00, 32) {
-            let serial = String::from_utf8_lossy(&buf)
-                .trim_end_matches(|c: char| {
-                    c == '\0' || c == '\u{00ff}' || !c.is_ascii_alphanumeric()
-                })
-                .to_string();
-            if serial.len() >= 8 && serial.chars().all(|c| c.is_ascii_alphanumeric()) {
-                tracing::info!(serial = %serial, "Miner serial from EEPROM");
-                return Some(serial);
-            }
+    // The bootstrap capability is intentionally fixed to secondary bus 1,
+    // address 0x51, offset zero. Bus-0 fallback would alias the runtime
+    // controller fabric on supported Zynq/Amlogic platforms.
+    if let Ok(buf) = dcentrald_hal::i2c::read_secondary_bus_miner_identity_eeprom() {
+        let serial = String::from_utf8_lossy(&buf)
+            .trim_end_matches(|c: char| c == '\0' || c == '\u{00ff}' || !c.is_ascii_alphanumeric())
+            .to_string();
+        if serial.len() >= 8 && serial.chars().all(|c| c.is_ascii_alphanumeric()) {
+            tracing::info!(serial = %serial, "Miner serial from EEPROM");
+            return Some(serial);
         }
     }
 
@@ -789,6 +864,38 @@ mod tests {
     use std::sync::Mutex;
 
     static EEPROM_PIC_DETECT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn owned_eeprom_retry_policy_never_retries_authority_or_unknown_outcome() {
+        assert!(is_retryable_owned_eeprom_readiness_error(
+            &dcentrald_hal::HalError::I2cEndpointNotReady {
+                bus: 0,
+                addr: 0x50,
+                detail: "at24 is still binding".into(),
+            }
+        ));
+        assert!(!is_retryable_owned_eeprom_readiness_error(
+            &dcentrald_hal::HalError::I2cSafetySuperseded {
+                bus: 0,
+                addr: 0x50,
+                detail: "safe-off generation advanced".into(),
+            }
+        ));
+        assert!(!is_retryable_owned_eeprom_readiness_error(
+            &dcentrald_hal::HalError::I2cSafeOffOutcomeUnknown {
+                bus: 0,
+                addr: 0x50,
+                detail: "shutdown completion unobserved".into(),
+            }
+        ));
+        assert!(!is_retryable_owned_eeprom_readiness_error(
+            &dcentrald_hal::HalError::I2c {
+                bus: 0,
+                addr: 0x50,
+                detail: "queue or service failure".into(),
+            }
+        ));
+    }
 
     #[test]
     fn correlated_declarations_do_not_mint_high_confidence() {

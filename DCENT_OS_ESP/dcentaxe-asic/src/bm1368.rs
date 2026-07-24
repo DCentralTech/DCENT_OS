@@ -271,7 +271,10 @@ impl BM1368 {
                 buffer[5]
             );
 
-            chip_counter += 1;
+            // Saturating: a looping/echoing chain or noise delivering >= 256
+            // CRC5-valid CHIP_ID frames must not overflow this u8 (debug panic) or
+            // wrap to 0 / small (release: false NoAsicsFound / mis-sized interval).
+            chip_counter = chip_counter.saturating_add(1);
         }
 
         if chip_counter != expected_count {

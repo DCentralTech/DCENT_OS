@@ -40,6 +40,14 @@ const BIP320_DEFAULT_VERSION_MASK: u32 = 0x1FFFE000;
 /// ~8192 * (sizeof key) which is acceptable on the ESP32-S3 mining thread.
 const SHARE_DEDUP_CAPACITY: usize = 8192;
 
+/// Defensive cap on midstate-index version-rolling iterations (midstate_mode).
+/// The legitimate BM1397 index is 0..3; this generous cap covers any real index
+/// while ensuring a garbage `rolled_version` (driver/config mismatch) cannot make
+/// `actual_version_for` loop up to 2^32 times and stall the mining loop into a
+/// task-watchdog reset. An out-of-range index yields a version that fails header
+/// validation and is dropped downstream (fail-closed).
+const MAX_MIDSTATE_ROLL_STEPS: u32 = 32;
+
 /// Bounded recent-share dedup keyed on `(stratum_job_id, nonce, asic_nr)`.
 ///
 /// XPPROTO-1: complements — does NOT duplicate — the driver-level per-stream
@@ -185,6 +193,16 @@ pub struct WorkItem {
     /// on multi-chip boards where the small job_id space (8 slots for BM1368)
     /// wraps faster than nonces return from the ASIC chain.
     pub dispatch_seq: u64,
+
+    /// The ASIC ticket (mask) difficulty in force when this work was DISPATCHED.
+    /// In-flight nonces were hashed under this ticket, so nonce classification
+    /// (Case-2 filtered vs Case-3 HW error, and recovery acceptance) must compare
+    /// against THIS value — not the live `stats.ticket_difficulty`. A vardiff raise
+    /// updates the live value at event-drain time, before the ASIC is reprogrammed
+    /// and its pipeline flushes; classifying in-flight nonces against the live value
+    /// then charges each as a genuine HW error, so a routine vardiff step looks like
+    /// a failing chip (false chip-health / accept-streak damage).
+    pub ticket_difficulty: f64,
 }
 
 /// Configuration for the mining dispatcher.
@@ -838,6 +856,10 @@ impl MiningDispatcher {
                                 dispatched_at: Instant::now(),
                                 pool_index,
                                 dispatch_seq: seq,
+                                // Capture the ticket in force AT DISPATCH so a later
+                                // vardiff raise cannot retroactively reclassify this
+                                // work's in-flight nonces as HW errors.
+                                ticket_difficulty: self.stats.ticket_difficulty,
                             };
                             self.active_jobs[job_id as usize] = Some(item);
                             self.valid_jobs[job_id as usize] = true;
@@ -1242,9 +1264,17 @@ impl MiningDispatcher {
             if item.work.version_mask == 0 {
                 return item.work.version;
             }
-            // BM1397: midstate_index -> compute rolled version via increment_bitmask
+            // BM1397: midstate_index -> compute rolled version via increment_bitmask.
+            // The legitimate index is tiny (BM1397 ASICBoost uses <= 4 midstates, so
+            // 0..3). A driver/config mismatch could deliver an arbitrary u32 here;
+            // without a bound, `0..rolled_version` runs up to 2^32 iterations and
+            // stalls the mining loop into a task-watchdog reset. Clamp to a generous
+            // fixed cap that covers any legitimate index — an out-of-range index then
+            // yields a version that fails header validation and is dropped downstream
+            // (fail-closed).
+            let steps = rolled_version.min(MAX_MIDSTATE_ROLL_STEPS);
             let mut ver = item.work.version;
-            for _ in 0..rolled_version {
+            for _ in 0..steps {
                 ver = increment_bitmask(ver, item.work.version_mask);
             }
             ver
@@ -1279,12 +1309,26 @@ impl MiningDispatcher {
     /// these already self-filter via header validation; dropping them
     /// explicitly keeps the per-pool reject accounting honest and avoids any
     /// edge case where a masked reconstruction coincidentally still validates.
+    /// Shared XPPROTO-3 predicate: did the chip roll version bits OUTSIDE the
+    /// pool's negotiated sub-mask? In midstate mode the version is not
+    /// chip-rolled, so no mask applies. Used by BOTH the primary submit path
+    /// ([`Self::rolled_outside_negotiated_mask`]) and the recovery lane
+    /// ([`Self::handle_recovered_nonce`]) so they drop the SAME shares — the
+    /// recovery lane is the NORMAL share path on BM1368/BM1370 (no job_id echo).
+    fn rolled_bits_outside_mask(
+        midstate_mode: bool,
+        version_mask: u32,
+        rolled_version: u32,
+    ) -> bool {
+        !midstate_mode && version_mask != 0 && (rolled_version & !version_mask) != 0
+    }
+
     fn rolled_outside_negotiated_mask(&self, item: &WorkItem, rolled_version: u32) -> bool {
-        if self.config.midstate_mode {
-            return false;
-        }
-        let negotiated = item.work.version_mask;
-        negotiated != 0 && (rolled_version & !negotiated) != 0
+        Self::rolled_bits_outside_mask(
+            self.config.midstate_mode,
+            item.work.version_mask,
+            rolled_version,
+        )
     }
 
     fn share_version_bits(item: &WorkItem, actual_version: u32) -> Option<String> {
@@ -1330,7 +1374,9 @@ impl MiningDispatcher {
                 let alt_version = self.actual_version_for(alt, rolled_version);
                 let (_alt_header, alt_diff, alt_meets_pool_target) =
                     validate_work_header(&alt.work, alt_version, nonce, false);
-                if alt_diff >= self.stats.ticket_difficulty {
+                // Classify against the ticket the ALT work was dispatched under,
+                // not the live stats ticket (which a vardiff raise moved).
+                if alt_diff >= alt.ticket_difficulty {
                     return Some((
                         slot,
                         alt.clone(),
@@ -1360,6 +1406,8 @@ impl MiningDispatcher {
         meets_pool_target: bool,
         asic_nr: u8,
         nonce: u32,
+        rolled_version: u32,
+        midstate_mode: bool,
     ) {
         let pool_index = item.pool_index;
         stats.slot_recoveries += 1;
@@ -1381,6 +1429,16 @@ impl MiningDispatcher {
                     "Dispatcher: dropped duplicate recovered share job={} nonce=0x{:08x} asic={}",
                     item.stratum_job_id, nonce, asic_nr
                 );
+                return;
+            }
+            // XPPROTO-3 parity with the primary path: on BM1368/BM1370 the
+            // recovery lane is the NORMAL share path (those chips do not echo
+            // the sent job_id), so it must apply the SAME out-of-negotiated-mask
+            // drop — otherwise a sub-mask pool rejects these as invalid-version
+            // shares, exactly the reject the primary path was hardened against.
+            if Self::rolled_bits_outside_mask(midstate_mode, item.work.version_mask, rolled_version)
+            {
+                stats.out_of_mask_dropped += 1;
                 return;
             }
             stats.record_chip_nonce(asic_nr);
@@ -1441,6 +1499,7 @@ impl MiningDispatcher {
         // adjacent extracted ID. Allow up to 2 full wraps as grace period.
         let n_slots = self.config.job_id_cycle_len().max(1);
         let max_age_seq = n_slots * 2; // 2 full wraps
+        let midstate_mode = self.config.midstate_mode;
 
         if let Some(ref item) = self.active_jobs[idx] {
             if item.dispatched_at.elapsed().as_secs() > MAX_WORK_AGE_SECS {
@@ -1459,6 +1518,8 @@ impl MiningDispatcher {
                         alt_meets_pool_target,
                         asic_nr,
                         nonce,
+                        rolled_version,
+                        midstate_mode,
                     );
                     return;
                 }
@@ -1487,6 +1548,8 @@ impl MiningDispatcher {
                     alt_meets_pool_target,
                     asic_nr,
                     nonce,
+                    rolled_version,
+                    midstate_mode,
                 );
                 return;
             }
@@ -1512,6 +1575,8 @@ impl MiningDispatcher {
                         alt_meets_pool_target,
                         asic_nr,
                         nonce,
+                        rolled_version,
+                        midstate_mode,
                     );
                     return;
                 }
@@ -1536,6 +1601,8 @@ impl MiningDispatcher {
                     alt_meets_pool_target,
                     asic_nr,
                     nonce,
+                    rolled_version,
+                    midstate_mode,
                 );
                 return;
             }
@@ -1665,7 +1732,7 @@ impl MiningDispatcher {
             } else {
                 error!("Dispatcher: pool_index {} out of range", pool_index);
             }
-        } else if achieved_diff >= self.stats.ticket_difficulty {
+        } else if achieved_diff >= item.ticket_difficulty {
             // Case 2: Valid ASIC nonce, below pool difficulty — expected, just count
             self.stats.record_chip_nonce(asic_nr);
             self.stats.filtered += 1;
@@ -1694,6 +1761,8 @@ impl MiningDispatcher {
                             alt_meets_pool_target,
                             asic_nr,
                             nonce,
+                            rolled_version,
+                            midstate_mode,
                         );
                     },
                 )
@@ -1833,6 +1902,7 @@ mod tests {
             dispatched_at: Instant::now(),
             pool_index,
             dispatch_seq,
+            ticket_difficulty: 0.0,
         }
     }
 
@@ -1876,6 +1946,7 @@ mod tests {
             dispatched_at: Instant::now(),
             pool_index: 0,
             dispatch_seq: 0,
+            ticket_difficulty: 0.0,
         });
         dispatcher.valid_jobs[0] = true;
         dispatcher.dispatch_seq = 1;
@@ -2238,6 +2309,7 @@ mod tests {
             dispatched_at: Instant::now(),
             pool_index: 0,
             dispatch_seq: 0,
+            ticket_difficulty: 0.0,
         });
         dispatcher.valid_jobs[0] = true;
 
@@ -2265,6 +2337,7 @@ mod tests {
             dispatched_at: Instant::now(),
             pool_index: 1,
             dispatch_seq: 1,
+            ticket_difficulty: 0.0,
         });
         dispatcher.valid_jobs[16] = true;
 
@@ -2655,6 +2728,58 @@ mod tests {
         drop(event_tx);
     }
 
+    #[test]
+    fn actual_version_for_clamps_out_of_range_midstate_index() {
+        // A driver/config mismatch could deliver an arbitrary u32 as the midstate
+        // index in midstate_mode. Without a bound, `for _ in 0..rolled_version`
+        // runs up to 2^32 iterations and stalls the mining loop into a task-watchdog
+        // reset. The clamp bounds it to the midstate count; THIS TEST COMPLETING is
+        // the proof (a 2^32 loop would time the test out).
+        let (event_tx, event_rx) = mpsc::channel();
+        let (share_tx, _share_rx) = mpsc::channel();
+        let dispatcher = MiningDispatcher::new(
+            event_rx,
+            share_tx,
+            DispatcherConfig {
+                job_interval_ms: 10,
+                job_id_step: 4,
+                job_id_max: 128,
+                midstate_mode: true,
+            },
+        );
+        let mut item = make_test_item("midstate-clamp", 0, 0, 0);
+        item.work.version_mask = 0x1FFF_E000; // non-zero → the increment_bitmask path
+        while item.work.midstates.len() < 4 {
+            item.work.midstates.push([0u8; 32]); // BM1397 max midstates
+        }
+
+        let ver = dispatcher.actual_version_for(&item, u32::MAX);
+
+        // Bounded, deterministic: base incremented exactly MAX_MIDSTATE_ROLL_STEPS
+        // times (the clamp), NOT 2^32 times.
+        let mut expected = item.work.version;
+        for _ in 0..MAX_MIDSTATE_ROLL_STEPS {
+            expected = increment_bitmask(expected, item.work.version_mask);
+        }
+        assert_eq!(
+            ver, expected,
+            "an out-of-range midstate index must clamp to MAX_MIDSTATE_ROLL_STEPS"
+        );
+        // And a legitimate in-range index is unaffected by the clamp.
+        assert_eq!(
+            dispatcher.actual_version_for(&item, 3),
+            {
+                let mut v = item.work.version;
+                for _ in 0..3 {
+                    v = increment_bitmask(v, item.work.version_mask);
+                }
+                v
+            },
+            "an in-range index must be unchanged by the clamp"
+        );
+        drop(event_tx);
+    }
+
     /// DCENT_axe BM1397 family scaling: `for_bm1397` accepts the chip count and
     /// the single BM1397 driver path covers the 1x / 4x / 6x SKUs. The job-id
     /// mechanics (step +4 mod 128, midstate ASICBoost mode) are chip-family
@@ -2868,6 +2993,12 @@ mod tests {
             .unwrap()
             .work
             .share_target = [0u8; 32];
+        // The item was dispatched under the HIGH ticket, so it classifies against
+        // that value (Case-3 HW error) — matches the "classify vs item ticket" fix.
+        dispatcher.active_jobs[0]
+            .as_mut()
+            .unwrap()
+            .ticket_difficulty = f64::MAX;
         dispatcher.dispatch_seq = 1;
 
         dispatcher.handle_nonce(0, 0x0000_0001, 0, 0);
@@ -2881,6 +3012,45 @@ mod tests {
             "a board-level HW error must NOT charge the pool's shares_rejected"
         );
         assert_eq!(dispatcher.stats.per_chip[0].errors, 1);
+    }
+
+    #[test]
+    fn test_vardiff_raise_does_not_charge_inflight_nonce_as_hw_error() {
+        // The bug: in-flight nonces were classified against the LIVE
+        // stats.ticket_difficulty. A vardiff raise updates it at event-drain time,
+        // BEFORE the ASIC is reprogrammed and its pipeline flushes, so every
+        // in-flight nonce (hashed under the OLD lower ticket) was charged as a
+        // genuine HW error — a routine vardiff step looked like a failing chip.
+        // After the fix, classification uses the ticket the WORK was dispatched
+        // under, so the nonce is `filtered` (below pool, above its own ticket),
+        // NOT `rejected`. Fails before the fix: rejected==1, filtered==0.
+        let (mut dispatcher, _event_tx, _share_rx) = make_single_pool_dispatcher();
+        // Dispatched under a LOW ticket (make_test_item leaves item ticket at 0.0).
+        insert_test_item(&mut dispatcher, 0, "primary", 0, 0);
+        // share_target all-0x00 → never meets the pool target (forces Case 2/3).
+        dispatcher.active_jobs[0]
+            .as_mut()
+            .unwrap()
+            .work
+            .share_target = [0u8; 32];
+        dispatcher.dispatch_seq = 1;
+        // Vardiff RAISE lands after dispatch, before the pipeline flushes.
+        dispatcher.stats.ticket_difficulty = f64::MAX;
+
+        dispatcher.handle_nonce(0, 0x0000_0001, 0, 0);
+
+        assert_eq!(
+            dispatcher.stats.filtered, 1,
+            "an in-flight nonce after a vardiff raise must be filtered, not a HW error"
+        );
+        assert_eq!(
+            dispatcher.stats.rejected, 0,
+            "a vardiff raise must NOT charge in-flight nonces as genuine HW errors"
+        );
+        assert_eq!(
+            dispatcher.pools[0].shares_rejected, 0,
+            "and must not charge the pool's shares_rejected"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3017,6 +3187,99 @@ mod tests {
         );
         assert_eq!(dispatcher.stats.accepted, 1);
         assert!(share_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn test_recovered_out_of_mask_roll_is_dropped_not_submitted() {
+        // XPPROTO-3 recovery-lane PARITY with the primary path. On BM1368/BM1370
+        // the recovery lane is the NORMAL share path (those chips do not echo the
+        // sent job_id), so a recovered nonce whose chip-rolled bits fall OUTSIDE
+        // the pool's negotiated sub-mask must be dropped + counted, NOT submitted
+        // (a sub-mask pool rejects it as an invalid version). Before the fix,
+        // handle_recovered_nonce submitted with no mask check — this test FAILS
+        // without the fix (out_of_mask_dropped would be 0 and a share submitted).
+        let (event_tx, event_rx) = mpsc::channel();
+        let (share_tx, share_rx) = mpsc::channel();
+        let mut dispatcher = MiningDispatcher::new(
+            event_rx,
+            share_tx,
+            DispatcherConfig {
+                job_interval_ms: 10,
+                job_id_step: 16,
+                job_id_max: 128,
+                midstate_mode: false,
+            },
+        );
+        insert_test_item(&mut dispatcher, 0, "submask-recovered", 0, 0);
+        let narrow = 0x0000_e000u32; // pool negotiated only bits 13..=15
+        dispatcher.active_jobs[0]
+            .as_mut()
+            .unwrap()
+            .work
+            .version_mask = narrow;
+        dispatcher.dispatch_seq = 1;
+        dispatcher.stats.ticket_difficulty = 0.0;
+
+        let rolled_outside = 0x0010_0000u32; // bit 20 — outside the narrow mask
+        assert_ne!(rolled_outside & !narrow, 0, "vector must be out-of-mask");
+
+        // job_id 0x08 maps to an EMPTY slot → recovery scans and finds slot 0.
+        dispatcher.handle_nonce(0x08, 0x1111_2222, rolled_outside, 0);
+
+        assert_eq!(dispatcher.stats.slot_recoveries, 1, "recovery must run");
+        assert_eq!(
+            dispatcher.stats.out_of_mask_dropped, 1,
+            "a recovered out-of-mask roll must be dropped + counted (recovery-lane parity)"
+        );
+        assert_eq!(
+            dispatcher.stats.accepted, 0,
+            "a recovered out-of-mask roll must not be accepted/submitted"
+        );
+        assert!(
+            share_rx.try_recv().is_err(),
+            "no share may reach the pool channel for a recovered out-of-mask roll"
+        );
+        drop(event_tx);
+    }
+
+    #[test]
+    fn test_recovered_in_mask_roll_is_submitted() {
+        // Companion to the drop test: a recovered nonce whose rolled bits stay
+        // WITHIN the negotiated sub-mask must still submit — the recovery-lane
+        // mask check must not over-drop valid shares.
+        let (event_tx, event_rx) = mpsc::channel();
+        let (share_tx, share_rx) = mpsc::channel();
+        let mut dispatcher = MiningDispatcher::new(
+            event_rx,
+            share_tx,
+            DispatcherConfig {
+                job_interval_ms: 10,
+                job_id_step: 16,
+                job_id_max: 128,
+                midstate_mode: false,
+            },
+        );
+        insert_test_item(&mut dispatcher, 0, "submask-recovered-ok", 0, 0);
+        let narrow = 0x0000_e000u32;
+        dispatcher.active_jobs[0]
+            .as_mut()
+            .unwrap()
+            .work
+            .version_mask = narrow;
+        dispatcher.dispatch_seq = 1;
+        dispatcher.stats.ticket_difficulty = 0.0;
+
+        let rolled_inside = 0x0000_4000u32; // within the narrow mask
+        assert_eq!(rolled_inside & !narrow, 0, "vector must be in-mask");
+        dispatcher.handle_nonce(0x08, 0x1111_2222, rolled_inside, 0);
+
+        assert_eq!(dispatcher.stats.slot_recoveries, 1);
+        assert_eq!(dispatcher.stats.out_of_mask_dropped, 0);
+        assert_eq!(dispatcher.stats.accepted, 1);
+        match share_rx.try_recv().unwrap() {
+            MiningEvent::SubmitShare(share) => assert_eq!(share.job_id, "submask-recovered-ok"),
+        }
+        drop(event_tx);
     }
 
     /// XPPROTO-3 must never fire on BM1397 (midstate_mode), where the

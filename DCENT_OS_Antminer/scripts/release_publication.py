@@ -11,6 +11,14 @@ from pathlib import Path
 import stat
 import sys
 import tempfile
+from typing import NoReturn
+
+from atomic_publish_file import (
+    CommitSignalGuard,
+    PublishError,
+    atomic_publish as publish_staged_file,
+    report_after_commit,
+)
 
 
 MAX_METADATA_BYTES = 1024 * 1024
@@ -20,7 +28,11 @@ class PublicationError(RuntimeError):
     pass
 
 
-def fail(message: str) -> "NoReturn":
+class PublicationSignal(PublicationError):
+    """Termination was requested before publication became authoritative."""
+
+
+def fail(message: str) -> NoReturn:
     raise PublicationError(message)
 
 
@@ -114,101 +126,121 @@ def publish(args: argparse.Namespace) -> None:
     source_path: Path | None = None
     source_descriptor: int | None = None
     source_before: os.stat_result | None = None
-    if args.command == "copy":
-        source_path, source_descriptor, source_before = open_source(args.source)
-
-    temporary_descriptor, temporary_value = tempfile.mkstemp(
-        prefix=f".{output.name}.publish.", dir=parent
-    )
-    temporary = Path(temporary_value)
-    published = False
+    temporary_descriptor: int | None = None
+    temporary: Path | None = None
+    temporary_identity: tuple[int, int] | None = None
+    committed = False
     digest = hashlib.sha256()
     size = 0
-    try:
-        os.chmod(temporary, 0o644)
-        with os.fdopen(temporary_descriptor, "wb", closefd=True) as destination:
-            if source_descriptor is not None:
-                while True:
-                    chunk = os.read(source_descriptor, 1024 * 1024)
-                    if not chunk:
-                        break
-                    destination.write(chunk)
-                    digest.update(chunk)
-                    size += len(chunk)
+    observed_digest = ""
+    with CommitSignalGuard(
+        "durable release publication", PublicationSignal
+    ) as termination:
+        try:
+            termination.refuse_pending_before_commit()
+            if args.command == "copy":
+                source_path, source_descriptor, source_before = open_source(args.source)
+            termination.refuse_pending_before_commit()
+
+            temporary_descriptor, temporary_value = tempfile.mkstemp(
+                prefix=f".{output.name}.publication-pending.", dir=parent
+            )
+            temporary = Path(temporary_value)
+            temporary_stat = os.fstat(temporary_descriptor)
+            temporary_identity = (temporary_stat.st_dev, temporary_stat.st_ino)
+            termination.refuse_pending_before_commit()
+
+            if hasattr(os, "fchmod"):
+                os.fchmod(temporary_descriptor, 0o644)
             else:
-                while True:
-                    chunk = sys.stdin.buffer.read(64 * 1024)
-                    if not chunk:
-                        break
-                    size += len(chunk)
-                    if size > MAX_METADATA_BYTES:
-                        fail("release metadata exceeds the one-MiB publication bound")
-                    destination.write(chunk)
-                    digest.update(chunk)
-            destination.flush()
-            os.fsync(destination.fileno())
+                os.chmod(temporary, 0o644)
+            destination = os.fdopen(temporary_descriptor, "wb", closefd=True)
+            temporary_descriptor = None
+            with destination:
+                if source_descriptor is not None:
+                    while True:
+                        chunk = os.read(source_descriptor, 1024 * 1024)
+                        if not chunk:
+                            break
+                        destination.write(chunk)
+                        digest.update(chunk)
+                        size += len(chunk)
+                else:
+                    while True:
+                        chunk = sys.stdin.buffer.read(64 * 1024)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > MAX_METADATA_BYTES:
+                            fail("release metadata exceeds the one-MiB publication bound")
+                        destination.write(chunk)
+                        digest.update(chunk)
+                destination.flush()
+                os.fsync(destination.fileno())
+            termination.refuse_pending_before_commit()
 
-        observed_digest = digest.hexdigest()
-        if args.command == "copy" and args.expected_sha256:
-            if args.expected_sha256 != observed_digest:
-                fail("copied source digest does not match signed closure evidence")
+            observed_digest = digest.hexdigest()
+            if args.command == "copy" and args.expected_sha256:
+                if args.expected_sha256 != observed_digest:
+                    fail("copied source digest does not match signed closure evidence")
 
-        if source_descriptor is not None:
-            source_after = os.fstat(source_descriptor)
-            path_after = os.lstat(source_path)
-            if (
-                stable_fields(source_before) != stable_fields(source_after)
-                or not stat.S_ISREG(path_after.st_mode)
-                or is_reparse(path_after)
-                or not same_identity(source_after, path_after)
-                or size != source_after.st_size
-            ):
-                fail("source changed or was replaced while being copied")
+            if source_descriptor is not None:
+                assert source_path is not None
+                assert source_before is not None
+                source_after = os.fstat(source_descriptor)
+                path_after = os.lstat(source_path)
+                if (
+                    stable_fields(source_before) != stable_fields(source_after)
+                    or not stat.S_ISREG(path_after.st_mode)
+                    or is_reparse(path_after)
+                    or not same_identity(source_after, path_after)
+                    or size != source_after.st_size
+                ):
+                    fail("source changed or was replaced while being copied")
+                os.close(source_descriptor)
+                source_descriptor = None
+            termination.refuse_pending_before_commit()
 
-        try:
-            os.link(temporary, output, follow_symlinks=False)
-        except FileExistsError:
-            fail(f"output appeared during publication: {output}")
-        except OSError as error:
-            fail(f"cannot publish output without replacement: {output}: {error}")
-        published = True
-        os.unlink(temporary)
-        final_status = os.lstat(output)
-        if (
-            not stat.S_ISREG(final_status.st_mode)
-            or is_reparse(final_status)
-            or getattr(final_status, "st_nlink", 1) != 1
-            or final_status.st_size != size
-        ):
-            fail(f"published output identity is invalid: {output}")
-        if os.name == "posix":
-            directory = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
             try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-    except BaseException:
-        if published:
-            try:
-                os.unlink(output)
-            except OSError:
-                pass
-        raise
-    finally:
-        if source_descriptor is not None:
-            os.close(source_descriptor)
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-
-    print(
-        json.dumps(
-            {"path": str(output), "sha256": observed_digest, "size": size},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-    )
+                publish_staged_file(
+                    temporary,
+                    output,
+                    require_directory_sync=True,
+                    require_staged_cleanup=True,
+                    expected_staged_identity=temporary_identity,
+                    _after_staged_open=termination.refuse_pending_before_commit,
+                )
+            except PublishError as error:
+                fail(f"cannot durably publish output without replacement: {error}")
+            committed = True
+            termination.mark_committed()
+            report_after_commit(
+                (
+                    json.dumps(
+                        {"path": str(output), "sha256": observed_digest, "size": size},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+            )
+        finally:
+            if temporary_descriptor is not None:
+                try:
+                    os.close(temporary_descriptor)
+                except OSError:
+                    pass
+            if source_descriptor is not None:
+                try:
+                    os.close(source_descriptor)
+                except OSError:
+                    pass
+            if not committed and temporary is not None and temporary_identity is not None:
+                try:
+                    current = temporary.lstat()
+                    if (current.st_dev, current.st_ino) == temporary_identity:
+                        temporary.unlink()
+                except OSError:
+                    pass
 
 
 def query_result(args: argparse.Namespace) -> None:

@@ -68,7 +68,7 @@ assert '"$IMAGE_NAME" bash -c' not in post_inspection
 assert "docker run --rm $IMAGE_NAME" not in post_inspection
 assert post_inspection.count('"$BUILD_CONTAINER_ID" bash -c') >= 10
 
-# The generic required-set contract keeps S9/AM2 init and BB/CV discovery
+# The generic required-set contract keeps S9/AM2 init and BB discovery
 # selection centralized rather than rebuilding Phase 5 special cases.
 for fragment in (
     "printf '%s\\n' dcentrald",
@@ -79,7 +79,7 @@ for fragment in (
 ):
     assert fragment in required, fragment
 assert 'if [ "$TARGET" = "am3-bb" ]' not in phase5
-assert "cv1835-s19jpro" in discovery_selection
+assert "cv1835-s19jpro" not in discovery_selection
 
 # Warm-volume invalidation is all-known, not merely current-target, and refuses
 # link-bearing destination components before deletion or installation.
@@ -274,7 +274,6 @@ functions = "dcent_target_requires_dcentos_init() {" + functions
 for target, expected in {
     "s9": ["dcentrald", "dcentos-init"],
     "am3-bb": ["dcentrald", "dcentos-discovery"],
-    "cv1835-s19jpro": ["dcentrald", "dcentos-discovery"],
     "am3-s21": ["dcentrald", "dcentos-init"],
 }.items():
     result = subprocess.run(

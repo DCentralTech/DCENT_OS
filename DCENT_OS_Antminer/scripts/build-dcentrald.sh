@@ -8,7 +8,7 @@
 #   zynq      - Antminer S9/S17/S19 Zynq boards (ARMv7-A, Cortex-A9)  [default]
 #   amlogic   - Antminer S19XP/S21+ Amlogic A113D boards (AArch64, Cortex-A53)
 #   beaglebone - Antminer S19j BeagleBone AM335x boards (ARMv7-A, Cortex-A8)
-#   cvitek    - Antminer S21/T21 CVitek CV1835 boards (AArch64, Cortex-A53)
+#   cvitek    - CV1835 Cortex-A53 hardware, ARMv7 hard-float compatibility ABI
 #   native    - Build for the host machine (development/testing)
 #
 # Requires Docker Desktop running.
@@ -39,6 +39,7 @@ CAPSULE_CONTAINER_STARTED=0
 BUILD_INPUT_SNAPSHOT=""
 BUILD_INPUT_DESTROY_TOKEN=""
 BUILD_INPUT_OWNED=0
+DOCKER_BIN="${DCENT_DOCKER_BIN:-}"
 
 _is_truthy() {
     case "${1:-}" in
@@ -286,6 +287,26 @@ else
     BUILD_INPUT_DESTROY_TOKEN="$(snapshot_result_field --field destroy_token)"
     BUILD_INPUT_OWNED=1
 fi
+select_docker_bin() {
+    if [ -n "$DOCKER_BIN" ]; then
+        command -v "$DOCKER_BIN" >/dev/null 2>&1 || {
+            echo "ERROR: configured Docker command not found: $DOCKER_BIN" >&2
+            return 1
+        }
+    elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        DOCKER_BIN=docker
+    elif command -v docker.exe >/dev/null 2>&1 && docker.exe info >/dev/null 2>&1; then
+        DOCKER_BIN=docker.exe
+    else
+        echo "ERROR: Docker daemon not responding via docker or docker.exe" >&2
+        return 1
+    fi
+}
+
+if [ "$TARGET" != native ]; then
+    select_docker_bin
+fi
+
 load_docker_spec_argv() {
     docker_spec=$1
     DOCKER_SPEC_ARGV=()
@@ -298,16 +319,20 @@ load_docker_spec_argv() {
         echo "ERROR: Docker resource helper emitted no valid argv" >&2
         return 1
     }
+    # The authenticated helper describes Docker semantics, while the host may
+    # expose Docker Desktop through docker.exe (for example WSL without distro
+    # integration). Preserve the verified argv and replace only its executable.
+    DOCKER_SPEC_ARGV[0]="$DOCKER_BIN"
 }
 cleanup_build_resources() {
     status=$?
     trap - EXIT INT TERM
     if [ "$CAPSULE_CONTAINER_STARTED" -eq 1 ]; then
-        observed_container="$(docker container inspect --format '{{.Name}}|{{index .Config.Labels "org.dcentral.dcentos.release-invocation-id"}}|{{index .Config.Labels "org.dcentral.dcentos.resource-role"}}' "$CAPSULE_CONTAINER_NAME" 2>/dev/null || true)"
+        observed_container="$("$DOCKER_BIN" container inspect --format '{{.Name}}|{{index .Config.Labels "org.dcentral.dcentos.release-invocation-id"}}|{{index .Config.Labels "org.dcentral.dcentos.resource-role"}}' "$CAPSULE_CONTAINER_NAME" 2>/dev/null || true)"
         expected_container="/$CAPSULE_CONTAINER_NAME|$CAPSULE_INVOCATION_ID|cargo-build"
         if [ -n "$observed_container" ]; then
             if [ "$observed_container" = "$expected_container" ]; then
-                docker container rm -f "$CAPSULE_CONTAINER_NAME" >/dev/null 2>&1 || {
+                "$DOCKER_BIN" container rm -f "$CAPSULE_CONTAINER_NAME" >/dev/null 2>&1 || {
                     echo "ERROR: failed to remove invocation-owned Cargo container: $CAPSULE_CONTAINER_NAME" >&2
                     [ "$status" -ne 0 ] || status=1
                 }
@@ -318,23 +343,23 @@ cleanup_build_resources() {
         fi
     fi
     if [ "$BUILDER_TAG_CREATED" -eq 1 ]; then
-        observed_image="$(docker image inspect --format '{{.Id}}|{{index .Config.Labels "org.dcentral.dcentos.release-invocation-id"}}' "$CAPSULE_BUILDER_TAG" 2>/dev/null || true)"
+        observed_image="$("$DOCKER_BIN" image inspect --format '{{.Id}}|{{index .Config.Labels "org.dcentral.dcentos.release-invocation-id"}}' "$CAPSULE_BUILDER_TAG" 2>/dev/null || true)"
         observed_image_id="${observed_image%%|*}"
         observed_image_invocation="${observed_image#*|}"
         if printf '%s\n' "$observed_image_id" | grep -qE '^sha256:[0-9a-f]{64}$' \
             && [ "$observed_image_invocation" = "$CAPSULE_INVOCATION_ID" ] \
             && { [ -z "${DOCKER_IMAGE_ID:-}" ] || [ "$observed_image_id" = "$DOCKER_IMAGE_ID" ]; }; then
             retained_cache_tag="dcentos-cargo-cache:${observed_image_id#sha256:}"
-            retained_cache_id="$(docker image inspect --format '{{.Id}}' "$retained_cache_tag" 2>/dev/null || true)"
+            retained_cache_id="$("$DOCKER_BIN" image inspect --format '{{.Id}}' "$retained_cache_tag" 2>/dev/null || true)"
             if [ -z "$retained_cache_id" ]; then
-                docker image tag "$observed_image_id" "$retained_cache_tag" >/dev/null 2>&1 || {
+                "$DOCKER_BIN" image tag "$observed_image_id" "$retained_cache_tag" >/dev/null 2>&1 || {
                     echo "ERROR: failed to retain content-addressed Cargo builder cache tag" >&2
                     [ "$status" -ne 0 ] || status=1
                 }
-                retained_cache_id="$(docker image inspect --format '{{.Id}}' "$retained_cache_tag" 2>/dev/null || true)"
+                retained_cache_id="$("$DOCKER_BIN" image inspect --format '{{.Id}}' "$retained_cache_tag" 2>/dev/null || true)"
             fi
             if [ "$retained_cache_id" = "$observed_image_id" ]; then
-                docker image rm "$CAPSULE_BUILDER_TAG" >/dev/null 2>&1 || {
+                "$DOCKER_BIN" image rm "$CAPSULE_BUILDER_TAG" >/dev/null 2>&1 || {
                     echo "ERROR: failed to remove invocation-owned builder tag: $CAPSULE_BUILDER_TAG" >&2
                     [ "$status" -ne 0 ] || status=1
                 }
@@ -421,12 +446,10 @@ if [ -n "${DCENT_MANIFEST_PUBLIC_KEY_HEX:-}" ]; then
     fi
 fi
 
-# Development may resolve the documented Rust tag. A release cross-build must
-# name an immutable OCI manifest digest so the Dockerfile cannot silently pick
-# up a different compiler base under the same tag. Debian package indexes used
-# inside that base remain an explicitly disclosed, non-reproducible input until
-# the cross toolchains move to a snapshot-pinned builder.
-RUST_BUILDER_BASE="${DCENT_RUST_BUILDER_BASE:-rust:1.90-bookworm}"
+# The default is the same immutable linux/amd64 Rust manifest used by the
+# canonical workspace test image. Callers may replace it only with another
+# digest-pinned image in release context.
+RUST_BUILDER_BASE="${DCENT_RUST_BUILDER_BASE:-rust@sha256:3f6e6f8d8725a65a2db964bb828850f888d430c68784d661f753144e5d787207}"
 if [ -n "$RELEASE_CONTEXT" ] \
     && ! _is_truthy "${DCENT_ALLOW_UNSIGNED_SYSUPGRADE:-0}" \
     && ! printf '%s\n' "$RUST_BUILDER_BASE" \
@@ -436,7 +459,10 @@ if [ -n "$RELEASE_CONTEXT" ] \
     exit 1
 fi
 
-# Map board name to Rust target triple
+# Map board name to Rust target triple and one C-toolchain ABI contract.
+MUSL_ZIG_BUILDER=0
+ZIG_CC_FLAGS=""
+BUILDER_PACKAGE_RESOLUTION="apt-bookworm-live-not-reconstructibly-pinned"
 case "$TARGET" in
     zynq)
         # Canonical Zynq target per root  is musleabihf (static
@@ -445,18 +471,14 @@ case "$TARGET" in
         # doesn't exist on bosminer's rootfs). musl-targeted Rust statically
         # links and runs on any Linux ARM kernel.
         TRIPLE="armv7-unknown-linux-musleabihf"
-        # Install BOTH:
-        #   - gcc-arm-linux-gnueabihf so cc-rs (used by transitive C-dep
-        #     crates like ring) finds an ARM C compiler. Object code is
-        #     ARM machine code, libc-independent at the C level.
-        #   - musl-tools for musl-gcc on the HOST (some crates probe).
-        CROSS_PKG="gcc-arm-linux-gnueabihf musl-tools"
-        # Linker is rust-lld (bundled with rustup; statically links musl).
+        CROSS_PKG=""
         CROSS_LINKER="rust-lld"
-        # Cross C compiler/archiver cc-rs uses for C deps (ring/secp256k1).
-        CROSS_CC="arm-linux-gnueabihf-gcc"
-        CROSS_AR="arm-linux-gnueabihf-ar"
-        ARCH_FLAGS="-C target-cpu=cortex-a9 -C target-feature=+vfp3"
+        CROSS_CC="/usr/local/bin/zig-cc-target-musl"
+        CROSS_AR="/usr/local/bin/zig-ar"
+        MUSL_ZIG_BUILDER=1
+        ZIG_CC_FLAGS="-target arm-linux-musleabihf -mcpu=cortex_a9 -mfloat-abi=hard -mfpu=vfpv3"
+        BUILDER_PACKAGE_RESOLUTION="official-zig-0.13.0-sha256-d45312e6"
+        ARCH_FLAGS="-C target-cpu=cortex-a9 -C target-feature=+crt-static"
         echo "Building for Zynq (S9/S17/S19) — ARMv7-A Cortex-A9 (musl, static)"
         ;;
     amlogic)
@@ -466,14 +488,14 @@ case "$TARGET" in
         # binary fails on the musl Buildroot rootfs (no dynamic linker) and
         # is not found by the post-build scripts (they read the musl path).
         TRIPLE="aarch64-unknown-linux-musl"
-        # gcc-aarch64-linux-gnu = the C cross-compiler cc-rs needs for the
-        # C deps (ring/secp256k1); musl-tools for host musl-gcc probes.
-        CROSS_PKG="gcc-aarch64-linux-gnu musl-tools"
-        # rust-lld statically links musl; no external musl gcc needed.
+        CROSS_PKG=""
         CROSS_LINKER="rust-lld"
-        CROSS_CC="aarch64-linux-gnu-gcc"
-        CROSS_AR="aarch64-linux-gnu-ar"
-        ARCH_FLAGS="-C target-cpu=cortex-a53"
+        CROSS_CC="/usr/local/bin/zig-cc-target-musl"
+        CROSS_AR="/usr/local/bin/zig-ar"
+        MUSL_ZIG_BUILDER=1
+        ZIG_CC_FLAGS="-target aarch64-linux-musl -mcpu=cortex_a53"
+        BUILDER_PACKAGE_RESOLUTION="official-zig-0.13.0-sha256-d45312e6"
+        ARCH_FLAGS="-C target-cpu=cortex-a53 -C target-feature=+crt-static"
         echo "Building for Amlogic A113D (S19XP/S21+) — AArch64 Cortex-A53 (musl, static)"
         ;;
     beaglebone)
@@ -486,17 +508,20 @@ case "$TARGET" in
         echo "Building for BeagleBone AM335x (S19j) — ARMv7-A Cortex-A8"
         ;;
     cvitek)
-        # CVitek CV1835 (S19j Pro CV1835 variant) = Cortex-A7, i.e. ARMv7
-        # 32-bit — NOT AArch64. Matches build_in_docker.sh cv1835-s19jpro
-        # and the cv1835 defconfig (armv7-unknown-linux-musleabihf). An
-        # aarch64 binary will not execute on the 32-bit Cortex-A7.
+        # CVitek CV1835 hardware is dual-core Cortex-A53/AArch64. The retained
+        # vendor kernel is AArch64 with CONFIG_COMPAT; DCENT_OS deliberately
+        # builds an ARMv7 hard-float compatibility userspace while tuning for
+        # the real Cortex-A53 cores.
         TRIPLE="armv7-unknown-linux-musleabihf"
-        CROSS_PKG="gcc-arm-linux-gnueabihf musl-tools"
+        CROSS_PKG=""
         CROSS_LINKER="rust-lld"
-        CROSS_CC="arm-linux-gnueabihf-gcc"
-        CROSS_AR="arm-linux-gnueabihf-ar"
-        ARCH_FLAGS="-C target-cpu=cortex-a7"
-        echo "Building for CVitek CV1835 (S19j Pro) — ARMv7-A Cortex-A7 (musl, static)"
+        CROSS_CC="/usr/local/bin/zig-cc-target-musl"
+        CROSS_AR="/usr/local/bin/zig-ar"
+        MUSL_ZIG_BUILDER=1
+        ZIG_CC_FLAGS="-target arm-linux-musleabihf -mcpu=cortex_a53 -mfloat-abi=hard -mfpu=neon-vfpv4"
+        BUILDER_PACKAGE_RESOLUTION="official-zig-0.13.0-sha256-d45312e6"
+        ARCH_FLAGS="-C target-cpu=cortex-a53 -C target-feature=+crt-static"
+        echo "Building for CVitek CV1835 (S19j Pro) — Cortex-A53 hardware, ARMv7 compatibility userspace (musl, static)"
         ;;
     native)
         echo "Building for host (native)"
@@ -544,7 +569,7 @@ echo ""
 # pre-existing invocation name, allocate an invocation-labeled Cargo volume,
 # and use an invocation-unique builder tag which is inspected before execution.
 if [ "$CAPSULE_MODE" -eq 1 ]; then
-    if docker image inspect "$CAPSULE_BUILDER_TAG" >/dev/null 2>&1; then
+    if "$DOCKER_BIN" image inspect "$CAPSULE_BUILDER_TAG" >/dev/null 2>&1; then
         echo "ERROR: invocation builder tag already exists: $CAPSULE_BUILDER_TAG" >&2
         exit 1
     fi
@@ -555,7 +580,7 @@ if [ "$CAPSULE_MODE" -eq 1 ]; then
         echo "ERROR: invocation Cargo target volume already exists: $CAPSULE_CARGO_VOLUME" >&2
         exit 1
     fi
-    if docker container inspect "$CAPSULE_CONTAINER_NAME" >/dev/null 2>&1; then
+    if "$DOCKER_BIN" container inspect "$CAPSULE_CONTAINER_NAME" >/dev/null 2>&1; then
         echo "ERROR: invocation Cargo container already exists: $CAPSULE_CONTAINER_NAME" >&2
         exit 1
     fi
@@ -580,25 +605,61 @@ else
 fi
 
 echo "Building Docker cross-compilation image: $DOCKER_IMAGE"
-docker build \
+DOCKER_BUILD_CONTEXT="$DCENTRALD_DIR"
+if [ "$DOCKER_BIN" = docker.exe ] && command -v wslpath >/dev/null 2>&1 \
+    && grep -qi microsoft /proc/version 2>/dev/null; then
+    DOCKER_BUILD_CONTEXT="$(wslpath -w "$DCENTRALD_DIR")"
+elif command -v cygpath >/dev/null 2>&1; then
+    DOCKER_BUILD_CONTEXT="$(cygpath -w "$DCENTRALD_DIR")"
+fi
+"$DOCKER_BIN" build \
     --label "org.dcentral.dcentos.release-invocation-id=${CAPSULE_INVOCATION_ID:-development}" \
-    -t "$DOCKER_IMAGE" -f - "$DCENTRALD_DIR" <<DOCKERFILE
+    -t "$DOCKER_IMAGE" -f - "$DOCKER_BUILD_CONTEXT" <<DOCKERFILE
 FROM ${RUST_BUILDER_BASE}
-ENV DEBIAN_FRONTEND=noninteractive
-RUN dpkg --add-architecture armhf 2>/dev/null || true && \
-    apt-get update && apt-get install -y \
-    ${CROSS_PKG} \
-    && rm -rf /var/lib/apt/lists/*
+RUN if [ "${MUSL_ZIG_BUILDER}" = "1" ]; then \
+        archive=/tmp/zig-linux-x86_64-0.13.0.tar.xz; \
+        curl --fail --show-error --location \
+            https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz \
+            --output "\$archive"; \
+        echo 'd45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea  /tmp/zig-linux-x86_64-0.13.0.tar.xz' \
+            | sha256sum --check --strict; \
+        mkdir -p /opt/zig; \
+        tar -xJf "\$archive" -C /opt/zig --strip-components=1; \
+        rm -f "\$archive"; \
+        printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'set -euo pipefail' \
+            'args=()' \
+            'for arg in "\$@"; do' \
+            '  case "\$arg" in' \
+            '    --target=*|-target=*|-march=*|-mcpu=*|-mfpu=*|-mfloat-abi=*) ;;' \
+            '    *) args+=("\$arg") ;;' \
+            '  esac' \
+            'done' \
+            'exec /opt/zig/zig cc ${ZIG_CC_FLAGS} "\${args[@]}"' \
+            > /usr/local/bin/zig-cc-target-musl; \
+        printf '%s\n' '#!/bin/sh' 'exec /opt/zig/zig ar "\$@"' \
+            > /usr/local/bin/zig-ar; \
+        chmod 0755 /usr/local/bin/zig-cc-target-musl /usr/local/bin/zig-ar; \
+        /opt/zig/zig version; \
+    else \
+        dpkg --add-architecture armhf 2>/dev/null || true; \
+        apt-get update; \
+        apt-get install -y ${CROSS_PKG}; \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
 RUN rustup target add ${TRIPLE}
-# Surface rust-lld (bundled with rustup) on PATH so the LINKER env var
-# below can resolve it. Needed for musl static targets where we don't
-# have a cross-gcc.
-RUN find /usr/local/rustup -name 'rust-lld' -type f -exec ln -sf {} /usr/local/bin/rust-lld \\; || true
+# Resolve exactly one host rust-lld rather than an arbitrary search result.
+RUN host_triple="\$(rustc -vV | sed -n 's/^host: //p')"; \
+    rust_lld="\$(rustc --print sysroot)/lib/rustlib/\${host_triple}/bin/rust-lld"; \
+    test -x "\$rust_lld"; \
+    ln -s "\$rust_lld" /usr/local/bin/rust-lld; \
+    rust-lld -flavor gnu --version
 RUN mkdir -p /knowledge-base/firmware-archive
 WORKDIR /src
 DOCKERFILE
 
-DOCKER_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$DOCKER_IMAGE")"
+DOCKER_IMAGE_ID="$("$DOCKER_BIN" image inspect --format '{{.Id}}' "$DOCKER_IMAGE")"
 if ! printf '%s\n' "$DOCKER_IMAGE_ID" | grep -qE '^sha256:[0-9a-f]{64}$'; then
     echo "ERROR: Docker returned a non-immutable cross-builder image identity: $DOCKER_IMAGE_ID" >&2
     exit 1
@@ -633,7 +694,16 @@ done
 TRIPLE_UPPER="$(echo "$TRIPLE" | tr '[:lower:]-' '[:upper:]_')"
 TRIPLE_LOWER="$(echo "$TRIPLE" | tr '-' '_')"
 
-if command -v cygpath >/dev/null 2>&1; then
+if [ "$DOCKER_BIN" = docker.exe ] && command -v wslpath >/dev/null 2>&1 \
+    && grep -qi microsoft /proc/version 2>/dev/null; then
+    DOCKER_DCENTRALD_DIR="$(wslpath -w "$DCENTRALD_DIR")"
+    DOCKER_DCENT_SCHEMA_DIR="$(wslpath -w "$DCENT_SCHEMA_DIR")"
+    DOCKER_STOCK_MANIFEST="$(wslpath -w "$STOCK_MANIFEST")"
+    DOCKER_STOCK_MANIFEST_SIGNATURE="$(wslpath -w "$STOCK_MANIFEST_SIGNATURE")"
+    if [ "$CAPSULE_MODE" -eq 1 ]; then
+        DOCKER_RESULT_ROOT="$(wslpath -w "$CAPSULE_RESULT_ROOT_SHELL")"
+    fi
+elif command -v cygpath >/dev/null 2>&1; then
     DOCKER_DCENTRALD_DIR="$(cygpath -w "$DCENTRALD_DIR")"
     DOCKER_DCENT_SCHEMA_DIR="$(cygpath -w "$DCENT_SCHEMA_DIR")"
     DOCKER_STOCK_MANIFEST="$(cygpath -w "$STOCK_MANIFEST")"
@@ -698,7 +768,7 @@ else
     DOCKER_RUN_IDENTITY_ARGS=()
 fi
 
-MSYS_NO_PATHCONV=1 docker run --rm \
+MSYS_NO_PATHCONV=1 "$DOCKER_BIN" run --rm \
     "${DOCKER_RUN_IDENTITY_ARGS[@]}" \
     "${DOCKER_MOUNT_ARGS[@]}" \
     -e "CARGO_TARGET_${TRIPLE_UPPER}_LINKER=${CROSS_LINKER}" \
@@ -709,12 +779,15 @@ MSYS_NO_PATHCONV=1 docker run --rm \
     -e "DCENT_BUILDER_KIND=docker-cross" \
     -e "DCENT_BUILDER_BASE_REFERENCE=${RUST_BUILDER_BASE}" \
     -e "DCENT_BUILDER_IMAGE_ID=${DOCKER_IMAGE_ID}" \
-    -e "DCENT_BUILDER_PACKAGE_RESOLUTION=apt-bookworm-live-not-reconstructibly-pinned" \
+    -e "DCENT_BUILDER_PACKAGE_RESOLUTION=${BUILDER_PACKAGE_RESOLUTION}" \
     -e "DCENT_METADATA_TARGET=${TRIPLE}" \
     "$DOCKER_IMAGE_ID" \
     bash -c '
         set -e
-        cargo build --release --locked --target "$DCENT_METADATA_TARGET"
+        # Fetch the complete locked graph (including dev-only packages used by
+        # Cargo metadata) before entering the offline build/receipt phase.
+        cargo fetch --locked
+        cargo build --release --locked --offline --target "$DCENT_METADATA_TARGET"
         if [ "$DCENT_CAPSULE_MODE" = 1 ]; then
             release_dir="/results/target/${DCENT_METADATA_TARGET}/release"
             inventory_dir="/results/target/release-inventory"

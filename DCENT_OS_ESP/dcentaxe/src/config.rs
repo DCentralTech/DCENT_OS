@@ -3,8 +3,8 @@
 // License: GPL-3.0
 
 use dcentaxe_hal::board::{
-    BitAxeModel, BoardConfig, BoardHardwareConfig, BoardVersionProfile, FanControllerKind,
-    PowerControllerKind, TempSensorKind,
+    AccessoryMode, BitAxeModel, BoardConfig, BoardHardwareConfig, BoardVersionProfile,
+    FanControllerKind, PowerControllerKind, TempSensorKind,
 };
 use dcentaxe_stratum::StratumConfig;
 
@@ -369,6 +369,50 @@ pub fn stock_asic_settings(model: BitAxeModel) -> StockAsicSettings {
     }
 }
 
+/// First-boot mining-mode intent shared with the DCENT_OS onboarding contract.
+/// Pool and solo-pool both use the configured Stratum endpoint. The mesh modes
+/// additionally configure the LoRa solo relay when that firmware feature is
+/// present; non-LoRa builds reject those choices at provisioning time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MiningMode {
+    Pool,
+    Solo,
+    GatewaySolo,
+    MeshSolo,
+}
+
+impl Default for MiningMode {
+    fn default() -> Self {
+        Self::Pool
+    }
+}
+
+impl MiningMode {
+    pub fn from_token(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "pool" => Ok(Self::Pool),
+            "solo" => Ok(Self::Solo),
+            "gateway-solo" | "gateway_solo" => Ok(Self::GatewaySolo),
+            "mesh-solo" | "mesh_solo" => Ok(Self::MeshSolo),
+            other => Err(format!("Unsupported mining mode: {other}")),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pool => "pool",
+            Self::Solo => "solo",
+            Self::GatewaySolo => "gateway-solo",
+            Self::MeshSolo => "mesh-solo",
+        }
+    }
+
+    pub const fn requires_lora(self) -> bool {
+        matches!(self, Self::GatewaySolo | Self::MeshSolo)
+    }
+}
+
 /// Full DCENT_axe configuration.
 ///
 /// Persisted to NVS as JSON. On first boot (no NVS config), the captive
@@ -391,6 +435,10 @@ pub struct DcentAxeConfig {
     pub wifi_password: String,
     /// Pool/Stratum configuration
     pub stratum: StratumConfig,
+    /// Operator-selected onboarding mode. Missing legacy fields default to
+    /// ordinary pool mining without a schema-version bump.
+    #[serde(default)]
+    pub mining_mode: MiningMode,
     /// Board model (e.g., "gamma", "ultra", "max", "hexultra")
     pub board_model: String,
     /// Runtime board version read from AxeOS/ESP-Miner NVS when available.
@@ -443,10 +491,26 @@ pub struct DcentAxeConfig {
     /// schema bump (same pattern as `fallback_pool`).
     #[serde(default)]
     pub sv2_authority_pubkey: Option<String>,
+    /// Voluntary, time-sliced D-Central donation configuration. Default ON at
+    /// 2%, matching DCENT_OS. A missing field in a legacy blob adopts this
+    /// disclosed default without a schema-version bump.
+    #[serde(default)]
+    pub donation: DonationConfig,
     /// MQTT + Home Assistant auto-discovery config (default-OFF, opt-in).
     /// `#[serde(default)]` ⇒ legacy NVS blobs round-trip with no schema bump.
     #[serde(default)]
     pub mqtt: MqttConfig,
+    /// Outbound-only Telegram/Discord/Slack notifications (default OFF).
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
+    /// Wired-Ethernet (W5500 "DCENT LAN Mod" accessory) + Wi-Fi failover
+    /// config — PLAN-E Phase 1. `eth_enabled` DEFAULT-OFF: a fresh/legacy unit
+    /// never touches the BAP/J4 SPI pins. Only meaningful when the firmware is
+    /// built with `--features eth-w5500`; still stored unconditionally so NVS
+    /// blobs round-trip across feature-differing images. `#[serde(default)]`
+    /// ⇒ legacy blobs load the disabled default with no schema bump.
+    #[serde(default)]
+    pub network: NetworkConfig,
     /// On-board LoRa / mesh config (default-OFF solo mesh). Only meaningful when
     /// the firmware is built with `--features lora`; still stored so NVS blobs
     /// round-trip. Fail-closed: `solo_relay_enabled=false`, mining_source=off.
@@ -559,6 +623,106 @@ impl Default for MqttConfig {
     }
 }
 
+/// Which network link the firmware should prefer when the W5500 LAN accessory
+/// is enabled (PLAN-E §4.2). Pure data — the runtime failover FSM consuming it
+/// lives in `net.rs` (compiled only under the `eth-w5500` feature).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkMode {
+    /// Wi-Fi STA only — Ethernet is never brought up even when `eth_enabled`.
+    WifiOnly,
+    /// Ethernet is the ONLY desired link. Honesty note (this increment):
+    /// Wi-Fi STA still boots for provisioning/management fallback — full Wi-Fi
+    /// teardown under EthOnly is a follow-up; the FSM reports `ActiveLink::None`
+    /// (not Wi-Fi) when the cable is down so the label never over-claims.
+    EthOnly,
+    /// LAN-first with Wi-Fi fallback — mirrors TNA's "auto-use Ethernet when
+    /// link + IP" behavior. The default whenever Ethernet is enabled.
+    #[default]
+    EthPreferred,
+}
+
+/// Wired-Ethernet (W5500 "DCENT LAN Mod") + Wi-Fi failover configuration —
+/// PLAN-E Phase 1. DEFAULT-OFF (`eth_enabled: false`): even an `eth-w5500`
+/// build ships Ethernet-dark until the operator opts in (the same
+/// runtime-opt-in discipline as `mqtt.enabled` and the LoRa `MeshConfig`).
+/// DHCP-only this increment; a static-IP block is a documented follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    /// Master toggle for the W5500 SPI-Ethernet accessory. DEFAULT-OFF.
+    /// Activation is additionally fail-closed by the accessory guard:
+    /// [`DcentAxeConfig::eth_lan_activation`] refuses LAN on a board whose
+    /// accessory mode is BAP-Touch (shared GPIO39/40).
+    #[serde(default)]
+    pub eth_enabled: bool,
+    /// Link preference / failover policy. Default [`NetworkMode::EthPreferred`].
+    #[serde(default)]
+    pub mode: NetworkMode,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            eth_enabled: false,
+            mode: NetworkMode::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub telegram_bot_token: String,
+    #[serde(default)]
+    pub telegram_chat_id: String,
+    #[serde(default)]
+    pub discord_webhook_url: String,
+    #[serde(default)]
+    pub slack_webhook_url: String,
+    #[serde(default)]
+    pub share_milestone: u64,
+    #[serde(default = "default_true")]
+    pub thermal_alerts: bool,
+    #[serde(default = "default_true")]
+    pub failover_alerts: bool,
+    #[serde(default = "default_true")]
+    pub ota_alerts: bool,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            telegram_bot_token: String::new(),
+            telegram_chat_id: String::new(),
+            discord_webhook_url: String::new(),
+            slack_webhook_url: String::new(),
+            share_milestone: 0,
+            thermal_alerts: true,
+            failover_alerts: true,
+            ota_alerts: true,
+        }
+    }
+}
+
+impl NotificationsConfig {
+    pub fn redacted(&self) -> Self {
+        let mut redacted = self.clone();
+        if !redacted.telegram_bot_token.is_empty() {
+            redacted.telegram_bot_token = "***".to_string();
+        }
+        if !redacted.discord_webhook_url.is_empty() {
+            redacted.discord_webhook_url = "***".to_string();
+        }
+        if !redacted.slack_webhook_url.is_empty() {
+            redacted.slack_webhook_url = "***".to_string();
+        }
+        redacted
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Sv2OwnTemplateConfig {
     /// Whether the primary SV2 endpoint is intended to be a local template/JD proxy.
@@ -587,6 +751,197 @@ pub enum RoomTempSource {
 /// Bump this (and add a migration arm in `nvs_config::migrate_config`) every
 /// time the saved config shape changes in a way older firmware can't read.
 pub const SCHEMA_VERSION: u8 = 1;
+
+// ---------------------------------------------------------------------------
+// Donation configuration — voluntary 2% default, fully transparent
+// ---------------------------------------------------------------------------
+
+pub const DONATION_PAYOUT_ADDRESS: &str = "bc1q04lzwddzgmtjex6jlsv2fwhe4se4jxje6rhzp6";
+const _: [(); 42] = [(); DONATION_PAYOUT_ADDRESS.len()];
+
+fn default_donation_enabled() -> bool {
+    true
+}
+
+fn default_donation_percent() -> f32 {
+    2.0
+}
+
+fn default_donation_pool() -> String {
+    "stratum+tcp://pool.d-central.tech:3333".to_string()
+}
+
+fn default_donation_worker() -> String {
+    "DungeonMaster".to_string()
+}
+
+fn default_donation_password() -> String {
+    "x".to_string()
+}
+
+fn default_donation_fallback_pool() -> String {
+    "stratum+tcp://stratum.braiins.com:3333".to_string()
+}
+
+fn default_donation_cycle() -> u64 {
+    3600
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DonationConfig {
+    #[serde(default = "default_donation_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_donation_percent")]
+    pub percent: f32,
+    #[serde(default = "default_donation_pool")]
+    pub pool_url: String,
+    #[serde(default = "default_donation_worker")]
+    pub worker: String,
+    #[serde(default = "default_donation_password")]
+    pub password: String,
+    #[serde(default = "default_true")]
+    pub fallback_enabled: bool,
+    #[serde(default = "default_donation_fallback_pool")]
+    pub fallback_pool_url: String,
+    #[serde(default = "default_donation_worker")]
+    pub fallback_worker: String,
+    #[serde(default = "default_donation_password")]
+    pub fallback_password: String,
+    #[serde(default = "default_donation_cycle")]
+    pub cycle_duration_s: u64,
+}
+
+impl DonationConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.percent.is_finite() || !(0.0..=5.0).contains(&self.percent) {
+            return Err("Donation percent must be between 0 and 5".to_string());
+        }
+        if !(60..=86_400).contains(&self.cycle_duration_s) {
+            return Err("Donation cycle must be between 60 and 86400 seconds".to_string());
+        }
+        if self.enabled && self.percent > 0.0 {
+            if self.pool_url.trim().is_empty() {
+                return Err("Donation pool URL is required when donation is enabled".to_string());
+            }
+            if self.worker.trim().is_empty() {
+                return Err("Donation worker is required when donation is enabled".to_string());
+            }
+            if self.fallback_enabled
+                && (self.fallback_pool_url.trim().is_empty()
+                    || self.fallback_worker.trim().is_empty())
+            {
+                return Err(
+                    "Donation fallback pool and worker are required when fallback is enabled"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn donation_window_secs(&self) -> u64 {
+        if !self.enabled || !self.percent.is_finite() || self.percent <= 0.0 {
+            return 0;
+        }
+        ((self.cycle_duration_s as f64 * self.percent as f64 / 100.0).round() as u64)
+            .min(self.cycle_duration_s)
+    }
+
+    pub fn redacted(&self) -> Self {
+        let mut redacted = self.clone();
+        if !redacted.password.is_empty() {
+            redacted.password = "***".to_string();
+        }
+        if !redacted.fallback_password.is_empty() {
+            redacted.fallback_password = "***".to_string();
+        }
+        redacted
+    }
+
+    pub fn to_directive(
+        &self,
+        version_rolling: bool,
+    ) -> Result<dcentaxe_stratum::DonationDirective, String> {
+        self.validate()?;
+        let primary = donation_pool_config(
+            &self.pool_url,
+            &self.worker,
+            &self.password,
+            version_rolling,
+        )?;
+        let fallback = if self.fallback_enabled {
+            Some(donation_pool_config(
+                &self.fallback_pool_url,
+                &self.fallback_worker,
+                &self.fallback_password,
+                version_rolling,
+            )?)
+        } else {
+            None
+        };
+        Ok(dcentaxe_stratum::DonationDirective {
+            enabled: self.enabled,
+            percent: self.percent,
+            primary,
+            fallback,
+            cycle_duration_s: self.cycle_duration_s,
+        })
+    }
+}
+
+fn donation_pool_config(
+    url: &str,
+    worker: &str,
+    password: &str,
+    version_rolling: bool,
+) -> Result<StratumConfig, String> {
+    let host = dcentaxe_stratum::endpoint_host_from_url(url);
+    if host.is_empty() {
+        return Err("Donation pool URL has no host".to_string());
+    }
+    let without_scheme = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or(url)
+        .split('@')
+        .next_back()
+        .unwrap_or(url);
+    let port = without_scheme
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .unwrap_or(3333);
+    if port == 0 {
+        return Err("Donation pool port must be non-zero".to_string());
+    }
+    Ok(StratumConfig {
+        url: url.to_string(),
+        port,
+        worker_name: worker.to_string(),
+        password: password.to_string(),
+        suggest_difficulty: 0,
+        version_rolling,
+    })
+}
+
+impl Default for DonationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            percent: default_donation_percent(),
+            pool_url: default_donation_pool(),
+            worker: default_donation_worker(),
+            password: default_donation_password(),
+            fallback_enabled: true,
+            fallback_pool_url: default_donation_fallback_pool(),
+            fallback_worker: default_donation_worker(),
+            fallback_password: default_donation_password(),
+            cycle_duration_s: default_donation_cycle(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoardProfileSource {
@@ -744,6 +1099,31 @@ impl DcentAxeConfig {
         board
     }
 
+    /// W5500 LAN activation gate — PLAN-E Phase 1 (host-pure, unit-tested).
+    ///
+    /// Answers "should this boot bring up the W5500 Ethernet link?" in one
+    /// fail-closed decision:
+    /// - `Ok(false)` — LAN not requested (`network.eth_enabled == false`, or
+    ///   `mode == WifiOnly` which makes an enabled toggle inert by definition).
+    /// - `Ok(true)`  — LAN requested AND legal for this board's accessory mode.
+    /// - `Err(msg)`  — LAN requested but ILLEGAL: the board's accessory mode is
+    ///   BAP-Touch and the existing `validate_accessory_mode` guard refuses the
+    ///   pair (W5500 SPI rides the BAP-UART pins GPIO39/40). Callers must log
+    ///   and keep Ethernet dark — mining is unaffected (fail-soft for mining,
+    ///   fail-closed for the pins).
+    ///
+    /// NOTE: picking LAN *over* Touch on a BAP-populated board (the PLAN-E
+    /// Risk-#6 "choose one" UX) is a follow-up increment — this gate only ever
+    /// refuses; it never flips a BAP board's accessory mode to LAN.
+    pub fn eth_lan_activation(&self) -> Result<bool, &'static str> {
+        if !self.network.eth_enabled || self.network.mode == NetworkMode::WifiOnly {
+            return Ok(false);
+        }
+        let board = self.board_config();
+        board.validate_accessory_mode(AccessoryMode::W5500Lan)?;
+        Ok(true)
+    }
+
     pub fn validate_safety(&self, unsafe_lab_bypass: bool) -> Result<(), String> {
         let board = self.board_config();
         board.validate().map_err(|e| e.to_string())?;
@@ -784,6 +1164,30 @@ impl DcentAxeConfig {
                 return Err(
                     "custom mining-capable board requires an explicit power controller".to_string(),
                 );
+            }
+        }
+
+        // Fail closed on a power-schedule slot whose autotuner target is outside
+        // the safe envelope. The interactive control paths route every target
+        // through `validate_autotune_target`, but a schedule slot's target is only
+        // loosely clamped on API save (and a slot loaded from a legacy NVS blob
+        // could carry any value); when such a slot activates it would drive the
+        // autotuner past the board's safe power/thermal budget. Validate each
+        // enabled slot's (mode, target) through the SAME envelope function.
+        for (idx, slot) in self.power_schedule.iter().enumerate() {
+            if slot.autotune_enabled != Some(true) {
+                continue;
+            }
+            if let (Some(mode_str), Some(target)) =
+                (slot.autotune_mode.as_deref(), slot.autotune_target)
+            {
+                if let Some(mode) =
+                    crate::chip_profiles_bitaxe::BestPointMode::from_api_str(mode_str)
+                {
+                    crate::chip_profiles_bitaxe::validate_autotune_target(mode, target).map_err(
+                        |e| format!("power_schedule slot {idx} autotune target invalid: {e}"),
+                    )?;
+                }
             }
         }
 
@@ -851,7 +1255,7 @@ impl DcentAxeConfig {
                 .max()
                 .unwrap_or(limits.max_frequency.round() as u16) as f32,
         );
-        let min_voltage_mv = board.min_voltage_mv.max(
+        let mut min_voltage_mv = board.min_voltage_mv.max(
             stock
                 .voltage_options
                 .iter()
@@ -878,12 +1282,34 @@ impl DcentAxeConfig {
             min_frequency = max_frequency;
         }
 
+        // Fail closed on a non-finite frequency. `f32::clamp(NaN)` returns NaN, and
+        // `(NaN - NaN).abs() > EPSILON` is false, so a NaN `frequency_mhz` would exit
+        // THE central V/F safety clamp UNCLAMPED and be reported `clamped: false`.
+        // Substitute the lowest safe frequency and force the `clamped` flag so no
+        // caller ever applies (or trusts) a non-finite operating point.
+        let (frequency_mhz, frequency_was_invalid) = if frequency_mhz.is_finite() {
+            (frequency_mhz, false)
+        } else {
+            (min_frequency, true)
+        };
+
         let qualified_frequency = frequency_mhz.clamp(min_frequency, max_frequency);
+        // Mirror the frequency guard above: `u16::clamp` PANICS when min > max (reboot under
+        // panic=abort). max_voltage_mv is narrowed AFTER min_voltage_mv is fixed — e.g. the
+        // GammaTurbo non-overclock cap toward default_voltage_mv — so a future board table whose
+        // min floor sat above that cap would panic in THE central V/F safety clamp. Unreachable
+        // with today's tables (pinned by voltage_clamp_never_panics_across_all_models), but the
+        // sibling frequency clamp is guarded and this one must be too; collapse toward the
+        // lower (safer) voltage cap.
+        if max_voltage_mv < min_voltage_mv {
+            min_voltage_mv = max_voltage_mv;
+        }
         let qualified_voltage = voltage_mv.clamp(min_voltage_mv, max_voltage_mv);
         QualifiedOperatingPoint {
             frequency_mhz: qualified_frequency,
             voltage_mv: qualified_voltage,
-            clamped: (qualified_frequency - frequency_mhz).abs() > f32::EPSILON
+            clamped: frequency_was_invalid
+                || (qualified_frequency - frequency_mhz).abs() > f32::EPSILON
                 || qualified_voltage != voltage_mv,
         }
     }
@@ -957,6 +1383,7 @@ impl Default for DcentAxeConfig {
             wifi_ssid: String::new(),
             wifi_password: String::new(),
             stratum: StratumConfig::default(),
+            mining_mode: MiningMode::default(),
             board_model: default_model_for_build().canonical_key().into(),
             board_version: profile.board_version.into(),
             asic_model: profile.asic_model.into(),
@@ -972,7 +1399,10 @@ impl Default for DcentAxeConfig {
             split_pool: None,
             sv2_own_templates: Sv2OwnTemplateConfig::default(),
             sv2_authority_pubkey: None,
+            donation: DonationConfig::default(),
             mqtt: MqttConfig::default(),
+            notifications: NotificationsConfig::default(),
+            network: NetworkConfig::default(),
             #[cfg(feature = "lora")]
             mesh: MeshConfig::default(),
             schedule_enabled: true,
@@ -1420,7 +1850,7 @@ pub fn mining_presets(model: BitAxeModel) -> Vec<MiningPreset> {
                 voltage_mv: 1150,
                 expected_hashrate_ghs: 1100.0,
                 expected_power_w: 13.0,
-                requires_overclock: false,
+                requires_overclock: true,
             },
             MiningPreset {
                 name: "High Perf",
@@ -1496,7 +1926,7 @@ pub fn mining_presets(model: BitAxeModel) -> Vec<MiningPreset> {
                 voltage_mv: 1150,
                 expected_hashrate_ghs: 625.0,
                 expected_power_w: 13.0,
-                requires_overclock: false,
+                requires_overclock: true,
             },
             MiningPreset {
                 name: "High Perf",
@@ -1572,7 +2002,7 @@ pub fn mining_presets(model: BitAxeModel) -> Vec<MiningPreset> {
                 voltage_mv: 1400,
                 expected_hashrate_ghs: 425.0,
                 expected_power_w: 14.0,
-                requires_overclock: false,
+                requires_overclock: true,
             },
             MiningPreset {
                 name: "High Perf",
@@ -1699,7 +2129,7 @@ pub fn mining_presets(model: BitAxeModel) -> Vec<MiningPreset> {
                 voltage_mv: 1200,
                 expected_hashrate_ghs: 4800.0,
                 expected_power_w: 75.0,
-                requires_overclock: false,
+                requires_overclock: true,
             },
         ],
         // Touch variants reuse the presets of their mining-board base.
@@ -1746,6 +2176,90 @@ pub fn mining_presets(model: BitAxeModel) -> Vec<MiningPreset> {
                 requires_overclock: false,
             },
         ],
+    }
+}
+
+#[cfg(test)]
+mod donation_tests {
+    use super::{DcentAxeConfig, DonationConfig, MiningMode, DONATION_PAYOUT_ADDRESS};
+
+    #[test]
+    fn donation_defaults_match_dcent_os_contract() {
+        let donation = DonationConfig::default();
+        assert!(donation.enabled);
+        assert_eq!(donation.percent, 2.0);
+        assert_eq!(donation.cycle_duration_s, 3600);
+        assert_eq!(donation.donation_window_secs(), 72);
+        assert_eq!(donation.pool_url, "stratum+tcp://pool.d-central.tech:3333");
+        assert!(DONATION_PAYOUT_ADDRESS.starts_with("bc1q"));
+        assert_eq!(DONATION_PAYOUT_ADDRESS.len(), 42);
+        donation.validate().expect("valid donation defaults");
+        let directive = donation.to_directive(true).expect("runtime directive");
+        assert_eq!(directive.primary.port, 3333);
+        assert_eq!(directive.primary.worker_name, "DungeonMaster");
+        assert_eq!(directive.fallback.as_ref().unwrap().port, 3333);
+    }
+
+    #[test]
+    fn donation_validation_is_bounded_and_fail_closed() {
+        let mut donation = DonationConfig::default();
+        donation.percent = -0.1;
+        assert!(donation.validate().is_err());
+        donation.percent = 5.1;
+        assert!(donation.validate().is_err());
+        donation.percent = f32::NAN;
+        assert!(donation.validate().is_err());
+        donation.percent = 2.0;
+        donation.cycle_duration_s = 59;
+        assert!(donation.validate().is_err());
+        donation.cycle_duration_s = 86_401;
+        assert!(donation.validate().is_err());
+    }
+
+    #[test]
+    fn donation_off_has_zero_window_and_redaction_never_leaks_passwords() {
+        let mut donation = DonationConfig::default();
+        donation.enabled = false;
+        assert_eq!(donation.donation_window_secs(), 0);
+        let redacted = donation.redacted();
+        assert_eq!(redacted.password, "***");
+        assert_eq!(redacted.fallback_password, "***");
+        assert!(!serde_json::to_string(&redacted).unwrap().contains("\"x\""));
+    }
+
+    #[test]
+    fn legacy_blob_without_donation_adopts_disclosed_default_without_schema_bump() {
+        let full = DcentAxeConfig::default();
+        let schema = full.schema_version;
+        let mut value = serde_json::to_value(&full).unwrap();
+        value.as_object_mut().unwrap().remove("donation");
+        let loaded: DcentAxeConfig = serde_json::from_value(value).unwrap();
+        assert!(loaded.donation.enabled);
+        assert_eq!(loaded.donation.percent, 2.0);
+        assert_eq!(loaded.schema_version, schema);
+    }
+
+    #[test]
+    fn default_config_remains_below_nvs_blob_limit() {
+        let json = serde_json::to_vec(&DcentAxeConfig::default()).unwrap();
+        assert!(json.len() < 3584, "default config is {} bytes", json.len());
+    }
+
+    #[test]
+    fn onboarding_mining_mode_is_bounded_and_legacy_defaults_to_pool() {
+        assert_eq!(MiningMode::from_token("pool").unwrap(), MiningMode::Pool);
+        assert_eq!(
+            MiningMode::from_token("gateway-solo").unwrap(),
+            MiningMode::GatewaySolo
+        );
+        assert!(MiningMode::from_token("invented").is_err());
+        assert!(MiningMode::GatewaySolo.requires_lora());
+        assert!(!MiningMode::Solo.requires_lora());
+
+        let mut value = serde_json::to_value(DcentAxeConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("mining_mode");
+        let loaded: DcentAxeConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.mining_mode, MiningMode::Pool);
     }
 }
 
@@ -2025,6 +2539,199 @@ mod tests {
         // Invariant: the overclock envelope is never below the safe envelope.
         assert!(oc_gamma.max_frequency >= safe_gamma.max_frequency);
         assert!(oc_gamma.max_voltage_mv >= safe_gamma.max_voltage_mv);
+    }
+
+    #[test]
+    fn qualify_operating_point_fails_closed_on_non_finite_frequency() {
+        // `f32::clamp(NaN)` is NaN and `(NaN - NaN).abs() > EPSILON` is false, so a
+        // non-finite frequency must NOT slip through THE central V/F clamp
+        // unclamped-and-reported-unclamped. It must be forced to a safe finite
+        // frequency within the envelope and flagged `clamped`.
+        let cfg = DcentAxeConfig::default(); // Gamma, safe mode
+        let limits = cfg.power_limits();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let qp = cfg.qualify_operating_point(bad, 1100, ControlSurface::Autotuner);
+            assert!(
+                qp.frequency_mhz.is_finite(),
+                "non-finite freq {bad} must be replaced with a finite value"
+            );
+            assert!(
+                qp.frequency_mhz <= limits.max_frequency,
+                "substituted frequency must stay within the safe envelope"
+            );
+            assert!(
+                qp.clamped,
+                "a non-finite frequency must be reported as clamped"
+            );
+        }
+    }
+
+    // ── Power-schedule time helpers (select the freq/volt/autotuner policy on
+    //    every loop; previously untested). ──
+    fn sched_entry(hour: u8, minute: u8, enabled: bool) -> PowerSchedule {
+        PowerSchedule {
+            enabled,
+            hour,
+            minute,
+            frequency: 500.0,
+            voltage_mv: 1150,
+            autotune_enabled: None,
+            autotune_mode: None,
+            autotune_target: None,
+            label: String::new(),
+        }
+    }
+
+    #[test]
+    fn schedule_start_minute_of_day_clamps_and_computes() {
+        let mk = |h: u8, m: u8| sched_entry(h, m, true).start_minute_of_day();
+        assert_eq!(mk(6, 30), 390);
+        assert_eq!(mk(0, 0), 0);
+        assert_eq!(mk(23, 59), 1439);
+        // Out-of-range hour/minute clamp to 23:59 (no overflow / wraparound).
+        assert_eq!(mk(25, 70), 1439);
+    }
+
+    #[test]
+    fn active_power_schedule_selects_latest_past_entry_and_wraps() {
+        let entries = vec![
+            sched_entry(6, 0, true),
+            sched_entry(12, 0, true),
+            sched_entry(18, 0, true),
+        ];
+        // 13:00 -> the 12:00 entry (latest start <= now).
+        assert_eq!(
+            active_power_schedule(&entries, 13 * 60).map(|(i, _)| i),
+            Some(1)
+        );
+        // 05:00 -> all entries start later -> wrap to yesterday's LATEST (18:00).
+        assert_eq!(
+            active_power_schedule(&entries, 5 * 60).map(|(i, _)| i),
+            Some(2)
+        );
+        let empty: [PowerSchedule; 0] = [];
+        assert_eq!(active_power_schedule(&empty, 600).map(|(i, _)| i), None);
+    }
+
+    #[test]
+    fn active_power_schedule_ties_prefer_later_index_and_skip_disabled() {
+        // Two entries at the SAME start: the later index wins (>= tie rule).
+        let tie = vec![sched_entry(6, 0, true), sched_entry(6, 0, true)];
+        assert_eq!(
+            active_power_schedule(&tie, 13 * 60).map(|(i, _)| i),
+            Some(1)
+        );
+        // A disabled earlier entry is skipped; the later enabled one is chosen.
+        let mixed = vec![sched_entry(6, 0, false), sched_entry(12, 0, true)];
+        assert_eq!(
+            active_power_schedule(&mixed, 13 * 60).map(|(i, _)| i),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn next_schedule_change_minutes_handles_today_and_midnight_wrap() {
+        let entries = vec![sched_entry(6, 0, true), sched_entry(18, 0, true)];
+        // 13:00 -> next is 18:00 today: 1080 - 780 = 300.
+        assert_eq!(next_schedule_change_minutes(&entries, 13 * 60), Some(300));
+        // 20:00 -> nothing later today -> tomorrow's 06:00: 1440 - 1200 + 360 = 600.
+        assert_eq!(next_schedule_change_minutes(&entries, 20 * 60), Some(600));
+        let empty: [PowerSchedule; 0] = [];
+        assert_eq!(next_schedule_change_minutes(&empty, 600), None);
+    }
+
+    #[test]
+    fn validate_safety_rejects_out_of_envelope_schedule_autotune_target() {
+        let mut cfg = DcentAxeConfig::default();
+        assert!(
+            cfg.validate_safety(false).is_ok(),
+            "baseline default config passes safety validation"
+        );
+
+        // A schedule slot with autotune enabled + an absurd target_watts must be
+        // rejected: the target bypasses the interactive validate_autotune_target
+        // envelope and would drive the autotuner past the board power budget when
+        // the slot activates.
+        cfg.power_schedule.push(PowerSchedule {
+            enabled: true,
+            hour: 12,
+            minute: 0,
+            frequency: 500.0,
+            voltage_mv: 1150,
+            autotune_enabled: Some(true),
+            autotune_mode: Some("target_watts".to_string()),
+            autotune_target: Some(1_000_000.0),
+            label: String::new(),
+        });
+        assert!(
+            cfg.validate_safety(false).is_err(),
+            "an out-of-envelope schedule autotune target must be rejected"
+        );
+
+        // A target within the envelope passes.
+        cfg.power_schedule.last_mut().unwrap().autotune_target = Some(15.0);
+        assert!(
+            cfg.validate_safety(false).is_ok(),
+            "a safe schedule autotune target must be accepted"
+        );
+
+        // A non-finite target is also rejected (fail closed).
+        cfg.power_schedule.last_mut().unwrap().autotune_target = Some(f32::NAN);
+        assert!(
+            cfg.validate_safety(false).is_err(),
+            "a NaN schedule autotune target must be rejected"
+        );
+
+        // MaxHashrate ignores the target entirely, so no envelope rejection.
+        let slot = cfg.power_schedule.last_mut().unwrap();
+        slot.autotune_mode = Some("max_hashrate".to_string());
+        slot.autotune_target = Some(1_000_000.0);
+        assert!(
+            cfg.validate_safety(false).is_ok(),
+            "MaxHashrate ignores the target, so no envelope rejection"
+        );
+    }
+
+    #[test]
+    fn presets_above_safe_max_frequency_are_flagged_requires_overclock() {
+        // `requires_overclock` is purely informational — the API surfaces it as
+        // `requiresOverclock` so the UI can warn the user. A preset whose
+        // frequency exceeds the board's SAFE envelope max but is flagged
+        // `requires_overclock: false` therefore LIES to the user (it presents an
+        // overclock as safe). Pin the invariant so a mislabeled preset can't ship.
+        const MODELS: &[BitAxeModel] = &[
+            BitAxeModel::GammaDuo,
+            BitAxeModel::GammaTurbo,
+            BitAxeModel::Gamma,
+            BitAxeModel::Supra,
+            BitAxeModel::Ultra,
+            BitAxeModel::Max,
+            BitAxeModel::HexUltra,
+            BitAxeModel::HexSupra,
+            BitAxeModel::NerdNOS,
+            BitAxeModel::NerdAxe,
+            BitAxeModel::NerdQaxePlus,
+            BitAxeModel::NerdQaxePP,
+            BitAxeModel::Touch,
+            BitAxeModel::GtTouch,
+        ];
+        let mut violations = Vec::new();
+        for &model in MODELS {
+            let safe_max = PowerLimits::safe(model).max_frequency;
+            for p in mining_presets(model) {
+                if p.frequency > safe_max && !p.requires_overclock {
+                    violations.push(format!(
+                        "{:?} '{}' {}MHz > safe-max {}MHz",
+                        model, p.name, p.frequency, safe_max
+                    ));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "presets above safe-max frequency must be flagged requires_overclock (the UI \
+             surfaces the flag as safe/unsafe): {violations:?}"
+        );
     }
 
     // ── XPH-2 (GammaTurbo special case, config.rs:405-407) ──
@@ -2621,5 +3328,179 @@ mod tests {
         let qp = cfg.qualify_operating_point(500.0, safe_max_v, ControlSurface::Autotuner);
         assert_eq!(qp.voltage_mv, default_v);
         assert!(qp.clamped);
+    }
+
+    /// Regression guard for the voltage-clamp panic asymmetry: `u16::clamp` panics when
+    /// min > max (reboot under panic=abort), and `qualify_operating_point` narrows
+    /// `max_voltage_mv` (GammaTurbo non-overclock cap) AFTER the floor is fixed. Re-derive
+    /// the exact bounds for EVERY shipped board version in BOTH overclock modes and assert
+    /// floor <= cap (proves the panic is unreachable today), then adversarially sweep
+    /// qualify itself to prove it never panics regardless.
+    #[test]
+    fn voltage_clamp_never_panics_across_all_models() {
+        for profile in dcentaxe_hal::board::BoardVersionProfile::ALL {
+            for overclock in [false, true] {
+                let mut cfg = DcentAxeConfig::default();
+                cfg.board_model = profile.device_model.to_string();
+                cfg.board_version = profile.board_version.to_string();
+                cfg.overclock_enabled = overclock;
+                cfg.canonicalize_identity();
+                let board = cfg.board_config();
+                let stock = stock_asic_settings(board.model);
+                let limits = cfg.power_limits();
+
+                // Mirror the exact derivation in qualify_operating_point (min floor, then the
+                // GammaTurbo non-overclock narrowing of max toward default_voltage_mv).
+                let floor = board.min_voltage_mv.max(
+                    stock
+                        .voltage_options
+                        .iter()
+                        .copied()
+                        .min()
+                        .unwrap_or(board.min_voltage_mv),
+                );
+                let mut cap = limits.max_voltage_mv.min(
+                    stock
+                        .voltage_options
+                        .iter()
+                        .copied()
+                        .max()
+                        .unwrap_or(limits.max_voltage_mv),
+                );
+                if board.model == BitAxeModel::GammaTurbo && !overclock {
+                    cap = cap.min(board.default_voltage_mv);
+                }
+                assert!(
+                    floor <= cap,
+                    "{} v{} oc={overclock}: derived voltage floor {floor} > cap {cap} — u16::clamp would panic",
+                    profile.device_model,
+                    profile.board_version
+                );
+
+                // Belt-and-suspenders: qualify never panics on adversarial operating points.
+                for &f in &[f32::NAN, 0.0, 650.0, 99_999.0] {
+                    for &v in &[0u16, 1350, u16::MAX] {
+                        let qp = cfg.qualify_operating_point(f, v, ControlSurface::Autotuner);
+                        assert!(qp.voltage_mv <= board.max_voltage_mv);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PLAN-E Phase 1 — W5500 LAN config + accessory-guard activation gate.
+// Host-run via the dcentaxe-core `#[path]` re-include (`cargo test -p dcentaxe-core`).
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod w5500_lan_network_config_guards {
+    use super::*;
+
+    // ── DEFAULT-OFF: a fresh unit ships Ethernet-dark ────────────────────────
+    #[test]
+    fn network_config_defaults_off_with_eth_preferred_mode() {
+        let cfg = DcentAxeConfig::default();
+        assert!(
+            !cfg.network.eth_enabled,
+            "network.eth_enabled must default OFF (Ethernet-dark)"
+        );
+        assert_eq!(cfg.network.mode, NetworkMode::EthPreferred);
+        assert_eq!(
+            cfg.eth_lan_activation(),
+            Ok(false),
+            "default config must not activate the W5500 LAN"
+        );
+    }
+
+    // ── Legacy NVS blobs without the field round-trip to the disabled default ─
+    #[test]
+    fn legacy_blob_without_network_field_loads_disabled_default() {
+        let full = DcentAxeConfig::default();
+        let schema = full.schema_version;
+        let mut value = serde_json::to_value(&full).unwrap();
+        value.as_object_mut().unwrap().remove("network");
+        let loaded: DcentAxeConfig = serde_json::from_value(value).unwrap();
+        assert!(!loaded.network.eth_enabled);
+        assert_eq!(loaded.network.mode, NetworkMode::EthPreferred);
+        assert_eq!(loaded.schema_version, schema, "no schema bump needed");
+    }
+
+    // ── Serde shape: kebab-case mode tokens are the wire contract ────────────
+    #[test]
+    fn network_mode_serializes_kebab_case_and_round_trips() {
+        for (mode, token) in [
+            (NetworkMode::WifiOnly, "\"wifi-only\""),
+            (NetworkMode::EthOnly, "\"eth-only\""),
+            (NetworkMode::EthPreferred, "\"eth-preferred\""),
+        ] {
+            assert_eq!(serde_json::to_string(&mode).unwrap(), token);
+            let back: NetworkMode = serde_json::from_str(token).unwrap();
+            assert_eq!(back, mode);
+        }
+        assert!(serde_json::from_str::<NetworkMode>("\"invented\"").is_err());
+    }
+
+    // ── Activation gate matrix ───────────────────────────────────────────────
+    #[test]
+    fn eth_enabled_on_a_no_bap_board_activates() {
+        let mut cfg = DcentAxeConfig::default();
+        cfg.board_model = "gamma".into(); // stock Gamma: no BAP header populated
+        cfg.board_version = String::new();
+        cfg.network.eth_enabled = true;
+        assert!(!cfg.board_config().model.has_bap(), "test premise");
+        assert_eq!(cfg.eth_lan_activation(), Ok(true));
+    }
+
+    #[test]
+    fn wifi_only_mode_makes_the_toggle_inert() {
+        let mut cfg = DcentAxeConfig::default();
+        cfg.board_model = "gamma".into();
+        cfg.board_version = String::new();
+        cfg.network.eth_enabled = true;
+        cfg.network.mode = NetworkMode::WifiOnly;
+        assert_eq!(cfg.eth_lan_activation(), Ok(false));
+    }
+
+    // The crux guard: W5500 SPI rides the BAP-UART pins (GPIO39/40), so a
+    // BAP-Touch board must REFUSE LAN — fail-closed, mining unaffected.
+    #[test]
+    fn eth_enabled_on_a_bap_board_is_refused_by_the_accessory_guard() {
+        for bap_model in ["touch", "dcentaxe_bm1397"] {
+            let mut cfg = DcentAxeConfig::default();
+            cfg.board_model = bap_model.into();
+            cfg.board_version = String::new();
+            cfg.network.eth_enabled = true;
+            let board = cfg.board_config();
+            assert!(board.model.has_bap(), "test premise for '{bap_model}'");
+            assert_eq!(board.accessory_mode(), AccessoryMode::BapTouch);
+            let refused = cfg.eth_lan_activation();
+            assert!(
+                refused.is_err(),
+                "'{bap_model}' must refuse W5500 LAN while accessory mode is BAP-Touch"
+            );
+            // The refusal is the existing guard's message — activation must go
+            // through validate_accessory_mode, not a parallel re-implementation.
+            assert_eq!(
+                refused,
+                Err(board
+                    .validate_accessory_mode(AccessoryMode::W5500Lan)
+                    .unwrap_err())
+            );
+        }
+    }
+
+    // EthOnly requests still respect the guard (only WifiOnly is inert).
+    #[test]
+    fn eth_only_mode_still_goes_through_the_guard() {
+        let mut cfg = DcentAxeConfig::default();
+        cfg.board_model = "gamma".into();
+        cfg.board_version = String::new();
+        cfg.network.eth_enabled = true;
+        cfg.network.mode = NetworkMode::EthOnly;
+        assert_eq!(cfg.eth_lan_activation(), Ok(true));
+
+        cfg.board_model = "touch".into();
+        assert!(cfg.eth_lan_activation().is_err());
     }
 }

@@ -27,7 +27,6 @@
 //!   upgrades baud to 3.125M, ramps PLL to target frequency.
 
 use std::collections::VecDeque;
-use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -56,10 +55,13 @@ use dcentrald_hal::i2c::{
     spawn_i2c_service_no_register_touch_with_denylist, I2cMutationLabel, I2cServiceHandle,
     I2cTransactionStep,
 };
-use dcentrald_hal::platform::{FanAccess, Platform};
+use dcentrald_hal::platform::{FanAccess, FanCommandReceipt, Platform};
 use dcentrald_hal::psu::Apw121215a;
 use dcentrald_hal::psu_gpio_gate::PsuGpioGate;
 use dcentrald_hal::serial_chain::SerialChainBackend;
+use dcentrald_thermal::controller::{
+    FanTachSafety, FanTachSafetyState, DEFAULT_FAN_BELOW_MINIMUM_FAILURE_TICKS,
+};
 
 use crate::config::DcentraldConfig;
 use crate::history::{self, HistoryBuffer};
@@ -91,11 +93,140 @@ const BM1398_WORK_HISTORY_PER_ID: usize = dcentrald_common::BM1398_WORK_HISTORY_
 const AMLOGIC_TEMP_STARTUP_GRACE_S: u64 = 30;
 const AMLOGIC_TEMP_MISS_LIMIT: u8 = 3;
 const AMLOGIC_THERMAL_RESTART_DELAY_S: u64 = 60;
+const AMLOGIC_FAN_SPINUP_ATTEMPTS: u32 = 3;
+const AMLOGIC_FAN_SPINUP_RETRY_DELAY: Duration = Duration::from_millis(250);
 const APW12_139_ASSUMED_FW: u8 = 0x71;
 const RUNTIME_THREAD_STOP_TIMEOUT: Duration = Duration::from_secs(3);
 const NOPIC_WATCHDOG_BRINGUP_GRACE: Duration = Duration::from_secs(120);
 const NOPIC_SAFETY_LIVENESS_INTERVAL: Duration = Duration::from_secs(2);
 const HASHBOARD_EEPROM_WRITE_DENYLIST: [u8; 8] = [0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57];
+
+#[derive(Debug)]
+struct FanTachSnapshot {
+    available: bool,
+    expected_channels: usize,
+    readings: Vec<(u8, u32)>,
+}
+
+impl FanTachSnapshot {
+    fn rpms(&self) -> Vec<u32> {
+        self.readings.iter().map(|(_, rpm)| *rpm).collect()
+    }
+}
+
+async fn sample_fan_tach(fan: Arc<dyn FanAccess>) -> Result<FanTachSnapshot> {
+    tokio::task::spawn_blocking(move || {
+        let readings = fan.get_per_fan_rpm();
+        FanTachSnapshot {
+            // Read availability after sampling so a sampler error that revokes
+            // the owner's evidence is part of this snapshot.
+            available: fan.tach_available(),
+            expected_channels: fan.fan_count() as usize,
+            readings,
+        }
+    })
+    .await
+    .context("fan tach sampling worker did not complete")
+}
+
+async fn admit_fan_motion_at_pwm(
+    fan: Arc<dyn FanAccess>,
+    safety: &mut FanTachSafety,
+    pwm: u8,
+    stage: &'static str,
+) -> Result<FanCommandReceipt> {
+    let receipt = fan
+        .set_speed_checked(pwm)
+        .with_context(|| format!("Amlogic {stage} fan command/readback failed"))?;
+    for attempt in 1..=AMLOGIC_FAN_SPINUP_ATTEMPTS {
+        let snapshot = sample_fan_tach(fan.clone()).await?;
+        let rpms = snapshot.rpms();
+        let state = safety.observe_required_airflow(
+            snapshot.available,
+            receipt.observed_pwm(),
+            snapshot.expected_channels,
+            &rpms,
+        );
+        match state {
+            FanTachSafetyState::Healthy => {
+                info!(
+                    stage,
+                    attempt,
+                    pwm = receipt.observed_pwm(),
+                    readings = ?snapshot.readings,
+                    "Amlogic pre-energize fan-motion admission accepted"
+                );
+                return Ok(receipt);
+            }
+            FanTachSafetyState::AirflowNotCommanded
+            | FanTachSafetyState::EvidenceUnavailable { .. } => {
+                anyhow::bail!("Amlogic {stage} pre-energize tach evidence unavailable: {state:?}");
+            }
+            FanTachSafetyState::Debouncing { .. } | FanTachSafetyState::Failed { .. }
+                if attempt < AMLOGIC_FAN_SPINUP_ATTEMPTS =>
+            {
+                warn!(stage, attempt, ?state, readings = ?snapshot.readings, "Amlogic fans have not established motion; retrying before power admission");
+                tokio::time::sleep(AMLOGIC_FAN_SPINUP_RETRY_DELAY).await;
+            }
+            _ => {
+                anyhow::bail!(
+                    "Amlogic {stage} pre-energize fan-motion admission refused after {} attempts: state={state:?}, readings={:?}",
+                    AMLOGIC_FAN_SPINUP_ATTEMPTS,
+                    snapshot.readings
+                );
+            }
+        }
+    }
+    anyhow::bail!("Amlogic {stage} pre-energize fan-motion admission did not complete")
+}
+
+async fn admit_fan_airflow_envelope(
+    fan: Arc<dyn FanAccess>,
+    safety: &mut FanTachSafety,
+    minimum_pwm: u8,
+    maximum_pwm: u8,
+) -> Result<FanCommandReceipt> {
+    admit_fan_motion_at_pwm(fan.clone(), safety, maximum_pwm, "spin-up").await?;
+    if minimum_pwm != maximum_pwm {
+        if let Err(minimum_error) =
+            admit_fan_motion_at_pwm(fan.clone(), safety, minimum_pwm, "energized minimum").await
+        {
+            match fan.set_speed_checked(maximum_pwm) {
+                Ok(_) => {
+                    anyhow::bail!(
+                        "Amlogic energized-minimum motion proof failed; restored startup ceiling before refusing power: {minimum_error:#}"
+                    );
+                }
+                Err(restore_error) => {
+                    anyhow::bail!(
+                        "Amlogic energized-minimum motion proof failed and startup ceiling restoration also failed: motion={minimum_error:#}; restore={restore_error}"
+                    );
+                }
+            }
+        }
+    }
+    // Leave startup at the retained ceiling. The low-point observation above
+    // proves the later proportional controller may safely return to its floor.
+    fan.set_speed_checked(maximum_pwm)
+        .context("Amlogic final pre-energize fan command/readback failed")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoPicFanLoopDisposition {
+    Continue,
+    SafeOffAndStop,
+}
+
+fn nopic_fan_loop_disposition(state: &FanTachSafetyState) -> NoPicFanLoopDisposition {
+    match state {
+        FanTachSafetyState::Healthy | FanTachSafetyState::Debouncing { .. } => {
+            NoPicFanLoopDisposition::Continue
+        }
+        FanTachSafetyState::AirflowNotCommanded
+        | FanTachSafetyState::Failed { .. }
+        | FanTachSafetyState::EvidenceUnavailable { .. } => NoPicFanLoopDisposition::SafeOffAndStop,
+    }
+}
 
 fn observed_dspic_firmware(version: Option<u8>) -> Result<DspicFirmware> {
     let version = version.context(
@@ -119,17 +250,39 @@ enum NoPicPowerState {
 
 struct NoPicPsuGuard {
     state: NoPicPowerState,
+    terminal_fence: Option<dcentrald_hal::platform::amlogic::AmlogicPowerThermalFence>,
+}
+
+struct NoPicSafeOffReceipt {
+    power: dcentrald_hal::platform::amlogic::PsuSafeOffReceipt,
+    management_fabric: dcentrald_hal::i2c::TerminalSafeOffTransition,
+}
+
+impl NoPicSafeOffReceipt {
+    fn power(&self) -> &dcentrald_hal::platform::amlogic::PsuSafeOffReceipt {
+        &self.power
+    }
+
+    fn management_fabric(&self) -> &dcentrald_hal::i2c::TerminalSafeOffTransition {
+        &self.management_fabric
+    }
 }
 
 impl NoPicPsuGuard {
     fn new() -> Self {
         Self {
             state: NoPicPowerState::NeverOwned,
+            terminal_fence: None,
         }
     }
 
-    fn prepare_enable(&mut self, fan_max_pwm: u8) {
+    fn prepare_enable(
+        &mut self,
+        fan_max_pwm: u8,
+        terminal_fence: dcentrald_hal::platform::amlogic::AmlogicPowerThermalFence,
+    ) {
         self.state = NoPicPowerState::MayBeEnergized;
+        self.terminal_fence = Some(terminal_fence);
         arm_nopic_teardown(fan_max_pwm);
     }
 
@@ -142,20 +295,39 @@ impl NoPicPsuGuard {
         self.state != NoPicPowerState::NeverOwned
     }
 
-    fn safe_off(&mut self) -> Result<dcentrald_hal::platform::amlogic::PsuSafeOffReceipt> {
+    fn safe_off(&mut self) -> Result<NoPicSafeOffReceipt> {
         if !self.owns_power() {
             anyhow::bail!("NoPic software safe-off requested without an owned power lease");
         }
+        let fabric_transition = self
+            .terminal_fence
+            .as_ref()
+            .map(|fence| fence.latch_terminal_safe_off());
         let receipt = dcentrald_hal::platform::amlogic::disable_psu_checked()
             .context("checked NoPic GPIO437 safe-off failed")?;
         self.state = NoPicPowerState::NeverOwned;
-        Ok(receipt)
+        let management_fabric = fabric_transition.context(
+            "NoPic GPIO437 is checked low, but no management-fabric terminal transition was issued",
+        )?;
+        Ok(NoPicSafeOffReceipt {
+            power: receipt,
+            management_fabric,
+        })
     }
 }
 
 impl Drop for NoPicPsuGuard {
     fn drop(&mut self) {
         if self.owns_power() {
+            if let Some(fence) = self.terminal_fence.as_ref() {
+                let transition = fence.latch_terminal_safe_off();
+                if !transition.no_controller_mutation_stage_in_flight() {
+                    error!(
+                        generation = transition.generation(),
+                        "NoPic drop fenced management I2C with a controller mutation still in flight"
+                    );
+                }
+            }
             // Safety (cut-hash-before-noise + PWM-30 home cap, per
             // ): CUT PSU POWER FIRST so the heat
             // source (the hashboards) is removed, THEN hold fans at the quiet
@@ -180,20 +352,11 @@ impl Drop for NoPicPsuGuard {
     }
 }
 
-fn checked_nopic_emergency_safe_off(
-    guard: &mut NoPicPsuGuard,
-) -> Result<dcentrald_hal::platform::amlogic::PsuSafeOffReceipt> {
+fn checked_nopic_emergency_safe_off(guard: &mut NoPicPsuGuard) -> Result<NoPicSafeOffReceipt> {
     if guard.owns_power() {
         guard.safe_off()
     } else {
-        // BM1366 adopted-live and legacy passthrough routes do not yet carry a
-        // typed power lease. Preserve their existing emergency cut capability,
-        // but use the checked GPIO-low path and never treat this receipt as
-        // authority to disarm the legacy watchdog. Migration to an explicit
-        // AdoptedPowerLease remains required before those routes can use the
-        // reusable safety-watchdog closeout contract.
-        dcentrald_hal::platform::amlogic::disable_psu_checked()
-            .context("checked emergency GPIO437 safe-off on unowned NoPic route failed")
+        anyhow::bail!("checked NoPic emergency safe-off requested without an owned power lease")
     }
 }
 
@@ -908,36 +1071,22 @@ const BM1362_PLL_TABLE: &[(u16, u32)] = &[
 
 const BM1398_MISC_CTRL_INIT: u32 = 0x0000_7A31; // BT8D=26 → 115200 baud
 const BM1398_MISC_CTRL_FAST: u32 = 0x0000_6031; // BT8D=0 → 3.125 MHz baud
-const BM1398_CORE_REG_CTRL: u32 = 0x8000_8074; // AsicBoost enable
 const BM1398_TICKET_MASK: u32 = 0x0000_00FF; // Difficulty 256
 const BM1398_ORDERED_CLK_EN: u32 = 0x0000_0001;
 const BM1398_CLK_ORDER_CTRL: u32 = 0x0000_0000;
 
-/// BM1398 PLL table — (freq_mhz, pll_reg_value).
-/// Copied from bm1398.rs bm1398_pll_calc() output.
-const BM1398_PLL_TABLE: &[(u16, u32)] = &[
-    (400, 0x4040_0221), // FBDIV=64, REFDIV=2, PD1=2, PD2=1
-    (450, 0x4048_0221),
-    (500, 0x4050_0221), // FBDIV=80
-    (550, 0x4058_0221),
-    (600, 0x4060_0221), // FBDIV=96
-    (650, 0x4068_0221),
-    (675, 0x406C_0221),
-    (700, 0x4070_0221),
-];
-
 fn bm1398_pll_lookup(target_mhz: u16) -> (u32, u16) {
-    let target = target_mhz.clamp(400, 700);
-    let mut best = BM1398_PLL_TABLE[0];
-    let mut best_diff = (target as i32 - best.0 as i32).unsigned_abs();
-    for &entry in &BM1398_PLL_TABLE[1..] {
-        let diff = (target as i32 - entry.0 as i32).unsigned_abs();
-        if diff < best_diff {
-            best = entry;
-            best_diff = diff;
-        }
-    }
-    (best.1, best.0)
+    let target_mhz = target_mhz.clamp(400, 700);
+    let solution = dcentrald_api_types::bm1398_protocol::resolve_bm1398_pll(target_mhz)
+        .expect("built-in BM1398 PLL search envelope must resolve mining frequencies");
+    let actual_millimhz = solution
+        .dividers
+        .output_millimhz(dcentrald_api_types::bm1398_protocol::BM1398_PLL_SEARCH_SPEC.reference_mhz)
+        .expect("resolved BM1398 dividers are non-zero");
+    (
+        solution.register_value,
+        ((actual_millimhz + 500) / 1_000) as u16,
+    )
 }
 
 fn bm1362_pll_lookup(target_mhz: u16) -> (u32, u16) {
@@ -1653,98 +1802,6 @@ impl SerialMiner {
             "BM1362 probe ladder"
         );
         Ok(())
-    }
-
-    /// Initialize PIC voltage controller at I2C address 0x21.
-    ///
-    /// **CRITICAL**: Do NOT send PIC RESET/JUMP bootloader-control opcodes on
-    /// S19j Pro. GET_VERSION recovery is handled by transaction shape: framed
-    /// probes read five bytes, short/bare probes read exactly one byte.
-    ///
-    /// Safe cold-boot sequence for PIC v0x89 (NO RESET/JUMP):
-    ///   1. Flush 16 zero bytes (clear parser state — v0x89 needs 16, not 8)
-    ///   2. GET_VERSION (cmd 0x17) through the service preflight path
-    ///   3. SET_VOLTAGE (cmd 0x10, arg=DAC value) → set safe init voltage
-    ///   4. ENABLE (cmd 0x15, arg=0x01) → voltage on
-    ///   5. First heartbeat (cmd 0x16)
-    fn init_pic(i2c_fd: &std::fs::File, fd: i32, pic_addr: u8) {
-        info!(
-            "PIC v0x5A init at 0x{:02X} via kernel I2C (byte-by-byte)",
-            pic_addr
-        );
-
-        // Set I2C slave address
-        let ret = unsafe { libc::ioctl(fd, 0x0706, pic_addr as libc::c_ulong) };
-        if ret < 0 {
-            error!(
-                "Failed to set I2C slave 0x{:02X}: {}",
-                pic_addr,
-                std::io::Error::last_os_error()
-            );
-            return;
-        }
-        unsafe { libc::ioctl(fd, 0x0702, 10 as libc::c_ulong) };
-
-        let mut fd_ref: &std::fs::File = i2c_fd;
-        use std::io::{Read, Write};
-
-        // Step 1: Read raw PIC byte to detect mode
-        let mut raw = [0u8; 1];
-        match fd_ref.read(&mut raw) {
-            Ok(1) => info!("PIC: raw read = 0x{:02X}", raw[0]),
-            Ok(n) => info!("PIC: raw read got {} bytes", n),
-            Err(e) => warn!("PIC: raw read failed: {}", e),
-        }
-
-        // Step 2: Flush PIC parser — 16 zero bytes as one I2C transaction
-        info!("PIC: flushing parser (16x 0x00) — single transaction");
-        match fd_ref.write_all(&[0u8; 16]) {
-            Ok(_) => info!("PIC: flush OK"),
-            Err(e) => warn!("PIC: flush write failed: {}", e),
-        }
-        std::thread::sleep(Duration::from_millis(100));
-
-        // Step 3: SET_VOLTAGE as SINGLE I2C transaction (not byte-by-byte!)
-        // The PIC needs all command bytes in ONE I2C transaction.
-        // Byte-by-byte creates separate START/STOP per byte — PIC doesn't
-        // accumulate across transactions. Multi-byte write via kernel driver
-        // handles clock stretching for the PIC's 1-byte MSSP buffer.
-        let set_v_cmd = pic_cmd(0x10, 6);
-        info!("PIC: SET_VOLTAGE {:02X?} — single transaction", set_v_cmd);
-        match fd_ref.write_all(&set_v_cmd) {
-            Ok(_) => info!("PIC: SET_VOLTAGE OK"),
-            Err(e) => warn!("PIC: SET_VOLTAGE failed: {}", e),
-        }
-        std::thread::sleep(Duration::from_millis(50));
-
-        // Step 4: ENABLE voltage as SINGLE I2C transaction.
-        //
-        // Use the 7-byte VNish-RE'd form `[55 AA 05 15 01 00 1B]` for fw=0x86/
-        // 0x89 PICs — the previous 6-byte form `[55 AA 04 15 01 1A]` was based
-        // on early RE that inferred a 1-byte payload. VNish disasm (RE corpus
-        // 2026-04-25) proves the actual frame is 7 bytes with a 2-byte payload
-        // `[0x01, 0x00]` and ACK status=0x01. See
-        // .
-        let enable_cmd = pic_enable_cmd_vnish(0x01);
-        info!(
-            "PIC: ENABLE {:02X?} — 7-byte VNish form, single transaction",
-            enable_cmd
-        );
-        match fd_ref.write_all(&enable_cmd) {
-            Ok(_) => info!("PIC: ENABLE OK"),
-            Err(e) => warn!("PIC: ENABLE failed: {}", e),
-        }
-        std::thread::sleep(Duration::from_millis(100));
-
-        // Step 5: First heartbeat as SINGLE I2C transaction
-        let hb_cmd = pic_cmd(0x16, 0x00);
-        info!("PIC: HEARTBEAT {:02X?} — single transaction", hb_cmd);
-        match fd_ref.write_all(&hb_cmd) {
-            Ok(_) => info!("PIC: HEARTBEAT OK"),
-            Err(e) => warn!("PIC: HEARTBEAT failed: {}", e),
-        }
-
-        info!("PIC: init complete — voltage should be ramping up");
     }
 
     /// Reset ASICs to 115200 baud from any previous baud rate (hot-start recovery).
@@ -2647,9 +2704,12 @@ impl SerialMiner {
         serial.send_write_reg_broadcast(0x20, BM1398_ORDERED_CLK_EN)?;
         std::thread::sleep(Duration::from_millis(5));
 
-        // Step 5: Core Register Control (AsicBoost enable)
-        serial.send_write_reg_broadcast(0x3C, BM1398_CORE_REG_CTRL)?;
-        std::thread::sleep(Duration::from_millis(5));
+        // Step 5: staged core-register control recovered independently from
+        // the stock NBP1901 miner and repair jig.
+        for write in dcentrald_api_types::bm1398_protocol::BM1398_PROVEN_CORE_WRITES {
+            serial.send_write_reg_broadcast(write.register, write.value)?;
+            std::thread::sleep(Duration::from_millis(5));
+        }
 
         // Step 6: TicketMask (difficulty 256)
         serial.send_write_reg_broadcast(0x14, BM1398_TICKET_MASK)?;
@@ -2726,11 +2786,29 @@ impl SerialMiner {
         let is_bm1370 = resolved_chip_id == 0x1370;
         let is_bm1362 = resolved_chip_id == 0x1362;
         let native_nopic_power_owner = !passthrough && (is_bm1368 || is_bm1370);
+        if is_bm1366 && nopic && !passthrough {
+            anyhow::bail!(
+                "native BM1366 NoPic mining is refused until S19K/S19 XP power adoption, retained bus-1 ownership, and watchdog closeout share one admitted lifecycle"
+            );
+        }
         let nopic_watchdog_liveness = SafetyLiveness::default();
         // Declared before the PSU guard so ordinary unwinding cuts GPIO437
-        // before dropping the watchdog command owner.
+        // before dropping the watchdog command owner. The retained bus-1
+        // owner is declared first so the PSU guard drops (and cuts power)
+        // before the final management-fabric handle can disappear.
+        let mut amlogic_admission: Option<dcentrald_hal::platform::amlogic::AmlogicNoPicAdmission> =
+            None;
+        let mut amlogic_power_thermal: Option<
+            dcentrald_hal::platform::amlogic::AmlogicPowerThermalService,
+        > = None;
+        let mut amlogic_fan: Option<Arc<dyn FanAccess>> = None;
+        let mut nopic_fan_safety = FanTachSafety::with_minimum_credible_rpm(
+            DEFAULT_FAN_BELOW_MINIMUM_FAILURE_TICKS,
+            dcentrald_hal::platform::amlogic::REQUIRED_AIRFLOW_MIN_RPM,
+        );
         let mut nopic_watchdog: Option<SafetyWatchdogOwner> = None;
         let mut nopic_psu_guard = NoPicPsuGuard::new();
+        let mut nopic_energized_at: Option<Instant> = None;
         let mut am2_power = Am2PsuRuntimeGuard::new();
         // Hardware-worker cancellation is independent from the process token.
         // The main loop observes process shutdown, admits watchdog Teardown,
@@ -2784,31 +2862,6 @@ impl SerialMiner {
         } else {
             None
         };
-        let bm1362_i2c_service = if (is_bm1398 || is_bm1366 || is_bm1362) && !nopic && !passthrough
-        {
-            Some(
-                spawn_i2c_service_no_register_touch_with_denylist(
-                    0,
-                    HASHBOARD_EEPROM_WRITE_DENYLIST.to_vec(),
-                )
-                .context("Failed to spawn AM2 serial /dev/i2c-0 service")?,
-            )
-        } else {
-            None
-        };
-        let bhb56_dspic_sessions = if pending_bhb56_endpoints.is_empty() {
-            Vec::new()
-        } else {
-            let i2c_service = bm1362_i2c_service
-                .as_ref()
-                .context("BHB56 endpoints were issued but serialized I2C service did not start")?;
-            pending_bhb56_endpoints
-                .into_iter()
-                .map(|endpoint| DspicEndpointSession::new(i2c_service.clone(), endpoint))
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .context("failed to bind BHB56 endpoints to serialized I2C service")?
-        };
-
         let bm1362_pic_addr = Self::bm1362_pic_addr_for_serial_runtime(
             &serial_device,
             is_bm1362,
@@ -2967,6 +3020,112 @@ impl SerialMiner {
                 }
             }
         }
+
+        // Bootstrap sysfs EEPROM reads above must finish before the sole
+        // runtime service reserves /dev/i2c-0. A kernel AT24 read is an I2C
+        // transfer even though it appears as a read-only sysfs file; allowing
+        // it after this boundary would create an invisible second bus owner.
+        let bm1362_i2c_service = if (is_bm1398 || is_bm1366 || is_bm1362) && !nopic && !passthrough
+        {
+            Some(
+                spawn_i2c_service_no_register_touch_with_denylist(
+                    0,
+                    HASHBOARD_EEPROM_WRITE_DENYLIST.to_vec(),
+                )
+                .context("Failed to spawn AM2 serial /dev/i2c-0 service")?,
+            )
+        } else {
+            None
+        };
+        if native_nopic_power_owner {
+            amlogic_admission = Some(
+                dcentrald_hal::platform::amlogic::AmlogicNoPicAdmission::detect(
+                    dcentrald_hal::platform::amlogic::AmlogicNoPicProfile::S21,
+                    &serial_device,
+                )
+                .context("Amlogic control-board identity did not admit native NoPic ownership")?,
+            );
+            let admission = amlogic_admission
+                .as_ref()
+                .context("Amlogic NoPic admission disappeared before owner construction")?;
+            amlogic_power_thermal = Some(
+                admission
+                    .spawn_power_thermal_service()
+                    .context("Failed to establish retained Amlogic /dev/i2c-1 ownership")?,
+            );
+        }
+
+        // Cooling ownership and a checked startup command are prerequisites
+        // for native NoPic power. This narrow constructor performs no platform
+        // re-detection or raw I2C probe after the serialized services exist.
+        let (effective_fan_min_pwm, effective_fan_max_pwm): (u8, u8) = if native_nopic_power_owner {
+            let accept_degraded_tach = std::env::var("DCENT_AM3_AML_ACCEPT_DEGRADED_TACH")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let mut profile = dcentrald_thermal::profiles::ThermalProfile {
+                fan_max_pwm: self.config.thermal.fan_max_pwm,
+                fan_min_pwm: self.config.thermal.fan_min_pwm,
+                ..Default::default()
+            };
+            let _ = dcentrald_thermal::profiles::enforce_amlogic_tach_safety_policy(
+                &mut profile,
+                true,
+                accept_degraded_tach,
+            );
+            dcentrald_thermal::profiles::enforce_required_airflow_pwm(
+                &mut profile,
+                dcentrald_hal::platform::amlogic::REQUIRED_AIRFLOW_MIN_PWM,
+            )
+            .context("Amlogic air-cooled fan profile cannot satisfy required airflow")?;
+            (profile.fan_min_pwm, profile.fan_max_pwm)
+        } else {
+            (
+                self.config.thermal.fan_min_pwm,
+                self.config.thermal.fan_max_pwm,
+            )
+        };
+        amlogic_fan = if native_nopic_power_owner {
+            let fan = amlogic_admission
+                .as_ref()
+                .context("Amlogic cooling construction lacks NoPic admission")?
+                .open_fan_controller()
+                .context("Failed to open Amlogic fan control before power admission")?;
+            if effective_fan_max_pwm < self.config.thermal.fan_max_pwm {
+                warn!(
+                    requested_cap = self.config.thermal.fan_max_pwm,
+                    applied_cap = effective_fan_max_pwm,
+                    "am3-aml fan cap exceeds degraded-tach safety policy; applying retained startup ceiling"
+                );
+            }
+            let receipt = admit_fan_airflow_envelope(
+                fan.clone(),
+                &mut nopic_fan_safety,
+                effective_fan_min_pwm,
+                effective_fan_max_pwm,
+            )
+            .await?;
+            debug!(
+                requested_pwm = receipt.requested_pwm(),
+                observed_pwm = receipt.observed_pwm(),
+                minimum_pwm = effective_fan_min_pwm,
+                "Amlogic cooling owner admitted before NoPic power after min/max motion proof"
+            );
+            Some(fan)
+        } else {
+            None
+        };
+        let bhb56_dspic_sessions = if pending_bhb56_endpoints.is_empty() {
+            Vec::new()
+        } else {
+            let i2c_service = bm1362_i2c_service
+                .as_ref()
+                .context("BHB56 endpoints were issued but serialized I2C service did not start")?;
+            pending_bhb56_endpoints
+                .into_iter()
+                .map(|endpoint| DspicEndpointSession::new(i2c_service.clone(), endpoint))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("failed to bind BHB56 endpoints to serialized I2C service")?
+        };
 
         let serial = if passthrough {
             info!("PASSTHROUGH MODE — skipping PIC/ASIC init");
@@ -3176,7 +3335,7 @@ impl SerialMiner {
         } else if is_bm1368 || is_bm1370 {
             // ---- BM1368 (S21/T21): NoPic + BM1368-specific init ----
             // Voltage architecture (verified 2026-04-12 via ftrace + fixture RE + live probe):
-            //   - TAS5782M DACs (bus 1, addr 0x49/0x4A/0x4B) are kernel-managed from DTB
+            //   - TAS5782M DACs (bus 0, addr 0x49/0x4A/0x4B) are kernel-managed from DTB
             //   - APW PSU enabled via GPIO 437 plus APW I2C/PMBus preboot sequence at 0x1f
             //   - Bosminer never writes to TAS5782M — voltage DACs stay kernel-managed
             //   - No PMBus device at 0x58 on either I2C bus (confirmed 2026-04-12);
@@ -3245,22 +3404,74 @@ impl SerialMiner {
             // old "PSU_nEN active LOW" — that inverted reading was the original
             // polarity bug. (prod-readiness hunt-2 #H2.) Arm the shutdown guard
             // immediately so a failed init does not leave boards powered.
-            nopic_psu_guard.prepare_enable(self.config.thermal.fan_max_pwm);
-            dcentrald_hal::platform::amlogic::enable_psu().context("Failed to enable NoPic PSU")?;
+            let power_thermal = amlogic_power_thermal
+                .as_ref()
+                .context("NoPic power route lacks retained Amlogic bus-1 ownership")?;
+            nopic_psu_guard.prepare_enable(effective_fan_max_pwm, power_thermal.terminal_fence());
+            let power_enable_owner = power_thermal.clone();
+            let enable_receipt =
+                tokio::task::spawn_blocking(move || power_enable_owner.enable_psu())
+                    .await
+                    .context("NoPic PSU enable worker did not complete")?
+                    .context("Failed to enable NoPic PSU")?;
+            debug!(
+                writes_completed_at = ?enable_receipt.writes_completed_at(),
+                status_word = ?enable_receipt.status_word(),
+                "NoPic APW enable receipt retained"
+            );
             nopic_psu_guard.mark_enabled();
+            let energized_at = Instant::now();
+            nopic_energized_at = Some(energized_at);
 
-            let startup_board_temps = dcentrald_hal::platform::amlogic::read_board_temps(1);
-            if startup_board_temps.is_empty() {
+            let startup_thermal_owner = power_thermal.clone();
+            let mut startup_board_temps = tokio::task::spawn_blocking(move || {
+                startup_thermal_owner
+                    .read_board_temperatures(Instant::now() + Duration::from_millis(750))
+            })
+            .await
+            .context("NoPic startup thermal worker did not complete")?;
+            let startup_deadline = energized_at + Duration::from_secs(AMLOGIC_TEMP_STARTUP_GRACE_S);
+            loop {
+                if let Some(hottest_temp) = startup_board_temps.hottest_celsius() {
+                    if hottest_temp >= self.config.thermal.dangerous_temp_c as f32 {
+                        let _safe_off = nopic_psu_guard
+                            .safe_off()
+                            .context("dangerous startup temperature safe-off failed")?;
+                        anyhow::bail!(
+                            "Amlogic startup observed dangerous temperature {hottest_temp:.1} C before ASIC initialization"
+                        );
+                    }
+                }
+                let startup_coverage = startup_board_temps.required_coverage();
+                if startup_coverage.is_complete() {
+                    break;
+                }
                 warn!(
-                    "No board temperatures responded immediately after PSU enable — falling back to ASIC liveness probe"
+                    required_slots = ?startup_coverage.required_slots(),
+                    missing_slots = ?startup_coverage.missing_slots(),
+                    deadline_ms = startup_deadline.saturating_duration_since(Instant::now()).as_millis(),
+                    "Required board-temperature coverage is incomplete after PSU enable; ASIC initialization remains blocked"
                 );
-            } else {
-                let hottest_temp = startup_board_temps
-                    .iter()
-                    .map(|(_, temp)| *temp)
-                    .fold(0.0f32, f32::max);
+                if self.shutdown.is_cancelled() || Instant::now() >= startup_deadline {
+                    let _safe_off = nopic_psu_guard
+                        .safe_off()
+                        .context("startup thermal-coverage safe-off failed")?;
+                    anyhow::bail!(
+                        "required Amlogic board-temperature coverage did not become complete before the powered-startup deadline"
+                    );
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let retry_owner = power_thermal.clone();
+                startup_board_temps = tokio::task::spawn_blocking(move || {
+                    retry_owner.read_board_temperatures(Instant::now() + Duration::from_millis(750))
+                })
+                .await
+                .context("NoPic startup thermal retry worker did not complete")?;
+            }
+            if let Some(hottest_temp) = startup_board_temps.hottest_celsius() {
                 info!(
-                    sensors = startup_board_temps.len(),
+                    sensors = startup_board_temps.readings().len(),
+                    unavailable = startup_board_temps.unavailable().len(),
                     hottest_c = format_args!("{:.1}", hottest_temp),
                     "Board temperature sensors responded after PSU enable"
                 );
@@ -3317,7 +3528,7 @@ impl SerialMiner {
             }
 
             if !found_chips {
-                if startup_board_temps.is_empty() {
+                if startup_board_temps.readings().is_empty() {
                     anyhow::bail!(
                         "NoPic PSU enable produced no board-temperature or ASIC-response proof — refusing to continue blind"
                     );
@@ -3761,68 +3972,11 @@ impl SerialMiner {
                         }
                     }
 
-                    if hb_uses_dspic {
-                        error!(
-                            bm1362 = hb_is_bm1362,
-                            "AM2 serial I2C service missing for dsPIC heartbeat; refusing second /dev/i2c-0 owner"
-                        );
-                    } else {
-                        let i2c_fd = match std::fs::OpenOptions::new()
-                            .read(true)
-                            .write(true)
-                            .open("/dev/i2c-0")
-                        {
-                            Ok(f) => f,
-                            Err(e) => {
-                                error!(error = %e, "Failed to open /dev/i2c-0 for heartbeat");
-                                return;
-                            }
-                        };
-                        let fd = i2c_fd.as_raw_fd();
-                        let ret = unsafe {
-                            libc::ioctl(
-                                fd,
-                                0x0706,
-                                heartbeat_pic_addr as libc::c_ulong,
-                            )
-                        };
-                        if ret < 0 {
-                            error!("I2C_SLAVE failed for heartbeat");
-                            return;
-                        }
-                        unsafe {
-                            libc::ioctl(fd, 0x0702, 10 as libc::c_ulong)
-                        };
-                        info!(
-                            "PIC heartbeat running (0x{:02X}) via kernel I2C",
-                            heartbeat_pic_addr
-                        );
-
-                        let hb_cmd = pic_cmd(0x16, 0x00);
-                        let mut fails = 0u32;
-                        loop {
-                            if hb_shutdown.is_cancelled() {
-                                break;
-                            }
-
-                            use std::io::Write;
-                            let mut fd_ref: &std::fs::File = &i2c_fd;
-                            // Single-transaction write — all 6 bytes in one I2C transaction
-                            let ok = fd_ref.write_all(&hb_cmd).is_ok();
-                            if ok {
-                                if fails > 0 {
-                                    info!("PIC heartbeat OK after {} fails", fails);
-                                }
-                                fails = 0;
-                            } else {
-                                fails += 1;
-                                if fails <= 3 || fails.is_multiple_of(10) {
-                                    warn!(fails, "PIC heartbeat fail ({}x)", fails);
-                                }
-                            }
-                            std::thread::sleep(Duration::from_millis(PIC_HEARTBEAT_INTERVAL_MS));
-                        }
-                    }
+                    error!(
+                        bm1362 = hb_is_bm1362,
+                        legacy_pic_route = !hb_uses_dspic,
+                        "serialized I2C heartbeat authority is unavailable; refusing an unbrokered /dev/i2c-0 owner"
+                    );
                 })
                 .context("Failed to spawn heartbeat thread")?;
             runtime_threads.push("s19j-pic-hb", handle);
@@ -4560,81 +4714,8 @@ impl SerialMiner {
 
         // Thermal management for NoPic/Amlogic platforms
         let mut thermal_timer = tokio::time::interval(Duration::from_secs(2));
-        // THERMAL-2: the am3-aml degraded-tach clamp must own EVERY fan command on
-        // this loop, not just the startup write — otherwise the steady-state /
-        // hot-path ceilings (which read `self.config.thermal.fan_max_pwm`) would
-        // re-introduce the un-clamped > 64 cap. Compute the effective ceiling once,
-        // here, via the same policy used at startup, and use it for every ceiling in
-        // the Amlogic thermal tick below. The clamp only LOWERS the value; on a home
-        // profile (≤ 64) or with the operator override it equals the configured cap.
-        let effective_fan_max_pwm: u8 = if is_nopic(&self.config) {
-            let accept_degraded_tach = std::env::var("DCENT_AM3_AML_ACCEPT_DEGRADED_TACH")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            let mut p = dcentrald_thermal::profiles::ThermalProfile {
-                fan_max_pwm: self.config.thermal.fan_max_pwm,
-                fan_min_pwm: self.config.thermal.fan_min_pwm,
-                ..Default::default()
-            };
-            let _ = dcentrald_thermal::profiles::enforce_amlogic_tach_safety_policy(
-                &mut p,
-                true,
-                accept_degraded_tach,
-            );
-            p.fan_max_pwm
-        } else {
-            self.config.thermal.fan_max_pwm
-        };
-        let amlogic_fan = if is_nopic(&self.config) {
-            match dcentrald_hal::platform::amlogic::AmlogicPlatform::new() {
-                Ok(p) => match p.open_fan() {
-                    Ok(fan) => {
-                        // THERMAL-2 (GAP-3 stage-2): ACTIVELY clamp the am3-aml startup
-                        // fan command to `effective_fan_max_pwm` (computed above via
-                        // `enforce_amlogic_tach_safety_policy`) instead of just logging the
-                        // would-clamp. A config requesting Advanced/HashrateMax (PWM > 64)
-                        // is clamped down to Balanced (PWM 64) unless the operator set
-                        // `DCENT_AM3_AML_ACCEPT_DEGRADED_TACH=1`. This only ever LOWERS the
-                        // commanded speed (quieter, never louder), so it cannot regress the
-                        // PWM-30 home cap or cut-hash-before-noise; a home profile (≤ 64) is
-                        // untouched.
-                        if effective_fan_max_pwm < self.config.thermal.fan_max_pwm {
-                            warn!(
-                                requested_cap = self.config.thermal.fan_max_pwm,
-                                applied_cap = effective_fan_max_pwm,
-                                "am3-aml fan cap exceeds degraded-tach safety policy — CLAMPING PWM>64 down to {} (set DCENT_AM3_AML_ACCEPT_DEGRADED_TACH=1 to opt back into Advanced/HashrateMax once per-fan tach is verified)",
-                                effective_fan_max_pwm,
-                            );
-                        }
-                        let fan_receipt = fan
-                            .set_speed_checked(effective_fan_max_pwm)
-                            .context("Amlogic two-channel safety PWM command/readback failed")?;
-                        debug!(
-                            requested_pwm = fan_receipt.requested_pwm(),
-                            observed_pwm = fan_receipt.observed_pwm(),
-                            "Amlogic startup fan command completed on both PWM channels"
-                        );
-                        info!(pwm = effective_fan_max_pwm, "Amlogic fan control initialized (degraded-tach-clamped profile max during startup)");
-                        Some(fan)
-                    }
-                    Err(e) => {
-                        return Err(anyhow::anyhow!(
-                            "Failed to open Amlogic fan control — refusing to mine without thermal control: {}",
-                            e
-                        ))
-                    }
-                },
-                Err(e) => {
-                    return Err(anyhow::anyhow!(
-                        "Failed to initialize Amlogic platform for thermal control: {}",
-                        e
-                    ))
-                }
-            }
-        } else {
-            None
-        };
-        let thermal_i2c_bus: u8 = 1; // S21: LM75 sensors on I2C bus 1
+        // The pre-energize cooling owner computed this retained ceiling once;
+        // every steady-state command below uses the same value.
         let mut latest_temp_c: f32 = 0.0;
         let mut latest_fan_pwm: u8 = if amlogic_fan.is_some() {
             // THERMAL-2: seed with the degraded-tach-clamped ceiling, matching the
@@ -4644,11 +4725,10 @@ impl SerialMiner {
             10
         };
         let mut latest_fan_rpm: u32 = 0;
-        let thermal_started_at = Instant::now();
+        let mut latest_per_fan: Vec<(u8, u32)> = Vec::new();
+        let thermal_started_at = nopic_energized_at.unwrap_or_else(Instant::now);
         let mut consecutive_missing_temp_ticks: u8 = 0;
-        let mut early_safe_off_receipt: Option<
-            dcentrald_hal::platform::amlogic::PsuSafeOffReceipt,
-        > = None;
+        let mut early_safe_off_receipt: Option<NoPicSafeOffReceipt> = None;
         let mut terminal_safety_error: Option<anyhow::Error> = None;
 
         if let Some(watchdog) = nopic_watchdog.as_mut() {
@@ -4664,9 +4744,118 @@ impl SerialMiner {
 
                 // Thermal control loop (every 2 seconds)
                 _ = thermal_timer.tick(), if amlogic_fan.is_some() => {
-                    let temps = dcentrald_hal::platform::amlogic::read_board_temps(thermal_i2c_bus);
+                    let Some(thermal_owner) = amlogic_power_thermal.clone() else {
+                        terminal_safety_error = Some(anyhow::anyhow!(
+                            "Amlogic cooling owner exists without retained power/thermal ownership"
+                        ));
+                        break;
+                    };
+                    let Some(fan_sampler) = amlogic_fan.clone() else {
+                        terminal_safety_error = Some(anyhow::anyhow!(
+                            "Amlogic thermal tick lost its retained cooling owner"
+                        ));
+                        break;
+                    };
+                    // Both operations are synchronous kernel/sysfs work. Run them
+                    // concurrently on the blocking pool so the Tokio worker can
+                    // continue processing shutdown and network tasks.
+                    let temperature_worker = tokio::task::spawn_blocking(move || {
+                        thermal_owner.read_board_temperatures(
+                            Instant::now() + Duration::from_millis(750),
+                        )
+                    });
+                    let fan_worker = sample_fan_tach(fan_sampler);
+                    let (temperature_result, fan_result) = tokio::join!(temperature_worker, fan_worker);
+                    let temperature_snapshot = match temperature_result {
+                        Ok(snapshot) => snapshot,
+                        Err(join_error) => {
+                            error!(%join_error, "Amlogic thermal polling worker failed; cutting hash power");
+                            match checked_nopic_emergency_safe_off(&mut nopic_psu_guard) {
+                                Ok(receipt) => early_safe_off_receipt = Some(receipt),
+                                Err(safe_off_error) => error!(%safe_off_error, "Amlogic thermal-worker safe-off did not complete"),
+                            }
+                            terminal_safety_error = Some(anyhow::anyhow!(
+                                "Amlogic thermal polling worker failed: {join_error}"
+                            ));
+                            break;
+                        }
+                    };
+                    let fan_snapshot = match fan_result {
+                        Ok(snapshot) => snapshot,
+                        Err(sample_error) => {
+                            error!(%sample_error, "Amlogic fan polling worker failed; cutting hash power");
+                            match checked_nopic_emergency_safe_off(&mut nopic_psu_guard) {
+                                Ok(receipt) => early_safe_off_receipt = Some(receipt),
+                                Err(safe_off_error) => error!(%safe_off_error, "Amlogic fan-worker safe-off did not complete"),
+                            }
+                            terminal_safety_error = Some(anyhow::anyhow!(
+                                "Amlogic fan polling worker failed: {sample_error}"
+                            ));
+                            break;
+                        }
+                    };
+                    let FanTachSnapshot {
+                        available: fan_tach_available,
+                        expected_channels: expected_fan_channels,
+                        readings,
+                    } = fan_snapshot;
+                    latest_per_fan = readings;
+                    latest_fan_rpm = latest_per_fan
+                        .iter()
+                        .map(|(_, rpm)| *rpm)
+                        .min()
+                        .unwrap_or(0);
+                    let fan_rpms = latest_per_fan
+                        .iter()
+                        .map(|(_, rpm)| *rpm)
+                        .collect::<Vec<_>>();
+                    let fan_safety_state = nopic_fan_safety.observe_required_airflow(
+                        fan_tach_available,
+                        latest_fan_pwm,
+                        expected_fan_channels,
+                        &fan_rpms,
+                    );
+                    if let FanTachSafetyState::Debouncing {
+                        consecutive_below_minimum,
+                        failure_ticks,
+                        minimum_credible_rpm,
+                    } = fan_safety_state
+                    {
+                        warn!(
+                            consecutive_below_minimum,
+                            failure_ticks,
+                            minimum_credible_rpm,
+                            readings = ?latest_per_fan,
+                            "Amlogic below-threshold RPM observation is inside the bounded fan-failure debounce"
+                        );
+                    }
+                    if nopic_fan_loop_disposition(&fan_safety_state)
+                        == NoPicFanLoopDisposition::SafeOffAndStop
+                    {
+                        error!(
+                            ?fan_safety_state,
+                            readings = ?latest_per_fan,
+                            "Amlogic fan safety admission revoked; cutting hash power"
+                        );
+                        match checked_nopic_emergency_safe_off(&mut nopic_psu_guard) {
+                            Ok(receipt) => early_safe_off_receipt = Some(receipt),
+                            Err(safe_off_error) => error!(%safe_off_error, "Amlogic fan-safety checked safe-off did not complete"),
+                        }
+                        let _ = crate::restart::schedule_daemon_restart(
+                            "amlogic_fan_safety_restart",
+                            Duration::from_secs(AMLOGIC_THERMAL_RESTART_DELAY_S),
+                        );
+                        terminal_safety_error = Some(anyhow::anyhow!(
+                            "Amlogic fan safety admission revoked: {fan_safety_state:?}"
+                        ));
+                        break;
+                    }
+                    let required_coverage = temperature_snapshot.required_coverage();
+                    let dangerous_observation = temperature_snapshot
+                        .hottest_celsius()
+                        .is_some_and(|temp| temp >= self.config.thermal.dangerous_temp_c as f32);
                     if let Some(ref fan) = amlogic_fan {
-                        if temps.is_empty() {
+                        if !required_coverage.is_complete() && !dangerous_observation {
                             latest_temp_c = 0.0;
                             // stale-temp / no thermal proof: cap fans at the PWM-30 home cap.
                             // NoPic (am3-aml) has no die-temp fallback, and disable_psu fires
@@ -4691,16 +4880,17 @@ impl SerialMiner {
                                     break;
                                 }
                             }
-                            latest_fan_rpm = fan.get_rpm();
                             consecutive_missing_temp_ticks = consecutive_missing_temp_ticks.saturating_add(1);
 
                             if thermal_started_at.elapsed() >= Duration::from_secs(AMLOGIC_TEMP_STARTUP_GRACE_S)
                                 && consecutive_missing_temp_ticks >= AMLOGIC_TEMP_MISS_LIMIT
                             {
                                 error!(
+                                    required_slots = ?required_coverage.required_slots(),
+                                    missing_slots = ?required_coverage.missing_slots(),
                                     missing_ticks = consecutive_missing_temp_ticks,
                                     grace_s = AMLOGIC_TEMP_STARTUP_GRACE_S,
-                                    "No valid Amlogic board temperatures after startup grace — shutting down NoPic mining for safety"
+                                    "Required Amlogic board-temperature coverage remained incomplete after startup grace — shutting down NoPic mining for safety"
                                 );
                                 match checked_nopic_emergency_safe_off(&mut nopic_psu_guard) {
                                     Ok(receipt) => early_safe_off_receipt = Some(receipt),
@@ -4711,13 +4901,15 @@ impl SerialMiner {
                                     Duration::from_secs(AMLOGIC_THERMAL_RESTART_DELAY_S),
                                 );
                                 terminal_safety_error = Some(anyhow::anyhow!(
-                                    "Amlogic board temperatures remained unavailable after the startup grace"
+                                    "Required Amlogic board-temperature coverage remained incomplete after the startup grace"
                                 ));
                                 break;
                             }
                         } else {
                             consecutive_missing_temp_ticks = 0;
-                            let max_temp = temps.iter().map(|(_, t)| *t).fold(0.0f32, f32::max);
+                            let max_temp = temperature_snapshot
+                                .hottest_celsius()
+                                .unwrap_or(0.0);
                             latest_temp_c = max_temp;
                             if max_temp >= self.config.thermal.dangerous_temp_c as f32 {
                                 error!(temp = max_temp, "DANGEROUS TEMP — emergency PSU disable!");
@@ -4743,7 +4935,6 @@ impl SerialMiner {
                                         break;
                                     }
                                 }
-                                latest_fan_rpm = fan.get_rpm();
                                 match checked_nopic_emergency_safe_off(&mut nopic_psu_guard) {
                                     Ok(receipt) => early_safe_off_receipt = Some(receipt),
                                     Err(safe_off_error) => error!(%safe_off_error, "Amlogic dangerous-temperature checked safe-off did not complete"),
@@ -4781,7 +4972,6 @@ impl SerialMiner {
                                         break;
                                     }
                                 }
-                                latest_fan_rpm = fan.get_rpm();
                             } else {
                                 // Proportional fan control: scale between min and the
                                 // THERMAL-2 degraded-tach-clamped max PWM.
@@ -4792,7 +4982,7 @@ impl SerialMiner {
                                 // min_pwm. `.max(1.0)` keeps the ratio finite and fail-safe.
                                 let ratio =
                                     ((max_temp - 30.0) / (target - 30.0).max(1.0)).clamp(0.0, 1.0);
-                                let min_pwm = self.config.thermal.fan_min_pwm.min(effective_fan_max_pwm) as f32;
+                                let min_pwm = effective_fan_min_pwm as f32;
                                 let max_pwm = effective_fan_max_pwm as f32;
                                 let pwm = (min_pwm + ratio * (max_pwm - min_pwm)) as u8;
                                 match fan.set_speed_checked(pwm) {
@@ -4809,7 +4999,6 @@ impl SerialMiner {
                                         break;
                                     }
                                 }
-                                latest_fan_rpm = fan.get_rpm();
                             }
                         }
                     }
@@ -5268,11 +5457,9 @@ impl SerialMiner {
                     // clobbering failover, donation, SV2, latency, and reject
                     // evidence between status events.
                     let current_ths = if elapsed > 0.0 { total_nonces as f64 * hw_difficulty as f64 * 4_294_967_296.0 / start_time.elapsed().as_secs_f64() / 1e12 } else { 0.0 };
-                    let per_fan = amlogic_fan
-                        .as_ref()
-                        .map(|fan| fan.get_per_fan_rpm())
-                        .unwrap_or_default()
-                        .into_iter()
+                    let per_fan = latest_per_fan
+                        .iter()
+                        .copied()
                         .map(|(id, rpm)| dcentrald_api::PerFanReading {
                             id,
                             rpm,
@@ -5292,7 +5479,7 @@ impl SerialMiner {
                             voltage_mv: published_voltage_mv,
                             temp_c: latest_temp_c,
                             // Amlogic (am3-aml / NoPic) reads real board sensors via
-                            // `read_board_temps`; label as a board sensor when we have
+                            // the retained typed thermal service; label as a board sensor when we have
                             // a reading, else leave the source unknown so the UI shows
                             // "no telemetry" rather than a fabricated 0 °C. There is no
                             // XADC die-temp fallback on this platform.
@@ -5392,17 +5579,19 @@ impl SerialMiner {
             }
             watchdog_teardown_result?;
             let mutation_barrier = mutation_barrier_result?;
-            let permit = WatchdogDisarmPermit::from_evidence(
-                &mutation_barrier,
+            let mutation_barriers: [&dyn crate::runtime::safety_watchdog::MutationBarrierEvidence;
+                2] = [&mutation_barrier, power_receipt.management_fabric()];
+            let permit = WatchdogDisarmPermit::from_evidence_set(
+                &mutation_barriers,
                 &thread_stop,
-                &power_receipt,
+                power_receipt.power(),
             )?;
             let closeout = watchdog_owner
                 .disarm_and_join(permit, DEFAULT_WATCHDOG_STOP_TIMEOUT)
                 .await?;
             match closeout {
                 WatchdogCloseoutReceipt::MagicCloseWriteCompletedAndWorkerExitObserved => info!(
-                    gpio = power_receipt.gpio(),
+                    gpio = power_receipt.power().gpio(),
                     "NoPic watchdog close and worker exit observed after actor quiescence and checked GPIO-low safe-off"
                 ),
             }
@@ -5531,6 +5720,158 @@ fn serial_next_asic_job_id(asic_job_id: u8, job_id_increment: u8) -> u8 {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct MotionFanMock {
+        pwm: std::sync::atomic::AtomicU8,
+        minimum_motion_pwm: std::sync::atomic::AtomicU8,
+        fail_on_command: std::sync::atomic::AtomicUsize,
+        commands: Mutex<Vec<u8>>,
+    }
+
+    impl FanAccess for MotionFanMock {
+        fn set_speed(&self, pwm: u8) {
+            self.pwm.store(pwm, Ordering::Release);
+            self.commands.lock().unwrap().push(pwm);
+        }
+
+        fn set_speed_checked(&self, pwm: u8) -> dcentrald_hal::Result<FanCommandReceipt> {
+            self.set_speed(pwm);
+            let command_count = self.commands.lock().unwrap().len();
+            if self.fail_on_command.load(Ordering::Acquire) == command_count {
+                return Err(dcentrald_hal::HalError::Fan(format!(
+                    "injected checked fan-command failure at command {command_count}"
+                )));
+            }
+            FanCommandReceipt::from_matching_readback(pwm, self.get_speed_pwm())
+        }
+
+        fn get_rpm(&self) -> u32 {
+            self.get_per_fan_rpm()
+                .into_iter()
+                .map(|(_, rpm)| rpm)
+                .min()
+                .unwrap_or(0)
+        }
+
+        fn get_speed_pwm(&self) -> u8 {
+            self.pwm.load(Ordering::Acquire)
+        }
+
+        fn get_per_fan_rpm(&self) -> Vec<(u8, u32)> {
+            let pwm = self.get_speed_pwm();
+            let minimum_motion_pwm = self.minimum_motion_pwm.load(Ordering::Acquire).max(1);
+            let rpm = if pwm == 0 {
+                0
+            } else if pwm >= minimum_motion_pwm {
+                1200
+            } else {
+                // Model one stray edge per second. A positive reading this low
+                // must not satisfy the Amlogic credible-motion admission floor.
+                30
+            };
+            (0..4).map(|id| (id, rpm)).collect()
+        }
+
+        fn fan_count(&self) -> u8 {
+            4
+        }
+    }
+
+    #[tokio::test]
+    async fn preenergize_airflow_envelope_proves_max_then_min_then_restores_max() {
+        let concrete = Arc::new(MotionFanMock::default());
+        let fan: Arc<dyn FanAccess> = concrete.clone();
+        let mut safety = FanTachSafety::with_minimum_credible_rpm(
+            DEFAULT_FAN_BELOW_MINIMUM_FAILURE_TICKS,
+            dcentrald_hal::platform::amlogic::REQUIRED_AIRFLOW_MIN_RPM,
+        );
+
+        let receipt = admit_fan_airflow_envelope(fan, &mut safety, 10, 30)
+            .await
+            .unwrap();
+
+        assert_eq!(receipt.observed_pwm(), 30);
+        assert_eq!(*concrete.commands.lock().unwrap(), [30, 10, 30]);
+    }
+
+    #[tokio::test]
+    async fn preenergize_airflow_envelope_refuses_low_point_and_restores_maximum() {
+        let concrete = Arc::new(MotionFanMock::default());
+        concrete.minimum_motion_pwm.store(20, Ordering::Release);
+        let fan: Arc<dyn FanAccess> = concrete.clone();
+        let mut safety = FanTachSafety::with_minimum_credible_rpm(
+            DEFAULT_FAN_BELOW_MINIMUM_FAILURE_TICKS,
+            dcentrald_hal::platform::amlogic::REQUIRED_AIRFLOW_MIN_RPM,
+        );
+
+        let error = admit_fan_airflow_envelope(fan, &mut safety, 10, 30)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("restored startup ceiling"));
+        assert_eq!(concrete.pwm.load(Ordering::Acquire), 30);
+        assert_eq!(*concrete.commands.lock().unwrap(), [30, 10, 30]);
+    }
+
+    #[tokio::test]
+    async fn preenergize_airflow_envelope_reports_low_point_and_restore_failures_together() {
+        let concrete = Arc::new(MotionFanMock::default());
+        concrete.minimum_motion_pwm.store(20, Ordering::Release);
+        concrete.fail_on_command.store(3, Ordering::Release);
+        let fan: Arc<dyn FanAccess> = concrete.clone();
+        let mut safety = FanTachSafety::with_minimum_credible_rpm(
+            DEFAULT_FAN_BELOW_MINIMUM_FAILURE_TICKS,
+            dcentrald_hal::platform::amlogic::REQUIRED_AIRFLOW_MIN_RPM,
+        );
+
+        let error = admit_fan_airflow_envelope(fan, &mut safety, 10, 30)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("motion proof failed"));
+        assert!(message.contains("restoration also failed"));
+        assert!(message.contains("injected checked fan-command failure"));
+        assert_eq!(*concrete.commands.lock().unwrap(), [30, 10, 30]);
+    }
+
+    #[test]
+    fn nopic_fan_loop_disposition_is_terminal_for_every_revoked_state() {
+        let continuing = [
+            FanTachSafetyState::Healthy,
+            FanTachSafetyState::Debouncing {
+                consecutive_below_minimum: 1,
+                failure_ticks: 3,
+                minimum_credible_rpm: 300,
+            },
+        ];
+        for state in continuing {
+            assert_eq!(
+                nopic_fan_loop_disposition(&state),
+                NoPicFanLoopDisposition::Continue
+            );
+        }
+
+        let terminal = [
+            FanTachSafetyState::AirflowNotCommanded,
+            FanTachSafetyState::Failed {
+                consecutive_below_minimum: 3,
+                failure_ticks: 3,
+                minimum_credible_rpm: 300,
+            },
+            FanTachSafetyState::EvidenceUnavailable {
+                expected_channels: 4,
+                observed_channels: 3,
+            },
+        ];
+        for state in terminal {
+            assert_eq!(
+                nopic_fan_loop_disposition(&state),
+                NoPicFanLoopDisposition::SafeOffAndStop
+            );
+        }
+    }
+
     #[test]
     fn bm1362_heartbeat_requires_supported_observed_dspic_firmware() {
         assert!(observed_dspic_firmware(None).is_err());
@@ -5541,6 +5882,22 @@ mod tests {
             observed_dspic_firmware(Some(0x89)).unwrap(),
             DspicFirmware::Fw89
         ));
+    }
+
+    #[test]
+    fn serial_runtime_has_no_unbrokered_kernel_i2c_fd_or_ioctl_path() {
+        let source = include_str!("serial_mining.rs");
+        let raw_open = ["std::fs::", "OpenOptions"].concat();
+        let raw_ioctl = ["libc::", "ioctl"].concat();
+        let raw_bus_type = ["I2c", "Bus::"].concat();
+        let platform_raw_open = [".open_i2c", "("].concat();
+        let direct_device_open = [".open(\"/dev/", "i2c-"].concat();
+        assert!(!source.contains(&raw_open));
+        assert!(!source.contains(&raw_ioctl));
+        assert!(!source.contains(&raw_bus_type));
+        assert!(!source.contains(&platform_raw_open));
+        assert!(!source.contains(&direct_device_open));
+        assert!(source.contains("refusing an unbrokered /dev/i2c-0 owner"));
     }
 
     fn sample_entry(version: u32, version_mask: u32) -> WorkEntry {
@@ -5877,11 +6234,38 @@ mod tests {
     #[test]
     fn nopic_watchdog_and_safeoff_order_is_fail_closed() {
         let source = include_str!("serial_mining.rs");
+        let management_owner = source
+            .find("let mut amlogic_power_thermal")
+            .expect("retained Amlogic management owner declaration");
+        let cooling_owner = source
+            .find("let mut amlogic_fan")
+            .expect("retained Amlogic cooling owner declaration");
+        let watchdog_owner = source
+            .find("let mut nopic_watchdog")
+            .expect("retained NoPic watchdog owner declaration");
+        let psu_guard = source
+            .find("let mut nopic_psu_guard")
+            .expect("NoPic PSU guard declaration");
+        let service_spawn = source
+            .find(".spawn_power_thermal_service()")
+            .expect("retained bus-1 service spawn");
+        let admission = source
+            .find("AmlogicNoPicAdmission::detect(")
+            .expect("typed Amlogic NoPic admission");
+        let bm1366_refusal = source
+            .find("native BM1366 NoPic mining is refused")
+            .expect("BM1366 NoPic fail-closed boundary");
+        let fan_open = source
+            .find(".open_fan_controller()")
+            .expect("pre-energize cooling admission");
+        let fan_motion = source
+            .find("let receipt = admit_fan_airflow_envelope(")
+            .expect("pre-energize fan-motion evidence gate");
         let power_start = source
             .find("if !native_nopic_power_owner")
             .expect("NoPic power-ownership boundary");
         let power_end = source[power_start..]
-            .find("let startup_board_temps")
+            .find("let mut startup_board_temps")
             .map(|offset| power_start + offset)
             .expect("NoPic post-enable temperature boundary");
         let power = &source[power_start..power_end];
@@ -5892,17 +6276,56 @@ mod tests {
             .find("nopic_psu_guard.prepare_enable")
             .expect("pre-mutation NoPic guard arm");
         let psu_enable = power
-            .find("amlogic::enable_psu()")
-            .expect("GPIO437 enable call");
+            .find("tokio::task::spawn_blocking(move || power_enable_owner.enable_psu())")
+            .expect("retained-service GPIO437/APW enable call");
         let enabled_receipt = power
             .find("nopic_psu_guard.mark_enabled()")
             .expect("NoPic enable ownership receipt");
+        let startup_coverage_gate = source[power_end..]
+            .find("if startup_coverage.is_complete()")
+            .map(|offset| power_end + offset)
+            .expect("complete startup thermal-coverage gate");
+        let first_asic_probe = source[power_end..]
+            .find("Phase 1c: Probing chips")
+            .map(|offset| power_end + offset)
+            .expect("first NoPic ASIC probe");
         assert!(watchdog_arm < may_be_energized);
         assert!(may_be_energized < psu_enable);
         assert!(psu_enable < enabled_receipt);
+        assert!(enabled_receipt + power_start < startup_coverage_gate);
+        assert!(startup_coverage_gate < first_asic_probe);
+        assert!(management_owner < cooling_owner);
+        assert!(cooling_owner < watchdog_owner);
+        assert!(watchdog_owner < psu_guard);
+        assert!(service_spawn < fan_open);
+        assert!(fan_open < fan_motion);
+        assert!(fan_motion < power_start);
+        assert!(bm1366_refusal < admission);
 
         assert!(source.contains("RuntimeThreadGuard::new(CancellationToken::new())"));
         assert!(source.contains("let reader_shutdown = runtime_threads.cancellation_token();"));
+        assert!(source.contains("AmlogicNoPicAdmission::detect("));
+        assert!(source.contains(".spawn_power_thermal_service()"));
+        assert!(source.contains(".read_board_temperatures("));
+        let raw_temperature_helper = ["amlogic::read_board_", "temps("].concat();
+        let generic_platform_open = ["amlogic::AmlogicPlatform::", "new()"].concat();
+        assert!(!source.contains(&raw_temperature_helper));
+        assert!(!source.contains(&generic_platform_open));
+        assert!(source.contains("fence.latch_terminal_safe_off();"));
+
+        let runtime_fan_safety = source
+            .find("let fan_safety_state = nopic_fan_safety.observe_required_airflow")
+            .expect("runtime fan-safety observation");
+        let runtime_safe_off = source[runtime_fan_safety..]
+            .find("checked_nopic_emergency_safe_off(&mut nopic_psu_guard)")
+            .map(|offset| runtime_fan_safety + offset)
+            .expect("runtime fan-safety checked safe-off");
+        let watchdog_progress = source[runtime_fan_safety..]
+            .find("nopic_watchdog_liveness.mark_progress()")
+            .map(|offset| runtime_fan_safety + offset)
+            .expect("NoPic watchdog liveness marker");
+        assert!(runtime_fan_safety < runtime_safe_off);
+        assert!(runtime_safe_off < watchdog_progress);
 
         let shutdown = source
             .split("info!(\"=== SHUTDOWN ===\");")
@@ -5924,8 +6347,9 @@ mod tests {
             .find("fan.set_speed_checked")
             .expect("checked quiet fan command");
         let permit = shutdown
-            .find("WatchdogDisarmPermit::from_evidence")
+            .find("WatchdogDisarmPermit::from_evidence_set")
             .expect("typed watchdog disarm permit");
+        assert!(shutdown.contains("power_receipt.management_fabric()"));
         let disarm = shutdown
             .find(".disarm_and_join")
             .expect("watchdog close and join");

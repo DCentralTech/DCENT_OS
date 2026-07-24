@@ -71,11 +71,30 @@ impl EfficiencyOptimizer {
 
         // At lower voltage, chips may not reach their characterized max_stable_mhz.
         // Apply a conservative derating based on the voltage ratio.
-        let voltage_ratio = optimal_voltage_mv as f64 / reference_voltage_mv as f64;
-
-        // Derating factor: approximate that max frequency scales with sqrt(V)
-        // This is conservative — real silicon may derate more or less.
-        let derating = voltage_ratio.sqrt();
+        //
+        // Guard an unset/garbage : dividing by 0 yields an
+        // infinite ratio → infinite derating, which (via a saturating float→int
+        // cast at the `derated_freq` line below) would silently select the MAXIMUM
+        // PLL frequency instead of a conservative one. With no valid reference to
+        // derate against, apply no derating (use the characterized max_stable_mhz);
+        // the PLL snap still bounds the result to a real frequency.
+        let derating = if reference_voltage_mv == 0 {
+            1.0
+        } else {
+            // Derating factor: approximate that max frequency scales with sqrt(V).
+            // Conservative — real silicon may derate more or less.
+            //
+            // Cap at 1.0: derating models max frequency FALLING at a lower voltage,
+            // so it can never legitimately exceed 1.0. Without the cap, a
+            //  below the optimal operating voltage (e.g. a
+            // caller passing the catalog default 8600 mV instead of the actual
+            // characterization voltage 9100 mV) yields a ratio > 1 → the
+            // `derated_freq = max_stable_mhz * derating` line below OVERCLOCKS the
+            // chip past its stability-tested maximum. Only ever derate, never boost.
+            (optimal_voltage_mv as f64 / reference_voltage_mv as f64)
+                .sqrt()
+                .min(1.0)
+        };
 
         let pll = dcentrald_asic::drivers::MinerProfile::pll_frequencies_for_chip(chip_id);
 
@@ -223,6 +242,53 @@ mod tests {
                 thermal_max_stable_mhz: None,
             })
             .collect()
+    }
+
+    #[test]
+    fn optimize_caps_derating_to_prevent_overclock_past_max_stable() {
+        // A reference_voltage_mv BELOW the optimal operating voltage makes the
+        // sqrt(optimal/reference) derating exceed 1.0, which would drive
+        // `derated_freq = max_stable_mhz * derating` PAST the stability-tested
+        // maximum (e.g. a caller passing the catalog default 8600 mV instead of
+        // the characterization voltage). The 1.0 cap must keep derating <= 1.0 so
+        // a chip is never commanded above its measured max_stable_mhz.
+        let model = PowerModel::new_bm1387();
+        let profiles = make_test_profiles(4, 450);
+        // optimal = min_voltage 9100 (no preferred), reference = 8600 → ratio ~1.029.
+        let (_v, freqs) =
+            EfficiencyOptimizer::optimize(&model, &profiles, 9100, 200, 0x1387, 8600, None);
+        for &f in &freqs {
+            assert!(
+                f <= 450,
+                "derating cap must keep freq <= max_stable (450); overclocked to {f}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_reference_voltage_does_not_produce_unbounded_frequency() {
+        // A zero  previously made the derating ratio
+        // infinite (0-division), which a saturating float→int cast would turn
+        // into a maximum-frequency pick. The guard applies no derating instead;
+        // the PLL snap bounds every returned frequency to a real value regardless.
+        let pm = PowerModel::new_bm1387();
+        let profiles = make_test_profiles(4, 700);
+        let (voltage, freqs) =
+            EfficiencyOptimizer::optimize(&pm, &profiles, 800, 100, 0x1387, 0, None);
+        assert!(voltage >= 800);
+        let pll = dcentrald_asic::drivers::MinerProfile::pll_frequencies_for_chip(0x1387);
+        let max_pll = pll.iter().copied().max().unwrap_or(0);
+        assert!(!freqs.is_empty());
+        for f in freqs {
+            assert!(
+                f == 100 || pll.contains(&f),
+                "frequency {f} is neither min_freq nor a valid PLL entry"
+            );
+            assert!(
+                f <= max_pll.max(100),
+                "frequency {f} exceeds the PLL ceiling"
+            );
+        }
     }
 
     #[test]

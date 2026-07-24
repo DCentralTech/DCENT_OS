@@ -15,6 +15,7 @@ path = "src/dspic_flash_main.rs"
 
 [dependencies]
 libc = "0.2"
+dcentrald-fabric-lease = { path = "../dcentrald-fabric-lease" }
 
 # W4.7 lint inheritance (DCENT_DevOps + DCENT_QA, 2026-05-07).
 # Near-clean crate: ~2 unwrap occurrences in src/. Recovery binary, so

@@ -1,0 +1,6 @@
+schema=dcentos-sysupgrade-lock-v3
+transaction_id=Tx-1
+boot_id=abcdef12-3456-7890-abcd-ef1234567890
+pid=123
+starttime=456
+owner=zynq-sysupgrade

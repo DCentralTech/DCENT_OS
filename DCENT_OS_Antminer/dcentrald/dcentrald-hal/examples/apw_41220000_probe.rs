@@ -80,8 +80,8 @@ fn main() -> DynResult<()> {
         read_gpio_value(GPIO_907)?
     );
 
-    let i2c = GpioBitBangI2c::new(SDA_GPIO, SCL_GPIO)?;
-    i2c.bus_recovery();
+    let i2c = GpioBitBangI2c::new_am2()?;
+    i2c.bus_recovery()?;
     println!("bus recovery complete");
 
     println!("-- address-only probe (empty write) --");

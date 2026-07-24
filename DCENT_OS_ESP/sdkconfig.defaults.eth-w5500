@@ -1,0 +1,20 @@
+# W5500 SPI-Ethernet sdkconfig OVERLAY — "DCENT LAN Mod" (PLAN-E Phase 1).
+#
+# OPT-IN: this file is deliberately NOT referenced by the default
+# ESP_IDF_SDKCONFIG_DEFAULTS in .cargo/config.toml, so the DEFAULT build is
+# byte-identical with or without it on disk. It exists for `eth-w5500` feature
+# builds only, which must stack it after the base defaults:
+#
+#   ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.eth-w5500" \
+#     CARGO_TARGET_DIR=C:/bt cargo build --release -p dcentaxe --features eth-w5500
+#
+# (esp-idf-sys takes a ;-separated list; later files override earlier ones.)
+# Remember the repo rule: changing effective sdkconfig requires deleting the
+# build cache (e.g. C:/bt) so the generated sdkconfig/autoconf.h regenerate.
+#
+# Why: esp-idf-svc's `SpiEthChipset::W5500` / `EthDriver::new_spi*` types exist
+# only under the `esp_idf_eth_spi_ethernet_w5500` cfg, which esp-idf-sys emits
+# from these Kconfig symbols. Without this overlay an `eth-w5500` build fails
+# with the actionable compile_error! in dcentaxe/src/eth_w5500.rs.
+CONFIG_ETH_USE_SPI_ETHERNET=y
+CONFIG_ETH_SPI_ETHERNET_W5500=y

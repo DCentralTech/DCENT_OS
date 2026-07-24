@@ -19,8 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-EXPECTED_SAFETY_CLAMP_COUNT = 94
-EXPECTED_SAFETY_CLAMP_DIGEST = "54ab513bdbe584c4508592bf7d6d70bda46b6f1d507dfed89f2daeaec3862a35"
+EXPECTED_SAFETY_CLAMP_COUNT = 93
+EXPECTED_SAFETY_CLAMP_DIGEST = "a9f2cb3e3e6e72b3e54d0aa4f3ff2df8551da52b6fa59fbf3d5c98649ea75b16"
 
 CLAMP_RE = re.compile(r"\.clamp\s*\(")
 COMMENT_PREFIXES = ("//", "///", "//!","/*", "*")

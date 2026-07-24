@@ -2,6 +2,9 @@
 #
 # Shared manifest/signature helpers for Buildroot board post-image scripts.
 
+DCENT_SYSUPGRADE_AUTHORITY_PROFILE='dcentos.sysupgrade-authority/v1'
+DCENT_SYSUPGRADE_UNSIGNED_LAB_PROFILE='dcentos.sysupgrade-unsigned-lab/v1'
+
 if ! command -v dcent_release_provenance_init >/dev/null 2>&1; then
     dcent_release_envelope_lib=""
     if [ -n "${PROJECT_ROOT:-}" ] && [ -f "${PROJECT_ROOT}/scripts/lib/release_envelope.sh" ]; then
@@ -40,8 +43,8 @@ dcent_require_release_image_hardening() {
     dcent_is_release_status "$package_status" || return 0
     if ! dcent_is_truthy "${DCENT_RELEASE_IMAGE:-0}"; then
         echo "ERROR: DCENT_PACKAGE_STATUS='${package_status}' (release-status) requires DCENT_RELEASE_IMAGE=1" >&2
-        echo "       (defconfig root-lock + /etc/dcentos/release-image marker). Use 'make release'," >&2
-        echo "       or set DCENT_PACKAGE_STATUS to a non-release lab value (e.g. lab_signed)." >&2
+        echo "       (defconfig root-lock + /etc/dcentos/release-image marker)." >&2
+        echo "       Release-root signatures are reserved for fully hardened release profiles." >&2
         exit 1
     fi
     if [ -n "${TARGET_DIR:-}" ] && [ ! -f "${TARGET_DIR}/etc/dcentos/release-image" ]; then
@@ -67,6 +70,41 @@ dcent_require_unsigned_lab_override() {
     fi
 }
 
+dcent_require_canonical_unsigned_lab_status() {
+    dcent_require_unsigned_lab_override "unsigned package generation"
+    package_status="${DCENT_PACKAGE_STATUS:-release}"
+    if [ "$package_status" != "lab_unsigned" ]; then
+        echo "ERROR: unsigned sysupgrade profile requires exact DCENT_PACKAGE_STATUS=lab_unsigned (found '${package_status}')" >&2
+        exit 1
+    fi
+}
+
+dcent_require_canonical_authority_status() {
+    package_status="${DCENT_PACKAGE_STATUS:-release}"
+    case "$package_status" in
+        ''|*[!A-Za-z0-9._+:-]*)
+            echo "ERROR: signed authority profile requires DCENT_PACKAGE_STATUS to be a non-empty JSON-safe token using only A-Za-z0-9._+:-" >&2
+            exit 1
+            ;;
+    esac
+    if ! dcent_release_require_signed_authority_profile \
+        "${DCENT_RELEASE_SIGNING_KEY:-}"; then
+        echo "ERROR: signed authority profile is not an admitted release profile" >&2
+        exit 1
+    fi
+}
+
+dcent_sysupgrade_manifest_profile() {
+    if [ "${DCENT_RELEASE_KEY_STAGED:-0}" = "1" ]; then
+        dcent_require_canonical_authority_status
+        printf '%s\n' "$DCENT_SYSUPGRADE_AUTHORITY_PROFILE"
+        return 0
+    fi
+
+    dcent_require_canonical_unsigned_lab_status
+    printf '%s\n' "$DCENT_SYSUPGRADE_UNSIGNED_LAB_PROFILE"
+}
+
 dcent_stage_release_key() {
     DCENT_RELEASE_KEY_STAGED=0
     DCENT_RELEASE_KEY_SIZE=""
@@ -77,10 +115,17 @@ dcent_stage_release_key() {
             echo "ERROR: DCENT_REQUIRE_RELEASE_KEY=1 but DCENT_RELEASE_SIGNING_KEY is unset" >&2
             exit 1
         fi
-        dcent_require_unsigned_lab_override "unsigned package generation"
+        dcent_require_canonical_unsigned_lab_status
+        for forbidden_leaf in MANIFEST.sig release_ed25519.pub; do
+            if [ -e "$SUP_DIR/$forbidden_leaf" ]; then
+                echo "ERROR: unsigned lab package staging contains forbidden $forbidden_leaf" >&2
+                exit 1
+            fi
+        done
         echo "WARNING: no signing key configured - package is unsigned (lab-only)"
         return 0
     fi
+    dcent_require_canonical_authority_status
 
     [ -f "$DCENT_RELEASE_SIGNING_KEY" ] || {
         echo "ERROR: signing key not found: $DCENT_RELEASE_SIGNING_KEY" >&2
@@ -98,26 +143,77 @@ dcent_stage_release_key() {
         }
         cp "$DCENT_RELEASE_PUBKEY_FILE" "$SUP_DIR/release_ed25519.pub"
     else
-        if [ "${DCENT_REQUIRE_RELEASE_KEY:-0}" = "1" ]; then
-            echo "ERROR: DCENT_REQUIRE_RELEASE_KEY=1 but DCENT_RELEASE_PUBKEY_FILE is unset" >&2
-            exit 1
-        fi
-        if dcent_is_release_status "${DCENT_PACKAGE_STATUS:-release}"; then
-            echo "ERROR: production release signing requires DCENT_RELEASE_PUBKEY_FILE; refusing self-derived generated-key package" >&2
-            exit 1
-        fi
-        dcent_require_unsigned_lab_override "self-derived generated-key package generation"
-        openssl pkey -in "$DCENT_RELEASE_SIGNING_KEY" -pubout -out "$SUP_DIR/release_ed25519.pub" >/dev/null 2>&1 || {
-            echo "ERROR: failed to derive release_ed25519.pub from signing key" >&2
-            exit 1
-        }
-        echo "WARNING: derived release_ed25519.pub from signing key - generated-key package is lab-only"
+        echo "ERROR: release-root signing requires a pinned DCENT_RELEASE_PUBKEY_FILE" >&2
+        echo "       The package must never derive its trust root from the signing key." >&2
+        exit 1
     fi
 
     DCENT_RELEASE_KEY_SIZE=$(stat -c%s "$SUP_DIR/release_ed25519.pub" 2>/dev/null || stat -f%z "$SUP_DIR/release_ed25519.pub")
     DCENT_RELEASE_KEY_SHA256=$(sha256sum "$SUP_DIR/release_ed25519.pub" | awk '{print $1}')
     echo "${DCENT_RELEASE_KEY_SHA256}  release_ed25519.pub" >> "$SUP_DIR/SHA256SUMS"
     DCENT_RELEASE_KEY_STAGED=1
+}
+
+dcent_toolbox_command_has_token() {
+    _dcent_toolbox_command=$1
+    _dcent_toolbox_token=$2
+    case " $_dcent_toolbox_command " in
+        *" $_dcent_toolbox_token "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+dcent_require_toolbox_install_contract() {
+    _dcent_toolbox_command=$1
+    _dcent_toolbox_install_mode=$2
+
+    case "$_dcent_toolbox_command" in
+        "dcent install <ip> -f "*) ;;
+        *)
+            echo "ERROR: toolbox install metadata is not a target-bound dcent install command" >&2
+            return 1
+            ;;
+    esac
+    if dcent_toolbox_command_has_token "$_dcent_toolbox_command" "--yes"; then
+        echo "ERROR: toolbox install metadata must preserve interactive confirmation" >&2
+        return 1
+    fi
+
+    case "$_dcent_toolbox_install_mode" in
+        host_driven_rootfs_window_lab)
+            if ! dcent_toolbox_command_has_token "$_dcent_toolbox_command" "--artifact-dir"; then
+                echo "ERROR: Amlogic install metadata must require restore-verified --artifact-dir evidence" >&2
+                return 1
+            fi
+            if dcent_toolbox_command_has_token \
+                "$_dcent_toolbox_command" "--accept-vnish-aml-rootfs-window"; then
+                echo "ERROR: package metadata must not pre-acknowledge the VNish-source safety gate" >&2
+                return 1
+            fi
+            ;;
+        target_sysupgrade)
+            case "${BOARD_NAME:-}" in
+                am2-*)
+                    for _dcent_toolbox_required_arg in \
+                        --artifact-dir \
+                        --accept-am2-persistent-lab \
+                        --i-have-recovery
+                    do
+                        if ! dcent_toolbox_command_has_token \
+                            "$_dcent_toolbox_command" "$_dcent_toolbox_required_arg"; then
+                            echo "ERROR: AM2 install metadata omits required $_dcent_toolbox_required_arg gate" >&2
+                            return 1
+                        fi
+                    done
+                    ;;
+            esac
+            ;;
+        *)
+            echo "ERROR: unsupported toolbox install mode: $_dcent_toolbox_install_mode" >&2
+            return 1
+            ;;
+    esac
+    return 0
 }
 
 dcent_write_sysupgrade_manifest() {
@@ -131,6 +227,11 @@ dcent_write_sysupgrade_manifest() {
     install_mode="${DCENT_TOOLBOX_INSTALL_MODE:-target_sysupgrade}"
     target_side_sysupgrade="${DCENT_TARGET_SIDE_SYSUPGRADE:-true}"
     package_status="${DCENT_PACKAGE_STATUS:-release}"
+    manifest_profile=$(dcent_sysupgrade_manifest_profile) || exit 1
+    dcent_require_toolbox_install_contract "$install_command" "$install_mode" || exit 1
+    if [ -n "$update_command" ]; then
+        dcent_require_toolbox_install_contract "$update_command" "$install_mode" || exit 1
+    fi
 
     verification_block=""
     if [ "${DCENT_RELEASE_KEY_STAGED:-0}" = "1" ]; then
@@ -160,9 +261,12 @@ dcent_write_sysupgrade_manifest() {
     cat > "$SUP_DIR/MANIFEST.json" <<EOF
 {
   "schema": 1,
+  "manifest_profile": "${manifest_profile}",
   "product": "DCENT_OS",
   "family": "antminer",
   "package_type": "sysupgrade",
+  "installable": true,
+  "artifact_maturity": "experimental",
   "board_family": "${BOARD_FAMILY}",
   "board": "${BOARD_NAME}",
   "board_target": "${BOARD_NAME}",
@@ -207,6 +311,19 @@ dcent_write_sysupgrade_manifest() {
   }
 }
 EOF
+
+    if [ "$manifest_profile" = "$DCENT_SYSUPGRADE_UNSIGNED_LAB_PROFILE" ]; then
+        if grep -Eq '"(verification_key|ota_intermediate_cert|ota_revoked_intermediates)"[[:space:]]*:' "$SUP_DIR/MANIFEST.json"; then
+            echo "ERROR: unsigned lab manifest contains forbidden authority material" >&2
+            exit 1
+        fi
+        for forbidden_leaf in MANIFEST.sig release_ed25519.pub; do
+            if [ -e "$SUP_DIR/$forbidden_leaf" ]; then
+                echo "ERROR: unsigned lab manifest staging contains forbidden $forbidden_leaf" >&2
+                exit 1
+            fi
+        done
+    fi
 }
 
 dcent_sign_sysupgrade_manifest() {
@@ -214,21 +331,18 @@ dcent_sign_sysupgrade_manifest() {
         return 0
     fi
 
-    openssl pkeyutl -sign -rawin \
-        -inkey "$DCENT_RELEASE_SIGNING_KEY" \
-        -in "$SUP_DIR/MANIFEST.json" \
-        -out "$SUP_DIR/MANIFEST.sig" || {
-            echo "ERROR: failed to sign MANIFEST.json" >&2
-            exit 1
-        }
-
-    openssl pkeyutl -verify -rawin -pubin \
-        -inkey "$SUP_DIR/release_ed25519.pub" \
-        -sigfile "$SUP_DIR/MANIFEST.sig" \
-        -in "$SUP_DIR/MANIFEST.json" >/dev/null || {
-            echo "ERROR: MANIFEST.sig verification failed against release_ed25519.pub" >&2
-            exit 1
-        }
+    exact_signer="${PROJECT_ROOT:-}/scripts/sign_release_artifact.py"
+    [ -n "${PROJECT_ROOT:-}" ] && [ -f "$exact_signer" ] || {
+        echo "ERROR: exact release artifact signer is missing: $exact_signer" >&2
+        exit 1
+    }
+    dcent_release_run_python "$exact_signer" "$SUP_DIR/MANIFEST.json" \
+        --key "$DCENT_RELEASE_SIGNING_KEY" \
+        --pubkey "$SUP_DIR/release_ed25519.pub" \
+        --output-sig "$SUP_DIR/MANIFEST.sig" >/dev/null || {
+        echo "ERROR: failed to sign exact MANIFEST.json bytes" >&2
+        exit 1
+    }
 
     echo "Signed MANIFEST.json"
 }

@@ -10,6 +10,8 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_DIR=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
+MANIFEST_JSON_HELPER="$PROJECT_DIR/scripts/lib/sysupgrade_manifest_json.py"
+export MANIFEST_JSON_HELPER
 
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/dcent-ota-version.XXXXXX" 2>/dev/null || mktemp -d)
 CASES=0
@@ -65,9 +67,13 @@ extract_version_prefix() {
     script_path=$1
     output_path=$2
 
+    # Extract function definitions only. Executing the caller prologue would
+    # incorrectly require its installed persistent-state helper even though
+    # this test exercises no upgrade transaction or filesystem mutation.
     awk '
+        /^cleanup_package\(\)/ { emit=1 }
         /^verify_sha256\(\)/ { exit }
-        { print }
+        emit { print }
     ' "$script_path" >"$output_path"
 
     grep -Fq 'compare_versions()' "$output_path" \
@@ -173,8 +179,20 @@ run_one_script() {
     run_compare_case "$prefix" "1.2" "1.2.0" "0" "$rel_path padded release"
     run_compare_case "$prefix" "1.2.0" "1.2.0-rc1" "1" "$rel_path final beats prerelease"
     run_compare_case "$prefix" "1.2.0-rc1" "1.2.0" "-1" "$rel_path prerelease below final"
+    run_compare_case "$prefix" "1.2.0-rc1" "1.2.0-rc2" "-1" "$rel_path compact prerelease lexical order"
+    run_compare_case "$prefix" "1.2.0-rc10" "1.2.0-rc2" "-1" "$rel_path compact prerelease is explicitly lexical"
+    run_compare_case "$prefix" "1.2.0-rc.10" "1.2.0-rc.2" "1" "$rel_path dotted numeric prerelease order"
+    run_compare_case "$prefix" "1.2.0-alpha" "1.2.0-alpha.0" "-1" "$rel_path shorter prerelease ranks lower"
+    run_compare_case "$prefix" "1.2.0-1" "1.2.0-alpha" "-1" "$rel_path numeric prerelease ranks below alphanumeric"
+    run_compare_case "$prefix" "1.2.0-ab" "1.2.0-ba" "-1" "$rel_path prerelease labels use collision-free ASCII order"
+    run_compare_case "$prefix" "9007199254740993.0" "9007199254740992.0" "1" "$rel_path release comparison preserves integers above 2^53"
+    run_compare_case "$prefix" "18446744073709551616.0" "18446744073709551615.0" "1" "$rel_path release comparison is not bounded by u64"
+    run_compare_case "$prefix" "1.2.0+build-7" "1.2.0+other" "0" "$rel_path build metadata never changes precedence"
     run_compare_reject_case "$prefix" "not-a-version" "1.0.0" "$rel_path malformed candidate"
     run_compare_reject_case "$prefix" "1.0.0" "not-a-version" "$rel_path malformed current"
+    for malformed in 1 1.2.3.4 01.2.0 1.02.0 1.2.0- 1.2.0-alpha..1 1.2.0-alpha.01 1.2.0+ 1.2.0_bad 1.2.0:bad; do
+        run_compare_reject_case "$prefix" "$malformed" "1.2.0" "$rel_path rejects noncanonical $malformed"
+    done
 
     run_floor_case "$prefix" "1.0.0" "1.0.0" "release" "0" "0" \
         "matches running firmware version" "$rel_path equal floor"
@@ -187,7 +205,7 @@ run_one_script() {
     run_floor_case "$prefix" "0.9.0" "1.0.0" "lab" "1" "0" \
         "allowing non-release downgrade 1.0.0 -> 0.9.0" "$rel_path lab downgrade override"
     run_floor_case "$prefix" "__missing__" "1.0.0" "release" "0" "1" \
-        "has no version field" "$rel_path missing candidate version"
+        "has no single non-empty string version" "$rel_path missing candidate version"
     run_floor_case "$prefix" "1.0.0" "__missing__" "release" "0" "1" \
         "current " "$rel_path missing current version"
 

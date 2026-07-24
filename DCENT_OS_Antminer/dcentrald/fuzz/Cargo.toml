@@ -9,8 +9,16 @@ cargo-fuzz = true
 
 [dependencies]
 dcentrald-api = { path = "../dcentrald-api", features = ["fuzzing"] }
+dcentrald-common = { path = "../dcentrald-common" }
 dcentrald-stratum = { path = "../dcentrald-stratum" }
 libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "dspic_reply_decoder"
+path = "fuzz_targets/dspic_reply_decoder.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "ota_sysupgrade_tar"

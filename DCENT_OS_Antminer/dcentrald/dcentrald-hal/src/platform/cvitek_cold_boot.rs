@@ -36,11 +36,11 @@
 //!
 //! ## Status
 //!
-//! **Code-only, hardware-gated.** No CV1835 unit on the production fleet
-//! (2026-05-10), so this routine is unreachable from any default code path.
-//! Tests + a future bench-unit operator harness are the only callers. The
-//! constructor [`crate::platform::cvitek::CViTekPlatform::new`] does NOT call
-//! this — opt-in by design.
+//! **Evidence only / NOT IMPLEMENTED.** No CV1835 runtime lane is admitted.
+//! The module is crate-private, the production constructor is an unconditional
+//! non-mutating refusal, and no operator environment flag makes this routine
+//! reachable from another crate. Tests retain the reconstructed sequence for
+//! future review against bench evidence.
 //!
 //! ## Phase map (matches R4 trace §1 timeline)
 //!

@@ -303,18 +303,14 @@ mod tests {
     fn bm1387_invalid_midstate_count_rejected() {
         let r =
             encode_work(WorkFrameFormat::Bm1387 { num_midstates: 2 }, &sample_job(0)).unwrap_err();
-        match r {
-            WorkEncodeError::InvalidMidstateCount {
-                family,
-                got,
-                allowed,
-            } => {
-                assert_eq!(family, "bm1387");
-                assert_eq!(got, 2);
-                assert_eq!(allowed, &[1, 4]);
-            }
-            _ => panic!("expected InvalidMidstateCount"),
-        }
+        let WorkEncodeError::InvalidMidstateCount {
+            family,
+            got,
+            allowed,
+        } = r;
+        assert_eq!(family, "bm1387");
+        assert_eq!(got, 2);
+        assert_eq!(allowed, &[1, 4]);
     }
 
     #[test]

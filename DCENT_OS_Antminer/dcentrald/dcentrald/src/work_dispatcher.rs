@@ -31,7 +31,10 @@ use dcentrald_asic::drivers::bm1370::Bm1370Driver;
 use dcentrald_asic::drivers::bm1387::Bm1387Driver;
 use dcentrald_asic::drivers::bm1397::Bm1397Driver;
 use dcentrald_asic::drivers::bm1398::Bm1398Driver;
-use dcentrald_asic::drivers::{ChipRegistry, MinerProfile, MiningWork as AsicWork, PicType};
+use dcentrald_asic::drivers::{
+    ChipDriverExecutionPolicy, ChipRegistry, FpgaNonceDecodeContext, MinerProfile,
+    MiningWork as AsicWork, PicType,
+};
 use dcentrald_autotuner::chip_stats::{
     ChipNonceTracker, ChipStatsSnapshot, BOARD_TEMP_STALE_TIMEOUT_S,
 };
@@ -47,6 +50,7 @@ use dcentrald_stratum::types::{JobTemplate, ValidShare};
 use crate::asic_identity_publication::{ActiveCompositionSession, AsicIdentityPublicationPort};
 use crate::runtime::task_guard::RuntimeTaskGuard;
 use crate::voltage_mailbox::{VoltageCommandSender, VoltageTrySendError};
+use crate::work_ledger::{ChainWorkLedger, LedgerLookup};
 
 const MIN_RUNTIME_FREQ_MHZ: u16 = 200;
 const RECENT_WORK_ID_SLOT_GUARD: Duration = Duration::from_secs(5);
@@ -158,13 +162,6 @@ struct WorkEntry {
     prev_block_hash: [u8; 32],
     /// Last 12 bytes of block header before nonce: merkle4(4) + ntime(4) + nbits(4).
     header_tail: [u8; 12],
-    /// Dispatch generation — monotonic counter to detect ring buffer overwrites.
-    /// When a nonce arrives, its work_id maps to a slot. If the slot's generation
-    /// doesn't match, the entry was overwritten by a newer dispatch → stale.
-    generation: u64,
-    /// Host timestamp when this work reached the FPGA dispatch path.
-    /// 8-bit FPGA work-id rings must not overwrite slots younger than 5s.
-    dispatched_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -473,6 +470,9 @@ pub struct WorkDispatcher {
     chains: Vec<Chain>,
     /// Detected chip ID (e.g., 0x1387 for BM1387).
     chip_id: u16,
+    /// Immutable executable-driver authority inherited from the sealed startup
+    /// composition. The dispatcher must not reconstruct a broader policy.
+    driver_execution_policy: ChipDriverExecutionPolicy,
     /// Hardware difficulty (TicketMask + 1). Default 256 for BM1387.
     hw_difficulty: u64,
     /// Channel to send per-chip stats snapshots to the autotuner.
@@ -586,6 +586,7 @@ impl WorkDispatcher {
         worker_name: String,
         chains: Vec<Chain>,
         chip_id: u16,
+        driver_execution_policy: ChipDriverExecutionPolicy,
         hw_difficulty: u64,
         autotune_stats_tx: Option<mpsc::Sender<ChipStatsSnapshot>>,
         freq_cmd_rx: Option<mpsc::Receiver<FreqCommand>>,
@@ -626,6 +627,7 @@ impl WorkDispatcher {
             worker_name,
             chains,
             chip_id,
+            driver_execution_policy,
             hw_difficulty,
             autotune_stats_tx,
             freq_cmd_rx,
@@ -740,10 +742,10 @@ impl WorkDispatcher {
 
     fn enter_curtailment_sleep(
         &mut self,
-        work_table: &mut [Option<Arc<WorkEntry>>],
+        work_ledgers: &mut [ChainWorkLedger<Arc<WorkEntry>>],
         hashrate: &mut HashrateTracker,
     ) {
-        work_table.iter_mut().for_each(|entry| *entry = None);
+        work_ledgers.iter_mut().for_each(ChainWorkLedger::clear);
         for chain in &mut self.chains {
             if chain.mining {
                 chain.fpga.flush_work_tx();
@@ -803,6 +805,7 @@ impl WorkDispatcher {
     fn normalize_tracker_chip_index(
         chip_id: u16,
         chip_count: u8,
+        address_plan: Option<dcentrald_api_types::asic_command::LinearAddressPlan>,
         raw_chip_index: u8,
     ) -> Option<u8> {
         if chip_count == 0 {
@@ -812,11 +815,7 @@ impl WorkDispatcher {
         let chip_index = match chip_id {
             0x1387 | 0x1362 => raw_chip_index,
             0x1397 | 0x1398 | 0x1366 | 0x1368 | 0x1370 => {
-                let addr_interval = 256u16 / chip_count as u16;
-                if addr_interval == 0 {
-                    return None;
-                }
-                (raw_chip_index as u16 / addr_interval) as u8
+                address_plan?.dense_index(raw_chip_index)? as u8
             }
             _ => raw_chip_index,
         };
@@ -871,41 +870,20 @@ impl WorkDispatcher {
         }
     }
 
-    fn allocate_work_id(
-        work_id_counter: &mut u16,
-        work_id_mask: u16,
-        work_table: &[Option<Arc<WorkEntry>>],
-        now: Instant,
-        min_slot_age: Duration,
-    ) -> Option<u16> {
-        if work_table.is_empty() {
-            return None;
-        }
-
-        for _ in 0..work_table.len() {
-            let candidate = *work_id_counter & work_id_mask;
-            *work_id_counter = candidate.wrapping_add(1) & work_id_mask;
-
-            let slot_recent = match work_table
-                .get(candidate as usize)
-                .and_then(|entry| entry.as_ref())
-            {
-                Some(entry) => now.saturating_duration_since(entry.dispatched_at) < min_slot_age,
-                None => false,
-            };
-            if !slot_recent {
-                return Some(candidate);
-            }
-        }
-
-        None
-    }
-
     fn decode_fpga_work_id_for_dispatch(
         chip_id: u16,
         hw_work_id: u16,
         fpga_midstate_cnt: u8,
-    ) -> (u16, u8) {
+    ) -> Option<(u16, u8)> {
+        if chip_id == 0x1398 {
+            let mode = match fpga_midstate_cnt {
+                2 => dcentrald_api_types::bm1398_protocol::Bm1398FpgaMidstateMode::Four,
+                3 => dcentrald_api_types::bm1398_protocol::Bm1398FpgaMidstateMode::Eight,
+                _ => return None,
+            };
+            return dcentrald_api_types::bm1398_protocol::BM1398_FPGA_FIFO_SPEC
+                .decode_work_id(mode, hw_work_id);
+        }
         let ms_shift = fpga_midstate_cnt.min(3) as u16;
         let ms_mask = (1u16 << ms_shift) - 1;
         let decoded_work_id = hw_work_id >> ms_shift;
@@ -915,7 +893,7 @@ impl WorkDispatcher {
             decoded_work_id
         };
 
-        (work_id, (hw_work_id & ms_mask) as u8)
+        Some((work_id, (hw_work_id & ms_mask) as u8))
     }
 
     fn version_bits_per_midstate(
@@ -1459,7 +1437,7 @@ impl WorkDispatcher {
 
         // Look up the chip driver only after the typed write boundary accepts
         // the identity. Unknown/missing/mixed identities stay monitoring-only.
-        let registry = ChipRegistry::new();
+        let registry = ChipRegistry::with_execution_policy(self.driver_execution_policy);
         let driver = dispatch_chip.and_then(|chip| registry.detect(chip.chip_id()));
 
         let mut identity_composition_session: Option<ActiveCompositionSession> = None;
@@ -1525,10 +1503,13 @@ impl WorkDispatcher {
             // Monitoring-only mode never dispatches. Keep a one-slot inert
             // table without selecting any ASIC family's work-id policy.
             .unwrap_or(1);
-        let work_id_mask = (work_id_space - 1) as u16;
-        let mut work_id_counter: u16 = 0;
-        let mut work_table: Vec<Option<Arc<WorkEntry>>> = vec![None; work_id_space];
-        let mut dispatch_generation: u64 = 0; // monotonic counter per dispatch
+        let mut work_ledgers = (0..self.chains.len())
+            .map(|chain_idx| {
+                ChainWorkLedger::new(work_id_space, chain_idx)
+                    .expect("admitted work ID domain must be a nonzero power of two")
+            })
+            .collect::<Vec<ChainWorkLedger<Arc<WorkEntry>>>>();
+        let mut next_dispatch_serial: u64 = 0;
         let mut hashrate = HashrateTracker::new(num_chains);
 
         // Nonce dedup set — local variable (dispatcher is single-threaded, no Mutex needed).
@@ -1674,11 +1655,17 @@ impl WorkDispatcher {
                 "Power cap enforcement ACTIVE — will throttle if wall power exceeds {}W", cap,
             );
         }
+        let total_work_id_capacity = work_ledgers
+            .iter()
+            .map(ChainWorkLedger::capacity)
+            .sum::<usize>();
         info!(
             work_id_space,
+            total_work_id_capacity,
             max_midstate_shift,
-            "Work ID tracking widened to {} entries (max MIDSTATE_CNT shift={})",
+            "Work ID tracking uses {} entries per chain, {} total (max MIDSTATE_CNT shift={})",
             work_id_space,
+            total_work_id_capacity,
             max_midstate_shift,
         );
 
@@ -1713,7 +1700,7 @@ impl WorkDispatcher {
                             "NEW BLOCK — pool sent clean job (new Bitcoin block found!). Flushing all pending work and starting fresh."
                         );
                         work_builder.reset_extranonce2();
-                        work_table.iter_mut().for_each(|e| *e = None);
+                        work_ledgers.iter_mut().for_each(ChainWorkLedger::clear);
                         // Flush both WORK_TX and WORK_RX FIFOs on all chains.
                         // clean_jobs means the previous block is dead; leaving stale work
                         // queued in TX keeps ASICs hashing the old block for extra seconds,
@@ -1813,7 +1800,7 @@ impl WorkDispatcher {
                             );
                         }
                         current_job = None;
-                        work_table.iter_mut().for_each(|entry| *entry = None);
+                        work_ledgers.iter_mut().for_each(ChainWorkLedger::clear);
                         for chain in &mut self.chains {
                             if chain.mining {
                                 chain.fpga.flush_work_tx();
@@ -1913,7 +1900,7 @@ impl WorkDispatcher {
                     if sleeping_now {
                         if !dispatcher_sleeping {
                             info!("Curtailment sleep active — pausing work dispatch and flushing FPGA FIFOs");
-                            self.enter_curtailment_sleep(&mut work_table, &mut hashrate);
+                            self.enter_curtailment_sleep(&mut work_ledgers, &mut hashrate);
                             dispatcher_sleeping = true;
                         }
                         continue;
@@ -1930,7 +1917,7 @@ impl WorkDispatcher {
                     if let Some(ref job) = current_job {
                         // AXI bus coordination: skip ENTIRE dispatch tick while heartbeat
                         // thread is doing I2C. Must check BEFORE work generation to avoid
-                        // wasting extranonce2 values and creating orphaned work_table entries.
+                        // wasting extranonce2 values and creating orphaned ledger entries.
                         // The FPGA TX FIFO is 2048 entries deep (~570 work items) — skipping
                         // one 5ms tick costs zero throughput. ASICs keep hashing from FIFO.
                         if self.i2c_active.load(Ordering::Acquire) {
@@ -1953,14 +1940,18 @@ impl WorkDispatcher {
                         // The `any_room` check above already ensures at least one chain needs work.
 
                         // Generate unique work for the FIRST chain (sets baseline for this tick)
-                        let Some(first_chain) = self.chains.iter().find(|c| c.mining && !c.fpga.work_tx_full()) else {
+                        let Some(first_chain_idx) = self
+                            .chains
+                            .iter()
+                            .position(|c| c.mining && !c.fpga.work_tx_full())
+                        else {
                             continue;
                         };
+                        let first_chain = &self.chains[first_chain_idx];
                         let first_dispatch_at = Instant::now();
-                        let Some(pending_first_wid) = Self::allocate_work_id(
-                            &mut work_id_counter,
-                            work_id_mask,
-                            &work_table,
+                        let pending_first_serial = next_dispatch_serial;
+                        let Some(pending_first_reservation) = work_ledgers[first_chain_idx].reserve(
+                            pending_first_serial,
                             first_dispatch_at,
                             RECENT_WORK_ID_SLOT_GUARD,
                         ) else {
@@ -1971,8 +1962,9 @@ impl WorkDispatcher {
                             );
                             continue;
                         };
-                        let pending_first_generation = dispatch_generation;
-                        dispatch_generation += 1;
+                        next_dispatch_serial = next_dispatch_serial.wrapping_add(1);
+                        let pending_first_wid = pending_first_reservation.work_id();
+                        let mut pending_first_reservation = Some(pending_first_reservation);
                         let first_chain_ms_cnt = first_chain.fpga_midstate_cnt;
                         let first_chain_chip_id = first_chain.chip_id;
                         work_builder.set_version_mask(Self::effective_version_mask(first_chain_chip_id, job.version_mask));
@@ -2063,7 +2055,8 @@ impl WorkDispatcher {
                             stratum_work.midstates.len(),
                         );
 
-                        // FIX (2026-04-12): Build entry but DON'T commit to work_table yet.
+                        // FIX (2026-04-12): Build the entry but do not commit it to
+                        // the owning chain ledger yet.
                         // Commit only after send_work() succeeds. If send_work fails, the
                         // slot would point to work that never reached hardware.
                         let pending_first_entry = Arc::new(WorkEntry {
@@ -2078,8 +2071,6 @@ impl WorkDispatcher {
                             merkle_root: stratum_work.merkle_root,
                             prev_block_hash: stratum_work.prev_block_hash,
                             header_tail,
-                            generation: pending_first_generation,
-                            dispatched_at: first_dispatch_at,
                         });
 
                         // Dispatch UNIQUE work to each active chain via FPGA WORK_TX_FIFO
@@ -2106,22 +2097,22 @@ impl WorkDispatcher {
                             // Generate unique work for chains after the first
                             if first_chain_done {
                                 let dispatch_at = Instant::now();
-                                let Some(pending_wid) = Self::allocate_work_id(
-                                    &mut work_id_counter,
-                                    work_id_mask,
-                                    &work_table,
+                                let pending_serial = next_dispatch_serial;
+                                let Some(pending_reservation) = work_ledgers[chain_idx].reserve(
+                                    pending_serial,
                                     dispatch_at,
                                     RECENT_WORK_ID_SLOT_GUARD,
                                 ) else {
                                     debug!(
+                                        chain_id = chain.chain_id,
                                         work_id_space,
                                         guard_ms = RECENT_WORK_ID_SLOT_GUARD.as_millis(),
-                                        "All work_id slots are recently dispatched; stopping this dispatch tick"
+                                        "This chain's work_id slots are recently dispatched; trying sibling chains"
                                     );
-                                    break;
+                                    continue;
                                 };
-                                let pending_generation = dispatch_generation;
-                                dispatch_generation += 1;
+                                next_dispatch_serial = next_dispatch_serial.wrapping_add(1);
+                                let pending_wid = pending_reservation.work_id();
                                 work_builder.set_version_mask(Self::effective_version_mask(chain.chip_id, job.version_mask));
                                 let sw = work_builder.next_work(job);
                                 let aw = AsicWork {
@@ -2146,7 +2137,8 @@ impl WorkDispatcher {
                                 ht[0..4].copy_from_slice(&sw.merkle4);
                                 ht[4..8].copy_from_slice(&sw.ntime.to_le_bytes());
                                 ht[8..12].copy_from_slice(&sw.nbits.to_le_bytes());
-                                // FIX (2026-04-12): Commit work_table entry AFTER send_work
+                                // FIX (2026-04-12): Commit the chain-ledger entry
+                                // only after send_work succeeds.
                                 // succeeds. If send_work fails, the slot would point to work
                                 // that never reached hardware — stale nonces could match it.
                                 let pending_entry = Arc::new(WorkEntry {
@@ -2161,12 +2153,12 @@ impl WorkDispatcher {
                                     merkle_root: sw.merkle_root,
                                     prev_block_hash: sw.prev_block_hash,
                                     header_tail: ht,
-                                    generation: pending_generation,
-                                    dispatched_at: dispatch_at,
                                 });
                                 match drv.send_work(&mut chain.fpga, &aw) {
                                     Ok(_) => {
-                                        work_table[pending_wid as usize] = Some(pending_entry);
+                                        work_ledgers[chain_idx]
+                                            .commit(pending_reservation, pending_entry)
+                                            .expect("reservation must commit to its owning chain ledger");
                                         total_work_dispatched += 1;
                                         pending_dispatches = pending_dispatches.saturating_add(1);
                                         dispatch_chain_counts[chain_idx] =
@@ -2183,8 +2175,14 @@ impl WorkDispatcher {
                             // Write first chain's work (generated above)
                             match drv.send_work(&mut chain.fpga, &asic_work) {
                                 Ok(wid) => {
-                                    // Commit work_table entry NOW (after send_work succeeded)
-                                    work_table[pending_first_wid as usize] = Some(pending_first_entry.clone());
+                                    work_ledgers[chain_idx]
+                                        .commit(
+                                            pending_first_reservation
+                                                .take()
+                                                .expect("first reservation may be committed only once"),
+                                            pending_first_entry.clone(),
+                                        )
+                                        .expect("first reservation must commit to its owning chain ledger");
                                     total_work_dispatched += 1;
                                     pending_dispatches = pending_dispatches.saturating_add(1);
                                     dispatch_chain_counts[chain_idx] =
@@ -2245,10 +2243,10 @@ impl WorkDispatcher {
                                     None
                                 }
                             });
-                        let work_ring_occupancy = work_table
+                        let work_ring_occupancy = work_ledgers
                             .iter()
-                            .filter(|entry| entry.is_some())
-                            .count()
+                            .map(ChainWorkLedger::occupancy)
+                            .sum::<usize>()
                             .min(u32::MAX as usize) as u32;
                         let local_validation_drops_total =
                             local_header_rejects_bm1398.saturating_add(local_share_rejects_legacy);
@@ -2296,10 +2294,10 @@ impl WorkDispatcher {
                                     None
                                 }
                             });
-                        let work_ring_occupancy = work_table
+                        let work_ring_occupancy = work_ledgers
                             .iter()
-                            .filter(|entry| entry.is_some())
-                            .count()
+                            .map(ChainWorkLedger::occupancy)
+                            .sum::<usize>()
                             .min(u32::MAX as usize) as u32;
                         let local_validation_drops_total =
                             local_header_rejects_bm1398.saturating_add(local_share_rejects_legacy);
@@ -2375,7 +2373,20 @@ impl WorkDispatcher {
                             };
 
                             // Decode the nonce using chip-specific driver
-                            let mut nonce_result = match drv.decode_nonce(&[w0, w1]) {
+                            let Some(decode_context) = FpgaNonceDecodeContext::try_new(
+                                chain.fpga_midstate_cnt as u8,
+                            ) else {
+                                hw_errors += 1;
+                                error!(
+                                    chain_id = chain.chain_id,
+                                    fpga_midstate_cnt = chain.fpga_midstate_cnt,
+                                    "Refusing nonce decode with an impossible FPGA midstate count"
+                                );
+                                break;
+                            };
+                            let mut nonce_result = match drv
+                                .decode_nonce_with_context(&[w0, w1], decode_context)
+                            {
                                 Ok(nr) => nr,
                                 Err(e) => {
                                     hw_errors += 1;
@@ -2387,7 +2398,7 @@ impl WorkDispatcher {
                                         if let Some(Some(tracker_idx)) = chain_idx_to_tracker.get(chain_idx) {
                                             if chain.chip_id == 0x1387 {
                                                 let raw_chip = ((w1 >> 24) & 0x3F) as u8;
-                                                if let Some(chip_idx) = Self::normalize_tracker_chip_index(chain.chip_id, chain.chip_count, raw_chip) {
+                                                if let Some(chip_idx) = Self::normalize_tracker_chip_index(chain.chip_id, chain.chip_count, chain.address_plan(), raw_chip) {
                                                     tracker.record_hw_error(*tracker_idx, chip_idx);
                                                 }
                                             }
@@ -2406,6 +2417,7 @@ impl WorkDispatcher {
                             let tracker_chip_index = Self::normalize_tracker_chip_index(
                                 chain.chip_id,
                                 chain.chip_count,
+                                chain.address_plan(),
                                 nonce_result.chip_index,
                             );
 
@@ -2414,12 +2426,23 @@ impl WorkDispatcher {
                             // same low 8-bit work-id ring as S9/S17-era FPGA paths.
                             {
                                 let hw_work_id = ((w1 >> 8) & 0xFFFF) as u16;
-                                let (decoded_work_id, midstate_idx) =
+                                let Some((decoded_work_id, midstate_idx)) =
                                     Self::decode_fpga_work_id_for_dispatch(
                                         chain.chip_id,
                                         hw_work_id,
                                         chain.fpga_midstate_cnt,
+                                    )
+                                else {
+                                    hw_errors += 1;
+                                    debug!(
+                                        chain_id = chain.chain_id,
+                                        chip_id = format_args!("0x{:04X}", chain.chip_id),
+                                        hw_work_id = format_args!("0x{:04X}", hw_work_id),
+                                        fpga_midstate_cnt = chain.fpga_midstate_cnt,
+                                        "Refusing nonce whose echoed work-id aliases outside the admitted carrier ring"
                                     );
+                                    continue;
+                                };
                                 nonce_result.work_id = decoded_work_id;
                                 nonce_result.midstate_idx = midstate_idx;
                             }
@@ -2466,18 +2489,21 @@ impl WorkDispatcher {
                             //
                             // MINE-3 bounds guard: on non-8-bit-work-id chips (e.g. BM1362)
                             // the decoded work_id is `hw_work_id >> ms_shift` and is NOT
-                            // family-masked. `work_id_space` (= `work_table.len()`) is sized
+                            // family-masked. `work_id_space` (= one chain ledger's capacity) is sized
                             // from the configured `max_midstate_shift`, but the decode uses
                             // the *actual* `fpga_midstate_cnt`. If the FPGA reports fewer
                             // midstates than configured, the decoded work_id can exceed
-                            // `work_table.len()`, so a raw `work_table[..]` index would panic
+                            // the ledger capacity, so an unchecked raw slot index would panic
                             // — and with `panic=abort` that crashes the daemon on attacker- or
                             // glitch-controlled wire data. Use a checked `.get()` and treat an
                             // out-of-range id as a stale/garbage nonce (same as an empty slot).
-                            let work_slot = work_table.get(nonce_result.work_id as usize);
-                            let work_entry = match work_slot.and_then(|slot| slot.as_ref()) {
-                                Some(entry) => {
-                                    let age = dispatch_generation.saturating_sub(entry.generation);
+                            let work_record = match work_ledgers
+                                .get(chain_idx)
+                                .map(|ledger| ledger.lookup(nonce_result.work_id))
+                            {
+                                Some(LedgerLookup::Found(record)) => {
+                                    let age = next_dispatch_serial
+                                        .saturating_sub(record.dispatch_serial);
                                     //  W1: tighten the stale-age
                                     // eviction threshold from
                                     // `work_id_space` (256 for BM1387's
@@ -2508,9 +2534,11 @@ impl WorkDispatcher {
                                         }
                                         continue;
                                     }
-                                    Arc::clone(entry)
+                                    record
                                 }
-                                None => {
+                                Some(LedgerLookup::Empty)
+                                | Some(LedgerLookup::OutOfRange { .. })
+                                | None => {
                                     stale_nonces += 1;
                                     stale_empty_slot_nonces += 1;
                                     // Report stale (empty slot) to autotuner.
@@ -2524,6 +2552,8 @@ impl WorkDispatcher {
                                     continue;
                                 }
                             };
+                            let work_dispatch_serial = work_record.dispatch_serial;
+                            let work_entry = work_record.payload;
 
                             // Deduplicate nonces across chains and midstate slots.
                             //
@@ -2559,7 +2589,7 @@ impl WorkDispatcher {
                                 // Combine generation + work_id for a unique job-scoped key.
                                 // Generation is monotonic, so even after work_id wraps, the
                                 // combination is unique for the lifetime of the daemon.
-                                let gen_key = work_entry.generation;
+                                let gen_key = work_dispatch_serial;
                                 let key = (gen_key, nonce_result.nonce, dedup_ms_idx);
                                 if !seen.insert(key) {
                                     dedup_discarded += 1;
@@ -2577,7 +2607,7 @@ impl WorkDispatcher {
                                 // clear() could allow duplicate submissions for nonces still in the FIFO pipeline.
                                 // retain() keeps recent entries (last 2048 generations) and prunes old ones.
                                 if seen.len() > 4000 {
-                                    let cutoff = dispatch_generation.saturating_sub(2048);
+                                    let cutoff = next_dispatch_serial.saturating_sub(2048);
                                     seen.retain(|&(gen, _, _)| gen >= cutoff);
                                 }
                             }
@@ -2643,8 +2673,8 @@ impl WorkDispatcher {
                                                 job_id = %work_entry.job_id,
                                                 work_id = nonce_result.work_id,
                                                 hw_work_id = format_args!("0x{:04X}", hw_work_id),
-                                                work_generation = work_entry.generation,
-                                                dispatch_generation,
+                                                work_generation = work_dispatch_serial,
+                                                dispatch_generation = next_dispatch_serial,
                                                 midstate_idx = nonce_result.midstate_idx,
                                                 nonce = format_args!("0x{:08x}", nonce_result.nonce),
                                                 version_bits = ?share_version_bits,
@@ -2759,8 +2789,8 @@ impl WorkDispatcher {
                                             .map(|d| d.as_millis() as u64)
                                             .unwrap_or(0);
                                         let hw_work_id_raw = ((w1 >> 8) & 0xFFFF) as u16;
-                                        let gen_age = dispatch_generation
-                                            .saturating_sub(work_entry.generation);
+                                        let gen_age = next_dispatch_serial
+                                            .saturating_sub(work_dispatch_serial);
                                         let diag = dcentrald_api_types::share_validation::LocalRejectDiagnostic {
                                             seq: local_share_rejects_legacy + 1,
                                             timestamp_ms: now_ms,
@@ -3805,7 +3835,7 @@ impl WorkDispatcher {
                     if self.curtailment_sleeping.load(Ordering::Acquire) {
                         if !dispatcher_sleeping {
                             info!("Curtailment sleep active — publishing low-power dispatcher snapshot");
-                            self.enter_curtailment_sleep(&mut work_table, &mut hashrate);
+                            self.enter_curtailment_sleep(&mut work_ledgers, &mut hashrate);
                             dispatcher_sleeping = true;
                         }
                         self.publish_curtailment_sleep_snapshot();
@@ -4319,45 +4349,66 @@ mod tests {
             merkle_root: [0x22; 32],
             prev_block_hash: [0x11; 32],
             header_tail,
-            generation: 7,
-            dispatched_at: Instant::now(),
         }
-    }
-
-    fn sample_work_entry_at(dispatched_at: Instant, generation: u64) -> WorkEntry {
-        let mut entry = sample_work_entry();
-        entry.dispatched_at = dispatched_at;
-        entry.generation = generation;
-        entry
     }
 
     #[test]
     fn normalize_tracker_chip_index_handles_dense_and_strided_families() {
+        let bm1397_plan =
+            dcentrald_api_types::asic_command::LinearAddressPlan::from_truncated_byte_space(48)
+                .unwrap();
+        let bm1398_plan = dcentrald_api_types::bm1398_protocol::S19_PRO_NBP1901_ADDRESS_PLAN;
         assert_eq!(
-            WorkDispatcher::normalize_tracker_chip_index(0x1387, 63, 12),
+            WorkDispatcher::normalize_tracker_chip_index(0x1387, 63, None, 12),
             Some(12)
         );
         assert_eq!(
-            WorkDispatcher::normalize_tracker_chip_index(0x1362, 126, 42),
+            WorkDispatcher::normalize_tracker_chip_index(0x1362, 126, None, 42),
             Some(42)
         );
 
         // BM1397 uses strided hardware addresses (256 / 48 = 5).
         assert_eq!(
-            WorkDispatcher::normalize_tracker_chip_index(0x1397, 48, 0),
+            WorkDispatcher::normalize_tracker_chip_index(0x1397, 48, Some(bm1397_plan), 0),
             Some(0)
         );
         assert_eq!(
-            WorkDispatcher::normalize_tracker_chip_index(0x1397, 48, 5),
+            WorkDispatcher::normalize_tracker_chip_index(0x1397, 48, Some(bm1397_plan), 5),
             Some(1)
         );
         assert_eq!(
-            WorkDispatcher::normalize_tracker_chip_index(0x1397, 48, 235),
+            WorkDispatcher::normalize_tracker_chip_index(0x1397, 48, Some(bm1397_plan), 6),
+            None,
+            "unassigned strided addresses must not alias a neighboring chip"
+        );
+        assert_eq!(
+            WorkDispatcher::normalize_tracker_chip_index(0x1397, 48, Some(bm1397_plan), 235),
             Some(47)
         );
         assert_eq!(
-            WorkDispatcher::normalize_tracker_chip_index(0x1397, 48, 240),
+            WorkDispatcher::normalize_tracker_chip_index(0x1397, 48, Some(bm1397_plan), 240),
             None
+        );
+
+        // S19 Pro uses interval 2; raw address 225 is not assigned and used
+        // to truncate to dense chip 112.
+        assert_eq!(
+            WorkDispatcher::normalize_tracker_chip_index(0x1398, 114, Some(bm1398_plan), 224),
+            Some(112)
+        );
+        assert_eq!(
+            WorkDispatcher::normalize_tracker_chip_index(0x1398, 114, Some(bm1398_plan), 225),
+            None
+        );
+        assert_eq!(
+            WorkDispatcher::normalize_tracker_chip_index(0x1398, 113, Some(bm1398_plan), 226),
+            None,
+            "observed population cannot reinterpret the immutable composition plan"
+        );
+        assert_eq!(
+            WorkDispatcher::normalize_tracker_chip_index(0x1398, 114, None, 224),
+            None,
+            "strided families fail closed without retained address authority"
         );
     }
 
@@ -4433,6 +4484,13 @@ mod tests {
             WorkDispatcher::normalize_dispatch_write_identity(0xFFFF, [0xFFFF]),
             Err(DispatchWriteIdentityError::Unsupported(0xFFFF))
         );
+        for scaffold_id in [0x1372, 0x1373] {
+            assert_eq!(
+                WorkDispatcher::normalize_dispatch_write_identity(scaffold_id, [scaffold_id]),
+                Err(DispatchWriteIdentityError::Unsupported(scaffold_id)),
+                "S23 scaffold identities must remain outside production work dispatch"
+            );
+        }
         assert_eq!(
             WorkDispatcher::normalize_dispatch_write_identity(0x1387, [0x1387, 0x1397]),
             Err(DispatchWriteIdentityError::Mixed {
@@ -4556,9 +4614,9 @@ mod tests {
         assert!(WorkDispatcher::uses_8bit_fpga_work_id(0x1398));
         assert_eq!(WorkDispatcher::work_id_space_for(0x1398, 2), 256);
 
-        let hw_work_id = (0x12ABu16 << 2) | 0x03;
+        let hw_work_id = (0x00ABu16 << 2) | 0x03;
         let (work_id, midstate_idx) =
-            WorkDispatcher::decode_fpga_work_id_for_dispatch(0x1398, hw_work_id, 2);
+            WorkDispatcher::decode_fpga_work_id_for_dispatch(0x1398, hw_work_id, 2).unwrap();
 
         assert_eq!(work_id, 0x00AB);
         assert_eq!(midstate_idx, 3);
@@ -4571,7 +4629,7 @@ mod tests {
 
         let hw_work_id = (0x12ABu16 << 2) | 0x02;
         let (work_id, midstate_idx) =
-            WorkDispatcher::decode_fpga_work_id_for_dispatch(0x1362, hw_work_id, 2);
+            WorkDispatcher::decode_fpga_work_id_for_dispatch(0x1362, hw_work_id, 2).unwrap();
 
         assert_eq!(work_id, 0x12AB);
         assert_eq!(midstate_idx, 2);
@@ -4623,32 +4681,20 @@ mod tests {
         }
     }
 
-    /// W17 regression: the FPGA work_id field is 8 bits on BM1387/BM1397/BM1398.
-    /// Even if a u16 work_id was assigned somewhere upstream, the FPGA only
-    /// returns the low byte in the nonce response. The dispatcher MUST mask
-    /// to 8 bits before looking up the work entry; otherwise nonces alias
-    /// to the wrong job (89% stale).
+    /// BM1398's carrier echoes a 16-bit extended field but admits only an
+    /// 8-bit logical ring. High logical bits are corruption, not permission
+    /// to mask-alias an old work-table slot.
     #[test]
-    fn bm1398_decode_masks_to_8_bits_even_when_high_bits_set() {
-        // hw_work_id is u16 = 16 bits = (work_id_bits << ms_shift) | ms_idx.
-        // With ms_shift=2 we have 14 bits of work_id available in the wire
-        // payload. The dispatcher must mask the decoded work_id down to
-        // 8 bits for the BM1387/1397/1398 family — otherwise the upper
-        // 6 bits leak into the work_table index and alias every nonce.
-        //
-        // hw_work_id payload = top14=0x3F12 (binary 11_1111_0001_0010), low2=0x01.
-        // Pre-shift work_id = 0x3F12; after the family-specific 8-bit mask
-        // it must be 0x12 (low byte only).
+    fn bm1398_decode_refuses_high_logical_work_id_bits() {
         let hw_work_id = (0x3F12u16 << 2) | 0x01;
-        let (decoded, ms_idx) =
-            WorkDispatcher::decode_fpga_work_id_for_dispatch(0x1398, hw_work_id, 2);
-        assert_eq!(decoded & !0x00FF, 0, "decoded work_id must fit in 8 bits");
-        assert_eq!(decoded, 0x12);
-        assert_eq!(ms_idx, 1);
+        assert_eq!(
+            WorkDispatcher::decode_fpga_work_id_for_dispatch(0x1398, hw_work_id, 2),
+            None
+        );
 
         // Same hw_work_id on a BM1362 (16-bit ring) keeps the upper bits.
         let (decoded_legacy, ms_idx_legacy) =
-            WorkDispatcher::decode_fpga_work_id_for_dispatch(0x1362, hw_work_id, 2);
+            WorkDispatcher::decode_fpga_work_id_for_dispatch(0x1362, hw_work_id, 2).unwrap();
         assert_eq!(decoded_legacy, 0x3F12);
         assert_eq!(ms_idx_legacy, 1);
     }
@@ -4675,7 +4721,7 @@ mod tests {
         // so the decode shift is 0 and the full 16-bit hw work_id survives.
         let hw_work_id = 0xFFFFu16;
         let (decoded_work_id, _midstate_idx) =
-            WorkDispatcher::decode_fpga_work_id_for_dispatch(0x1362, hw_work_id, 0);
+            WorkDispatcher::decode_fpga_work_id_for_dispatch(0x1362, hw_work_id, 0).unwrap();
         assert_eq!(decoded_work_id, 0xFFFF); // 65535 — far past 16384
 
         // The decoded id is out of range for the table.
@@ -4693,79 +4739,6 @@ mod tests {
             "out-of-range work_id must miss the table (no panic, no UB)"
         );
         // A raw `work_table[decoded_work_id as usize]` here would have panicked.
-    }
-
-    #[test]
-    fn work_id_allocator_skips_recently_dispatched_slots() {
-        let now = Instant::now();
-        let mut table = vec![None; 4];
-        table[0] = Some(Arc::new(sample_work_entry_at(
-            now - Duration::from_secs(1),
-            10,
-        )));
-        table[1] = Some(Arc::new(sample_work_entry_at(
-            now - Duration::from_millis(4999),
-            11,
-        )));
-        let mut counter = 0;
-
-        let wid = WorkDispatcher::allocate_work_id(
-            &mut counter,
-            0x0003,
-            &table,
-            now,
-            RECENT_WORK_ID_SLOT_GUARD,
-        );
-
-        assert_eq!(wid, Some(2));
-        assert_eq!(counter, 3);
-    }
-
-    #[test]
-    fn work_id_allocator_reuses_slot_after_guard_age() {
-        let now = Instant::now();
-        let mut table = vec![None; 4];
-        table[0] = Some(Arc::new(sample_work_entry_at(
-            now - Duration::from_secs(5),
-            10,
-        )));
-        let mut counter = 0;
-
-        let wid = WorkDispatcher::allocate_work_id(
-            &mut counter,
-            0x0003,
-            &table,
-            now,
-            RECENT_WORK_ID_SLOT_GUARD,
-        );
-
-        assert_eq!(wid, Some(0));
-        assert_eq!(counter, 1);
-    }
-
-    #[test]
-    fn work_id_allocator_returns_none_when_all_slots_are_young() {
-        let now = Instant::now();
-        let table: Vec<Option<Arc<WorkEntry>>> = (0..4)
-            .map(|generation| {
-                Some(Arc::new(sample_work_entry_at(
-                    now - Duration::from_secs(1),
-                    generation,
-                )))
-            })
-            .collect();
-        let mut counter = 0;
-
-        let wid = WorkDispatcher::allocate_work_id(
-            &mut counter,
-            0x0003,
-            &table,
-            now,
-            RECENT_WORK_ID_SLOT_GUARD,
-        );
-
-        assert_eq!(wid, None);
-        assert_eq!(counter, 0);
     }
 
     /// W17 regression: ASICBoost's three atomic changes cooperate end-to-end:

@@ -201,7 +201,11 @@ impl Hashboard {
             Hashboard::Bhb42801 => HashboardCatalogEntry {
                 sku: "BHB42801",
                 chip_name: "BM1362",
-                chips_per_chain: 126,
+                // BHB42801 is high-bin: 88 chips/chain (`pvt_tables.h`, matching
+                // bm1362::Bm1362HashboardSku::Bhb42801.asics_per_chain() and the 88
+                // that runtime API surfaces serve). Was 126 in W11; the W13.C2 pass
+                // corrected sibling 42611 (126->120) but missed this one.
+                chips_per_chain: 88,
                 eeprom_preamble: Some([0x04, 0x11]),
                 used_in: &["S19 Pro+", "S19j Pro+"],
             },

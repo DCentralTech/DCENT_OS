@@ -1,159 +1,464 @@
 #!/bin/sh
 #
-# S37board_setup - Amlogic A113D GPIO + PWM pinmux for DCENT_OS
+# S37board_setup - checked Amlogic A113D safe baseline and board pinmux
 #
-# Shared across am3-aml platforms (S21, S19K Pro, S19 XP). Verbatim port from
-# the .78 (S19K Pro NoPic) BraiinsOS+ live capture, refactored for POSIX/ash:
-#
-#
-# GPIO map (Amlogic A113D, kernel 4.9.113):
-#   437  PWR_CONTROL          (out)        — APW PSU enable, active LOW (0=ON)
-#   438  GPIO_LED_RED         (out)
-#   439  CH0_PLUG             (in,  pulldown)  hashboard 0 detect
-#   440  CH1_PLUG             (in,  pulldown)  hashboard 1 detect
-#   441  CH2_PLUG             (in,  pulldown)  hashboard 2 detect
-#   445  GPIO_IP_GET          (in,  rising)    IP Reporter button
-#   446  GPIO_RECOVERY        (in,  rising)    Recovery button
-#   447  FAN_FRONT_SPEED0     (in,  falling)   front fan #0 tach
-#   448  FAN_FRONT_SPEED1     (in,  falling)   front fan #1 tach
-#   449  FAN_REAR_SPEED0      (in,  falling)   rear fan  #0 tach
-#   450  FAN_REAR_SPEED1      (in,  falling)   rear fan  #1 tach
-#   453  GPIO_LED_GREEN       (out)
-#   454  CH0_RST              (out)            hashboard 0 reset (active LOW)
-#   455  CH1_RST              (out)            hashboard 1 reset (active LOW)
-#   456  CH2_RST              (out)            hashboard 2 reset (active LOW)
-#   476  i2c-1 SDA pinmux fix (out, HIGH)
-#   477  i2c-1 SCL pinmux fix (out, HIGH)
-#
-# PWM:
-#   pwmchip0/pwm0  — rear fan group  (FAN2 + FAN4)
-#   pwmchip0/pwm1  — front fan group (FAN1 + FAN3)
-# Both shipped at 100000 ns period / 100000 ns duty (=100% duty, fail-safe
-# loud) until dcentrald takes ownership and runs the thermal PID loop.
-#
+# GPIO437 is PWR_EN and is active HIGH: 1=ON, 0=OFF.  Linux starts from an
+# UnknownInherited power state because U-Boot may have touched APW bus 1 and a
+# warm reset may preserve GPIO state.  The first safety-critical Linux
+# mutation is therefore the sysfs ABI's glitch-free `direction=low`, followed
+# by direction and value readback.  Readback is software evidence only; it is
+# not a measurement of the physical rail.
 
-export_gpio() {
-    GPIO="$1"
-    [ -d "/sys/class/gpio/gpio${GPIO}" ] && return 0
-    echo "${GPIO}" > /sys/class/gpio/export 2>/dev/null
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+GPIO_ROOT=/sys/class/gpio
+PWM_ROOT=/sys/class/pwm/pwmchip0
+IDENTITY_ROOT=/etc/dcentos
+RECEIPT_DIR=/run/dcentos
+RECEIPT=$RECEIPT_DIR/amlogic-boot-safe-state-v1
+PWR_GPIO=437
+FAN_PERIOD_NS=100000
+FAN_BOOT_DUTY_NS=30000
+
+log_error() {
+    printf '  [FAIL] S37board_setup: %s\n' "$*" >&2
 }
 
-set_dir() {
-    GPIO="$1"
-    DIR="$2"
-    [ -d "/sys/class/gpio/gpio${GPIO}" ] || return 1
-    echo "${DIR}" > "/sys/class/gpio/gpio${GPIO}/direction" 2>/dev/null
+read_trimmed() {
+    [ -r "$1" ] || return 1
+    VALUE=$(cat "$1" 2>/dev/null) || return 1
+    printf '%s' "$VALUE"
 }
 
-set_edge() {
-    GPIO="$1"
-    EDGE="$2"
-    [ -e "/sys/class/gpio/gpio${GPIO}/edge" ] || return 0
-    echo "${EDGE}" > "/sys/class/gpio/gpio${GPIO}/edge" 2>/dev/null
+read_identity() {
+    PLATFORM=$(read_trimmed "$IDENTITY_ROOT/platform") || {
+        log_error 'missing exact platform marker'
+        return 1
+    }
+    BOARD_TARGET=$(read_trimmed "$IDENTITY_ROOT/board_target") || {
+        log_error 'missing exact board_target marker'
+        return 1
+    }
+    RAIL_GPIO=$(read_trimmed "$IDENTITY_ROOT/rail_gpio") || {
+        log_error 'missing rail_gpio marker'
+        return 1
+    }
+
+    [ "$RAIL_GPIO" = "$PWR_GPIO" ] || {
+        log_error "rail_gpio=$RAIL_GPIO does not match sealed Amlogic GPIO$PWR_GPIO profile"
+        return 1
+    }
+
+    case "$PLATFORM:$BOARD_TARGET" in
+        am3-aml-s19jpro:am3-s19jpro-aml|\
+        am3-aml-s19k:am3-s19k|\
+        am3-aml-s21:am3-s21|\
+        am3-aml-s21pro:am3-s21pro|\
+        am3-aml-s21xp:am3-s21xp|\
+        am3-aml-t21:am3-t21)
+            ;;
+        *)
+            log_error "unsealed Amlogic identity platform=$PLATFORM board_target=$BOARD_TARGET"
+            return 1
+            ;;
+    esac
 }
 
-set_pull() {
-    GPIO="$1"
-    PULL="$2"
-    [ -e "/sys/class/gpio/gpio${GPIO}/pull" ] || return 0
-    echo "${PULL}" > "/sys/class/gpio/gpio${GPIO}/pull" 2>/dev/null
+export_gpio_checked() {
+    GPIO=$1
+    GPIO_DIR=$GPIO_ROOT/gpio$GPIO
+    if [ ! -d "$GPIO_DIR" ]; then
+        printf '%s\n' "$GPIO" > "$GPIO_ROOT/export" 2>/dev/null || true
+        [ -d "$GPIO_DIR" ] || sleep 1
+    fi
+    [ -d "$GPIO_DIR" ] || {
+        log_error "GPIO$GPIO did not appear after export"
+        return 1
+    }
 }
 
-set_value() {
-    GPIO="$1"
-    VAL="$2"
-    [ -e "/sys/class/gpio/gpio${GPIO}/value" ] || return 1
-    echo "${VAL}" > "/sys/class/gpio/gpio${GPIO}/value" 2>/dev/null
+set_gpio_direction_checked() {
+    GPIO=$1
+    REQUESTED=$2
+    EXPECTED=$3
+    DIR_PATH=$GPIO_ROOT/gpio$GPIO/direction
+    printf '%s\n' "$REQUESTED" > "$DIR_PATH" 2>/dev/null || {
+        log_error "GPIO$GPIO direction=$REQUESTED write failed"
+        return 1
+    }
+    OBSERVED=$(read_trimmed "$DIR_PATH") || {
+        log_error "GPIO$GPIO direction readback failed"
+        return 1
+    }
+    [ "$OBSERVED" = "$EXPECTED" ] || {
+        log_error "GPIO$GPIO direction readback=$OBSERVED expected=$EXPECTED"
+        return 1
+    }
 }
 
-mem_info() {
-    MEM_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null)
-    echo "  Board memory: ${MEM_KB} KB"
+set_gpio_value_checked() {
+    GPIO=$1
+    EXPECTED=$2
+    VALUE_PATH=$GPIO_ROOT/gpio$GPIO/value
+    printf '%s\n' "$EXPECTED" > "$VALUE_PATH" 2>/dev/null || {
+        log_error "GPIO$GPIO value=$EXPECTED write failed"
+        return 1
+    }
+    OBSERVED=$(read_trimmed "$VALUE_PATH") || {
+        log_error "GPIO$GPIO value readback failed"
+        return 1
+    }
+    [ "$OBSERVED" = "$EXPECTED" ] || {
+        log_error "GPIO$GPIO value readback=$OBSERVED expected=$EXPECTED"
+        return 1
+    }
+}
+
+force_psu_safe_low() {
+    export_gpio_checked "$PWR_GPIO" || return 1
+
+    ACTIVE_LOW_PATH=$GPIO_ROOT/gpio$PWR_GPIO/active_low
+    [ -e "$ACTIVE_LOW_PATH" ] || {
+        log_error "GPIO$PWR_GPIO active_low control is unavailable"
+        return 1
+    }
+    write_and_check "$ACTIVE_LOW_PATH" 0 || {
+        log_error "GPIO$PWR_GPIO active_low=0 write/readback failed"
+        return 1
+    }
+
+    # Kernel GPIO sysfs ABI: writing `low` selects output with an initial LOW
+    # value without the out-then-value glitch of two separate operations.
+    set_gpio_direction_checked "$PWR_GPIO" low out || return 1
+    set_gpio_value_checked "$PWR_GPIO" 0 || return 1
+}
+
+configure_input_gpio() {
+    GPIO=$1
+    export_gpio_checked "$GPIO" || return 1
+    set_gpio_direction_checked "$GPIO" in in
+}
+
+configure_output_low_gpio() {
+    GPIO=$1
+    export_gpio_checked "$GPIO" || return 1
+    set_gpio_direction_checked "$GPIO" low out || return 1
+    set_gpio_value_checked "$GPIO" 0
+}
+
+set_optional_attribute_checked() {
+    GPIO=$1
+    ATTRIBUTE=$2
+    EXPECTED=$3
+    PATHNAME=$GPIO_ROOT/gpio$GPIO/$ATTRIBUTE
+    [ -e "$PATHNAME" ] || return 0
+    printf '%s\n' "$EXPECTED" > "$PATHNAME" 2>/dev/null || {
+        log_error "GPIO$GPIO $ATTRIBUTE=$EXPECTED write failed"
+        return 1
+    }
+    OBSERVED=$(read_trimmed "$PATHNAME") || return 1
+    [ "$OBSERVED" = "$EXPECTED" ] || {
+        log_error "GPIO$GPIO $ATTRIBUTE readback=$OBSERVED expected=$EXPECTED"
+        return 1
+    }
+}
+
+write_and_check() {
+    PATHNAME=$1
+    EXPECTED=$2
+    printf '%s\n' "$EXPECTED" > "$PATHNAME" 2>/dev/null || return 1
+    OBSERVED=$(read_trimmed "$PATHNAME") || return 1
+    [ "$OBSERVED" = "$EXPECTED" ]
+}
+
+configure_fan_channel() {
+    CHANNEL=$1
+    PWM_DIR=$PWM_ROOT/pwm$CHANNEL
+    if [ ! -d "$PWM_DIR" ]; then
+        printf '%s\n' "$CHANNEL" > "$PWM_ROOT/export" 2>/dev/null || true
+        [ -d "$PWM_DIR" ] || sleep 1
+    fi
+    [ -d "$PWM_DIR" ] || {
+        log_error "fan PWM channel $CHANNEL did not appear after export"
+        return 1
+    }
+
+    ENABLED=$(read_trimmed "$PWM_DIR/enable") || return 1
+    PERIOD=$(read_trimmed "$PWM_DIR/period") || return 1
+    if [ "$ENABLED" = 1 ] && [ "$PERIOD" != "$FAN_PERIOD_NS" ]; then
+        write_and_check "$PWM_DIR/enable" 0 || {
+            log_error "fan PWM$CHANNEL disable before period change failed"
+            return 1
+        }
+        ENABLED=0
+    fi
+    if [ "$PERIOD" != "$FAN_PERIOD_NS" ]; then
+        # Reduce duty before shrinking the period; sysfs rejects period < duty.
+        write_and_check "$PWM_DIR/duty_cycle" 0 || {
+            log_error "fan PWM$CHANNEL zero-duty transition failed"
+            return 1
+        }
+        write_and_check "$PWM_DIR/period" "$FAN_PERIOD_NS" || {
+            log_error "fan PWM$CHANNEL period setup failed"
+            return 1
+        }
+    fi
+    write_and_check "$PWM_DIR/duty_cycle" "$FAN_BOOT_DUTY_NS" || {
+        log_error "fan PWM$CHANNEL duty setup/readback failed"
+        return 1
+    }
+    if [ "$ENABLED" != 1 ]; then
+        write_and_check "$PWM_DIR/enable" 1 || {
+            log_error "fan PWM$CHANNEL enable/readback failed"
+            return 1
+        }
+    fi
+}
+
+configure_fans_checked() {
+    configure_fan_channel 0 || return 1
+    configure_fan_channel 1 || return 1
+}
+
+dcentrald_may_execute() {
+    for PID in $(pidof dcentrald 2>/dev/null || true); do
+        case "$PID" in
+            ''|*[!0-9]*) return 0 ;;
+        esac
+        STATE=$(awk '{print $3}' "/proc/$PID/stat" 2>/dev/null) || return 0
+        [ "$STATE" = Z ] || return 0
+    done
+    return 1
+}
+
+write_receipt() {
+    STATE=$1
+    BOOT_ID=$(read_trimmed /proc/sys/kernel/random/boot_id) || {
+        log_error 'boot_id unavailable; refusing an unbound safety receipt'
+        return 1
+    }
+    mkdir -p "$RECEIPT_DIR" || return 1
+    chmod 0700 "$RECEIPT_DIR" || return 1
+    TMP=$RECEIPT.tmp.$$
+    umask 077
+    {
+        printf 'schema=dcentos.amlogic-safe-state/v1\n'
+        printf 'state=%s\n' "$STATE"
+        printf 'boot_id=%s\n' "$BOOT_ID"
+        printf 'platform=%s\n' "$PLATFORM"
+        printf 'board_target=%s\n' "$BOARD_TARGET"
+        printf 'resource=amlogic-gpio437-power-gate\n'
+        printf 'gpio_direction=out\n'
+        printf 'gpio_active_low=0\n'
+        printf 'commanded_value=0\n'
+        printf 'readback_value=0\n'
+        printf 'fan0_duty_ns=%s\n' "$FAN_BOOT_DUTY_NS"
+        printf 'fan0_period_ns=%s\n' "$FAN_PERIOD_NS"
+        printf 'fan0_enabled=1\n'
+        printf 'fan1_duty_ns=%s\n' "$FAN_BOOT_DUTY_NS"
+        printf 'fan1_period_ns=%s\n' "$FAN_PERIOD_NS"
+        printf 'fan1_enabled=1\n'
+        printf 'evidence_grade=software-readback\n'
+        printf 'physical_rail_measured=false\n'
+    } > "$TMP" || {
+        rm -f "$TMP"
+        return 1
+    }
+    chmod 0600 "$TMP" || {
+        rm -f "$TMP"
+        return 1
+    }
+    mv "$TMP" "$RECEIPT" || {
+        rm -f "$TMP"
+        return 1
+    }
+}
+
+receipt_field_is() {
+    KEY=$1
+    EXPECTED=$2
+    COUNT=$(grep -c "^$KEY=" "$RECEIPT" 2>/dev/null) || return 1
+    [ "$COUNT" = 1 ] || return 1
+    grep -Fqx "$KEY=$EXPECTED" "$RECEIPT" 2>/dev/null
+}
+
+verify_safe_receipt() {
+    read_identity || return 1
+    [ -f "$RECEIPT" ] && [ ! -L "$RECEIPT" ] || {
+        log_error 'boot-safe receipt is absent or unsafe'
+        return 1
+    }
+    BOOT_ID=$(read_trimmed /proc/sys/kernel/random/boot_id) || return 1
+    receipt_field_is schema dcentos.amlogic-safe-state/v1 || return 1
+    receipt_field_is boot_id "$BOOT_ID" || return 1
+    receipt_field_is platform "$PLATFORM" || return 1
+    receipt_field_is board_target "$BOARD_TARGET" || return 1
+    receipt_field_is resource amlogic-gpio437-power-gate || return 1
+    receipt_field_is gpio_direction out || return 1
+    receipt_field_is gpio_active_low 0 || return 1
+    receipt_field_is commanded_value 0 || return 1
+    receipt_field_is readback_value 0 || return 1
+    receipt_field_is fan0_duty_ns "$FAN_BOOT_DUTY_NS" || return 1
+    receipt_field_is fan0_period_ns "$FAN_PERIOD_NS" || return 1
+    receipt_field_is fan0_enabled 1 || return 1
+    receipt_field_is fan1_duty_ns "$FAN_BOOT_DUTY_NS" || return 1
+    receipt_field_is fan1_period_ns "$FAN_PERIOD_NS" || return 1
+    receipt_field_is fan1_enabled 1 || return 1
+    receipt_field_is evidence_grade software-readback || return 1
+    receipt_field_is physical_rail_measured false || return 1
+    receipt_field_is state boot-safe \
+        || receipt_field_is state runtime-handoff \
+        || receipt_field_is state terminal-safe \
+        || return 1
+
+    DIRECTION=$(read_trimmed "$GPIO_ROOT/gpio$PWR_GPIO/direction") || return 1
+    VALUE=$(read_trimmed "$GPIO_ROOT/gpio$PWR_GPIO/value") || return 1
+    ACTIVE_LOW=$(read_trimmed "$GPIO_ROOT/gpio$PWR_GPIO/active_low") || return 1
+    [ "$DIRECTION" = out ] && [ "$VALUE" = 0 ] && [ "$ACTIVE_LOW" = 0 ] || {
+        log_error "GPIO$PWR_GPIO revalidation failed direction=$DIRECTION value=$VALUE active_low=$ACTIVE_LOW"
+        return 1
+    }
+    for CHANNEL in 0 1; do
+        PWM_DIR=$PWM_ROOT/pwm$CHANNEL
+        DUTY=$(read_trimmed "$PWM_DIR/duty_cycle") || return 1
+        PERIOD=$(read_trimmed "$PWM_DIR/period") || return 1
+        ENABLED=$(read_trimmed "$PWM_DIR/enable") || return 1
+        [ "$DUTY" = "$FAN_BOOT_DUTY_NS" ] \
+            && [ "$PERIOD" = "$FAN_PERIOD_NS" ] \
+            && [ "$ENABLED" = 1 ] || {
+            log_error "fan PWM$CHANNEL revalidation failed duty=$DUTY period=$PERIOD enable=$ENABLED"
+            return 1
+        }
+    done
 }
 
 pinmux_init() {
-    # Buttons (level-triggered rising)
-    for G in 446 445; do
-        export_gpio "$G"
-        set_dir "$G" in
-        set_edge "$G" rising
+    # Buttons.
+    for GPIO in 446 445; do
+        configure_input_gpio "$GPIO" || return 1
+        set_optional_attribute_checked "$GPIO" edge rising || return 1
     done
 
-    # Hashboard plug-detect (active HIGH, pulldown for safety when unplugged)
-    for G in 439 440 441; do
-        export_gpio "$G"
-        set_dir "$G" in
-        set_pull "$G" down
+    # Hashboard plug detect, active HIGH with optional pull-down.
+    for GPIO in 439 440 441; do
+        configure_input_gpio "$GPIO" || return 1
+        set_optional_attribute_checked "$GPIO" pull down || return 1
     done
 
-    # Hashboard reset lines (active LOW; default direction out, value
-    # untouched so dcentrald can hold or release per platform recovery).
-    for G in 454 455 456; do
-        export_gpio "$G"
-        set_dir "$G" out
+    # Hold hashboards in reset (active LOW) until the runtime owner admits them.
+    for GPIO in 454 455 456; do
+        configure_output_low_gpio "$GPIO" || return 1
     done
 
-    # PSU enable (PWR_CONTROL). Leave value alone — dcentrald drives it.
-    export_gpio 437
-    set_dir 437 out
-
-    # Status LEDs
-    for G in 453 438; do
-        export_gpio "$G"
-        set_dir "$G" out
+    # Status LEDs default LOW.
+    for GPIO in 453 438; do
+        configure_output_low_gpio "$GPIO" || return 1
     done
 
-    # Fan tachometers (4 fans, falling-edge counters)
-    for G in 447 448 449 450; do
-        export_gpio "$G"
-        set_dir "$G" in
-        set_edge "$G" falling
+    # Fan tach inputs.
+    for GPIO in 447 448 449 450; do
+        configure_input_gpio "$GPIO" || return 1
+        set_optional_attribute_checked "$GPIO" edge falling || return 1
     done
 
-    # i2c-1 pinmux fix — must be exported BEFORE any /dev/i2c-1 access.
-    # Drives the SDA/SCL lines HIGH so the in-SoC pinmux selects i2c
-    # function over alt-function GPIO. Required on AML A113D per O.3.
-    for G in 476 477; do
-        export_gpio "$G"
-        set_dir "$G" out
-        set_value "$G" 1
+    # GPIO476/477 are I2C-1 SDA/SCL pinmux guards.  Verified stock S21 and the
+    # retained runtime both require input, not the old output-high sequence.
+    for GPIO in 476 477; do
+        configure_input_gpio "$GPIO" || return 1
     done
-
-    # PWM rear fans (FAN2 + FAN4) on pwmchip0/pwm0
-    if [ ! -d /sys/class/pwm/pwmchip0/pwm0 ]; then
-        echo 0 > /sys/class/pwm/pwmchip0/export 2>/dev/null
-    fi
-    if [ -d /sys/class/pwm/pwmchip0/pwm0 ]; then
-        echo 100000 > /sys/class/pwm/pwmchip0/pwm0/period 2>/dev/null
-        echo 100000 > /sys/class/pwm/pwmchip0/pwm0/duty_cycle 2>/dev/null
-        echo 1      > /sys/class/pwm/pwmchip0/pwm0/enable 2>/dev/null
-    fi
-
-    # PWM front fans (FAN1 + FAN3) on pwmchip0/pwm1
-    if [ ! -d /sys/class/pwm/pwmchip0/pwm1 ]; then
-        echo 1 > /sys/class/pwm/pwmchip0/export 2>/dev/null
-    fi
-    if [ -d /sys/class/pwm/pwmchip0/pwm1 ]; then
-        echo 100000 > /sys/class/pwm/pwmchip0/pwm1/period 2>/dev/null
-        echo 100000 > /sys/class/pwm/pwmchip0/pwm1/duty_cycle 2>/dev/null
-        echo 1      > /sys/class/pwm/pwmchip0/pwm1/enable 2>/dev/null
-    fi
 }
 
-case "$1" in
-    start|"")
-        echo "  Initializing Amlogic A113D board (GPIO + PWM)..."
-        mem_info
-        pinmux_init
-        echo "  [OK] board_setup complete"
+start_board() {
+    # First safety-critical mutation: remove the hash-power gate.
+    if ! force_psu_safe_low; then
+        # Power is still UnknownInherited. Preserve the maximum verified home
+        # emergency cooling command and refuse all later board initialization.
+        configure_fans_checked || true
+        return 1
+    fi
+    configure_fans_checked || return 1
+    # Identity gates every operation except the monotonic fixed GPIO437 cut.
+    # A corrupt/partial rootfs may block admission, but must not block removal
+    # of the sealed Amlogic image's power-gate command.
+    read_identity || return 1
+    pinmux_init || return 1
+    write_receipt boot-safe || return 1
+}
+
+emergency_safe_off() {
+    if dcentrald_may_execute; then
+        log_error 'refusing a competing emergency owner while dcentrald is live'
+        return 1
+    fi
+    if ! force_psu_safe_low; then
+        configure_fans_checked || true
+        return 1
+    fi
+    configure_fans_checked || return 1
+    read_identity || return 1
+    write_receipt terminal-safe
+}
+
+mark_runtime_handoff() {
+    verify_boot_safe_receipt || return 1
+    configure_fans_checked || return 1
+    # Revalidate the power gate after cooling and immediately before the
+    # supervisor publishes the runtime owner.
+    DIRECTION=$(read_trimmed "$GPIO_ROOT/gpio$PWR_GPIO/direction") || return 1
+    VALUE=$(read_trimmed "$GPIO_ROOT/gpio$PWR_GPIO/value") || return 1
+    [ "$DIRECTION" = out ] && [ "$VALUE" = 0 ] || return 1
+    write_receipt runtime-handoff
+}
+
+verify_boot_safe_receipt() {
+    verify_safe_receipt || return 1
+    receipt_field_is state boot-safe
+}
+
+verify_terminal_safe_receipt() {
+    verify_safe_receipt || return 1
+    receipt_field_is state terminal-safe
+}
+
+case "${1:-start}" in
+    start)
+        printf '  Establishing checked Amlogic boot-safe baseline...\n'
+        if start_board; then
+            printf '  [OK] GPIO437 software readback LOW; fan PWM <=30; pinmux checked\n'
+        else
+            log_error 'safe baseline incomplete; dcentrald admission must remain blocked'
+            exit 1
+        fi
+        ;;
+    verify-safe-state)
+        verify_boot_safe_receipt || {
+            log_error 'boot-safe receipt or live GPIO revalidation failed'
+            exit 1
+        }
+        ;;
+    mark-runtime-handoff)
+        mark_runtime_handoff || {
+            log_error 'runtime handoff revalidation failed'
+            exit 1
+        }
+        ;;
+    verify-terminal-safe-state)
+        verify_terminal_safe_receipt || {
+            log_error 'terminal SafeOff receipt/revalidation failed'
+            exit 1
+        }
+        ;;
+    emergency-safe-off)
+        emergency_safe_off || exit 1
         ;;
     stop)
-        # No teardown — GPIO state is owned by dcentrald during runtime.
+        # Runtime teardown owns the normal SafeOff transition.  S82 invokes
+        # emergency-safe-off only after the runtime owner is confirmed dead.
         :
         ;;
     *)
-        echo "Usage: $0 {start|stop}" >&2
-        exit 1
+        echo "Usage: $0 {start|stop|verify-safe-state|mark-runtime-handoff|verify-terminal-safe-state|emergency-safe-off}" >&2
+        exit 64
         ;;
 esac
 

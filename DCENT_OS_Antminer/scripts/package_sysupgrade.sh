@@ -48,20 +48,21 @@ PROJECT_ROOT="$(dirname "$FIRMWARE_DIR")"
 IMAGES_DIR="$FIRMWARE_DIR/buildroot/output/images"
 . "$SCRIPT_DIR/lib/dcentrald_version_gate.sh"
 . "$SCRIPT_DIR/lib/release_envelope.sh"
+. "$SCRIPT_DIR/lib/sysupgrade_archive_admission.sh"
+. "$SCRIPT_DIR/lib/sysupgrade_zynq_geometry.sh"
 
 OUTPUT_FILE=""
 UPLOAD_IP=""
 # CRITICAL (2026-03-24): Board name MUST match platform exactly.
 # BraiinsOS sysupgrade extracts from sysupgrade-{board_name}/.
 # Wrong name = silent failure = empty UBI = brick.
-#   S9:       am1-s9    (14 UIO, chain6-8, 95MB firmware slots)
-#   S19j Pro: am2-s19j  (legacy AM2 package board name; NOT am2-s17 or am2-s19jpro)
-#   S19 Pro:  not accepted by this legacy packager; use the dedicated S19 Pro path when validated
+#   S9: am1-s9 (14 UIO, chain6-8, 95MB firmware slots)
+# AM2 targets use their dedicated Buildroot post-image producers. This
+# S9-specific packager must never wrap an AM2 kernel with the S9 device tree.
 BOARD_NAME="am1-s9"
 BOARD_EXPLICIT=0
 EXTRACTIONS_DIR=""
 BOARD_FAMILY=""
-AM2_S9_PLACEHOLDER=0
 SIGNING_KEY="${DCENT_RELEASE_SIGNING_KEY:-}"
 VERIFY_PUBKEY="${DCENT_RELEASE_PUBKEY_FILE:-}"
 REQUIRE_RELEASE_KEY="${DCENT_REQUIRE_RELEASE_KEY:-0}"
@@ -204,6 +205,24 @@ require_unsigned_lab_override() {
     fi
 }
 
+require_canonical_unsigned_lab_status() {
+    require_unsigned_lab_override "unsigned package generation"
+    if [ "$PACKAGE_STATUS" != "lab_unsigned" ]; then
+        error "Unsigned sysupgrade profile requires exact DCENT_PACKAGE_STATUS=lab_unsigned (found '$PACKAGE_STATUS')."
+    fi
+}
+
+require_canonical_authority_status() {
+    case "$PACKAGE_STATUS" in
+        ''|[[:space:]]*|*[[:space:]])
+            error "Signed authority profile requires a non-empty DCENT_PACKAGE_STATUS with no surrounding whitespace."
+            ;;
+    esac
+    if [ "$PACKAGE_STATUS" = "lab_unsigned" ]; then
+        error "Signed authority profile forbids DCENT_PACKAGE_STATUS=lab_unsigned."
+    fi
+}
+
 # =============================================================================
 # Parse Arguments
 # =============================================================================
@@ -273,39 +292,8 @@ case "$BOARD_NAME" in
         fi
         BOARD_FAMILY="am1"
         ;;
-    am2-s19j)
-        # S19j Pro Zynq AM2 legacy package lane. Board name MUST be "am2-s19j"
-        # (NOT "am2-s17" or "am2-s19jpro") — .
-        # Kernel sourcing mirrors post-image.sh probe order; S9 kernel fallback
-        # is PLACEHOLDER-only — Phase 3 must supply a real am2 kernel via
-        # DCENT_AM2_S19J_KERNEL or the  path.
-        REPO_ROOT="$(dirname "$PROJECT_ROOT")"
-        if [ -n "${DCENT_EXTRACTIONS_DIR:-}" ] && [ -d "$DCENT_EXTRACTIONS_DIR" ]; then
-            EXTRACTIONS_DIR="$DCENT_EXTRACTIONS_DIR"
-        elif [ -d "$REPO_ROOT/knowledge-base/extractions/s19j" ]; then
-            EXTRACTIONS_DIR="$REPO_ROOT/knowledge-base/extractions/s19j"
-        elif [ -d "$REPO_ROOT/knowledge-base/research/s19j/live-probe-139" ]; then
-            EXTRACTIONS_DIR="$REPO_ROOT/knowledge-base/research/s19j/live-probe-139"
-        elif [ -d "$REPO_ROOT/knowledge-base/extractions/s9" ]; then
-            # CE-056: fail closed by default. An S9 kernel/DTB is a PLACEHOLDER
-            # for am2-s19j — packaging a wrong-board AM2 image bricks the unit.
-            # Only an explicit lab opt-in produces a clearly NON-FLASHABLE build.
-            if [ "${DCENT_ALLOW_AM2_S9_PLACEHOLDER:-0}" != "1" ]; then
-                error "am2-s19j: no real S19j kernel input (searched \$DCENT_EXTRACTIONS_DIR, $REPO_ROOT/knowledge-base/extractions/s19j, $REPO_ROOT/knowledge-base/research/s19j/live-probe-139). Refusing to package am2-s19j with an S9 placeholder kernel/DTB — a wrong-board AM2 image bricks the unit. Supply DCENT_AM2_S19J_KERNEL / a real s19j extractions dir, or set DCENT_ALLOW_AM2_S9_PLACEHOLDER=1 for an explicitly NON-FLASHABLE lab placeholder build."
-            fi
-            warn "am2-s19j: DCENT_ALLOW_AM2_S9_PLACEHOLDER=1 — NON-FLASHABLE S9-placeholder lab artifact only (DO NOT FLASH)."
-            AM2_S9_PLACEHOLDER=1
-            EXTRACTIONS_DIR="$REPO_ROOT/knowledge-base/extractions/s9"
-        else
-            error "No extractions dir for am2-s19j. Searched: \$DCENT_EXTRACTIONS_DIR, $REPO_ROOT/knowledge-base/extractions/s19j, $REPO_ROOT/knowledge-base/research/s19j/live-probe-139, $REPO_ROOT/knowledge-base/extractions/s9"
-        fi
-        BOARD_FAMILY="am2"
-        ;;
-    am2-s17)
-        error "am2-s17 is not a valid sysupgrade board name — use 'am2-s19j' for S19j Pro Zynq builds (feedback_sysupgrade_board_name.md)."
-        ;;
     *)
-        error "Unsupported board: $BOARD_NAME (accepted: am1-s9, am2-s19j)"
+        error "Unsupported board: $BOARD_NAME (accepted: am1-s9). Use the target's dedicated Buildroot post-image producer."
         ;;
 esac
 
@@ -403,11 +391,13 @@ esac
 # CE-183: a release-status package must not decouple from release-image
 # hardening (root SSH lockdown + /etc/dcentos/release-image marker).
 if is_release_status "$PACKAGE_STATUS" && ! is_truthy "${DCENT_RELEASE_IMAGE:-0}"; then
-    error "release-status package requires DCENT_RELEASE_IMAGE=1 (release-image hardening); set DCENT_PACKAGE_STATUS to a non-release lab value (e.g. lab_signed) for dev/lab packages (CE-183)."
+    error "release-status package requires DCENT_RELEASE_IMAGE=1 (release-image hardening); release-root signatures are reserved for fully hardened release profiles (CE-183)."
 fi
 
 DCENT_BUILD_TARGET="${DCENT_BUILD_TARGET:-$BOARD_NAME}"
 DCENT_PACKAGE_STATUS="$PACKAGE_STATUS"
+dcent_release_require_signed_authority_profile "$SIGNING_KEY" ||
+    error "Invalid release-root signing authority profile."
 dcent_release_provenance_init || error "Invalid or missing release provenance."
 CANONICAL_BUILD_TIME=$(printf '%s' "$DCENT_CREATED_AT_UTC" | sed 's/T/ /; s/Z/ UTC/')
 
@@ -463,7 +453,7 @@ fi
 # Idempotent: if the located kernel is ALREADY a FIT/uImage (e.g. a future
 # extraction or a pre-wrapped artifact), we use it as-is.
 case "$BOARD_NAME" in
-    am1-s9|am2-s19j)
+    am1-s9)
         if kernel_is_bootm_ready "$KERNEL"; then
             info "Kernel '$(basename "$KERNEL")' is already a bootable container (magic=$(file_magic_hex "$KERNEL")) — using as-is."
         else
@@ -481,7 +471,7 @@ case "$BOARD_NAME" in
         ;;
     *)
         # No other board reaches this builder (the case statement above only
-        # accepts am1-s9 / am2-s19j), but fail closed rather than silently
+        # accepts am1-s9), but fail closed rather than silently
         # shipping an unvalidated kernel container if that ever changes.
         kernel_is_bootm_ready "$KERNEL" \
             || error "Kernel for board '$BOARD_NAME' is not a bootable FIT/uImage (magic=$(file_magic_hex "$KERNEL")) and no FIT-wrap recipe is defined for it."
@@ -490,6 +480,10 @@ esac
 
 ROOTFS_SIZE=$(stat -c%s "$ROOTFS" 2>/dev/null || stat -f%z "$ROOTFS" 2>/dev/null)
 KERNEL_SIZE=$(stat -c%s "$KERNEL" 2>/dev/null || stat -f%z "$KERNEL" 2>/dev/null)
+dcent_zynq_geometry_require_payload_fit "$BOARD_NAME" rootfs "$ROOTFS_SIZE" \
+    || error "Rootfs exceeds the evidence-backed $BOARD_NAME package window"
+dcent_zynq_geometry_require_payload_fit "$BOARD_NAME" kernel "$KERNEL_SIZE" \
+    || error "Kernel exceeds the evidence-backed $BOARD_NAME package window"
 
 info "Kernel: $(basename "$KERNEL") ($((KERNEL_SIZE / 1024)) KB)"
 info "Rootfs: $(basename "$ROOTFS") ($((ROOTFS_SIZE / 1024)) KB)"
@@ -514,21 +508,13 @@ header "Building Sysupgrade Package"
 
 # Create temp directory with sysupgrade structure
 STAGING=$(mktemp -d)
-# CE-056: a NON-FLASHABLE am2-s19j S9-placeholder lab build (opt-in only via
-# DCENT_ALLOW_AM2_S9_PLACEHOLDER=1) carries a loud non-flashable marker in BOTH
-# the staged sysupgrade subdir name AND the output tar filename, so it can never
-# be mistaken for / uploaded as a flashable am2-s19j image (the on-target
-# sysupgrade greps for the exact "sysupgrade-<board>/" member and will reject
-# the renamed subdir). The real am2-s19j / am1-s9 paths are byte-unchanged.
 SYSUPGRADE_SUBDIR="sysupgrade-$BOARD_NAME"
-if [ "$AM2_S9_PLACEHOLDER" = "1" ]; then
-    SYSUPGRADE_SUBDIR="sysupgrade-$BOARD_NAME-PLACEHOLDER-DO-NOT-FLASH"
-    case "$OUTPUT_FILE" in
-        *PLACEHOLDER-DO-NOT-FLASH*) : ;;
-        *.tar) OUTPUT_FILE="${OUTPUT_FILE%.tar}-PLACEHOLDER-DO-NOT-FLASH.tar" ;;
-        *)     OUTPUT_FILE="${OUTPUT_FILE}-PLACEHOLDER-DO-NOT-FLASH" ;;
-    esac
-fi
+ARTIFACT_FILENAME=${OUTPUT_FILE##*/}
+case "$ARTIFACT_FILENAME" in
+    ""|"."|".."|*..*|*[!A-Za-z0-9._-]*)
+        error "Output artifact basename '$ARTIFACT_FILENAME' is unsafe for manifest install metadata."
+        ;;
+esac
 SYSUPGRADE_DIR="$STAGING/$SYSUPGRADE_SUBDIR"
 mkdir -p "$SYSUPGRADE_DIR"
 
@@ -564,6 +550,14 @@ EOF
 METADATA_SIZE=$(stat -c%s "$SYSUPGRADE_DIR/METADATA" 2>/dev/null || stat -f%z "$SYSUPGRADE_DIR/METADATA" 2>/dev/null)
 METADATA_SHA256=$(sha256sum "$SYSUPGRADE_DIR/METADATA" | awk '{print $1}')
 
+if [ -n "$SIGNING_KEY" ]; then
+    require_canonical_authority_status
+    MANIFEST_PROFILE="dcentos.sysupgrade-authority/v1"
+else
+    require_canonical_unsigned_lab_status
+    MANIFEST_PROFILE="dcentos.sysupgrade-unsigned-lab/v1"
+fi
+
 cat > "$SYSUPGRADE_DIR/SHA256SUMS" << EOF
 $KERNEL_SHA256  kernel
 $ROOTFS_SHA256  root
@@ -573,9 +567,12 @@ EOF
 cat > "$SYSUPGRADE_DIR/MANIFEST.json" << EOF
 {
   "schema": 1,
+  "manifest_profile": "$MANIFEST_PROFILE",
   "product": "DCENT_OS",
   "family": "antminer",
   "package_type": "sysupgrade",
+  "installable": true,
+  "artifact_maturity": "experimental",
   "board_family": "$BOARD_FAMILY",
   "board": "$BOARD_NAME",
   "board_target": "$BOARD_NAME",
@@ -609,8 +606,8 @@ cat > "$SYSUPGRADE_DIR/MANIFEST.json" << EOF
     }
   },
   "toolbox": {
-    "install_command": "dcent install <ip> -f dcentos-sysupgrade.tar",
-    "update_command": "dcent install <ip> -f dcentos-sysupgrade.tar",
+    "install_command": "dcent install <ip> -f $ARTIFACT_FILENAME",
+    "update_command": "dcent install <ip> -f $ARTIFACT_FILENAME",
     "upload_endpoint": null,
     "board_target_header": null,
     "requires_inactive_slot": true
@@ -626,17 +623,7 @@ if [ -n "$SIGNING_KEY" ]; then
         [ -f "$VERIFY_PUBKEY" ] || error "Verification public key not found: $VERIFY_PUBKEY"
         PACKAGE_PUBKEY="$VERIFY_PUBKEY"
     else
-        if [ "$REQUIRE_RELEASE_KEY" = "1" ]; then
-            error "DCENT_REQUIRE_RELEASE_KEY=1 but no trusted public key was provided. Use --verify-pubkey or DCENT_RELEASE_PUBKEY_FILE."
-        fi
-        if is_release_status "$PACKAGE_STATUS"; then
-            error "Production release signing requires --verify-pubkey or DCENT_RELEASE_PUBKEY_FILE; refusing self-derived generated-key package."
-        fi
-        require_unsigned_lab_override "self-derived generated-key package generation"
-        PACKAGE_PUBKEY="$STAGING/release_ed25519.pub"
-        openssl pkey -in "$SIGNING_KEY" -pubout -out "$PACKAGE_PUBKEY" >/dev/null 2>&1 \
-            || error "Failed to derive public key from $SIGNING_KEY"
-        warn "Derived release_ed25519.pub from signing key - generated-key package is lab-only."
+        error "Release-root signing requires --verify-pubkey or DCENT_RELEASE_PUBKEY_FILE; the package must never derive its trust root from the signing key."
     fi
     cp "$PACKAGE_PUBKEY" "$SYSUPGRADE_DIR/release_ed25519.pub"
     PACKAGE_PUBKEY_SIZE=$(stat -c%s "$SYSUPGRADE_DIR/release_ed25519.pub" 2>/dev/null || stat -f%z "$SYSUPGRADE_DIR/release_ed25519.pub" 2>/dev/null)
@@ -646,9 +633,12 @@ if [ -n "$SIGNING_KEY" ]; then
     cat > "$SYSUPGRADE_DIR/MANIFEST.json" << EOF
 {
   "schema": 1,
+  "manifest_profile": "dcentos.sysupgrade-authority/v1",
   "product": "DCENT_OS",
   "family": "antminer",
   "package_type": "sysupgrade",
+  "installable": true,
+  "artifact_maturity": "experimental",
   "board_family": "$BOARD_FAMILY",
   "board": "$BOARD_NAME",
   "board_target": "$BOARD_NAME",
@@ -687,27 +677,34 @@ if [ -n "$SIGNING_KEY" ]; then
     }
   },
   "toolbox": {
-    "install_command": "dcent install <ip> -f dcentos-sysupgrade.tar",
-    "update_command": "dcent install <ip> -f dcentos-sysupgrade.tar",
+    "install_command": "dcent install <ip> -f $ARTIFACT_FILENAME",
+    "update_command": "dcent install <ip> -f $ARTIFACT_FILENAME",
     "upload_endpoint": null,
     "board_target_header": null,
     "requires_inactive_slot": true
   }
 }
 EOF
-    openssl pkeyutl -sign -rawin -inkey "$SIGNING_KEY" -in "$SYSUPGRADE_DIR/MANIFEST.json" -out "$SYSUPGRADE_DIR/MANIFEST.sig" \
-        || error "Failed to sign MANIFEST.json with $SIGNING_KEY"
-    if [ -n "$PACKAGE_PUBKEY" ]; then
-        openssl pkeyutl -verify -rawin -pubin -inkey "$PACKAGE_PUBKEY" -sigfile "$SYSUPGRADE_DIR/MANIFEST.sig" -in "$SYSUPGRADE_DIR/MANIFEST.json" >/dev/null \
-            || error "MANIFEST.sig verification failed against package verification key"
-    elif [ "$REQUIRE_RELEASE_KEY" = "1" ]; then
-        error "DCENT_REQUIRE_RELEASE_KEY=1 but no verification public key was provided. Use --verify-pubkey or DCENT_RELEASE_PUBKEY_FILE."
-    fi
+    [ -f "$SCRIPT_DIR/sign_release_artifact.py" ] \
+        || error "Exact release artifact signer is missing: $SCRIPT_DIR/sign_release_artifact.py"
+    dcent_release_run_python "$SCRIPT_DIR/sign_release_artifact.py" \
+        "$SYSUPGRADE_DIR/MANIFEST.json" \
+        --key "$SIGNING_KEY" \
+        --pubkey "$SYSUPGRADE_DIR/release_ed25519.pub" \
+        --output-sig "$SYSUPGRADE_DIR/MANIFEST.sig" >/dev/null \
+        || error "Failed to sign exact MANIFEST.json bytes"
     SIGNED_PACKAGE=true
     info "Signed MANIFEST.json -> MANIFEST.sig"
     info "Embedded release_ed25519.pub (sha256: $PACKAGE_PUBKEY_HASH)"
 else
-    require_unsigned_lab_override "unsigned package generation"
+    require_canonical_unsigned_lab_status
+    for forbidden_leaf in MANIFEST.sig release_ed25519.pub; do
+        [ ! -e "$SYSUPGRADE_DIR/$forbidden_leaf" ] \
+            || error "Unsigned lab package contains forbidden $forbidden_leaf."
+    done
+    if grep -Eq '"(verification_key|ota_intermediate_cert|ota_revoked_intermediates)"[[:space:]]*:' "$SYSUPGRADE_DIR/MANIFEST.json"; then
+        error "Unsigned lab manifest contains forbidden authority material."
+    fi
     warn "No signing key configured — package is unsigned and lab-only."
 fi
 
@@ -715,7 +712,11 @@ fi
 # OpenWrt sysupgrade expects a plain tar (no compression) with the
 # sysupgrade-<board>/ directory at the top level.
 info "Creating sysupgrade tar..."
-dcent_create_deterministic_tar "$OUTPUT_FILE" "$STAGING" "$SYSUPGRADE_SUBDIR"
+dcent_create_deterministic_tar \
+    "$OUTPUT_FILE" "$STAGING" "$SYSUPGRADE_SUBDIR" \
+    "$SCRIPT_DIR/release_envelope_archive.py"
+dcent_sysupgrade_archive_admit "$OUTPUT_FILE" "${SYSUPGRADE_SUBDIR#sysupgrade-}" "$STAGING" \
+    || error "Generated package failed canonical archive admission"
 
 # Cleanup staging
 rm -rf "$STAGING"
@@ -789,17 +790,6 @@ if [ -n "$UPLOAD_IP" ]; then
         am1-s9)
             if [[ "$MODEL_LC" != *"s9"* ]] && [[ "$HWID_LC" != *"am1"* ]] && [ "${UIO_COUNT:-0}" -gt 16 ]; then
                 error "Remote target does not look like validated am1-s9 hardware (model=${MODEL:-unknown}, hwid=${HWID:-unknown}, uio=${UIO_COUNT:-0})."
-            fi
-            ;;
-        am2-s19j)
-            # am2-s19j live upload is NOT yet validated — refuse unless the
-            # operator forces it (Phase 3 will lift this gate). This avoids
-            # an unattended write request for an unvalidated package.
-            if [ "${DCENT_FORCE_AM2_UPLOAD:-0}" != "1" ]; then
-                error "Live --upload of am2-s19j packages is gated pending Phase 3 validation. Set DCENT_FORCE_AM2_UPLOAD=1 to override for a controlled lab sysupgrade request on .139."
-            fi
-            if [[ "$MODEL_LC" != *"s19"* ]] && [[ "$HWID_LC" != *"am2"* ]]; then
-                error "Remote target does not look like am2-s19j hardware (model=${MODEL:-unknown}, hwid=${HWID:-unknown})."
             fi
             ;;
     esac

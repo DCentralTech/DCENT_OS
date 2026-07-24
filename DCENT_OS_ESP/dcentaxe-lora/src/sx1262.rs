@@ -28,17 +28,13 @@
 // NOT enable DIO2-switch mode. DIO2 mode (`SetDIO2AsRfSwitchCtrl`) is kept only
 // for pinless maps whose module really is DIO2-switched.
 //
-// ⚠️ PROVISIONAL GPIO MAP (doc 05 §1.3) — NEEDS-NETLIST-LOCK before routing.
-// The fork plan's worked example collided MOSI with the stock fan-tach pin, so
-// these are the corrected provisional pins; lock against the real DCENT_axe
-// KiCad netlist:
+// ✅ LOCKED GPIO MAP — dcentaxe-hal::lora_pins (netlist-confirmed BM1397 9/9):
 //     LORA_SCLK   = GPIO5    LORA_MOSI  = GPIO6    LORA_MISO = GPIO7
 //     LORA_NSS    = GPIO15   LORA_BUSY  = GPIO16   LORA_DIO1 = GPIO21
-//     LORA_NRESET = GPIO8 (or a shared RC power-on reset → saves a pin)
+//     LORA_NRESET = GPIO8
 //     LORA_TXEN   = GPIO2    LORA_RXEN  = GPIO9   (E22 RF switch, host-driven)
-// (DCENT_Raven, being a standalone board, froze a DIFFERENT map on the FSPI
-// IOMUX quartet: SCK12/MOSI11/MISO13/NSS10, BUSY14/DIO1-9/NRST8 — do not copy
-// it verbatim onto DCENT_axe; the stock Bitaxe pin usage differs.)
+// (DCENT_Raven freezes a DIFFERENT map on FSPI IOMUX — do not copy it onto
+// DCENT_axe; stock Bitaxe pin usage differs. MOSI is NOT GPIO14/fan-tach.)
 
 use crate::{GpioPin, LoraError, SpiBus};
 

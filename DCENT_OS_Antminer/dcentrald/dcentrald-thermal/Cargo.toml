@@ -13,6 +13,10 @@ thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
 
+[dev-dependencies]
+# Property testing for the load-bearing home-mining fan-PWM cap (controller.rs).
+proptest = { workspace = true }
+
 [features]
 # `hal` pulls in the Unix-only dcentrald-hal crate (mmap / ioctl / AsRawFd).
 # Default-ON, so every consumer (dcentrald, dcentrald-api, dcentrald-diagnostics —

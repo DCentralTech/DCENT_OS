@@ -24,6 +24,10 @@ pub mod autotune_policy;
 pub mod baud_switch;
 /// S21/BM1368 per-chip temperature readback DTO shape (HAL-free, not live-proven by default).
 pub mod bm1368_temperature;
+/// Evidence-scoped BM1398 chip, NBP1901 chain, and FPGA FIFO contracts.
+pub mod bm1398_protocol;
+/// Deterministic evidence-parameterized BM13xx four-divider PLL search.
+pub mod bm13xx_pll;
 ///  boot-A: boot-flow phase timeline DTO (HAL-free).
 pub mod boot_flow;
 ///  orch-A: system-orchestration FSM DTOs (HAL-free).

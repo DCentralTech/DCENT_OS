@@ -1,4 +1,4 @@
-{"schema":"dcent-init-trace-v1","model":"s19pro","strictness":"exact","provenance":["","","",""]}
+{"schema":"dcent-init-trace-v1","model":"s19pro","strictness":"implementation_snapshot","maturity":"experimental","evidence_boundary":"The staged core-control writes and PLL solution are binary-backed chip-scope evidence. The complete ordered trace is a DCENT_OS simulator regression snapshot, not a vendor-exact NBP1901 cold-boot recipe.","known_divergences":["stock NBP1901 production relay sequence is composition-scoped and absent from this driver trace","baud transition and remaining initialization stages are not claimed byte-exact to stock firmware"],"provenance":["","","",""]}
 {"event":"baud_changed","chain_id":0,"baud":114678}
 {"event":"command","chain_id":0,"bytes":[81,9,0,128]}
 {"event":"command","chain_id":0,"bytes":[0,0,0,0]}
@@ -7,7 +7,9 @@
 {"event":"command","chain_id":0,"bytes":[81,9,0,32]}
 {"event":"command","chain_id":0,"bytes":[0,0,0,1]}
 {"event":"command","chain_id":0,"bytes":[81,9,0,60]}
-{"event":"command","chain_id":0,"bytes":[128,0,128,116]}
+{"event":"command","chain_id":0,"bytes":[128,0,135,16]}
+{"event":"command","chain_id":0,"bytes":[81,9,0,60]}
+{"event":"command","chain_id":0,"bytes":[128,0,128,80]}
 {"event":"command","chain_id":0,"bytes":[81,9,0,20]}
 {"event":"command","chain_id":0,"bytes":[0,0,0,255]}
 {"event":"command","chain_id":0,"bytes":[81,9,0,88]}
@@ -21,9 +23,9 @@
 {"event":"command","chain_id":0,"bytes":[81,9,0,112]}
 {"event":"command","chain_id":0,"bytes":[15,15,15,0]}
 {"event":"command","chain_id":0,"bytes":[81,9,0,8]}
-{"event":"command","chain_id":0,"bytes":[64,108,2,33]}
+{"event":"command","chain_id":0,"bytes":[64,162,2,19]}
 {"event":"command","chain_id":0,"bytes":[81,9,0,8]}
-{"event":"command","chain_id":0,"bytes":[64,108,2,33]}
+{"event":"command","chain_id":0,"bytes":[64,162,2,19]}
 {"event":"command","chain_id":0,"bytes":[66,5,0,8]}
 {"event":"command","chain_id":0,"bytes":[81,9,0,24]}
 {"event":"command","chain_id":0,"bytes":[0,0,96,49]}

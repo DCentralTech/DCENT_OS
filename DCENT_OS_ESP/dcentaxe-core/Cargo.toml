@@ -15,10 +15,17 @@ description = "Host-testable pure logic for DCENT_axe (config safety/clamp + OTA
 # test host-runs under `cargo test -p dcentaxe-hal -p dcentaxe-core` (feature
 # unification), catching a silent SX1262 GPIO renumber. It never reaches a firmware
 # image (dcentaxe does not depend on dcentaxe-core).
-default = ["pins-bitaxe", "pins-lora"]
+# `eth-w5500` follows the pins-lora precedent: enabling it in the default host
+# feature set compiles dcentaxe-hal's pure `eth` module so its W5500 pin-map /
+# MAC-derivation / clock-constant table tests host-run under
+# `cargo test -p dcentaxe-hal -p dcentaxe-core` (feature unification) —
+# catching a silent GPIO renumber or a desk-review clock raise. It never
+# reaches a firmware image (dcentaxe does not depend on dcentaxe-core).
+default = ["pins-bitaxe", "pins-lora", "eth-w5500"]
 pins-bitaxe = ["dcentaxe-hal/pins-bitaxe"]
 pins-nerd = ["dcentaxe-hal/pins-nerd"]
 pins-lora = ["dcentaxe-hal/pins-lora"]
+eth-w5500 = ["dcentaxe-hal/eth-w5500"]
 
 [dependencies]
 dcentaxe-hal = { path = "../dcentaxe-hal", default-features = false }

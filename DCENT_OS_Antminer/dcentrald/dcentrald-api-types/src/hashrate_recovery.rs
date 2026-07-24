@@ -3,9 +3,11 @@
 //! This is the operator-gated follow-up to the **detection-only**
 //! `degraded_hashrate_alert_floor_ghs` alert: when a sustained low-hashrate
 //! episode is confirmed, an *enabled* ladder may request a bounded number of
-//! graceful daemon restarts before giving up and latching a persistent
-//! "recovery exhausted" alert. Competitors (LuxOS / VNish / stock) ship
-//! auto-recovery; this is DCENT_OS's clean-room, safety-first equivalent.
+//! daemon recovery attempts before giving up and latching a persistent
+//! "recovery exhausted" alert. The daemon currently refuses process replacement
+//! for every platform until a typed hardware-disposition receipt can authorize
+//! a new owner. The pure FSM remains useful for detection and durable budgeting;
+//! its outcome is a request, never restart authority.
 //!
 //! ## Why this module is a pure FSM in a HAL-free crate
 //!
@@ -43,13 +45,14 @@
 //!    (cold-boot ramp protection; also bounds restart-respawn loops).
 //! 7. **Degraded-hardware skip.** Never act when the unit can't safely re-init
 //!    (dsPIC fw=0x86 / untrusted EEPROM) — alert-only.
-//! 8. **No box reboot in v1.** The only action is a graceful daemon restart.
+//! 8. **No box reboot in v1.** The only action is a daemon-restart request,
+//!    currently refused at the shared persistent-session policy boundary.
 //!    A box-reboot rung (heavier; transits a loud hardware-default fan state
 //!    during the OS-down window) is a deliberate, deferred, separately-gated
 //!    future increment — NOT in this module.
 //! 9. **Never raise fans, never invent hardware control.** The outcome is a
-//!    restart *request* only; the proven restart path caps fans ≤ PWM 30 on the
-//!    way out. This module emits no fan/voltage/I2C/PSU action of any kind.
+//!    restart *request* only. This module emits no fan/voltage/I2C/PSU action of
+//!    any kind and cannot clear the persistent hardware-session latch.
 
 use serde::{Deserialize, Serialize};
 

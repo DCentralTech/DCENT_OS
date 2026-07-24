@@ -939,6 +939,20 @@ impl PowerModel {
             return Vec::new();
         }
 
+        // Fail closed on a non-finite / non-positive chain voltage. The per-chip
+        // solve below is `raw_freq = chip_budget / (c_eff * power_scale * V * V)`,
+        // so V <= 0 makes the denominator 0 → `raw_freq = +inf` → `inf as u16`
+        // saturates to 65535 → every chip clamps to its `max_stable_mhz` (MAXIMUM
+        // frequency) while the modeled power reads 0 W and never trims. That is the
+        // exact fail-open class the EfficiencyOptimizer zero
+        // guard closes: a corrupted/hand-edited saved profile can warm-start
+        // `voltage_mv = 0` (frequencies are validated on load, voltage is not), and
+        // this is fed straight in via the Power/target-watts apply path. Run every
+        // chip at the floor instead (mirrors the budget-below-static early return).
+        if !voltage_v.is_finite() || voltage_v <= 0.0 {
+            return vec![min_freq_mhz; chip_profiles.len()];
+        }
+
         // Step 1: Subtract static overhead from budget
         let static_overhead =
             self.static_per_chain_w() * num_chains as f64 + self.control_board_w();
@@ -1650,6 +1664,39 @@ mod tests {
             "Total power {:.1}W should be <= 800W budget",
             total
         );
+    }
+
+    #[test]
+    fn allocate_budget_fails_closed_on_zero_or_nonfinite_voltage() {
+        // A voltage_v of 0 makes the per-chip solve divide by V² = 0 → +inf →
+        // `inf as u16` saturates to 65535 → every chip would clamp to its
+        // max_stable_mhz (MAXIMUM frequency) while the power model reads 0 W and
+        // never trims. The guard must fail closed to the floor instead. Reachable
+        // from a corrupted/hand-edited profile warm-start carrying voltage_mv = 0.
+        let model = PowerModel::new_bm1387();
+        let profiles: Vec<ChipProfile> = (0..63)
+            .map(|i| ChipProfile {
+                chip_index: i as u8,
+                max_stable_mhz: 650,
+                operating_mhz: 650,
+                grade: ChipGrade::B,
+                error_rate: 0.001,
+                nonces_counted: 100,
+                vf_curve: None,
+                thermal_max_stable_mhz: None,
+            })
+            .collect();
+
+        for bad_v in [0.0_f64, -1.0, f64::NAN, f64::INFINITY] {
+            let result = model.allocate_budget(300.0, bad_v, &profiles, 200, 1);
+            assert_eq!(result.len(), 63);
+            assert!(
+                result.iter().all(|&f| f == 200),
+                "voltage_v={bad_v} must fail closed to the floor (200), not pin chips to \
+                 max_stable; got {:?}",
+                &result[..4]
+            );
+        }
     }
 
     #[test]

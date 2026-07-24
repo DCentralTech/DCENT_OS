@@ -11,7 +11,7 @@
 **DCENT_axe** is the ESP32 product identity inside the
 [DCENT_OS](https://github.com/DCentralTech/DCENT_OS) family. It targets the same
 home-miner audience, with the same philosophy — *quiet by default,
-transparent, locally controlled, no cloud account, no mandatory devfee* —
+transparent, locally controlled, no cloud account, no mandatory fee* —
 but on ESP32-S3 BitAxe-class boards instead of industrial Antminers. The
 D-Central DCENT_axe open-hardware boards live in `projects/dcent-axe/` and
 run this firmware.
@@ -61,7 +61,19 @@ Three reasons:
 
 DCENT_axe stays neutral toward existing pools and existing AxeOS workflows.
 It is not pool-locked, not vendor-locked, and not D-Central-locked, and it
-ships with **zero dev fee** — every share is yours.
+ships with a disclosed, voluntary donation: **ON by default at 2%**, adjustable
+from 0–5%, and one-toggle OFF. It is time-sliced rather than a second
+simultaneous pool and never overrides user-pool failover.
+
+### Donation and update consent
+
+The default is a trust-sensitive change for existing installations: after an
+OTA to this release, a legacy config with no donation field adopts the disclosed
+2% default. The first-boot wizard, dashboard, release notes, and public
+`GET /api/donation/info` surface the setting, current routing state, pool,
+firmware-baked payout address, and an on-chain verification link. Turn the
+toggle off (or set the percentage to 0) for 100% user-pool time. We call this a
+**donation**, always—never a hidden fee.
 
 ---
 
@@ -145,15 +157,19 @@ The firmware is a multi-crate Rust workspace targeting `xtensa-esp32s3-espidf`:
   and built for the device; live broker delivery is not yet field-proven.*
   HA can also still poll the AxeOS-style REST API directly.
 - **Stratum V1, with optional Stratum V2 builds.** Non-V2 builds fail closed if
-  a V2 pool is configured.
+  a V2 pool is configured. SV2 is implemented and unit-tested; live delivery
+  remains pending and the API reports that maturity explicitly.
 - **Signed OTA release path.** Public release packages are Ed25519-signed;
   ad hoc local packaging emits signatures only when the signing environment is
   configured. Manifest-checked update slot fit is always part of the package
   gate.
 - **Local-first.** All dashboard assets ship with the firmware. No CDN
   fonts, no telemetry phone-home, no remote-management backdoor.
-- **Zero dev fee.** No mandatory fee and no pool lock-in — 100% of every
-  share goes to your own pool account. Fully open source (GPL-3.0).
+- **Transparent donation, default ON at 2%.** No mandatory fee and no pool
+  lock-in. Donation windows are time-sliced, visible in status, subordinate to
+  user-pool failover, and can be disabled with one toggle. The firmware-baked
+  payout address and `/api/donation/info` endpoint support independent
+  verification. Fully open source (GPL-3.0).
 
 ---
 
@@ -171,10 +187,13 @@ Gamma, Hex Ultra, and Hex Supra. They run from the same Rust workspace with a
 build feature per board (`--features bitaxe-gamma` etc.) for the right fan
 controller and ASIC count.
 
-LoRa mesh support is scaffolded, default-OFF, and not wired into the
-`dcentaxe` binary yet. This ESP tier is not presented as having passed the
-industrial two-Xilinx public-beta gate used by the Antminer side of
-DCENT_OS.
+LoRa mesh support is wired behind the optional `lora` feature and remains
+default-OFF. A LoRa build may select gateway-solo or mesh-solo during first
+boot; ordinary images disable and server-side reject those choices. The radio,
+mesh tip relay, and solo candidate path are implemented and host-tested, but
+live radio/submit delivery remains pending. This ESP tier is not presented as
+having passed the industrial two-Xilinx public-beta gate used by the Antminer
+side of DCENT_OS.
 
 ---
 

@@ -184,9 +184,22 @@ fn parse_serial_bytes_strips_eeprom_padding() {
 
 #[test]
 fn path_c_log_path_default_is_var_log_dcent() {
-    // Make absolutely sure no test left the env var set; this lives at
-    // process scope so other tests in the same binary could leak it.
-    std::env::remove_var("DCENT_PIC_RECOVERY_LOG_DIR");
+    const CHILD: &str = "DCENT_RECOVERY_DEFAULT_PATH_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("current recovery integration test executable"),
+        )
+        .arg("--exact")
+        .arg("path_c_log_path_default_is_var_log_dcent")
+        .arg("--nocapture")
+        .env(CHILD, "1")
+        .env_remove("DCENT_PIC_RECOVERY_LOG_DIR")
+        .status()
+        .expect("run default-path contract in an isolated child process");
+        assert!(status.success(), "default-path child failed: {status}");
+        return;
+    }
+
     let p = path_c_log_path();
     assert_eq!(
         p,
@@ -199,16 +212,32 @@ fn append_path_c_invocation_log_redirects_via_env_var() {
     // Path C invocations must persist to disk for forensic audit. Test
     // exercises the env-redirect path so we never write to /var/log
     // from `cargo test`.
+    const CHILD: &str = "DCENT_RECOVERY_REDIRECT_PATH_CHILD";
     let dir = std::env::temp_dir().join(format!(
-        "dcent_recovery_path_c_int_{}_{}",
+        "dcent_recovery_path_c_int_{}_int_test",
         std::process::id(),
-        // Salt with a unique-per-test suffix so parallel test runners
-        // don't collide. The other host-test in `recovery_fw86.rs` uses
-        // a different suffix.
-        "int_test",
     ));
+    if std::env::var_os(CHILD).is_none() {
+        let _ = std::fs::remove_dir_all(&dir);
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("current recovery integration test executable"),
+        )
+        .arg("--exact")
+        .arg("append_path_c_invocation_log_redirects_via_env_var")
+        .arg("--nocapture")
+        .env(CHILD, "1")
+        .env("DCENT_PIC_RECOVERY_LOG_DIR", &dir)
+        .status()
+        .expect("run recovery-log redirect contract in an isolated child process");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(status.success(), "recovery-log child failed: {status}");
+        return;
+    }
+
+    let dir = std::env::var_os("DCENT_PIC_RECOVERY_LOG_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("child recovery log directory");
     let _ = std::fs::remove_dir_all(&dir);
-    std::env::set_var("DCENT_PIC_RECOVERY_LOG_DIR", &dir);
 
     append_path_c_invocation_log(
         0x21,
@@ -236,6 +265,5 @@ fn append_path_c_invocation_log_redirects_via_env_var() {
     assert!(log.contains("serial=BHB42801XYZ"));
     assert!(log.contains("platform=am2-s17"));
 
-    std::env::remove_var("DCENT_PIC_RECOVERY_LOG_DIR");
     let _ = std::fs::remove_dir_all(&dir);
 }

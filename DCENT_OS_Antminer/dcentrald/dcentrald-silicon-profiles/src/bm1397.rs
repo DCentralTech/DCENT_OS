@@ -27,8 +27,8 @@
 //! the reconstructed watt rows here for S17 Pro power estimation.
 //!
 //! The 5 rows below are `Reconstructed` (and step 0 is labeled
-//! `OperatorConfirmed` for the *nameplate*, but there is **no live S17** on
-//! the fleet — the table is `RegisterMappedFromRE`). The step-0 anchor
+//! `OperatorConfirmed` for the *nameplate*, but there is **no DCENT_OS S17
+//! execution evidence** — the table is `RegisterMappedFromRE`). The step-0 anchor
 //! 675 MHz / 76 TH / 3182 W (≈41.9 J/TH) **overstates efficiency** vs the
 //! operator's live VNish RE curve, which puts 675 MHz at **65 TH / 2680 W**
 //! (≈41.2 J/TH) and stock S17 Pro at ~53 TH @ 1750 W.
@@ -99,7 +99,7 @@ pub const BM1397_TABLE: SiliconTable = SiliconTable {
     default_step: 0,
     sweet_spot_step: -2,
     // HONESTY FIX 2026-06-10 (HashSource S17 jig RE): BM1397 has NEVER been
-    // hashed on a live DCENT_OS unit (no S17 on the fleet), so LiveConfirmed
+    // hashed on a live DCENT_OS unit, so LiveConfirmed
     // (rank 5 = "hashed on real hardware") was an over-claim. The register set
     // is now byte-exact RE-confirmed from the S17 single-board-test jig (see
     // the RE consts below +  §2) → the honest
@@ -131,7 +131,7 @@ pub const BM1397_MISCCTRL_BAUD_VALUE: u32 = 0x0000_6031;
 // Byte-exact from the Bitmain S17 single-board-test binary, decompiled corpus
 // .
 // CATALOG/REFERENCE constants documenting the BHB07601 (S17 BM1397) factory-jig
-// chain path — NOT wired into a live path (no live S17 unit; the AM2 path uses
+// chain path — NOT wired into a DCENT_OS execution path; the AM2 path uses
 // BM1397_MISCCTRL_BAUD_VALUE above). The fast-UART mechanism here is a DISTINCT
 // two-register write, NOT the single MiscCtrl 0x18 write — do not merge; the
 // divisor still needs an on-wire scope confirm. See
@@ -149,7 +149,7 @@ pub const BM1397_MISC_CONTROL_DEFAULT: u32 = 0x0000_3A01;
 /// BM1397 fast-UART (BHB07601 jig path) = a TWO-register write: reg 0x68 then
 /// reg 0x28. Source `set_baud_ext@269A4.c`. UNVERIFIED on-wire — do NOT wire
 /// into a live path without a scope capture (RE-ASK-CHIP-BM1397).
-pub const BM1397_FAST_UART_REG68: u32 = 0xC066_0011;
+pub const BM1397_FAST_UART_REG68: u32 = 0xC070_0111;
 pub const BM1397_FAST_UART_REG28: u32 = 0x0600_000F;
 
 #[cfg(test)]
@@ -218,6 +218,12 @@ mod tests {
         // baud-switching-analysis.md line 33: 6.25 Mbaud.
         assert_eq!(BM1397_OPERATIONAL_BAUD, 6_250_000);
         assert_eq!(BM1397_MISCCTRL_BAUD_VALUE, 0x0000_6031);
+    }
+
+    #[test]
+    fn factory_jig_fast_uart_words_are_byte_exact() {
+        assert_eq!(BM1397_FAST_UART_REG68, 0xC070_0111);
+        assert_eq!(BM1397_FAST_UART_REG28, 0x0600_000F);
     }
 
     #[test]

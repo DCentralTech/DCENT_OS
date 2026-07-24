@@ -39,6 +39,28 @@ pub struct StratumConfig {
     pub version_rolling: bool,
 }
 
+/// Runtime donation routing directive. This is deliberately separate from
+/// user-pool failover and split-pool configuration: the client swaps its
+/// active `StratumConfig` only at bounded cycle transitions.
+#[derive(Debug, Clone)]
+pub struct DonationDirective {
+    pub enabled: bool,
+    pub percent: f32,
+    pub primary: StratumConfig,
+    pub fallback: Option<StratumConfig>,
+    pub cycle_duration_s: u64,
+}
+
+impl DonationDirective {
+    pub fn window_secs(&self) -> u64 {
+        if !self.enabled || !self.percent.is_finite() || self.percent <= 0.0 {
+            return 0;
+        }
+        ((self.cycle_duration_s as f64 * self.percent as f64 / 100.0).round() as u64)
+            .min(self.cycle_duration_s)
+    }
+}
+
 impl Default for StratumConfig {
     fn default() -> Self {
         Self {
@@ -115,6 +137,10 @@ pub struct StratumStatus {
     pub extranonce_subscribe_requested: bool,
     pub extranonce_subscribe_accepted: bool,
     pub failover_active: bool,
+    #[serde(default)]
+    pub donating: bool,
+    #[serde(default)]
+    pub donation_percent: f32,
     pub primary_failback_state: PrimaryFailbackState,
     pub primary_failback_detail: String,
     pub last_primary_reprobe_unix_ms: u64,
@@ -170,6 +196,8 @@ impl StratumStatus {
             extranonce_subscribe_requested: self.extranonce_subscribe_requested,
             extranonce_subscribe_accepted: self.extranonce_subscribe_accepted,
             failover_active: self.failover_active,
+            donating: self.donating,
+            donation_percent: self.donation_percent,
             primary_failback_state: self.primary_failback_state,
             primary_failback_detail: self.primary_failback_detail.clone(),
             last_primary_reprobe_unix_ms: self.last_primary_reprobe_unix_ms,
@@ -299,6 +327,8 @@ pub enum StratumEventKind {
     ReconnectBackoff,
     FailoverEntered,
     FailoverSkipped,
+    DonationEntered,
+    DonationExited,
     PrimaryReprobeStarted,
     PrimaryReprobeFailed,
     PrimaryReprobeReady,

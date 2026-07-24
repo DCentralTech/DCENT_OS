@@ -65,62 +65,89 @@ impl RollbackVerdict {
     }
 }
 
-/// Parsed version: numeric components (`0.6.0` -> `[0,6,0]`) plus a
-/// pre-release suffix tag count. A pre-release version compares LESS than
-/// its release counterpart (`0.6.0-rc1 < 0.6.0`); within pre-releases the
-/// numeric tail (`rc1` -> 1) breaks ties.
+/// A version admitted by the bounded `DCENT_VERSION/1` grammar.
+///
+/// Components remain canonical strings instead of fixed-width integers so
+/// rollback ordering cannot overflow or lose precision. Build metadata is
+/// validated by [`parse_version`] but is intentionally omitted because it
+/// never affects precedence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedVersion {
-    /// Major.minor.patch... numeric segments parsed from before the first `-`.
-    pub release: Vec<u32>,
-    /// Pre-release suffix; empty Vec for a real release. The tuple is
-    /// `(label_priority, numeric_tail)` so `rc1 < rc2` and any non-empty
-    /// pre-release sorts BEFORE the release.
-    pub prerelease: Vec<u32>,
+    /// Two or three canonical decimal core components.
+    pub release: Vec<String>,
+    /// Dot-separated prerelease identifiers; empty for a final release.
+    pub prerelease: Vec<String>,
 }
 
-/// Parse a semver-ish version string into a `ParsedVersion`.
-/// Tolerates `v`-prefixed strings and pre-release suffixes (`v0.6.0-rc1`).
-/// Returns `None` if no numeric component is parseable for the release.
-pub fn parse_version(version: &str) -> Option<ParsedVersion> {
-    let trimmed = version.trim().trim_start_matches('v');
-    let mut iter = trimmed.splitn(2, '-');
-    let release_part = iter.next()?;
-    let prerelease_part = iter.next();
+const MAX_VERSION_BYTES: usize = 128;
+const MAX_VERSION_PARTS: usize = 16;
+const MAX_VERSION_PART_BYTES: usize = 32;
 
-    let release: Vec<u32> = release_part
-        .split('.')
-        .filter_map(|p| p.parse::<u32>().ok())
-        .collect();
-    if release.is_empty() {
+fn is_canonical_decimal(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && (value == "0" || !value.starts_with('0'))
+}
+
+fn parse_identifiers(value: &str, reject_numeric_leading_zeroes: bool) -> Option<Vec<String>> {
+    let parts: Vec<&str> = value.split('.').collect();
+    if parts.is_empty() || parts.len() > MAX_VERSION_PARTS {
+        return None;
+    }
+    for part in &parts {
+        if part.is_empty()
+            || part.len() > MAX_VERSION_PART_BYTES
+            || !part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return None;
+        }
+        if reject_numeric_leading_zeroes
+            && part.bytes().all(|byte| byte.is_ascii_digit())
+            && part.len() > 1
+            && part.starts_with('0')
+        {
+            return None;
+        }
+    }
+    Some(parts.into_iter().map(str::to_owned).collect())
+}
+
+/// Parse the bounded `DCENT_VERSION/1` language.
+///
+/// The accepted form is `v?MAJOR.MINOR[.PATCH][-PRERELEASE][+BUILD]`.
+/// There is no whitespace normalization or best-effort recovery: any
+/// non-canonical component fails closed.
+pub fn parse_version(version: &str) -> Option<ParsedVersion> {
+    if version.is_empty() || version.len() > MAX_VERSION_BYTES || !version.is_ascii() {
         return None;
     }
 
-    let prerelease: Vec<u32> = match prerelease_part {
-        None => Vec::new(),
-        Some(s) => s
-            .split(['.', '-'])
-            .filter_map(|p| {
-                // Extract leading non-digit label + trailing digits as
-                // [label_chars_summed, numeric_tail]. Pure digits parse as
-                // a single number. Pure non-digits give a label-priority value.
-                if p.is_empty() {
-                    return None;
-                }
-                if let Ok(n) = p.parse::<u32>() {
-                    Some(n)
-                } else {
-                    // For "rc1", split into "rc" + "1": label sums codepoints
-                    // (deterministic), then numeric tail.
-                    let split_at = p.find(|c: char| c.is_ascii_digit()).unwrap_or(p.len());
-                    let (label, tail) = p.split_at(split_at);
-                    let label_score: u32 = label.bytes().map(|b| b as u32).sum();
-                    let tail_n = tail.parse::<u32>().unwrap_or(0);
-                    Some(label_score.saturating_mul(1_000_000).saturating_add(tail_n))
-                }
-            })
-            .collect(),
+    let unprefixed = version.strip_prefix('v').unwrap_or(version);
+    if unprefixed.is_empty() {
+        return None;
+    }
+
+    let (precedence, build) = match unprefixed.split_once('+') {
+        Some((precedence, build)) => (precedence, Some(build)),
+        None => (unprefixed, None),
     };
+    if let Some(build) = build {
+        parse_identifiers(build, false)?;
+    }
+
+    let (release_part, prerelease) = match precedence.split_once('-') {
+        Some((release, prerelease)) => (release, parse_identifiers(prerelease, true)?),
+        None => (precedence, Vec::new()),
+    };
+    let release_parts: Vec<&str> = release_part.split('.').collect();
+    if !(2..=3).contains(&release_parts.len())
+        || release_parts.iter().any(|part| !is_canonical_decimal(part))
+    {
+        return None;
+    }
+    let release = release_parts.into_iter().map(str::to_owned).collect();
 
     Some(ParsedVersion {
         release,
@@ -128,17 +155,47 @@ pub fn parse_version(version: &str) -> Option<ParsedVersion> {
     })
 }
 
-fn cmp_padded(a: &[u32], b: &[u32]) -> std::cmp::Ordering {
+fn cmp_digits(a: &str, b: &str) -> std::cmp::Ordering {
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+fn cmp_release(a: &[String], b: &[String]) -> std::cmp::Ordering {
     let len = a.len().max(b.len());
     for i in 0..len {
-        let av = *a.get(i).unwrap_or(&0);
-        let bv = *b.get(i).unwrap_or(&0);
-        match av.cmp(&bv) {
+        let av = a.get(i).map(String::as_str).unwrap_or("0");
+        let bv = b.get(i).map(String::as_str).unwrap_or("0");
+        match cmp_digits(av, bv) {
             std::cmp::Ordering::Equal => continue,
             other => return other,
         }
     }
     std::cmp::Ordering::Equal
+}
+
+fn cmp_prerelease(a: &[String], b: &[String]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    match (a.is_empty(), b.is_empty()) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Greater,
+        (false, true) => return Ordering::Less,
+        (false, false) => {}
+    }
+
+    for (av, bv) in a.iter().zip(b) {
+        let a_numeric = av.bytes().all(|byte| byte.is_ascii_digit());
+        let b_numeric = bv.bytes().all(|byte| byte.is_ascii_digit());
+        let order = match (a_numeric, b_numeric) {
+            (true, true) => cmp_digits(av, bv),
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => av.cmp(bv),
+        };
+        if order != Ordering::Equal {
+            return order;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 /// Compare two version strings. Returns:
@@ -150,18 +207,8 @@ pub fn compare_versions(candidate: &str, current: &str) -> Option<std::cmp::Orde
     let a = parse_version(candidate)?;
     let b = parse_version(current)?;
     use std::cmp::Ordering;
-    // Compare release segments first, padding the shorter with zeros so
-    // "0.6.0" == "0.6".
-    match cmp_padded(&a.release, &b.release) {
-        Ordering::Equal => {
-            // Pre-release rule: any pre-release < release (empty prerelease).
-            match (a.prerelease.is_empty(), b.prerelease.is_empty()) {
-                (true, true) => Some(Ordering::Equal),
-                (true, false) => Some(Ordering::Greater),
-                (false, true) => Some(Ordering::Less),
-                (false, false) => Some(cmp_padded(&a.prerelease, &b.prerelease)),
-            }
-        }
+    match cmp_release(&a.release, &b.release) {
+        Ordering::Equal => Some(cmp_prerelease(&a.prerelease, &b.prerelease)),
         ord => Some(ord),
     }
 }
@@ -267,17 +314,16 @@ mod tests {
     #[test]
     fn parse_version_handles_v_prefix_and_rc_suffix() {
         let p1 = parse_version("0.6.0").unwrap();
-        assert_eq!(p1.release, vec![0, 6, 0]);
+        assert_eq!(p1.release, vec!["0", "6", "0"]);
         assert!(p1.prerelease.is_empty());
 
         let p2 = parse_version("v0.6.0").unwrap();
-        assert_eq!(p2.release, vec![0, 6, 0]);
+        assert_eq!(p2.release, vec!["0", "6", "0"]);
         assert!(p2.prerelease.is_empty());
 
         let p3 = parse_version("v0.6.0-rc1").unwrap();
-        assert_eq!(p3.release, vec![0, 6, 0]);
-        // Pre-release present; exact internal tag depends on the encoder.
-        assert!(!p3.prerelease.is_empty());
+        assert_eq!(p3.release, vec!["0", "6", "0"]);
+        assert_eq!(p3.prerelease, vec!["rc1"]);
     }
 
     #[test]
@@ -301,6 +347,110 @@ mod tests {
         // 0.6.0 vs 0.6 should treat missing component as 0.
         assert_eq!(compare_versions("0.6.0", "0.6"), Some(Ordering::Equal));
         assert_eq!(compare_versions("0.6.1", "0.6"), Some(Ordering::Greater));
+    }
+
+    #[test]
+    fn compares_core_numbers_as_digit_strings_without_precision_loss() {
+        // Boundaries above IEEE-754's exact integer range and above u64::MAX
+        // must remain admissible and exactly ordered.
+        assert_eq!(
+            compare_versions("9007199254740993.0", "9007199254740992.999"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_versions("18446744073709551616.0", "18446744073709551615.999"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_versions(
+                "99999999999999999999999999999999.1",
+                "10000000000000000000000000000000.999",
+            ),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_versions(
+                "100000000000000000000000000000000.0",
+                "99999999999999999999999999999999.999",
+            ),
+            Some(Ordering::Greater)
+        );
+    }
+
+    #[test]
+    fn build_metadata_is_validated_but_does_not_affect_precedence() {
+        assert_eq!(
+            compare_versions("1.2.3+build.001", "1.2.3+other.999"),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            compare_versions("1.2.3-rc.2+first", "1.2.3-rc.2+second"),
+            Some(Ordering::Equal)
+        );
+        assert!(parse_version("1.2.3+").is_none());
+        assert!(parse_version("1.2.3+bad_identifier").is_none());
+    }
+
+    #[test]
+    fn prerelease_ordering_matches_dcent_version_v1() {
+        assert_eq!(
+            compare_versions("1.2.3-rc1", "1.2.3-rc2"),
+            Some(Ordering::Less)
+        );
+        // Compact suffixes are alphanumeric identifiers and compare lexically.
+        assert_eq!(
+            compare_versions("1.2.3-rc10", "1.2.3-rc2"),
+            Some(Ordering::Less)
+        );
+        // Dot-separated numeric identifiers compare numerically.
+        assert_eq!(
+            compare_versions("1.2.3-rc.10", "1.2.3-rc.2"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_versions("1.2.3-9", "1.2.3-alpha"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_versions("1.2.3-alpha", "1.2.3-alpha.1"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_versions("1.2.3", "1.2.3-alpha"),
+            Some(Ordering::Greater)
+        );
+    }
+
+    #[test]
+    fn rejects_noncanonical_or_out_of_bounds_versions() {
+        for malformed in [
+            "1",
+            "1.2.3.4",
+            " 1.2.3",
+            "1.2.3 ",
+            "V1.2.3",
+            "01.2.3",
+            "1.02.3",
+            "1.2.03",
+            "1.2.3-01",
+            "1.2.3-",
+            "1.2.3-alpha..1",
+            "1.2.3-alpha_beta",
+            "1.2.3+build+again",
+            "1.2.3-\u{00e9}",
+        ] {
+            assert!(
+                parse_version(malformed).is_none(),
+                "unexpectedly admitted {malformed:?}"
+            );
+        }
+
+        let too_many_parts = format!("1.2-{}", vec!["a"; 17].join("."));
+        assert!(parse_version(&too_many_parts).is_none());
+        let oversized_identifier = format!("1.2-{}", "a".repeat(33));
+        assert!(parse_version(&oversized_identifier).is_none());
+        let oversized_version = format!("{}.0", "9".repeat(127));
+        assert!(parse_version(&oversized_version).is_none());
     }
 
     #[test]

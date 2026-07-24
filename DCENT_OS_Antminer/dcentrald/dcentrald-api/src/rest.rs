@@ -66,6 +66,7 @@ use dcent_schema::update::{
     InstallIntent, ToolboxPackageInfo, UpdateMetadata, UPDATE_SCHEMA_VERSION,
 };
 use dcentrald_asic::drivers::{MinerProfile, PicType};
+use dcentrald_common::BoardDesc;
 use dcentrald_diagnostics::builders::{
     build_board_health_snapshot, build_chip_health_snapshot, build_hashreport_snapshot,
 };
@@ -733,10 +734,16 @@ fn antminer_beta_anchor(chip_id: Option<u16>, hw: &crate::HardwareInfo) -> bool 
         // BM1387 also appears outside S9. The exact typed board-target
         // declaration is composition evidence for support-tier selection; it
         // still cannot authorize mutations without measured ASIC evidence.
-        Some(0x1387) => has_declared_asic_target(hw, "am1-s9", "BM1387"),
+        Some(0x1387) => {
+            antminer_declared_board_target(hw) == Some("am1-s9")
+                && has_declared_asic_target(hw, "am1-s9", "BM1387")
+        }
         // BM1362 is not enough by itself: plain S19j/S19j Pro routes and
         // non-Zynq control boards exist. Require the exact shipped AM2 target.
-        Some(0x1362) => has_declared_asic_target(hw, "am2-s19j", "BM1362"),
+        Some(0x1362) => {
+            antminer_declared_board_target(hw) == Some("am2-s19j")
+                && has_declared_asic_target(hw, "am2-s19j", "BM1362")
+        }
         _ => false,
     }
 }
@@ -944,7 +951,10 @@ fn antminer_grants_mutating_capabilities(
         )
 }
 
-fn antminer_runtime_caps(grants_mutations: bool, board_target: &str) -> Vec<RuntimeCapability> {
+fn antminer_runtime_caps(
+    grants_mutations: bool,
+    board_desc: Option<&BoardDesc>,
+) -> Vec<RuntimeCapability> {
     let mut caps = READ_ONLY_RUNTIME_CAPABILITIES.to_vec();
     if grants_mutations {
         push_runtime_cap(&mut caps, RuntimeCapability::PoolsRw);
@@ -953,9 +963,13 @@ fn antminer_runtime_caps(grants_mutations: bool, board_target: &str) -> Vec<Runt
         push_runtime_cap(&mut caps, RuntimeCapability::Identify);
         push_runtime_cap(&mut caps, RuntimeCapability::Reboot);
         push_runtime_cap(&mut caps, RuntimeCapability::Backup);
-        if board_target.starts_with("antminer-zynq-") {
-            push_runtime_cap(&mut caps, RuntimeCapability::FlashOta);
-            push_runtime_cap(&mut caps, RuntimeCapability::Restore);
+        if let Some(descriptor) = board_desc {
+            if crate::ota_signature::require_public_update_policy(descriptor.board_target).is_ok() {
+                push_runtime_cap(&mut caps, RuntimeCapability::FlashOta);
+            }
+            if descriptor.enablement.allows_restore() {
+                push_runtime_cap(&mut caps, RuntimeCapability::Restore);
+            }
         }
     }
     caps
@@ -1043,13 +1057,16 @@ fn build_antminer_capability_descriptor(
 ) -> DeviceCapabilityDescriptor {
     let chip_id = chip_type_to_chip_id(&hw.chip_type);
     let profile = chip_id.and_then(MinerProfile::for_chip);
+    let board_desc = antminer_board_desc(hw);
+    let exact_board_target = antminer_declared_board_target(hw).map(str::to_string);
     let board_target = antminer_board_target(hw);
     let board_version = antminer_board_version(hw);
     let sources = capability_identity_sources(hw);
     let confidence = capability_identity_confidence(hw, profile);
     let support = antminer_support_tier(chip_id, profile, hw);
-    let grants_mutations = antminer_grants_mutating_capabilities(support, confidence);
-    let mut runtime_caps = antminer_runtime_caps(grants_mutations, &board_target);
+    let grants_mutations =
+        antminer_grants_mutating_capabilities(support, confidence) && board_desc.is_some();
+    let mut runtime_caps = antminer_runtime_caps(grants_mutations, board_desc);
     let power_writes_enabled = grants_mutations
         && profile
             .map(|profile| profile.pic_type != dcentrald_asic::drivers::PicType::NoPic)
@@ -1068,13 +1085,13 @@ fn build_antminer_capability_descriptor(
             sources,
             note: capability_identity_note(hw, confidence),
             device_model: profile.map(|profile| profile.name.to_string()),
-            board_target: Some(board_target.clone()),
+            board_target: exact_board_target.clone(),
             board_version: Some(board_version.clone()),
             platform: Some("dcentos-antminer".to_string()),
         },
         support,
         board: BoardCapability {
-            board_target: Some(board_target.clone()),
+            board_target: exact_board_target.clone(),
             family: Some("antminer".to_string()),
             control_board: if hw.control_board.trim().is_empty() {
                 None
@@ -1146,7 +1163,9 @@ fn build_antminer_capability_descriptor(
         references: CapabilityReferences {
             fixture_refs: Vec::new(),
             sim_profile_ref: None,
-            bench_checklist_ref: Some(format!("bench/{board_target}")),
+            bench_checklist_ref: exact_board_target
+                .as_deref()
+                .map(|target| format!("bench/{target}")),
         },
         runtime_caps,
         install: antminer_install_plan(support, grants_mutations, &board_target),
@@ -1871,41 +1890,16 @@ const AUTOTUNER_STALE_AFTER_S: u64 = 15;
 const SYSTEM_UPGRADE_MAX_UPLOAD_BYTES: usize = 128 * 1024 * 1024;
 const SYSTEM_UPGRADE_STAGE_ROOT: &str = "/tmp/dcentos-upgrade";
 const SYSTEM_UPGRADE_RELEASE_PUBKEY: &str = "/etc/dcentos/release_ed25519.pub";
+const SYSTEM_BOARD_TARGET_PATH: &str = "/etc/dcentos/board_target";
 const KERNEL_WATCHDOG0_SYSFS: &str = "/sys/class/watchdog/watchdog0";
 
-/// The installed init-script name. Every Buildroot overlay ships
-/// `/etc/init.d/S82dcentrald` (verified across zynq / amlogic / beaglebone /
-/// cvitek / am2-*); there is **no** `/etc/init.d/dcentrald` symlink anywhere.
-///
-/// WAVE 0 STABILIZE (2026-06-05) — RESTART-NO-RESPAWN fix: the prior
-/// `trigger_daemon_restart()` ran `Command::new("/etc/init.d/dcentrald")`,
-/// a path that does NOT exist, so the init.d restart always failed
-/// ("No such file or directory") and fell through to `kill -TERM self`.
-/// On a unit whose supervisor wrapper (`S82dcentrald`) reads a clean SIGTERM
-/// exit as an *intentional stop*, the respawn loop then exits and the daemon
-/// stays DEAD until power-cycle — i.e. the operator-facing "Restart" button
-/// killed the unit. This constant + `build_daemon_restart_command` target the
-/// REAL installed script, identical to the daemon crate's
-/// `restart.rs::schedule_daemon_restart` (the documented, unit-tested
-/// auto-recovery path) so both control planes restart the same way. The API
-/// crate cannot call into the `dcentrald` binary crate directly (the dep edge
-/// runs the other way), so this mirrors that proven logic byte-for-byte.
-const DAEMON_RESTART_INIT_SCRIPT: &str = "/etc/init.d/S82dcentrald";
-
-/// Build the detached restart shell command. Pure + unit-testable so the
-/// init-script path can never silently drift from the installed name again,
-/// and so the SIGTERM respawn fallback is regression-pinned.
-///
-/// Runs `<script> restart`; if the script is somehow absent the `|| kill`
-/// fallback sends `kill -TERM <self_pid>` so the `S82dcentrald` crash-wrapper
-/// (or procd) respawns. This matches `restart.rs::build_restart_command` in the
-/// daemon crate exactly.
-fn build_daemon_restart_command(self_pid: u32) -> String {
-    format!(
-        "{DAEMON_RESTART_INIT_SCRIPT} restart >/tmp/dcentrald_restart_cmd.log 2>&1 \
-         || kill -TERM {self_pid}"
-    )
-}
+/// Process exit is not evidence that every hash rail reached a typed, verified
+/// disposition. Until the daemon and supervisor exchange a durable hardware
+/// disposition receipt, an in-process restart request must leave the current
+/// hardware owner running and report a refusal. The guarded init-script path
+/// remains available to an operator who is prepared to resolve the persistent
+/// session latch after physically verifying the unit.
+const DAEMON_RESTART_REFUSAL: &str = "Daemon restart refused: no typed hardware disposition receipt can yet prove every owned rail safe across process exit. Keep the current hardware owner running; use the guarded service workflow only with operator verification.";
 
 fn sanitize_upload_filename(name: &str) -> String {
     let candidate = std::path::Path::new(name)
@@ -2397,21 +2391,51 @@ fn unix_time_ms() -> u64 {
 }
 
 fn antminer_board_version(hw: &crate::HardwareInfo) -> String {
-    if hw.control_board.starts_with("AML") || hw.control_board.contains("am2") {
-        hw.control_board.clone()
-    } else {
-        "am1-s9".to_string()
+    let observed = hw.control_board.trim();
+    if !observed.is_empty() && !observed.eq_ignore_ascii_case("unknown") {
+        return observed.to_string();
     }
+    antminer_declared_board_target(hw)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn antminer_declared_board_target(hw: &crate::HardwareInfo) -> Option<&str> {
+    let mut exact_target: Option<&str> = None;
+    for evidence in &hw.identification.evidence {
+        if evidence.claim != crate::HardwareIdentityClaim::AsicFamily
+            || evidence.source
+                != crate::HardwareIdentityEvidenceSource::Declared(
+                    crate::DeclaredIdentitySource::BoardTarget,
+                )
+        {
+            continue;
+        }
+
+        let candidate = evidence.source_value.trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        if exact_target
+            .map(|current| current != candidate)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        exact_target = Some(candidate);
+    }
+
+    exact_target
+}
+
+fn antminer_board_desc(hw: &crate::HardwareInfo) -> Option<&'static BoardDesc> {
+    antminer_declared_board_target(hw).and_then(BoardDesc::lookup)
 }
 
 fn antminer_board_target(hw: &crate::HardwareInfo) -> String {
-    if hw.control_board.starts_with("AML") {
-        "antminer-amlogic".to_string()
-    } else if hw.control_board.contains("am2") {
-        "antminer-zynq-am2".to_string()
-    } else {
-        "antminer-zynq-am1".to_string()
-    }
+    antminer_declared_board_target(hw)
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 fn swarm_api_url(ipv4: &str) -> Option<String> {
@@ -4522,10 +4546,10 @@ const API_COMPATIBILITY_CGMINER_COMMANDS: &[ApiCompatibilityCommandEntry] = &[
     },
     ApiCompatibilityCommandEntry {
         name: "restart",
-        support: "implemented",
-        mutates: true,
-        provenance: "cgminer::handle_command routes restart to rest::grpc_bridge_reboot (trigger_daemon_restart — respawns the daemon, preserving fan management)",
-        limitations: &["Restarts the dcentrald daemon, not a full SoC reboot."],
+        support: "recognized_refused",
+        mutates: false,
+        provenance: "cgminer::handle_command routes restart to rest::grpc_bridge_reboot, which preserves the live hardware owner and returns the persistent-session safety refusal",
+        limitations: &["In-process restart remains disabled until a typed hardware-disposition receipt can authorize safe re-admission."],
     },
     ApiCompatibilityCommandEntry {
         name: "quit",
@@ -9247,8 +9271,9 @@ fn validate_and_write_pool_config(
 //   * `grpc_bridge_set_fan`    → `compute_commanded_fan_pwm` (same per-mode
 //     envelope incl. the load-bearing HOME PWM-30 hard cap as `post_fan`) then
 //     the same `set_fan_pwm_via_hal` write. Returns the POST-clamp applied PWM.
-//   * `grpc_bridge_reboot`     → `trigger_daemon_restart` (the same restart
-//     action `post_action_restart` performs).
+//   * `grpc_bridge_reboot`     → the same fail-closed persistent-session policy
+//     as `post_action_restart`; it preserves the current hardware owner and
+//     returns an explicit refusal until typed disposition receipts exist.
 //
 // Honest outcomes: each returns `Ok(..)` only on a real applied success and
 // `Err(String)` on validation/cap rejection or hardware failure — never a
@@ -9359,15 +9384,16 @@ pub fn grpc_bridge_set_fan(
     Ok(pwm)
 }
 
-/// gRPC bridge for `Reboot`. Triggers the SAME daemon-restart action as
-/// `POST /api/action/restart` (write the restart flag + spawn the init.d
-/// restart). Returns the human status string for the delegate's ack.
+/// gRPC bridge for the legacy `Reboot` control verb.
+///
+/// The capability guard deliberately runs first so an unknown identity cannot
+/// use the refusal text as an authorization oracle. An authorized caller still
+/// receives the same non-destructive persistent-session refusal as REST and
+/// CGMiner; no flag is written and the live hardware owner is not signalled.
 pub fn grpc_bridge_reboot(state: &AppState) -> std::result::Result<String, String> {
-    // CE-052: fail-closed capability gate FIRST — before the restart flag is
-    // written / init.d restart is spawned. REST twins enforce `Reboot`.
+    // CE-052: fail-closed capability gate FIRST. REST twins enforce `Reboot`.
     bridge_runtime_capability_guard(state, RuntimeCapability::Reboot, "bridge:reboot")?;
-    trigger_daemon_restart();
-    Ok("Mining restart initiated — daemon will restart in ~2 seconds".to_string())
+    Err(DAEMON_RESTART_REFUSAL.to_string())
 }
 
 // ───────────────────────────────────────────────────────────────────────

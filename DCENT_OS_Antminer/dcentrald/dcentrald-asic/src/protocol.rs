@@ -106,6 +106,10 @@ pub const HDR_JOB_WRITE: u8 = TYPE_JOB | CMD_WRITE;
 /// Verified from working asic_init.py on live S9.
 pub const FIFO_CMD_CHAIN_INACTIVE: u32 = 0x0000_0555;
 
+/// BM1397+ Chain Inactive broadcast.
+/// Wire bytes: `[0x53, 0x05, 0x00, 0x00]`.
+pub const FIFO_CMD_CHAIN_INACTIVE_BM139X: u32 = 0x0000_0553;
+
 /// Encode a GetAddress broadcast command for CMD_TX_FIFO (BM1387).
 /// Wire format: [0x54, 0x05, 0x00, 0x00] — header 0x54 (CMD|BCAST|READ), length 5, reg 0x00.
 /// GetAddress = broadcast read of register 0x00 (ChipAddress register).
@@ -123,6 +127,12 @@ pub const FIFO_CMD_GET_ADDRESS_BM139X: u32 = 0x0000_0552;
 /// `addr` is the chip address to assign.
 pub fn fifo_cmd_set_address(addr: u8) -> u32 {
     ((addr as u32) << 16) | 0x0541
+}
+
+/// Encode a BM1397+ SetChipAddress command for the FPGA CMD FIFO.
+/// Wire bytes: `[0x40, 0x05, addr, 0x00]`.
+pub const fn fifo_cmd_set_address_bm139x(addr: u8) -> u32 {
+    ((addr as u32) << 16) | 0x0540
 }
 
 /// Encode a Read Register command for CMD_TX_FIFO.

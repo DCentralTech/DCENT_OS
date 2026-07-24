@@ -29,6 +29,7 @@ pub(crate) struct PlatformIdentitySnapshot {
     pub(crate) board_desc: Option<&'static dcentrald_common::BoardDesc>,
     pub(crate) declared_platform_marker: Option<String>,
     pub(crate) declared_subtype: Option<String>,
+    pub(crate) declared_psu_hardware_variant: Option<String>,
     pub(crate) observed_control_board: String,
 }
 
@@ -43,6 +44,10 @@ impl PlatformIdentitySnapshot {
 
     pub(crate) fn subtype(&self) -> &str {
         self.declared_subtype.as_deref().unwrap_or_default()
+    }
+
+    pub(crate) fn psu_hardware_variant(&self) -> Option<&str> {
+        self.declared_psu_hardware_variant.as_deref()
     }
 }
 
@@ -213,6 +218,7 @@ mod tests {
             board_desc: dcentrald_common::BoardDesc::lookup("am1-s9"),
             declared_platform_marker: Some("zynq-bm1-s9".to_string()),
             declared_subtype: None,
+            declared_psu_hardware_variant: None,
             observed_control_board: "Zynq am1-s9".to_string(),
         }
     }
@@ -496,6 +502,7 @@ mod tests {
                 board_desc: dcentrald_common::BoardDesc::lookup("am2-s19pro"),
                 declared_platform_marker: Some("zynq-bm3-am2".to_string()),
                 declared_subtype: None,
+                declared_psu_hardware_variant: None,
                 observed_control_board: "SimPlatform(Zynq)".to_string(),
             }
         }

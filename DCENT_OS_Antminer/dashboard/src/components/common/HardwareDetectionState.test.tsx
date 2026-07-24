@@ -10,7 +10,7 @@ function descriptor(
   overrides: Partial<DeviceCapabilityDescriptor> = {},
 ): DeviceCapabilityDescriptor {
   const base: DeviceCapabilityDescriptor = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     family: 'antminer',
     identity: {
       confidence: 'exact',

@@ -48,9 +48,10 @@ Rust workspace is the DCENT_OS-for-ESP member; see [`docs/ESP_DEVICES.md`](docs/
 > **Readiness boundary (2026-06-26):** DCENT_OS is one firmware family, but
 > public production install readiness is not claimed for every model in the
 > S9-to-S21 and Bitaxe-class range. Antminer rows below separate mining/lab
-> evidence from public-install readiness; the Xilinx public beta gate is still
-> waiting on public artifact verification and witnessed live-install capstone
-> evidence. ESP rows are DCENT_OS-for-ESP driver/build targets with Gamma
+> evidence from public-install readiness; S9 is the only public-beta
+> first-install target, while S19j Pro Xilinx public-beta authorization is
+> scoped to guarded update on an already-running DCENT_OS image. ESP rows are
+> DCENT_OS-for-ESP driver/build targets with Gamma
 > live verification and legacy BM1370 lab context called out explicitly. Use DCENT Toolbox route dry-runs and
 > per-platform install notes before any live write.
 
@@ -253,7 +254,7 @@ host-tested, with live validation called out where it exists.
 | --- | --- | --- | --- | --- |
 | Industrial Antminer | **Antminer S9** | BM1387 | **Mining achieved** — sustained standalone cold-boot mining with accepted pool shares | Public-gated route: Toolbox route exists, public artifact + witnessed live-install capstone still required |
 | Industrial Antminer | **Antminer S19 Pro** | BM1398 | Hashing achieved — cold boot, full chain enumeration, clean nonce flow; accepted shares untested on latest binaries | Lab-gated route: dedicated signed package/runbook/live capstone pending |
-| Industrial Antminer | **Antminer S19j Pro** (Zynq) | BM1362 | **Mining achieved** — standalone cold-boot mining with accepted pool shares | Public-gated route: Xilinx public beta remains pending public artifact + witnessed clean-unit capstone |
+| Industrial Antminer | **Antminer S19j Pro** (Zynq) | BM1362 | **Mining achieved** — standalone cold-boot mining with accepted pool shares | Guarded DCENT_OS-source self-update only; vendor-source first install is evidence-gap |
 | Industrial Antminer | **Antminer S19j Pro** (BeagleBone) | BM1362 | **Mining achieved** — accepted pool shares (runtime path); untested on latest binaries | Lab-gated route: SD/runtime path only, not a general NAND/sysupgrade production install |
 | Industrial Antminer | **Antminer S21** | BM1368 | **Mining achieved** — sustained hashing with accepted pool shares (runtime path); untested on latest binaries | Lab-gated route: runtime evidence exists; stock AMLCtrl in-place install remains blocked |
 | Industrial Antminer | **Antminer S17 / S17 Pro** | BM1397 | Bring-up — drivers in place, validation expanding | Evidence gap: no customer write route in this release |

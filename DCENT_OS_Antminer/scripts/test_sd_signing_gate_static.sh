@@ -21,9 +21,16 @@ missing_img="$tmpdir/missing-manifest.img"
 lab_img="$tmpdir/lab.img"
 lab_manifest="$lab_img.manifest.json"
 
-: > "$complete_img"
-cat > "$complete_manifest" <<'EOF'
+printf 'complete synthetic SD image\n' > "$complete_img"
+complete_size=$(wc -c < "$complete_img" | tr -d '[:space:]')
+complete_sha=$(sha256sum "$complete_img" | awk '{print $1}')
+cat > "$complete_manifest" <<EOF
 {
+  "schema": "dcentos.am2_s19jpro_sd_image_manifest.v2",
+  "target": "am2-s19jpro-sd",
+  "image": "complete.img",
+  "image_size_bytes": $complete_size,
+  "image_sha256": "$complete_sha",
   "boot_artifacts_complete": true,
   "artifacts": {
     "BOOT.bin": true,

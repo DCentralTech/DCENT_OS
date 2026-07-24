@@ -34,51 +34,43 @@
 //!
 //! ## Voltage controller routing
 //!
-//! Subtype detection in `crate::platform::subtype` reads `/etc/subtype`
-//! (canonical `CVCtrl_BHB42XXX` per dev-kit rootfs) and probes 0x20 on
-//! `/dev/i2c-0`. When both signals agree the platform constructs a
-//! `Pic1704Service` from `dcentrald-asic::pic1704::service::platforms::Cv1835S19jPro`
-//! marker. Misclassification falls back to dsPIC33EP (the existing safe
-//! path), so a unit whose `/etc/subtype` is missing or whose 0x20
-//! NACKs cannot accidentally route into the PIC1704 path.
+//! The retained classifier can compare the canonical `CVCtrl_BHB42XXX`
+//! subtype with an I²C 0x20 probe. No admitted daemon path calls it. A future
+//! runtime proposal must treat agreement as evidence for PIC1704 selection and
+//! disagreement as refusal; it must not silently fall back to another mutating
+//! controller path.
 //!
 //! ## Single-I²C-owner architecture
 //!
-//! Per the AM2 SINGLE-I2C-OWNER rule (`feedback_*` memory
-//! rules): one process holds `/dev/i2c-0`. CV1835 follows the same
-//! discipline — a single `I2cService` thread spawned in `new()` owns
-//! the fd, and PIC1704, APW PSU, and LM75A reads all share the
-//! resulting `I2cServiceHandle`. EEPROM addresses 0x50..=0x57 are
-//! write-denied via the same per-bus denylist mechanism Amlogic uses.
+//! Any future CV1835 runtime lane must follow the AM2 SINGLE-I2C-OWNER rule:
+//! one process owns `/dev/i2c-0`, and PIC1704, APW PSU, and LM75A traffic
+//! shares one `I2cServiceHandle`. The retained service helper installs the
+//! same EEPROM write denylist as Amlogic, but the refused constructor does
+//! not spawn it.
 //!
 //! ## Live verification status
 //!
-//! **Code-only, hardware-gated**: no CV1835 unit on the production
-//! fleet (2026-05-09). All numeric register values, GPIO numbers, and
-//! sysfs paths are pulled verbatim from the dev-kit RE deliverable.
-//! `DCENT_CVITEK_ACCEPT_UNVERIFIED=1` is the lab override for any code
-//! path that wants to attempt live mining before the fleet picks up a
-//! CV1835 unit. dcent-toolbox's install routing labels CV1835 as
-//! `runtime-only` until a 24-devmem replay match against a fresh
-//! hardware probe lands.
+//! **Evidence only / NOT IMPLEMENTED**: no CV1835 runtime or artifact lane is
+//! admitted. Numeric register values, GPIO numbers, and sysfs paths are
+//! retained from the dev-kit reverse-engineering corpus, but the production
+//! constructor is a non-mutating refusal and no environment override can
+//! promote this evidence into hardware authority.
 
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
 
 use super::config::{ChainTransport, PlatformConfig, VoltageControllerKind};
-use super::cvitek_pinmux::replay_pinmux;
 use super::subtype::{classify_with_probe, read_subtype};
 use super::{BoardType, ChainAccess, FanAccess, GpioAccess, Platform};
 use crate::i2c::{spawn_i2c_service_no_register_touch_with_denylist, I2cBus, I2cServiceHandle};
-use crate::serial::{select_uart_table_cv1835, DevmemUart};
+use crate::serial::DevmemUart;
 use crate::{HalError, Result};
 
-// Re-export the cold-boot orchestrator so callers can write
-// `cvitek::cold_boot(...)` instead of reaching into the submodule. Per the
-// W12.5 W12A.2 wave constraint, the constructor of `CViTekPlatform` does
-// NOT call this — cold-boot is opt-in (operator / bench-unit tooling), and
-// is gated behind `DCENT_CV1835_ACCEPT_INFERRED_SOC_REGS=1` (W15.A3
+// Retain the reconstructed cold-boot symbols inside this crate for tests and
+// future evidence comparison. The crate-private module and refused constructor
+// expose no production/operator route. The inferred register phase remains
+// gated behind `DCENT_CV1835_ACCEPT_INFERRED_SOC_REGS=1` (W15.A3
 // rename —  Q6 confirmed CV1835 has NO FPGA; the deprecated
 // `DCENT_CV1835_ACCEPT_INFERRED_FPGA` env-var name is still accepted as
 // a silent backwards-compat alias).
@@ -200,17 +192,9 @@ const GPIO_ASIC_RST: [u32; CV1835_CHAIN_COUNT as usize] = [
     GPIO_ASIC_RST3,
 ];
 
-/// Lab override env var. When set to `1` the CV1835 platform constructor
-/// proceeds even though no live unit has signed off the 24-devmem
-/// replay match against fresh hardware. Mirrors
-/// `DCENT_AM3_BB_ACCEPT_DEGRADED_TACH` and `DCENT_AM2_TRUST_DEGRADED_FW`.
-pub const CV1835_ACCEPT_UNVERIFIED_ENV: &str = "DCENT_CVITEK_ACCEPT_UNVERIFIED";
+// ─── Evidence-only helpers (no admitted daemon caller) ───
 
-// ─── Free function used by the daemon BEFORE the platform constructs ───
-
-/// Resolve the voltage-controller kind for a CV1835 unit (back-compat
-/// with W2A.2 — the daemon's voltage-controller selection runs before
-/// the full Platform is constructed).
+/// Reconstruct the candidate voltage-controller kind for CV1835 evidence.
 ///
 /// Reads `/etc/subtype` and runs `classify_with_probe` against
 /// `/dev/i2c-{CVITEK_PIC1704_I2C_BUS}`. Returns `Pic1704` only when
@@ -231,11 +215,9 @@ pub fn cvitek_voltage_controller() -> VoltageControllerKind {
 /// Spawn the kernel-fd-only I²C service for `/dev/i2c-0` with the CV1835
 /// hashboard EEPROM write-deny range pre-registered.
 ///
-/// Parity helper with `amlogic::spawn_amlogic_protected_i2c0_service`.
-/// Production daemon paths should always go through this helper rather
-/// than calling `spawn_i2c_service_no_register_touch_with_denylist`
-/// directly — keeps the EEPROM denylist colocated with the platform
-/// it protects.
+/// Parity helper retained for tests and a future reviewed runtime proposal.
+/// No production daemon path calls it. Any future I²C owner must preserve
+/// this colocated EEPROM denylist rather than opening the bus directly.
 pub fn spawn_cvitek_protected_i2c0_service() -> std::io::Result<I2cServiceHandle> {
     let denylist: Vec<u8> = CV1835_EEPROM_DENYLIST.to_vec();
     let handle =
@@ -259,86 +241,30 @@ pub struct CViTekPlatform {
 }
 
 impl CViTekPlatform {
-    /// Create the CV1835 platform.
+    /// Refuse CV1835 runtime construction until a reviewed runtime lane exists.
     ///
-    /// Order of operations (mirrors `s19j_board_init` PHASE_PINMUX →
-    /// PHASE_GPIO_EXPORT → PHASE_PSU_POWERON ordering, but stops short
-    /// of running PSU init here — that lives in the daemon's cold-boot
-    /// path):
-    /// 1. Verify CV1835 SoC signature OR honor lab override env.
-    /// 2. Replay the canonical 33-entry pinmux table (`replay_pinmux`).
-    /// 3. Flip the global `DevmemUart` MMIO table to CV1835 (the W10.3
-    ///    OnceLock — must run before any chain UART open).
-    /// 4. Subtype + 0x20 probe → voltage controller classification.
+    /// The retained constants and trait implementation are reverse-engineering
+    /// evidence, not mutation authority. In particular, construction must not
+    /// replay pinmux, select an MMIO UART table, probe I²C, or honor an
+    /// environment override.
     pub fn new() -> Result<Self> {
-        // (1) Hardware signature check. CV1835 ships /proc/device-tree/
-        // model containing "Sophgo CV1835" or similar; the dev-kit also
-        // surfaces the SoC string in /sys/firmware/devicetree/base/compatible.
-        // We do NOT hard-fail on a missing signature — the lab override
-        // env var lets pre-fleet bring-up proceed.
-        let signature_ok = Self::has_cv1835_signature();
-        let override_set = std::env::var(CV1835_ACCEPT_UNVERIFIED_ENV)
-            .map(|v| v == "1" || v == "true")
-            .unwrap_or(false);
-        if !signature_ok && !override_set {
-            return Err(HalError::Platform(format!(
-                "CV1835: no Sophgo signature in /proc/device-tree/model and \
-                 {} not set — refusing to construct platform on non-CV1835 \
-                 hardware",
-                CV1835_ACCEPT_UNVERIFIED_ENV,
-            )));
-        }
-        if !signature_ok && override_set {
-            tracing::warn!(
-                env = CV1835_ACCEPT_UNVERIFIED_ENV,
-                "CV1835: lab override engaged — constructing platform on \
-                 hardware that does not match Sophgo signature. Live test \
-                 promotion requires a 24-devmem replay match against fresh \
-                 hardware."
-            );
-        }
-
-        // (2) Replay pinmux. Idempotent — safe even when another agent
-        // already ran S37bitmainer_setup.
-        replay_pinmux()?;
-
-        // (3) Flip DevmemUart's active MMIO table BEFORE any chain UART
-        // open. This is a OnceLock from W10.3 — second-set with the
-        // matching table is a no-op, second-set with the wrong table
-        // returns Err. We propagate that as a HalError so a corrupted
-        // boot environment fails fast instead of silently routing chain
-        // UARTs to the wrong physical address.
-        select_uart_table_cv1835()?;
-
-        // (4) Voltage controller classification. The result is stored in
-        // PlatformConfig.voltage_controller; the daemon constructs the
-        // PIC1704 service from `dcentrald-asic::pic1704::service::platforms::Cv1835S19jPro`
-        // when this is `Pic1704`.
-        let mut config = Self::cv1835_s19j_default_config();
-        let subtype = read_subtype();
-        let kind = classify_with_probe(subtype.as_deref(), CVITEK_PIC1704_I2C_BUS);
-        config.voltage_controller = kind;
-        tracing::info!(
-            platform = %config.name,
-            chains = config.chains.len(),
-            subtype = %subtype.as_deref().unwrap_or("<missing>"),
-            voltage_controller = kind.as_str(),
-            "CV1835 platform initialized"
-        );
-
-        Ok(Self { config })
+        Err(HalError::Platform(
+            "CV1835 runtime NOT IMPLEMENTED: reverse-engineered register evidence is retained, but no runtime mutation lane is admitted"
+                .to_string(),
+        ))
     }
 
     /// Build with explicit config (test-only). Skips signature, pinmux,
     /// and UART-table selection — call sites that use this are inside
     /// host-test cfg blocks.
-    pub fn with_config(config: PlatformConfig) -> Self {
+    #[cfg(test)]
+    fn with_config(config: PlatformConfig) -> Self {
         Self { config }
     }
 
     /// Construct the canonical CV1835 S19j Pro platform config. 4 BHB42xxx
     /// chains, /dev/ttyS1-4, dsPIC33EP fallback voltage controller (gets
-    /// upgraded to Pic1704 by the runtime probe in `new()`).
+    /// retained as Pic1704 classification evidence for a future runtime lane).
     fn cv1835_s19j_default_config() -> PlatformConfig {
         use super::config::{
             Architecture, ChainConfig, FanConfig, FanMethod, PicType, VoltageControl,
@@ -370,9 +296,9 @@ impl CViTekPlatform {
                 fan_count: CV1835_FAN_COUNT,
             },
             has_pic: true,
-            // BHB42xxx default to dsPIC family at the static layer; the
-            // runtime probe in `new()` upgrades to PIC1704 when subtype
-            // + 0x20 ACK both pass.
+            // BHB42xxx defaults to dsPIC at the static evidence layer. A future
+            // admitted runtime lane may promote it only after subtype + 0x20
+            // ACK classification passes.
             pic_type: PicType::DsPic33EP16GS202,
             voltage_control: VoltageControl::DsPic,
             has_xadc: false,
@@ -551,11 +477,8 @@ impl Platform for CViTekPlatform {
     }
 
     fn voltage_controller(&self) -> VoltageControllerKind {
-        // Cached from new()/with_config(). The daemon reads this and
-        // chooses between PIC1704 (subtype + 0x20 ACK pass) and the
-        // existing dsPIC path. PIC1704Service construction itself
-        // happens in the daemon — sealed-trait-gated by the Cv1835S19jPro
-        // marker exposed via `Self::open_pic1704`.
+        // Test fixtures cache the evidence-only classification here. The
+        // refused production constructor cannot publish it to the daemon.
         self.config.voltage_controller
     }
 }
@@ -1100,12 +1023,12 @@ mod tests {
     }
 
     #[test]
-    fn cv1835_psu_gate_env_var_name_is_canonical() {
-        // Memory-rule alignment: env var name is referenced by docs.
-        assert_eq!(
-            CV1835_ACCEPT_UNVERIFIED_ENV,
-            "DCENT_CVITEK_ACCEPT_UNVERIFIED"
-        );
+    fn cv1835_runtime_constructor_is_a_non_mutating_refusal() {
+        let error = match CViTekPlatform::new() {
+            Err(error) => error,
+            Ok(_) => panic!("CV1835 runtime must remain unadmitted"),
+        };
+        assert!(error.to_string().contains("runtime NOT IMPLEMENTED"));
     }
 
     #[test]

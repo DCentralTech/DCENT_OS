@@ -27,11 +27,28 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
 . "$SCRIPT_DIR/lib/am3_geometry.sh"
+ZYNQ_GEOMETRY_HELPER="$SCRIPT_DIR/lib/sysupgrade_zynq_geometry.sh"
+[ -r "$ZYNQ_GEOMETRY_HELPER" ] || {
+    echo "FAIL: canonical Zynq geometry helper is missing: $ZYNQ_GEOMETRY_HELPER" >&2
+    exit 1
+}
+# shellcheck source=/dev/null
+. "$ZYNQ_GEOMETRY_HELPER"
 
 fail() {
     echo "FAIL: $1" >&2
     exit 1
 }
+
+ARCHIVE_ADMISSION_HELPER="$SCRIPT_DIR/lib/sysupgrade_archive_admission.sh"
+MANIFEST_JSON_HELPER="$SCRIPT_DIR/lib/sysupgrade_manifest_json.py"
+[ -r "$ARCHIVE_ADMISSION_HELPER" ] || fail "canonical sysupgrade archive-admission helper is missing: $ARCHIVE_ADMISSION_HELPER"
+[ -r "$MANIFEST_JSON_HELPER" ] || fail "canonical semantic manifest helper is missing: $MANIFEST_JSON_HELPER"
+command -v python3 >/dev/null 2>&1 || fail "python3 is required for semantic manifest admission"
+# shellcheck source=lib/sysupgrade_archive_admission.sh
+. "$ARCHIVE_ADMISSION_HELPER"
+command -v dcent_sysupgrade_archive_admit >/dev/null 2>&1 \
+    || fail "canonical sysupgrade archive-admission helper did not provide its required API"
 
 pass() {
     echo "PASS: $1"
@@ -55,6 +72,35 @@ manifest_string_field() {
     key=$1
     file=$2
     sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$file" | head -n 1
+}
+
+manifest_key_count() {
+    file=$1
+    key=$2
+    awk -v needle="\"$key\"" '
+        {
+            line = $0
+            while ((position = index(line, needle)) > 0) {
+                count++
+                line = substr(line, position + length(needle))
+            }
+        }
+        END { print count + 0 }
+    ' "$file"
+}
+
+manifest_boolean_field() {
+    key=$1
+    file=$2
+    [ "$(manifest_key_count "$file" "$key")" = "1" ] || return 1
+    sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*\(true\|false\)[[:space:]]*[,}].*/\1/p' "$file" | head -n 1
+}
+
+manifest_integer_field() {
+    key=$1
+    file=$2
+    [ "$(manifest_key_count "$file" "$key")" = "1" ] || return 1
+    sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*[,}].*/\1/p' "$file" | head -n 1
 }
 
 manifest_payload_block() {
@@ -84,12 +130,6 @@ manifest_payload_number_matches() {
 payload_magic() {
     od -An -N4 -tx1 "$1" 2>/dev/null | tr -d ' \n'
 }
-
-ZYNQ_UBI_LEB_SIZE_BYTES=$((124 * 1024))
-AM1_S9_KERNEL_MAX_BYTES=$((32 * ZYNQ_UBI_LEB_SIZE_BYTES))
-AM1_S9_ROOTFS_MAX_BYTES=$((134 * ZYNQ_UBI_LEB_SIZE_BYTES))
-AM2_ZYNQ_KERNEL_MAX_BYTES=$(((23 + 4) * ZYNQ_UBI_LEB_SIZE_BYTES))
-AM2_ZYNQ_ROOTFS_MAX_BYTES=$((179 * ZYNQ_UBI_LEB_SIZE_BYTES))
 
 assert_payload_fits_window() {
     label=$1
@@ -122,7 +162,7 @@ validate_board_payload_profile() {
                 || fail "AM3 root payload exceeds am3 rootfs window (${root_size}B > ${DCENT_AM3_ROOTFS_WINDOW_DEC}B)"
             pass "AM3 root payload fits am3 rootfs window (${root_size}B <= ${DCENT_AM3_ROOTFS_WINDOW_DEC}B)"
             ;;
-        am1-s9|am2-s19j|am2-s19jpro|am2-s17p)
+        am1-s9|am2-s19j|am2-s19jpro|am2-s19pro|am2-s17p)
             ROOT_MAGIC=$(payload_magic "$root_path")
             case "$ROOT_MAGIC" in
                 68737173|73717368)
@@ -153,16 +193,9 @@ validate_board_payload_profile() {
                     fail "$board kernel payload is NOT a bootm-ready FIT/uImage (magic=$KERNEL_MAGIC) -- a bare zImage will brick the unit"
                     ;;
             esac
-            case "$board" in
-                am1-s9)
-                    ZYNQ_KERNEL_MAX_BYTES=$AM1_S9_KERNEL_MAX_BYTES
-                    ZYNQ_ROOTFS_MAX_BYTES=$AM1_S9_ROOTFS_MAX_BYTES
-                    ;;
-                *)
-                    ZYNQ_KERNEL_MAX_BYTES=$AM2_ZYNQ_KERNEL_MAX_BYTES
-                    ZYNQ_ROOTFS_MAX_BYTES=$AM2_ZYNQ_ROOTFS_MAX_BYTES
-                    ;;
-            esac
+            if ! dcent_zynq_geometry_select "$board"; then
+                fail "no canonical Zynq payload geometry for board '$board'"
+            fi
             assert_payload_fits_window "$board kernel" "$kernel_size" "$ZYNQ_KERNEL_MAX_BYTES" "zynq kernel window"
             assert_payload_fits_window "$board root" "$root_size" "$ZYNQ_ROOTFS_MAX_BYTES" "zynq rootfs window"
             ;;
@@ -226,6 +259,8 @@ validate_package_only() {
         fail "tarball contains entries outside $EXPECTED_PREFIX/"
     fi
 
+    dcent_sysupgrade_archive_admit "$PACKAGE_TARBALL" "$EXPECTED_BOARD" "$TMPDIR_P" \
+        || fail "package failed canonical pre-extraction archive admission"
     tar -xf "$PACKAGE_TARBALL" -C "$TMPDIR_P" || fail "could not extract package"
     SUP_DIR="$TMPDIR_P/$EXPECTED_PREFIX"
     [ -d "$SUP_DIR" ] || fail "expected package directory missing: $EXPECTED_PREFIX"
@@ -238,9 +273,83 @@ validate_package_only() {
     (cd "$SUP_DIR" && sha256sum -c SHA256SUMS >/dev/null) || fail "SHA256SUMS verification failed"
     pass "SHA256SUMS verifies kernel/root/METADATA"
 
-    grep -F "\"board\": \"$EXPECTED_BOARD\"" "$SUP_DIR/MANIFEST.json" >/dev/null 2>&1 \
+    MANIFEST="$SUP_DIR/MANIFEST.json"
+    python3 "$MANIFEST_JSON_HELPER" validate "$MANIFEST" \
+        || fail "MANIFEST.json failed semantic/canonical JSON admission"
+    for authority_key in schema manifest_profile product package_type installable artifact_maturity board board_target version; do
+        [ "$(manifest_key_count "$MANIFEST" "$authority_key")" = "1" ] \
+            || fail "MANIFEST.json must contain exactly one '$authority_key' authority field"
+    done
+    for payload_key in kernel rootfs metadata; do
+        [ "$(manifest_key_count "$MANIFEST" "$payload_key")" = "1" ] \
+            || fail "MANIFEST.json must contain exactly one '$payload_key' payload"
+    done
+    MANIFEST_STATUS_COUNT=$(manifest_key_count "$MANIFEST" status)
+    [ "$MANIFEST_STATUS_COUNT" = "1" ] \
+        || fail "MANIFEST.json must contain exactly one 'status' authority field"
+    MANIFEST_PROFILE=$(manifest_string_field manifest_profile "$MANIFEST" || echo)
+    MANIFEST_STATUS=$(manifest_string_field status "$MANIFEST" || echo)
+    [ -n "$MANIFEST_STATUS" ] \
+        || fail "MANIFEST.json status must be a non-empty string"
+    MANIFEST_STATUS_TRIMMED=$(printf '%s' "$MANIFEST_STATUS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [ "$MANIFEST_STATUS" = "$MANIFEST_STATUS_TRIMMED" ] \
+        || fail "MANIFEST.json status must not contain surrounding whitespace"
+    for unsupported_chain_key in ota_intermediate_cert ota_revoked_intermediates; do
+        [ "$(manifest_key_count "$MANIFEST" "$unsupported_chain_key")" = "0" ] \
+            || fail "MANIFEST.json profile '$MANIFEST_PROFILE' forbids '$unsupported_chain_key'; certificate validity has no trusted-time authority on Zynq"
+    done
+    case "$MANIFEST_PROFILE" in
+        dcentos.sysupgrade-authority/v1)
+            [ "$MANIFEST_STATUS" != "lab_unsigned" ] \
+                || fail "MANIFEST.json authority-v1 forbids status=lab_unsigned"
+            [ "$(manifest_key_count "$MANIFEST" verification_key)" = "1" ] \
+                || fail "MANIFEST.json authority-v1 must contain exactly one verification_key payload"
+            [ -f "$SUP_DIR/MANIFEST.sig" ] \
+                || fail "MANIFEST.json authority-v1 requires MANIFEST.sig"
+            [ -f "$SUP_DIR/release_ed25519.pub" ] \
+                || fail "MANIFEST.json authority-v1 requires release_ed25519.pub"
+            ;;
+        dcentos.sysupgrade-unsigned-lab/v1)
+            is_truthy "${DCENT_ALLOW_UNSIGNED_SYSUPGRADE:-0}" \
+                || fail "MANIFEST.json unsigned-lab/v1 requires DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1"
+            [ "$MANIFEST_STATUS" = "lab_unsigned" ] \
+                || fail "MANIFEST.json unsigned-lab/v1 requires exactly one status=lab_unsigned field"
+            [ "$(manifest_key_count "$MANIFEST" verification_key)" = "0" ] \
+                || fail "MANIFEST.json unsigned-lab/v1 forbids a verification_key payload"
+            [ ! -e "$SUP_DIR/MANIFEST.sig" ] \
+                || fail "MANIFEST.json unsigned-lab/v1 forbids MANIFEST.sig"
+            [ ! -e "$SUP_DIR/release_ed25519.pub" ] \
+                || fail "MANIFEST.json unsigned-lab/v1 forbids release_ed25519.pub"
+            ;;
+        *)
+            fail "MANIFEST.json profile '$MANIFEST_PROFILE' is unsupported"
+            ;;
+    esac
+    [ "$(manifest_integer_field schema "$MANIFEST" || echo)" = "1" ] \
+        || fail "MANIFEST.json schema must be integer 1"
+    case "$MANIFEST_PROFILE" in
+        dcentos.sysupgrade-authority/v1|dcentos.sysupgrade-unsigned-lab/v1) ;;
+        *) fail "MANIFEST.json lacks a supported sysupgrade mutation profile" ;;
+    esac
+    [ "$(manifest_string_field product "$MANIFEST" || echo)" = "DCENT_OS" ] \
+        || fail "MANIFEST.json product must be DCENT_OS"
+    [ "$(manifest_string_field package_type "$MANIFEST" || echo)" = "sysupgrade" ] \
+        || fail "MANIFEST.json package_type must be sysupgrade"
+    [ "$(manifest_boolean_field installable "$MANIFEST" || echo)" = "true" ] \
+        || fail "MANIFEST.json must declare JSON boolean installable=true"
+    [ "$(manifest_string_field artifact_maturity "$MANIFEST" || echo)" = "experimental" ] \
+        || fail "MANIFEST.json artifact_maturity must be experimental"
+    MANIFEST_VERSION=$(manifest_string_field version "$MANIFEST" || echo)
+    [ -n "$MANIFEST_VERSION" ] \
+        || fail "MANIFEST.json version must be a non-empty string"
+    MANIFEST_VERSION_TRIMMED=$(printf '%s' "$MANIFEST_VERSION" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [ "$MANIFEST_VERSION" = "$MANIFEST_VERSION_TRIMMED" ] \
+        || fail "MANIFEST.json version must not contain surrounding whitespace"
+    pass "MANIFEST.json carries the versioned typed sysupgrade authority contract"
+
+    [ "$(manifest_string_field board "$MANIFEST" || echo)" = "$EXPECTED_BOARD" ] \
         || fail "MANIFEST.json board does not match $EXPECTED_BOARD"
-    grep -F "\"board_target\": \"$EXPECTED_BOARD\"" "$SUP_DIR/MANIFEST.json" >/dev/null 2>&1 \
+    [ "$(manifest_string_field board_target "$MANIFEST" || echo)" = "$EXPECTED_BOARD" ] \
         || fail "MANIFEST.json board_target does not match $EXPECTED_BOARD"
     pass "MANIFEST.json board/board_target match $EXPECTED_BOARD"
 
@@ -274,30 +383,18 @@ validate_package_only() {
         || fail "MANIFEST.json metadata sha256 does not match $METADATA_SHA"
     pass "MANIFEST.json payload paths/sizes/hashes match actual files"
 
-    MANIFEST_STATUS=$(manifest_string_field status "$SUP_DIR/MANIFEST.json" || echo)
-    if is_truthy "${DCENT_ALLOW_UNSIGNED_SYSUPGRADE:-0}"; then
-        if [ -f "$SUP_DIR/MANIFEST.sig" ] && [ -f "$SUP_DIR/release_ed25519.pub" ] && [ -n "${DCENT_RELEASE_PUBKEY_FILE:-}" ]; then
+    case "$MANIFEST_PROFILE" in
+        dcentos.sysupgrade-authority/v1)
+            [ -n "${DCENT_RELEASE_PUBKEY_FILE:-}" ] \
+                || fail "DCENT_RELEASE_PUBKEY_FILE is required for authority-v1 package validation"
             sh "$SCRIPT_DIR/verify_sysupgrade_signature.sh" "$PACKAGE_TARBALL" "$DCENT_RELEASE_PUBKEY_FILE" "$EXPECTED_BOARD" >/dev/null \
                 || fail "release signature verification failed"
             pass "release signature verified against trusted key"
-        else
-            if is_release_status "$MANIFEST_STATUS"; then
-                fail "manifest status '$MANIFEST_STATUS' is release; unsigned/generated-key lab override requires a non-release package status"
-            fi
-            if [ -f "$SUP_DIR/MANIFEST.sig" ] && [ -f "$SUP_DIR/release_ed25519.pub" ]; then
-                pass "package-embedded generated-key signature accepted only because DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1"
-            else
-                pass "unsigned package accepted only because DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1"
-            fi
-        fi
-    else
-        [ -f "$SUP_DIR/MANIFEST.sig" ] || fail "MANIFEST.sig missing; set DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 only for lab packages"
-        [ -f "$SUP_DIR/release_ed25519.pub" ] || fail "release_ed25519.pub missing; set DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 only for lab packages"
-        [ -n "${DCENT_RELEASE_PUBKEY_FILE:-}" ] || fail "DCENT_RELEASE_PUBKEY_FILE is required for release package validation"
-        sh "$SCRIPT_DIR/verify_sysupgrade_signature.sh" "$PACKAGE_TARBALL" "$DCENT_RELEASE_PUBKEY_FILE" "$EXPECTED_BOARD" >/dev/null \
-            || fail "release signature verification failed"
-        pass "release signature verified against trusted key"
-    fi
+            ;;
+        dcentos.sysupgrade-unsigned-lab/v1)
+            pass "unsigned-lab/v1 package accepted only because DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1"
+            ;;
+    esac
 
     echo ""
     echo "PACKAGE-ONLY VALIDATION PASSED"
@@ -342,38 +439,121 @@ validate_am1_backup_floor() {
     # Look for a fresh result manifest for this exact target IP.
     backup_root="$SCRIPT_DIR/../output/am1-backups"
     safe_ip=$(printf '%s' "$miner" | tr -c 'A-Za-z0-9_.=-' '-')
-    candidate_glob="$backup_root/${safe_ip}-*/am1_nand_backup_${safe_ip}_*.manifest.json"
-    latest_manifest=$(ls -t $candidate_glob 2>/dev/null | head -n 1)
+    latest_manifest=""
+    latest_manifest_mtime=-1
+    for candidate in \
+        "$backup_root"/"${safe_ip}-"*/"am1_nand_backup_${safe_ip}_"*.manifest.json \
+        "$backup_root"/"${safe_ip}-"*/am1_nand_backup.manifest.json
+    do
+        [ -f "$candidate" ] || continue
+        candidate_mtime=$(stat -c %Y "$candidate" 2>/dev/null || \
+            stat -f %m "$candidate" 2>/dev/null || echo 0)
+        case "$candidate_mtime" in
+            ""|*[!0-9]*) continue ;;
+        esac
+        if [ "$candidate_mtime" -gt "$latest_manifest_mtime" ]; then
+            latest_manifest="$candidate"
+            latest_manifest_mtime="$candidate_mtime"
+        fi
+    done
 
     if [ -z "$latest_manifest" ] || [ ! -f "$latest_manifest" ]; then
+        suggested_backup_dir="$backup_root/${safe_ip}-$(date -u +%Y%m%dT%H%M%SZ)"
         fail "am1-backup-floor: no result manifest found for $miner under $backup_root.
-        Run:  scripts/am1_nand_backup_execute.sh --target $miner --plan <plan.json>
+        Run:  DCENT_NAND_BACKUP_AUTHORIZED=1 scripts/am1_nand_backup_execute.sh \\
+              --target $miner --plan <plan.json> --local-backup-dir \"$suggested_backup_dir\" \\
+              --known-hosts \"$KNOWN_HOSTS\" --expected-host-key-sha256 \"$EXPECTED_HOST_KEY_SHA256\" \\
+              --operator-authorized-backup --readback-verify
         Or pass --skip-am1-backup for lab-only override (NOT for production)."
     fi
 
-    # Validate the manifest before trusting it.
-    if ! sh "$SCRIPT_DIR/am1_nand_backup_manifest.sh" --validate \
-            --manifest "$latest_manifest" >/dev/null 2>&1; then
+    observed_mac=$(ssh_target \
+        'tr "A-F" "a-f" </sys/class/net/eth0/address 2>/dev/null | tr -d "\r\n"' \
+        2>/dev/null || echo)
+    observed_hwid=$(ssh_target \
+        'cat /config/CONF_HARDWARE_ID 2>/dev/null | tr -d "\r\n"' \
+        2>/dev/null || echo)
+    observed_model=$(ssh_target \
+        '(cat /proc/device-tree/model 2>/dev/null || cat /sys/firmware/devicetree/base/model 2>/dev/null) | tr "\000" "\n" | sed "s/ /_/g" | sed -n "1p"' \
+        2>/dev/null || echo)
+    observed_compatible=$(ssh_target \
+        '(cat /proc/device-tree/compatible 2>/dev/null || cat /sys/firmware/devicetree/base/compatible 2>/dev/null) | tr "\000" "\n" | sed "s/,/_/g" | sed -n "1p"' \
+        2>/dev/null || echo)
+    observed_board_target=$(ssh_target \
+        'cat /etc/dcentos/board_target 2>/dev/null | tr -d "[:space:]"' \
+        2>/dev/null || echo)
+    if ! printf '%s\n' "$observed_mac" | \
+            grep -Eq '^[0-9a-f]{2}(:[0-9a-f]{2}){5}$'; then
+        fail "am1-backup-floor: could not establish the target's physical MAC"
+    fi
+    case "$observed_hwid" in
+        ""|*[!A-Za-z0-9_.:-]*)
+            fail "am1-backup-floor: could not establish a safe target HWID"
+            ;;
+    esac
+    for observed_identity in "$observed_model" "$observed_compatible" "$observed_board_target"; do
+        case "$observed_identity" in
+            ""|*[!A-Za-z0-9_.:-]*)
+                fail "am1-backup-floor: could not establish exact model/compatible/board identity"
+                ;;
+        esac
+    done
+
+    # Validate local evidence, then compare its canonical geometry with a
+    # fresh query over the already pinned SSH transport.
+    validation_output=$(bash "$SCRIPT_DIR/am1_nand_backup_manifest.sh" --validate \
+            --manifest "$latest_manifest" \
+            --expected-target "$miner" \
+            --expected-mac "$observed_mac" \
+            --expected-hwid "$observed_hwid" \
+            --expected-model "$observed_model" \
+            --expected-compatible "$observed_compatible" \
+            --expected-board-target "$observed_board_target" \
+            --expected-host-key-sha256 "$EXPECTED_HOST_KEY_SHA256" \
+            --max-age-seconds 86400 2>&1) || {
         fail "am1-backup-floor: manifest $latest_manifest failed validation. Re-run the am1 backup ritual."
-    fi
+    }
+    manifest_geometry=$(printf '%s\n' "$validation_output" | sed -n 's/^partition_geometry=//p' | tail -n 1)
+    live_geometry=$(ssh_target 'cat /proc/mtd 2>/dev/null' 2>/dev/null | awk '
+        /^mtd[0-9]+:/ {
+            node=$1; sub(/:$/, "", node); name=$4; gsub(/"/, "", name)
+            printf "%s%s:%s:%s:%s", (seen ? " " : ""), tolower(node), tolower($2), tolower($3), name
+            seen=1
+        }
+    ')
+    [ -n "$manifest_geometry" ] && [ "$live_geometry" = "$manifest_geometry" ] || {
+        fail "am1-backup-floor: live MTD geometry does not match validated backup evidence"
+    }
 
-    # Reject manifests older than 24 hours - a stale backup is not proof
-    # against the post-W14 inactive-slot churn that prompted this gate.
-    manifest_mtime=$(stat -c %Y "$latest_manifest" 2>/dev/null || stat -f %m "$latest_manifest" 2>/dev/null || echo 0)
-    now_epoch=$(date +%s)
-    age_hr=$(( (now_epoch - manifest_mtime) / 3600 ))
-    if [ "$age_hr" -ge 24 ]; then
-        fail "am1-backup-floor: manifest $latest_manifest is ${age_hr}h old (>= 24h). Re-run am1 backup ritual."
-    fi
-
-    echo "PASS am1-backup-floor: validated manifest $latest_manifest (${age_hr}h old)"
+    echo "PASS am1-backup-floor: validated fresh manifest $latest_manifest"
 }
 
 MINER="${1:?usage: pre_flash_validate.sh <miner-ip> <tarball>}"
 TARBALL="${2:?missing tarball argument}"
 
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -o LogLevel=ERROR"
-SSH="ssh $SSH_OPTS root@$MINER"
+KNOWN_HOSTS=${DCENT_SSH_KNOWN_HOSTS:-}
+EXPECTED_HOST_KEY_SHA256=${DCENT_EXPECTED_HOST_KEY_SHA256:-}
+[ -n "$KNOWN_HOSTS" ] && [ -f "$KNOWN_HOSTS" ] && [ ! -L "$KNOWN_HOSTS" ] || \
+    fail "DCENT_SSH_KNOWN_HOSTS must name a regular pinned known_hosts file"
+printf '%s\n' "$EXPECTED_HOST_KEY_SHA256" | grep -Eq '^SHA256:[A-Za-z0-9+/]{43}$' || \
+    fail "DCENT_EXPECTED_HOST_KEY_SHA256 must be an OpenSSH SHA256 fingerprint"
+command -v ssh-keygen >/dev/null 2>&1 || fail "ssh-keygen is required for host-key admission"
+PINNED_FINGERPRINTS=$(
+    ssh-keygen -F "$MINER" -f "$KNOWN_HOSTS" 2>/dev/null |
+        awk '!/^#/ && NF >= 3 {print}' |
+        while IFS= read -r key; do
+            printf '%s\n' "$key" | ssh-keygen -lf - -E sha256 2>/dev/null | awk '{print $2}'
+        done
+)
+[ "$(printf '%s\n' "$PINNED_FINGERPRINTS" | sed '/^$/d' | wc -l | awk '{print $1}')" = 1 ] && \
+    [ "$PINNED_FINGERPRINTS" = "$EXPECTED_HOST_KEY_SHA256" ] || \
+    fail "known_hosts must contain exactly the expected key for $MINER"
+ssh_target() {
+    ssh -o StrictHostKeyChecking=yes \
+        -o "UserKnownHostsFile=$KNOWN_HOSTS" \
+        -o GlobalKnownHostsFile=/dev/null \
+        -o ConnectTimeout=8 -o LogLevel=ERROR "root@$MINER" "$@"
+}
 
 echo "=== pre-flash validation: $MINER <- $TARBALL ==="
 echo ""
@@ -387,7 +567,7 @@ echo ""
 # -----------------------------------------------------------------------------
 # Gate 1: SSH reachable.
 # -----------------------------------------------------------------------------
-if $SSH 'echo ok' >/dev/null 2>&1; then
+if ssh_target 'echo ok' >/dev/null 2>&1; then
     echo "PASS 1/8: SSH reachable to root@$MINER"
 else
     fail "1/8 SSH unreachable to root@$MINER - check network, credentials, and that miner is powered on"
@@ -402,7 +582,7 @@ fi
 # am1 NAND layout has different mtd numbers and no UBI A/B that we can
 # probe with this script's am2-specific LEB template).
 # -----------------------------------------------------------------------------
-PLATFORM=$($SSH 'cat /etc/bos_platform 2>/dev/null' 2>/dev/null || echo 'missing')
+PLATFORM=$(ssh_target 'cat /etc/bos_platform 2>/dev/null' 2>/dev/null || echo 'missing')
 case "$PLATFORM" in
     zynq-bm3-am2)
         echo "PASS 2/8: /etc/bos_platform = zynq-bm3-am2"
@@ -440,7 +620,7 @@ esac
 # BraiinsOS/DCENT_OS stores the active slot in the U-Boot env var `firmware`
 # (value "1" or "2"). mtd7 = slot 1, mtd8 = slot 2.
 # -----------------------------------------------------------------------------
-ACTIVE=$($SSH 'fw_printenv firmware 2>/dev/null | cut -d= -f2' 2>/dev/null || echo '')
+ACTIVE=$(ssh_target 'fw_printenv firmware 2>/dev/null | cut -d= -f2' 2>/dev/null || echo '')
 case "$ACTIVE" in
     1) ACTIVE_MTD=7; INACTIVE=2; INACTIVE_MTD=8 ;;
     2) ACTIVE_MTD=8; INACTIVE=1; INACTIVE_MTD=7 ;;
@@ -458,15 +638,15 @@ echo "PASS 3/8: active slot=$ACTIVE (mtd$ACTIVE_MTD), inactive=$INACTIVE (mtd$IN
 # first. UBI device numbers are arbitrary but we use 3 to avoid collisions
 # with the active runtime (usually ubi0/ubi1).
 UBI_PROBE_NUM=3
-$SSH "ubidetach -d $UBI_PROBE_NUM 2>/dev/null || true" >/dev/null 2>&1
-ATTACH_OUT=$($SSH "ubiattach -m $INACTIVE_MTD -d $UBI_PROBE_NUM 2>&1" 2>/dev/null || echo 'attach failed')
+ssh_target "ubidetach -d $UBI_PROBE_NUM 2>/dev/null || true" >/dev/null 2>&1
+ATTACH_OUT=$(ssh_target "ubiattach -m $INACTIVE_MTD -d $UBI_PROBE_NUM 2>&1" 2>/dev/null || echo 'attach failed')
 if echo "$ATTACH_OUT" | grep -q 'UBI device number'; then
     echo "PASS 4/8: inactive UBI (mtd$INACTIVE_MTD) attached as ubi$UBI_PROBE_NUM"
     # Read volume layout while attached (gate 5 needs this).
-    VOL_LIST=$($SSH "ls /sys/class/ubi/ubi${UBI_PROBE_NUM}_* 2>/dev/null | wc -l" 2>/dev/null || echo 0)
+    VOL_LIST=$(ssh_target "ls /sys/class/ubi/ubi${UBI_PROBE_NUM}_* 2>/dev/null | wc -l" 2>/dev/null || echo 0)
     # Capture LEB counts and usable LEB size for each volume for gate 5.
-    LEB_REPORT=$($SSH "for v in /sys/class/ubi/ubi${UBI_PROBE_NUM}_*; do [ -d \"\$v\" ] && printf '%s:%s:%s ' \"\$(cat \$v/name 2>/dev/null)\" \"\$(cat \$v/reserved_ebs 2>/dev/null)\" \"\$(cat \$v/usable_eb_size 2>/dev/null)\"; done" 2>/dev/null || echo '')
-    $SSH "ubidetach -d $UBI_PROBE_NUM 2>/dev/null || true" >/dev/null 2>&1
+    LEB_REPORT=$(ssh_target "for v in /sys/class/ubi/ubi${UBI_PROBE_NUM}_*; do [ -d \"\$v\" ] && printf '%s:%s:%s ' \"\$(cat \$v/name 2>/dev/null)\" \"\$(cat \$v/reserved_ebs 2>/dev/null)\" \"\$(cat \$v/usable_eb_size 2>/dev/null)\"; done" 2>/dev/null || echo '')
+    ssh_target "ubidetach -d $UBI_PROBE_NUM 2>/dev/null || true" >/dev/null 2>&1
 else
     fail "4/8 ubiattach -m $INACTIVE_MTD failed: $ATTACH_OUT"
 fi
@@ -595,9 +775,88 @@ gate_8a_package_signed() {
         rm -rf "$SIG_TMPDIR"
         fail "8a/8 sysupgrade prefix dir missing after extract: $g8a_prefix"
     fi
-    if is_truthy "${DCENT_ALLOW_UNSIGNED_SYSUPGRADE:-0}"; then
-        if [ -f "$SIG_DIR/MANIFEST.sig" ] && [ -f "$SIG_DIR/release_ed25519.pub" ] && \
-           [ -n "${DCENT_RELEASE_PUBKEY_FILE:-}" ]; then
+    G8A_MANIFEST="$SIG_DIR/MANIFEST.json"
+    [ -f "$G8A_MANIFEST" ] || {
+        rm -rf "$SIG_TMPDIR"
+        fail "8a/8 MANIFEST.json is missing"
+    }
+    python3 "$MANIFEST_JSON_HELPER" validate "$G8A_MANIFEST" || {
+        rm -rf "$SIG_TMPDIR"
+        fail "8a/8 manifest failed semantic/canonical JSON admission"
+    }
+    for authority_key in schema manifest_profile product package_type installable artifact_maturity board board_target version; do
+        [ "$(manifest_key_count "$G8A_MANIFEST" "$authority_key")" = "1" ] || {
+            rm -rf "$SIG_TMPDIR"
+            fail "8a/8 manifest must contain exactly one '$authority_key' authority field"
+        }
+    done
+    for payload_key in kernel rootfs metadata; do
+        [ "$(manifest_key_count "$G8A_MANIFEST" "$payload_key")" = "1" ] || {
+            rm -rf "$SIG_TMPDIR"
+            fail "8a/8 manifest must contain exactly one '$payload_key' payload"
+        }
+    done
+    G8A_PROFILE=$(manifest_string_field manifest_profile "$G8A_MANIFEST" 2>/dev/null || echo)
+    G8A_STATUS_COUNT=$(manifest_key_count "$G8A_MANIFEST" status)
+    [ "$G8A_STATUS_COUNT" = "1" ] || {
+        rm -rf "$SIG_TMPDIR"
+        fail "8a/8 manifest must contain exactly one 'status' authority field"
+    }
+    G8A_STATUS=$(manifest_string_field status "$G8A_MANIFEST" 2>/dev/null || echo)
+    [ -n "$G8A_STATUS" ] || {
+        rm -rf "$SIG_TMPDIR"
+        fail "8a/8 manifest status must be a non-empty string"
+    }
+    G8A_STATUS_TRIMMED=$(printf '%s' "$G8A_STATUS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [ "$G8A_STATUS" = "$G8A_STATUS_TRIMMED" ] || {
+        rm -rf "$SIG_TMPDIR"
+        fail "8a/8 manifest status must not contain surrounding whitespace"
+    }
+    for forbidden_cert_field in ota_intermediate_cert ota_revoked_intermediates; do
+        [ "$(manifest_key_count "$G8A_MANIFEST" "$forbidden_cert_field")" = "0" ] || {
+            rm -rf "$SIG_TMPDIR"
+            fail "8a/8 profile '$G8A_PROFILE' forbids '$forbidden_cert_field'"
+        }
+    done
+    [ "$(manifest_integer_field schema "$G8A_MANIFEST" 2>/dev/null || echo)" = "1" ] &&
+    [ "$(manifest_string_field product "$G8A_MANIFEST" 2>/dev/null || echo)" = "DCENT_OS" ] &&
+    [ "$(manifest_string_field package_type "$G8A_MANIFEST" 2>/dev/null || echo)" = "sysupgrade" ] &&
+    [ "$(manifest_boolean_field installable "$G8A_MANIFEST" 2>/dev/null || echo)" = "true" ] &&
+    [ "$(manifest_string_field artifact_maturity "$G8A_MANIFEST" 2>/dev/null || echo)" = "experimental" ] &&
+    [ "$(manifest_string_field board "$G8A_MANIFEST" 2>/dev/null || echo)" = "$g8a_board" ] &&
+    [ "$(manifest_string_field board_target "$G8A_MANIFEST" 2>/dev/null || echo)" = "$g8a_board" ] || {
+        rm -rf "$SIG_TMPDIR"
+        fail "8a/8 manifest typed target contract is invalid for $g8a_board"
+    }
+    G8A_VERSION=$(manifest_string_field version "$G8A_MANIFEST" 2>/dev/null || echo)
+    [ -n "$G8A_VERSION" ] || {
+        rm -rf "$SIG_TMPDIR"
+        fail "8a/8 manifest version must be a non-empty string"
+    }
+    G8A_VERSION_TRIMMED=$(printf '%s' "$G8A_VERSION" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [ "$G8A_VERSION" = "$G8A_VERSION_TRIMMED" ] || {
+        rm -rf "$SIG_TMPDIR"
+        fail "8a/8 manifest version must not contain surrounding whitespace"
+    }
+
+    case "$G8A_PROFILE" in
+        dcentos.sysupgrade-authority/v1)
+            [ "$G8A_STATUS" != "lab_unsigned" ] || {
+                rm -rf "$SIG_TMPDIR"
+                fail "8a/8 authority-v1 forbids status=lab_unsigned"
+            }
+            [ "$(manifest_key_count "$G8A_MANIFEST" verification_key)" = "1" ] || {
+                rm -rf "$SIG_TMPDIR"
+                fail "8a/8 authority-v1 requires exactly one verification_key payload"
+            }
+            [ -f "$SIG_DIR/MANIFEST.sig" ] && [ -f "$SIG_DIR/release_ed25519.pub" ] || {
+                rm -rf "$SIG_TMPDIR"
+                fail "8a/8 authority-v1 requires MANIFEST.sig and release_ed25519.pub"
+            }
+            [ -n "${DCENT_RELEASE_PUBKEY_FILE:-}" ] || {
+                rm -rf "$SIG_TMPDIR"
+                fail "8a/8 DCENT_RELEASE_PUBKEY_FILE is required for authority-v1 validation"
+            }
             if sh "$SCRIPT_DIR/verify_sysupgrade_signature.sh" "$g8a_tarball" \
                     "$DCENT_RELEASE_PUBKEY_FILE" "$g8a_board" >/dev/null 2>&1; then
                 echo "PASS 8a/8: release signature verified against trusted key (${g8a_board})"
@@ -605,35 +864,31 @@ gate_8a_package_signed() {
                 rm -rf "$SIG_TMPDIR"
                 fail "8a/8 ${g8a_board} sysupgrade signature verification failed (trusted key)"
             fi
-        else
-            MAN_STATUS=$(manifest_string_field status "$SIG_DIR/MANIFEST.json" 2>/dev/null || echo)
-            if is_release_status "$MAN_STATUS"; then
+            ;;
+        dcentos.sysupgrade-unsigned-lab/v1)
+            is_truthy "${DCENT_ALLOW_UNSIGNED_SYSUPGRADE:-0}" || {
                 rm -rf "$SIG_TMPDIR"
-                fail "8a/8 manifest status '$MAN_STATUS' is release; lab override requires non-release status"
-            fi
-            echo "PASS 8a/8: unsigned ${g8a_board} package accepted (DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1, lab status)"
-        fi
-    else
-        if [ ! -f "$SIG_DIR/MANIFEST.sig" ]; then
+                fail "8a/8 unsigned-lab/v1 requires DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1"
+            }
+            [ "$G8A_STATUS" = "lab_unsigned" ] || {
+                rm -rf "$SIG_TMPDIR"
+                fail "8a/8 unsigned-lab/v1 requires exactly one status=lab_unsigned field"
+            }
+            [ "$(manifest_key_count "$G8A_MANIFEST" verification_key)" = "0" ] || {
+                rm -rf "$SIG_TMPDIR"
+                fail "8a/8 unsigned-lab/v1 forbids a verification_key payload"
+            }
+            [ ! -e "$SIG_DIR/MANIFEST.sig" ] && [ ! -e "$SIG_DIR/release_ed25519.pub" ] || {
+                rm -rf "$SIG_TMPDIR"
+                fail "8a/8 unsigned-lab/v1 forbids MANIFEST.sig and release_ed25519.pub"
+            }
+            echo "PASS 8a/8: unsigned-lab/v1 ${g8a_board} package accepted by explicit local override"
+            ;;
+        *)
             rm -rf "$SIG_TMPDIR"
-            fail "8a/8 MANIFEST.sig missing; set DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 only for lab packages"
-        fi
-        if [ ! -f "$SIG_DIR/release_ed25519.pub" ]; then
-            rm -rf "$SIG_TMPDIR"
-            fail "8a/8 release_ed25519.pub missing; set DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 only for lab packages"
-        fi
-        if [ -z "${DCENT_RELEASE_PUBKEY_FILE:-}" ]; then
-            rm -rf "$SIG_TMPDIR"
-            fail "8a/8 DCENT_RELEASE_PUBKEY_FILE is required for release ${g8a_board} package validation"
-        fi
-        if sh "$SCRIPT_DIR/verify_sysupgrade_signature.sh" "$g8a_tarball" \
-                "$DCENT_RELEASE_PUBKEY_FILE" "$g8a_board" >/dev/null 2>&1; then
-            echo "PASS 8a/8: release signature verified against trusted key (${g8a_board})"
-        else
-            rm -rf "$SIG_TMPDIR"
-            fail "8a/8 ${g8a_board} sysupgrade signature verification failed (trusted key)"
-        fi
-    fi
+            fail "8a/8 unsupported manifest profile '$G8A_PROFILE'"
+            ;;
+    esac
     rm -rf "$SIG_TMPDIR"
 }
 

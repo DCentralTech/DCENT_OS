@@ -1333,9 +1333,9 @@ fn declare_uart_platform(platform: UartPlatform) -> Result<()> {
 ///
 /// Idempotent on repeat calls with the same table (OnceLock returns Err on
 /// second `set` attempt; we ignore that as long as the active table matches).
-/// Called by `platform::cvitek::CViTekPlatform::new()` once the CV1835 port
-/// stands up.
-#[allow(dead_code)] // wired by CV1835 platform impl in a follow-up wave (B1).
+/// Retained for evidence-only CV1835 work; no admitted production constructor
+/// calls it.
+#[allow(dead_code)]
 pub(crate) fn select_uart_table_cv1835() -> Result<()> {
     select_uart_table(UART_MMIO_MAP_CV1835)
 }

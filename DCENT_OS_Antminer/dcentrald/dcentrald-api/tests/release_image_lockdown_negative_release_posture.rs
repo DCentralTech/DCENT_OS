@@ -48,7 +48,7 @@
 //! of failing.
 //!
 //! Run locally on Linux (release half — needs sudo for the marker):
-//!   sudo bash scripts/ci/release-image-negative-test.sh
+//!   bash scripts/ci/release-image-negative-test.sh
 //!
 //! Run inside CI (`.github/workflows/dcentrald-api-tests.yml`): the
 //! workflow invokes the script as a separate step.
@@ -142,7 +142,7 @@ fn release_posture_provisioned_or_skip(test_name: &str) -> bool {
             "[{}] SKIP — DCENT_RELEASE_IMAGE_TEST_MARKER != 1; \
              release-image lockdown integration tests must be run via \
              scripts/ci/release-image-negative-test.sh (provisions the \
-             /etc/dcentos/release-image marker via sudo before launching \
+             /etc/dcentos/release-image marker with narrow sudo operations before launching \
              this test binary)",
             test_name,
         );

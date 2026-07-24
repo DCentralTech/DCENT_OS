@@ -1725,12 +1725,9 @@ async fn handle_addpool(state: &AppState, param: &Option<String>) -> serde_json:
 
 /// Handle the `restart` command.
 ///
-/// Wired to the REAL daemon-restart action (the SAME `trigger_daemon_restart`
-/// that `POST /api/action/restart` and the gRPC `Reboot` bridge perform):
-/// write the intentional-restart flag, then spawn the init.d restart on a
-/// background task. A restart RESPAWNS the daemon, so fan management is
-/// re-established by the new process — this is the safe control verb (unlike
-/// `quit`, which would leave an AM2 board with no fan manager).
+/// Routes through the same capability and persistent-session policy as REST
+/// and gRPC. Until typed hardware-disposition receipts exist, an authorized
+/// request is explicitly refused without signalling the live hardware owner.
 async fn handle_restart(state: &AppState) -> serde_json::Value {
     match crate::rest::grpc_bridge_reboot(state) {
         Ok(message) => serde_json::json!({

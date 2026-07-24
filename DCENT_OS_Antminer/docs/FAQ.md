@@ -15,11 +15,14 @@ a space heater**. See [`COMPARISON.md`](COMPARISON.md) for the full table.
 
 ## Which Antminer models actually work?
 
-Antminer **S9, S19j Pro (Zynq and BeagleBone), and S21** have bench mining proof on real hardware.
-Only S9 and S19j Pro Zynq are in the current Public Beta install lane. **S19 Pro** is an
-Experimental feature with cold-boot and nonce evidence; its accepted-share and persistent-install
-promotion gates remain open. S17, S19, the Amlogic S19j Pro, and S19k Pro are in active bring-up.
-See [`PLATFORMS.md`](PLATFORMS.md).
+Antminer **S9, S19j Pro (Zynq and BeagleBone), and S21** have bench mining proof
+on real hardware. S9 is the current public-beta first-install target. S19j Pro
+Zynq has a public-beta signed artifact and guarded update path only when
+DCENT_OS is already running; vendor-source first install remains an evidence
+gap. **S19 Pro** is Experimental, with cold-boot and nonce evidence; its
+accepted-share and persistent-install promotion gates remain open. S17, S19,
+the Amlogic S19j Pro, and S19k Pro are in active bring-up. See
+[`PLATFORMS.md`](PLATFORMS.md).
 
 ## Why is it written in Rust?
 

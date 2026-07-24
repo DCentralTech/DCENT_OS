@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("release_signing_authority.py")
@@ -37,6 +38,11 @@ class ReleaseSigningAuthorityTests(unittest.TestCase):
         self.public.write_bytes(b"PUBLIC-ED25519-TEST-AUTHORITY\n")
         if os.name == "posix":
             os.chmod(self.private, 0o600)
+        elif os.name == "nt":
+            authority.atomic_publish_directory.set_windows_file_acl(
+                self.private,
+                authority.atomic_publish_directory.WINDOWS_PRIVATE_FILE_SDDL,
+            )
         self.release_invocation = invocation.create_invocation(
             self.invocation_parent, "s9"
         )
@@ -109,6 +115,48 @@ class ReleaseSigningAuthorityTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(created.stage.stat().st_mode), 0o700)
             for path in (*created.stage.iterdir(), created.capability):
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o400)
+        elif os.name == "nt":
+            authority._require_private_windows_path(
+                created.stage, "created signing authority stage"
+            )
+            authority._require_private_windows_path(
+                created.capability, "created signing authority capability"
+            )
+            for path in created.stage.iterdir():
+                authority._require_private_windows_path(
+                    path, f"created signing authority {path.name}"
+                )
+
+    @unittest.skipUnless(os.name == "nt", "Windows ACL proof is Windows-only")
+    def test_windows_rejects_public_private_key_acl(self) -> None:
+        authority.atomic_publish_directory.set_windows_file_acl(
+            self.private,
+            authority.atomic_publish_directory.WINDOWS_PUBLIC_FILE_SDDL,
+        )
+        with self.assertRaisesRegex(
+            authority.SigningAuthorityError, "Everyone|untrusted SID"
+        ):
+            self.create()
+
+    @unittest.skipUnless(os.name == "nt", "Windows ACL proof is Windows-only")
+    def test_windows_normalizes_existing_capability_directory_acl(self) -> None:
+        capability_directory = (
+            self.authority_parent / authority.CAPABILITY_DIRECTORY
+        )
+        capability_directory.mkdir()
+        authority.atomic_publish_directory.set_windows_directory_acl(
+            capability_directory,
+            authority.atomic_publish_directory.WINDOWS_PUBLIC_DIRECTORY_SDDL,
+        )
+
+        created = self.create()
+
+        authority._require_private_windows_path(
+            capability_directory, "existing capability directory"
+        )
+        authority._require_private_windows_path(
+            created.capability, "created capability"
+        )
 
     def test_query_result_and_cli_lifecycle_are_strict(self) -> None:
         result = self.run_cli(
@@ -150,6 +198,280 @@ class ReleaseSigningAuthorityTests(unittest.TestCase):
         noncanonical = json.dumps(created).encode("ascii")
         rejected = self.run_cli("query-result", "--field", "stage", stdin=noncanonical)
         self.assertNotEqual(rejected.returncode, 0)
+
+    def test_create_is_idempotent_and_repairs_authenticated_partial_files(self) -> None:
+        created = self.create()
+        capability_raw = created.capability.read_bytes()
+        created.public_key.unlink()
+        if os.name == "posix":
+            os.chmod(created.private_key, 0o600)
+        created.private_key.write_bytes(b"PARTIAL")
+        if os.name == "posix":
+            os.chmod(created.private_key, 0o400)
+
+        recovered = self.create()
+
+        self.assertEqual(recovered, created)
+        self.assertEqual(recovered.capability.read_bytes(), capability_raw)
+        self.assertEqual(recovered.private_key.read_bytes(), self.private.read_bytes())
+        self.assertEqual(recovered.public_key.read_bytes(), self.public.read_bytes())
+        authority.verify_authority(recovered.stage, self.release_invocation.stage)
+
+    def test_create_failure_after_capability_is_resumable(self) -> None:
+        original = authority._ensure_stage_file
+        calls = 0
+
+        def fail_after_descriptor(path: Path, raw: bytes) -> None:
+            nonlocal calls
+            calls += 1
+            original(path, raw)
+            if calls == 1:
+                raise OSError("injected interruption after descriptor publication")
+
+        with mock.patch.object(
+            authority, "_ensure_stage_file", side_effect=fail_after_descriptor
+        ):
+            with self.assertRaisesRegex(OSError, "injected interruption"):
+                self.create()
+
+        stages = [
+            path
+            for path in self.authority_parent.iterdir()
+            if path.name.startswith(authority.STAGE_PREFIX)
+        ]
+        self.assertEqual(len(stages), 1)
+        capability = authority.capability_path(stages[0])
+        self.assertTrue(capability.is_file())
+        recovered = self.create()
+        authority.verify_authority(recovered.stage, self.release_invocation.stage)
+
+    def test_durable_result_precedes_key_copy_and_is_idempotent(self) -> None:
+        result_parent = self.root / "private-results"
+        result_parent.mkdir()
+        authority._set_private_directory(result_parent)
+        result_output = result_parent / "signing-authority.result.json"
+        original = authority._ensure_stage_file
+
+        def interrupt_first_copy(path: Path, raw: bytes) -> None:
+            original(path, raw)
+            raise OSError("injected interruption after durable result")
+
+        with mock.patch.object(
+            authority, "_ensure_stage_file", side_effect=interrupt_first_copy
+        ):
+            with self.assertRaisesRegex(OSError, "durable result"):
+                authority.create_authority(
+                    self.authority_parent,
+                    self.release_invocation.stage,
+                    self.private,
+                    self.public,
+                    result_output=result_output,
+                )
+
+        result_raw = result_output.read_bytes()
+        result = json.loads(result_raw)
+        self.assertTrue(Path(result["capability"]).is_file())
+        self.assertTrue(Path(result["stage"]).is_dir())
+        synced: list[Path] = []
+        original_sync = authority._fsync_directory
+
+        def record_sync(path: Path) -> None:
+            original_sync(path)
+            synced.append(path)
+
+        with mock.patch.object(
+            authority, "_fsync_directory", side_effect=record_sync
+        ):
+            recovered = authority.create_authority(
+                self.authority_parent,
+                self.release_invocation.stage,
+                self.private,
+                self.public,
+                result_output=result_output,
+            )
+        self.assertEqual(result_output.read_bytes(), result_raw)
+        self.assertEqual(Path(result["stage"]), recovered.stage)
+        self.assertIn(result_parent, synced)
+
+    def test_create_recovers_linked_capability_publication_boundary(self) -> None:
+        original = authority._unlink_verified
+        interrupted = False
+
+        def interrupt_pending(path: Path, metadata, label: str) -> None:
+            nonlocal interrupted
+            if label.startswith("published release signing authority") and not interrupted:
+                interrupted = True
+                raise OSError("injected interruption after capability link")
+            original(path, metadata, label)
+
+        with mock.patch.object(
+            authority, "_unlink_verified", side_effect=interrupt_pending
+        ):
+            with self.assertRaisesRegex(OSError, "injected interruption"):
+                self.create()
+
+        stages = [
+            path
+            for path in self.authority_parent.iterdir()
+            if path.name.startswith(authority.STAGE_PREFIX)
+        ]
+        self.assertEqual(len(stages), 1)
+        capability = authority.capability_path(stages[0])
+        pending = capability.with_name(f"{capability.name}.pending")
+        self.assertTrue(capability.is_file())
+        self.assertTrue(pending.is_file())
+        recovered = self.create()
+        self.assertFalse(pending.exists())
+        authority.verify_capability(recovered.stage, recovered.capability)
+
+    def test_create_rebinds_durable_capability_after_empty_stage_loss(self) -> None:
+        created = self.create()
+        before = json.loads(created.capability.read_bytes())
+        for path in created.stage.iterdir():
+            authority._unlink_verified(
+                path, os.lstat(path), f"simulated lost stage {path.name}"
+            )
+        authority._fsync_directory(created.stage)
+        authority._rmdir_verified(
+            created.stage,
+            os.lstat(created.stage),
+            "simulated lost signing authority stage",
+        )
+        authority._fsync_directory(created.stage.parent)
+
+        recovered = self.create()
+
+        after = json.loads(recovered.capability.read_bytes())
+        metadata = os.lstat(recovered.stage)
+        self.assertEqual(after["token"], before["token"])
+        self.assertEqual((after["stage_dev"], after["stage_ino"]), (
+            metadata.st_dev,
+            metadata.st_ino,
+        ))
+        authority.verify_authority(recovered.stage, self.release_invocation.stage)
+
+    def test_descriptor_directory_barrier_precedes_every_key_copy(self) -> None:
+        events: list[tuple[str, str]] = []
+        original_ensure = authority._ensure_stage_file
+        original_sync = authority._fsync_directory
+
+        def record_ensure(path: Path, raw: bytes) -> None:
+            original_ensure(path, raw)
+            events.append(("file", path.name))
+
+        def record_sync(path: Path) -> None:
+            original_sync(path)
+            events.append(("sync", path.name))
+
+        with mock.patch.object(
+            authority, "_ensure_stage_file", side_effect=record_ensure
+        ), mock.patch.object(authority, "_fsync_directory", side_effect=record_sync):
+            created = self.create()
+
+        descriptor = events.index(("file", authority.DESCRIPTOR_NAME))
+        private_key = events.index(("file", authority.PRIVATE_KEY_NAME))
+        public_key = events.index(("file", authority.PUBLIC_KEY_NAME))
+        stage_syncs = [
+            index
+            for index, event in enumerate(events)
+            if event == ("sync", created.stage.name)
+        ]
+        self.assertTrue(any(descriptor < index < private_key for index in stage_syncs))
+        self.assertTrue(any(private_key < index < public_key for index in stage_syncs))
+
+    def test_destroy_retries_after_partial_key_removal(self) -> None:
+        created = self.create()
+        original = authority._unlink_verified
+        failed = False
+
+        def interrupt_public(path: Path, metadata, label: str) -> None:
+            nonlocal failed
+            if path.name == authority.PUBLIC_KEY_NAME and not failed:
+                failed = True
+                raise OSError("injected interruption during key removal")
+            original(path, metadata, label)
+
+        with mock.patch.object(
+            authority, "_unlink_verified", side_effect=interrupt_public
+        ):
+            with self.assertRaisesRegex(OSError, "injected interruption"):
+                authority.destroy_authority(created.stage, created.capability)
+
+        self.assertFalse(created.private_key.exists())
+        self.assertTrue(created.descriptor.exists())
+        authority.destroy_authority(created.stage, created.capability)
+        self.assertFalse(created.stage.exists())
+        self.assertFalse(created.capability.exists())
+
+    def test_destroy_retries_after_stage_removal(self) -> None:
+        created = self.create()
+        original = authority._unlink_verified
+        failed = False
+
+        def interrupt_capability(path: Path, metadata, label: str) -> None:
+            nonlocal failed
+            if path == created.capability and not failed:
+                failed = True
+                raise OSError("injected interruption after stage removal")
+            original(path, metadata, label)
+
+        with mock.patch.object(
+            authority, "_unlink_verified", side_effect=interrupt_capability
+        ):
+            with self.assertRaisesRegex(OSError, "injected interruption"):
+                authority.destroy_authority(created.stage, created.capability)
+
+        self.assertFalse(created.stage.exists())
+        self.assertTrue(created.capability.exists())
+        authority.destroy_authority(created.stage, created.capability)
+        self.assertFalse(created.capability.exists())
+        synced: list[Path] = []
+        original_sync = authority._fsync_directory
+
+        def record_sync(path: Path) -> None:
+            original_sync(path)
+            synced.append(path)
+
+        with mock.patch.object(
+            authority, "_fsync_directory", side_effect=record_sync
+        ):
+            authority.destroy_authority(created.stage, created.capability)
+        self.assertIn(created.stage.parent, synced)
+
+    def test_destroy_upgrades_legacy_capability_before_mutation(self) -> None:
+        created = self.create()
+        current = json.loads(created.capability.read_bytes())
+        legacy = {
+            "authority_id": current["authority_id"],
+            "invocation_id": current["invocation_id"],
+            "schema": authority.LEGACY_CAPABILITY_SCHEMA,
+            "stage_name": current["stage_name"],
+            "token": current["token"],
+        }
+        if os.name == "posix":
+            os.chmod(created.capability, 0o600)
+        created.capability.write_bytes(authority.canonical_bytes(legacy))
+        if os.name == "posix":
+            os.chmod(created.capability, 0o400)
+
+        authority.destroy_authority(created.stage, created.capability)
+
+        self.assertFalse(created.stage.exists())
+        self.assertFalse(created.capability.exists())
+
+    @unittest.skipUnless(
+        os.name == "posix" and Path("/proc/self/fd").is_dir(),
+        "file-descriptor accounting requires procfs",
+    )
+    def test_exclusive_write_closes_descriptor_when_fdopen_fails(self) -> None:
+        output = self.root / "fdopen-failure"
+        before = len(list(Path("/proc/self/fd").iterdir()))
+        with mock.patch.object(authority.os, "fdopen", side_effect=OSError("fdopen")):
+            with self.assertRaisesRegex(OSError, "fdopen"):
+                authority._write_exclusive(output, b"bounded\n")
+        after = len(list(Path("/proc/self/fd").iterdir()))
+        self.assertEqual(after, before)
+        self.assertFalse(output.exists())
 
     def test_wrong_capability_and_invocation_cannot_authorize(self) -> None:
         first = self.create()

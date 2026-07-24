@@ -203,6 +203,36 @@ pub enum AmlogicTachPolicy {
     ClampedToBalanced { requested_cap: u8, applied_cap: u8 },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "required energized-airflow PWM floor {required_min_pwm} exceeds configured fan_max_pwm {configured_max_pwm}"
+)]
+pub struct RequiredAirflowRefusal {
+    pub required_min_pwm: u8,
+    pub configured_max_pwm: u8,
+}
+
+/// Apply a platform capability's minimum energized-airflow command without
+/// widening the configured maximum. A maximum below the capability floor is a
+/// hard refusal: silently lowering the required floor would permit hashing
+/// without an airflow command.
+pub fn enforce_required_airflow_pwm(
+    profile: &mut ThermalProfile,
+    required_min_pwm: u8,
+) -> std::result::Result<(), RequiredAirflowRefusal> {
+    if profile.fan_max_pwm < required_min_pwm {
+        return Err(RequiredAirflowRefusal {
+            required_min_pwm,
+            configured_max_pwm: profile.fan_max_pwm,
+        });
+    }
+    profile.fan_min_pwm = profile
+        .fan_min_pwm
+        .max(required_min_pwm)
+        .min(profile.fan_max_pwm);
+    Ok(())
+}
+
 /// am3-aml fan-channel calibration is not yet live-verified per fan.
 /// Until then, refuse Advanced (PWM 65-100) and HashrateMax (PWM 101+)
 /// fan modes on Amlogic platforms and clamp the profile down to
@@ -228,22 +258,10 @@ pub enum AmlogicTachPolicy {
 /// home mining default is PWM 30 anyway, so this clamp only ever hits
 /// users who explicitly opted into Advanced/HashrateMax on Amlogic.
 ///
-/// # Wiring status — gap-swarm GAP-3 (2026-05-29)
-///
-/// As of 2026-05-29 this policy is **implemented + unit-tested but NOT yet
-/// called from the live daemon.** The Amlogic fan command in
-/// `dcentrald::serial_mining` (the `is_nopic` fan-init branch) sets fan speed
-/// directly from `config.thermal.fan_max_pwm`, so an am3-aml config requesting
-/// PWM > 64 (Advanced/HashrateMax) is NOT clamped today. Wiring the *active*
-/// clamp is deferred on purpose: it would lower a commanded fan speed on a
-/// default-executing path, which needs live am3-aml per-fan tach validation
-/// before it can ship (a wrong clamp could under-cool a genuinely hot board —
-/// the home PWM-30 default already covers the common case, so the only
-/// affected users are those who explicitly opted into Advanced/HashrateMax).
-/// Rollout plan: (1) observe-only — log the would-clamp at the fan-init site
-/// without applying it; (2) after live tach validation, apply the clamp.
-/// Tracked as GAP-3 in
-/// .
+/// The native Amlogic serial-mining path applies this policy before acquiring
+/// pre-energization fan-motion evidence. It additionally enforces the platform
+/// capability's positive energized-airflow PWM floor; this function remains
+/// concerned only with the upper mode ceiling.
 pub fn enforce_amlogic_tach_safety_policy(
     profile: &mut ThermalProfile,
     is_amlogic: bool,
@@ -295,6 +313,36 @@ pub fn daily_cost(watts: u32, rate_per_kwh: f32) -> f32 {
 #[cfg(test)]
 mod amlogic_tach_policy_tests {
     use super::*;
+
+    #[test]
+    fn required_airflow_floor_never_allows_an_energized_zero_command() {
+        let mut profile = ThermalProfile {
+            fan_min_pwm: 0,
+            fan_max_pwm: 30,
+            ..Default::default()
+        };
+        enforce_required_airflow_pwm(&mut profile, 10).unwrap();
+        assert_eq!(profile.fan_min_pwm, 10);
+        assert_eq!(profile.fan_max_pwm, 30);
+    }
+
+    #[test]
+    fn required_airflow_floor_refuses_a_maximum_below_capability() {
+        let mut profile = ThermalProfile {
+            fan_min_pwm: 0,
+            fan_max_pwm: 9,
+            ..Default::default()
+        };
+        assert_eq!(
+            enforce_required_airflow_pwm(&mut profile, 10),
+            Err(RequiredAirflowRefusal {
+                required_min_pwm: 10,
+                configured_max_pwm: 9,
+            })
+        );
+        assert_eq!(profile.fan_min_pwm, 0);
+        assert_eq!(profile.fan_max_pwm, 9);
+    }
 
     #[test]
     fn non_amlogic_platforms_are_never_clamped() {

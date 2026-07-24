@@ -43,6 +43,8 @@ pub mod impls;
 pub mod job_declaration;
 pub mod notifications;
 pub(crate) mod safety_watchdog;
+#[cfg(test)]
+pub(crate) mod source_contract;
 pub(crate) mod task_guard;
 pub(crate) mod thread_guard;
 

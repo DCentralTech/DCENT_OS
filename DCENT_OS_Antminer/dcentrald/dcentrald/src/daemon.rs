@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -23,7 +23,9 @@ use dcentrald_asic::chain::{
     chain_meets_min_fraction, driver_for_chain_with_policy, Chain, ChainDriverDecision,
     DivergentChipPolicy,
 };
-use dcentrald_asic::drivers::{ChipRegistry, MinerProfile, PicType};
+use dcentrald_asic::drivers::{
+    ChipDriverAdmission, ChipDriverExecutionPolicy, ChipRegistry, MinerProfile, PicType,
+};
 use dcentrald_asic::dspic::DspicService;
 use dcentrald_asic::pic::{Pic16EndpointSession, PicController, PicFirmware, PicServiceController};
 use dcentrald_hal::fan::FanController;
@@ -110,7 +112,13 @@ struct InitializedPicAddrs(Arc<std::sync::Mutex<Vec<u8>>>);
 
 impl InitializedPicAddrs {
     fn new(addrs: Vec<u8>) -> Self {
-        Self(Arc::new(std::sync::Mutex::new(addrs)))
+        let mut unique = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            if !unique.contains(&addr) {
+                unique.push(addr);
+            }
+        }
+        Self(Arc::new(std::sync::Mutex::new(unique)))
     }
 
     fn lock_recover(&self, operation: &'static str) -> std::sync::MutexGuard<'_, Vec<u8>> {
@@ -138,11 +146,71 @@ impl InitializedPicAddrs {
     }
 
     fn record_success(&self, addr: u8, operation: &'static str) {
-        self.lock_recover(operation).push(addr);
+        let mut addrs = self.lock_recover(operation);
+        if !addrs.contains(&addr) {
+            addrs.push(addr);
+        }
+    }
+}
+
+#[cfg(test)]
+mod initialized_pic_addrs_tests {
+    use super::InitializedPicAddrs;
+
+    #[test]
+    fn membership_is_deduplicated_at_construction_and_recording() {
+        let addrs = InitializedPicAddrs::new(vec![0x55, 0x55, 0x56]);
+        addrs.record_success(0x56, "duplicate test");
+        addrs.record_success(0x57, "new member test");
+
+        assert_eq!(
+            addrs.snapshot("membership assertion"),
+            vec![0x55, 0x56, 0x57]
+        );
     }
 
-    fn len(&self, operation: &'static str) -> usize {
-        self.lock_recover(operation).len()
+    #[cfg(feature = "sim-hal")]
+    #[tokio::test]
+    async fn init_retry_revokes_old_service_and_refuses_unproven_replacement() {
+        use super::{Daemon, PicFirmware};
+        use crate::config::DcentraldConfig;
+        use crate::daemon_lifecycle::PlatformIdentitySnapshot;
+        use dcentrald_hal::platform::sim::{SimModel, SimPlatform};
+        use tokio_util::sync::CancellationToken;
+
+        let config: DcentraldConfig = toml::from_str("").unwrap();
+        let identity = PlatformIdentitySnapshot {
+            declared_board_target: Some("am3-s19xp".into()),
+            board_desc: None,
+            declared_platform_marker: None,
+            declared_subtype: None,
+            declared_psu_hardware_variant: None,
+            observed_control_board: "unknown".into(),
+        };
+        let mut daemon = Daemon::new(
+            config,
+            "simulated-retry.toml".into(),
+            identity.clone(),
+            CancellationToken::new(),
+        );
+        let platform = SimPlatform::new(SimModel::S9);
+        let old_service = platform.open_i2c_service(0).unwrap();
+        let old_endpoint = platform.pic16_endpoint(0, 0x55).unwrap();
+        daemon.i2c_service = Some(old_service.clone());
+        daemon.initialized_pic_addrs_final = vec![0x55];
+        daemon.pic_firmware = PicFirmware::BraiinsOs;
+        let error = daemon.init(&identity).await.unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("in-process replacement is refused"));
+        assert!(old_service.terminal_safe_off_is_latched());
+        let _safe_off_trace = platform.drain_i2c_trace().unwrap();
+        assert!(old_service.pic16_heartbeat(&old_endpoint).is_err());
+        assert!(platform.drain_i2c_trace().unwrap().is_empty());
+        assert!(daemon.initialized_pic_addrs_final.is_empty());
+        assert_eq!(daemon.pic_firmware, PicFirmware::Unknown);
+        assert!(daemon.asic_enumeration_receipts.is_empty());
     }
 }
 
@@ -532,11 +600,21 @@ impl crate::daemon_lifecycle::PlatformIdentitySource for SystemPlatformIdentityS
                 "/proc/device-tree/model",
             ]),
             declared_subtype: optional_declared(&["/etc/subtype"]),
+            declared_psu_hardware_variant: optional_declared(&[
+                "/etc/dcentos/psu_hardware_variant",
+            ]),
             // This remains an observation of OS device signatures. It must not
             // be promoted to measured hashboard or ASIC identity.
             observed_control_board: detect_control_board(),
         })
     }
+}
+
+/// Capture the production platform identity exactly once for route admission
+/// and the complete standard-daemon lifecycle.
+pub(crate) fn capture_system_platform_identity(
+) -> Result<crate::daemon_lifecycle::PlatformIdentitySnapshot> {
+    crate::daemon_lifecycle::PlatformIdentitySource::capture_identity(&SystemPlatformIdentitySource)
 }
 
 fn divergent_chip_policy_for_platform(
@@ -625,6 +703,91 @@ enum StandardI2cTransport {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StandardHardwareOwnership {
+    ColdBringup,
+    AdoptedHandoff,
+}
+
+/// Complete, sealed execution plan for the legacy standard-daemon route.
+///
+/// This is intentionally distinct from safe-direction cleanup authority.  It
+/// binds the authoritative board target, model topology, voltage-controller
+/// class, serialized bus transport, work engine, ownership origin, and exact
+/// executable ASIC-driver admission before the route opens I2C, fan, GPIO, or
+/// FPGA hardware.  Fields are private so no other runtime can mint one from a
+/// chip ID alone.
+#[derive(Debug, Clone)]
+struct StandardHardwareCompositionAdmission {
+    board_target: String,
+    profile: &'static MinerProfile,
+    pic_type: PicType,
+    pic_addrs: Vec<u8>,
+    i2c_transport: StandardI2cTransport,
+    ownership: StandardHardwareOwnership,
+    asic: ChipDriverAdmission,
+}
+
+impl StandardHardwareCompositionAdmission {
+    fn admits_chip(&self, chip_id: u16) -> bool {
+        self.asic.chip_id() == chip_id && self.profile.chip_id == chip_id
+    }
+}
+
+fn admit_standard_hardware_composition(
+    board_target: &str,
+    profile: &'static MinerProfile,
+    pic_type: PicType,
+    pic_addrs: &[u8],
+    i2c_transport: StandardI2cTransport,
+    passthrough: bool,
+    registry: &ChipRegistry,
+) -> Result<StandardHardwareCompositionAdmission> {
+    let is_am1_s9 = board_target.trim().starts_with("am1-s9");
+    validate_profile_platform_authority(board_target, is_am1_s9, profile)?;
+    validate_standard_daemon_topology(profile, pic_type, pic_addrs)?;
+    match (is_am1_s9, i2c_transport) {
+        (true, StandardI2cTransport::Am1S9Devmem) => {}
+        (true, observed) => anyhow::bail!(
+            "am1-s9 composition requires the devmem I2C transport, got {observed:?}"
+        ),
+        (false, StandardI2cTransport::Am1S9Devmem) => anyhow::bail!(
+            "non-S9 composition {board_target} cannot acquire the destructive AM1 devmem I2C transport"
+        ),
+        (false, _) => {}
+    }
+    let recognition = registry.recognize(profile.chip_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} declares unrecognized ASIC chip ID 0x{:04X}",
+            profile.name,
+            profile.chip_id
+        )
+    })?;
+    let asic = registry.admit(profile.chip_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} / {} recognizes {} (0x{:04X}) as {:?}, but the active policy does not admit its executable driver",
+            board_target,
+            profile.name,
+            recognition.chip_name(),
+            recognition.chip_id(),
+            recognition.maturity(),
+        )
+    })?;
+    Ok(StandardHardwareCompositionAdmission {
+        board_target: board_target.to_string(),
+        profile,
+        pic_type,
+        pic_addrs: pic_addrs.to_vec(),
+        i2c_transport,
+        ownership: if passthrough {
+            StandardHardwareOwnership::AdoptedHandoff
+        } else {
+            StandardHardwareOwnership::ColdBringup
+        },
+        asic,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SerializedI2cRequest {
     transport: StandardI2cTransport,
     recover_am1_bus: bool,
@@ -660,9 +823,7 @@ trait SerializedI2cFactory {
 trait SerializedI2cOperations {
     type Handle;
 
-    fn recover_am1_bus_without_keepalive(&self);
-    fn unbind_kernel_i2c_driver(&self);
-    fn spawn_am1_devmem(&self) -> std::io::Result<Self::Handle>;
+    fn spawn_am1_devmem(&self, recover_bus: bool) -> std::io::Result<Self::Handle>;
     fn spawn_amlogic_protected(&self) -> std::io::Result<Self::Handle>;
     fn spawn_kernel_protected(&self) -> std::io::Result<Self::Handle>;
 }
@@ -672,13 +833,7 @@ fn open_serialized_i2c_with_operations<O: SerializedI2cOperations>(
     request: SerializedI2cRequest,
 ) -> std::io::Result<O::Handle> {
     match request.transport {
-        StandardI2cTransport::Am1S9Devmem => {
-            if request.recover_am1_bus {
-                operations.recover_am1_bus_without_keepalive();
-            }
-            operations.unbind_kernel_i2c_driver();
-            operations.spawn_am1_devmem()
-        }
+        StandardI2cTransport::Am1S9Devmem => operations.spawn_am1_devmem(request.recover_am1_bus),
         StandardI2cTransport::AmlogicProtected => operations.spawn_amlogic_protected(),
         StandardI2cTransport::KernelProtected => operations.spawn_kernel_protected(),
     }
@@ -689,16 +844,8 @@ struct ProductionSerializedI2cOperations;
 impl SerializedI2cOperations for ProductionSerializedI2cOperations {
     type Handle = dcentrald_hal::i2c::I2cServiceHandle;
 
-    fn recover_am1_bus_without_keepalive(&self) {
-        Daemon::recover_am1_i2c_bus_without_keepalive();
-    }
-
-    fn unbind_kernel_i2c_driver(&self) {
-        dcentrald_hal::i2c::unbind_kernel_i2c_driver();
-    }
-
-    fn spawn_am1_devmem(&self) -> std::io::Result<Self::Handle> {
-        dcentrald_hal::i2c::spawn_i2c_service(0, true)
+    fn spawn_am1_devmem(&self, recover_bus: bool) -> std::io::Result<Self::Handle> {
+        dcentrald_hal::i2c::spawn_am1_s9_i2c0_service(recover_bus)
     }
 
     fn spawn_amlogic_protected(&self) -> std::io::Result<Self::Handle> {
@@ -804,16 +951,12 @@ mod serialized_i2c_factory_tests {
     impl SerializedI2cOperations for RecordingOperations {
         type Handle = &'static str;
 
-        fn recover_am1_bus_without_keepalive(&self) {
-            self.record("recover-am1");
-        }
-
-        fn unbind_kernel_i2c_driver(&self) {
-            self.record("unbind-kernel");
-        }
-
-        fn spawn_am1_devmem(&self) -> std::io::Result<Self::Handle> {
-            self.record("spawn-am1-devmem-bus0");
+        fn spawn_am1_devmem(&self, recover_bus: bool) -> std::io::Result<Self::Handle> {
+            self.record(if recover_bus {
+                "reserve-prepare-spawn-am1-devmem-bus0"
+            } else {
+                "reserve-unbind-spawn-am1-devmem-bus0"
+            });
             Ok("am1")
         }
 
@@ -839,7 +982,7 @@ mod serialized_i2c_factory_tests {
         );
         assert_eq!(
             operations.snapshot(),
-            ["recover-am1", "unbind-kernel", "spawn-am1-devmem-bus0"]
+            ["reserve-prepare-spawn-am1-devmem-bus0"]
         );
 
         let operations = RecordingOperations::default();
@@ -848,7 +991,7 @@ mod serialized_i2c_factory_tests {
         open_serialized_i2c_with_operations(&operations, request).unwrap();
         assert_eq!(
             operations.snapshot(),
-            ["unbind-kernel", "spawn-am1-devmem-bus0"]
+            ["reserve-unbind-spawn-am1-devmem-bus0"]
         );
     }
 
@@ -916,6 +1059,7 @@ mod is_am1_s9_evidence_tests {
             board_desc: board_target.and_then(dcentrald_common::BoardDesc::lookup),
             declared_platform_marker: None,
             declared_subtype: None,
+            declared_psu_hardware_variant: None,
             observed_control_board: control_board.to_string(),
         }
     }
@@ -1229,10 +1373,13 @@ fn passthrough_miner_profile(chip_id: u16) -> Result<&'static MinerProfile> {
 #[cfg(test)]
 mod identified_miner_profile_tests {
     use super::{
-        identified_miner_profile, passthrough_miner_profile, pre_enumeration_topology_profile,
-        validate_profile_platform_authority, validate_standard_daemon_topology,
+        admit_standard_hardware_composition, identified_miner_profile, passthrough_miner_profile,
+        pre_enumeration_topology_profile, validate_profile_platform_authority,
+        validate_standard_daemon_topology, StandardHardwareOwnership, StandardI2cTransport,
     };
-    use dcentrald_asic::drivers::PicType;
+    use dcentrald_asic::drivers::{
+        ChipDriverExecutionPolicy, ChipDriverMaturity, ChipRegistry, PicType,
+    };
 
     #[test]
     fn known_identity_resolves_and_unknown_or_zero_fail_closed() {
@@ -1295,6 +1442,79 @@ mod identified_miner_profile_tests {
         assert!(validate_profile_platform_authority("am1-s9", true, s19).is_err());
         assert!(validate_profile_platform_authority("am2-s19pro", false, s9).is_err());
         assert!(validate_profile_platform_authority("am3-s21", false, s19).is_err());
+    }
+
+    #[test]
+    fn sealed_standard_composition_binds_every_execution_facet() {
+        let s9 = identified_miner_profile(0x1387).unwrap();
+        let registry = ChipRegistry::production();
+        let admission = admit_standard_hardware_composition(
+            "am1-s9",
+            s9,
+            PicType::Pic16F1704,
+            s9.pic_addrs,
+            StandardI2cTransport::Am1S9Devmem,
+            false,
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(admission.board_target, "am1-s9");
+        assert_eq!(admission.ownership, StandardHardwareOwnership::ColdBringup);
+        assert_eq!(admission.asic.chip_id(), 0x1387);
+        assert_eq!(
+            admission.asic.recognition().maturity(),
+            ChipDriverMaturity::Production
+        );
+        assert!(admission.admits_chip(0x1387));
+        assert!(!admission.admits_chip(0x1398));
+
+        assert!(admit_standard_hardware_composition(
+            "am1-s9",
+            s9,
+            PicType::Pic16F1704,
+            s9.pic_addrs,
+            StandardI2cTransport::KernelProtected,
+            false,
+            &registry,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn experimental_driver_authority_is_exact_and_adopted_handoff_is_explicit() {
+        let s19 = identified_miner_profile(0x1398).unwrap();
+        assert!(admit_standard_hardware_composition(
+            "am2-s19pro",
+            s19,
+            PicType::DsPic33EP,
+            s19.pic_addrs,
+            StandardI2cTransport::KernelProtected,
+            true,
+            &ChipRegistry::production(),
+        )
+        .is_err());
+
+        let policy = ChipDriverExecutionPolicy::with_experimental_chip(0x1398);
+        let registry = ChipRegistry::with_execution_policy(policy);
+        let admission = admit_standard_hardware_composition(
+            "am2-s19pro",
+            s19,
+            PicType::DsPic33EP,
+            s19.pic_addrs,
+            StandardI2cTransport::KernelProtected,
+            true,
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(
+            admission.ownership,
+            StandardHardwareOwnership::AdoptedHandoff
+        );
+        assert_eq!(
+            admission.asic.recognition().maturity(),
+            ChipDriverMaturity::Experimental
+        );
+        assert!(admission.admits_chip(0x1398));
     }
 }
 
@@ -1442,7 +1662,7 @@ mod hardware_preflight_policy_tests {
     }
 
     #[test]
-    fn source_orders_cooling_gpio_and_presence_before_endpoint_keepalive() {
+    fn source_orders_cooling_gpio_and_presence_before_non_mutating_pic16_capabilities() {
         // Anchor on the implementation's doc comment instead of reconstructing
         // an obsolete single-line signature. `init` intentionally accepts the
         // immutable platform-identity snapshot now.
@@ -1465,33 +1685,34 @@ mod hardware_preflight_policy_tests {
             .find("Phase 3: Hash Board Detection")
             .map(|offset| gpio + offset)
             .expect("presence preflight marker");
-        let heartbeat = DAEMON_SOURCE[presence..]
-            .find("Phase 0: Endpoint-Scoped PIC16 Heartbeats")
+        let capability = DAEMON_SOURCE[presence..]
+            .find("Phase 0: Non-Mutating PIC16 Topology Capabilities")
             .map(|offset| presence + offset)
-            .expect("endpoint heartbeat marker");
-        assert!(cooling < gpio && gpio < presence && presence < heartbeat);
+            .expect("PIC16 capability marker");
+        assert!(cooling < gpio && gpio < presence && presence < capability);
 
-        let pre_admission = &DAEMON_SOURCE[init..heartbeat];
+        let pre_admission = &DAEMON_SOURCE[init..capability];
         assert!(!pre_admission.contains("[0x55, 0xAA, 0x16]"));
         assert!(!pre_admission.contains("devmem_i2c_write("));
         assert!(!pre_admission.contains(".heartbeat("));
 
-        let endpoint_slice = &DAEMON_SOURCE[heartbeat..];
+        let endpoint_slice = &DAEMON_SOURCE[capability..];
         let endpoint_slice = endpoint_slice
             .split("Found {} hash board(s)")
             .next()
-            .expect("endpoint heartbeat block");
+            .expect("endpoint capability block");
         assert!(endpoint_slice.contains("self.detected_board_indices"));
-        assert!(endpoint_slice.contains("discover_system_pic16_endpoint_with_heartbeat"));
+        assert!(endpoint_slice.contains("discover_system_pic16_endpoint"));
         assert!(endpoint_slice.contains("Pic16EndpointSession::new"));
         assert!(!endpoint_slice.contains("i2c_svc.heartbeat("));
+        assert!(!endpoint_slice.contains(".pic16_heartbeat("));
         assert!(endpoint_slice.contains("if is_am1_s9"));
         assert!(endpoint_slice.contains("DEFAULT_PIC_ADDRS.get(board_index)"));
         assert!(!endpoint_slice.contains("self.pic_addrs()"));
         assert!(!endpoint_slice.contains("configured_model_pic"));
         assert!(!endpoint_slice.contains("miner_profile"));
 
-        let cooling_handoff = &DAEMON_SOURCE[cooling..heartbeat];
+        let cooling_handoff = &DAEMON_SOURCE[cooling..capability];
         assert!(!cooling_handoff.contains("FAN_PWM_QUIET_BOOT"));
         let legacy_runtime_drop = ["Fan mining boot", ": PWM"].concat();
         assert!(!DAEMON_SOURCE.contains(&legacy_runtime_drop));
@@ -1504,6 +1725,42 @@ mod hardware_preflight_policy_tests {
     }
 
     #[test]
+    fn init_denial_cannot_turn_an_empty_disable_set_into_safe_off_proof() {
+        let init_signature = ["async fn in", "it("].concat();
+        let init = DAEMON_SOURCE
+            .find(&init_signature)
+            .expect("standard hardware init body");
+        let unknown = DAEMON_SOURCE[init..]
+            .find("self.preflight_hardware_state_unknown = true;")
+            .map(|offset| init + offset)
+            .expect("init entry must conservatively mark rail state unknown");
+        let composition = DAEMON_SOURCE[init..]
+            .find("let composition_admission = admit_standard_hardware_composition(")
+            .map(|offset| init + offset)
+            .expect("standard composition admission");
+        let complete = DAEMON_SOURCE[composition..]
+            .find("self.preflight_hardware_state_unknown = false;")
+            .map(|offset| composition + offset)
+            .expect("successful init completion receipt");
+
+        assert!(
+            unknown < composition && composition < complete,
+            "composition denial must retain unknown rail state until complete init succeeds"
+        );
+        let shutdown = DAEMON_SOURCE
+            .rfind("let mut software_disable_failed =")
+            .expect("shutdown safe-off evidence fold");
+        let disable_fold = DAEMON_SOURCE[shutdown..]
+            .split_once(';')
+            .map(|(statement, _)| statement.split_whitespace().collect::<Vec<_>>().join(" "))
+            .expect("shutdown safe-off evidence statement");
+        assert_eq!(
+            disable_fold,
+            "let mut software_disable_failed = self.preflight_hardware_state_unknown || mining_quiescence_failed"
+        );
+    }
+
+    #[test]
     fn standard_daemon_pic16_services_have_no_raw_constructor_fallback() {
         let raw_new = ["PicServiceController", "::new("].concat();
         let raw_new_with_firmware = ["PicServiceController", "::new_with_firmware("].concat();
@@ -1511,6 +1768,25 @@ mod hardware_preflight_policy_tests {
         assert!(!DAEMON_SOURCE.contains(&raw_new_with_firmware));
         assert!(DAEMON_SOURCE.contains("pic16_service_for_endpoint("));
         assert!(DAEMON_SOURCE.contains("refusing raw-address fallback"));
+    }
+
+    #[test]
+    fn controller_admission_is_endpoint_scoped_and_gates_phase7() {
+        let hot_start_marker = DAEMON_SOURCE
+            .rfind("Hot start: sending PIC16 heartbeats via kernel I2C")
+            .expect("hot-start controller marker");
+        let hot_start = DAEMON_SOURCE[hot_start_marker..]
+            .split("Collect PIC addresses from hot chains")
+            .next()
+            .expect("bounded hot-start controller block");
+        assert!(hot_start.contains("for &chain_idx in &hot_chain_indices"));
+        assert!(!hot_start.contains("for &idx in &self.detected_board_indices"));
+
+        assert!(DAEMON_SOURCE.contains("cold_pic_admitted_board_indices"));
+        assert!(DAEMON_SOURCE.contains("controller_admitted_chain_indices"));
+        assert!(DAEMON_SOURCE.contains("controller admission is absent; chain remains disabled"));
+        assert!(DAEMON_SOURCE.contains("PIC16 pre-admission heartbeat intentionally skipped"));
+        assert!(DAEMON_SOURCE.contains("PIC16 detect/disable intentionally skipped"));
     }
 }
 
@@ -2922,6 +3198,9 @@ mod init_heartbeat_ownership_tests {
 pub struct Daemon {
     config: DcentraldConfig,
     config_path: String,
+    /// Immutable identity already used by the top-level route admission.
+    /// Never reread board-target/platform files after hardware authority is minted.
+    platform_identity: crate::daemon_lifecycle::PlatformIdentitySnapshot,
     shutdown_token: CancellationToken,
     /// Sole owner of asynchronous mining hardware tasks. Its standalone token
     /// stops work dispatch and thermal actuation only after the watchdog enters
@@ -2960,6 +3239,11 @@ pub struct Daemon {
     /// Contains all model-specific constants (PIC addrs, chain IDs, voltage range, etc.).
     /// Falls back to S9 defaults when no profile is detected.
     miner_profile: Option<&'static MinerProfile>,
+    /// Sealed standard-route plan minted before new-generation hardware access.
+    /// Safe-off/cleanup paths intentionally do not depend on this authority.
+    standard_composition_admission: Option<StandardHardwareCompositionAdmission>,
+    /// Exact driver-execution policy carried into Phase 7 and WorkDispatcher.
+    asic_driver_execution_policy: ChipDriverExecutionPolicy,
     /// Separate token for heartbeat thread shutdown. This is NOT the same as shutdown_token.
     /// The heartbeat thread must keep running DURING graceful shutdown (while voltage is
     /// being disabled) and only stop AFTER voltage is safely off. The mining owner
@@ -2971,6 +3255,13 @@ pub struct Daemon {
     /// ALL I2C operations (init, heartbeat, shutdown) go through this handle.
     /// Matches BraiinsOS's AsyncI2cDev pattern: 1 fd, 1 thread, mpsc channel.
     i2c_service: Option<dcentrald_hal::i2c::I2cServiceHandle>,
+    /// Read-only I2C/sysfs observations captured before any runtime fabric
+    /// service exists. Runtime policy consumes these immutable values rather
+    /// than issuing hidden kernel-adapter transfers through sysfs.
+    bootstrap_eeprom_fingerprints: Vec<Option<String>>,
+    bootstrap_eeprom_preambles: Vec<Option<[u8; 2]>>,
+    bootstrap_hb_type: Option<String>,
+    resolved_pic_type: Option<PicType>,
     /// Initialization-only PIC heartbeat ownership. These fields are installed
     /// immediately after the OS thread is spawned, rather than returned only
     /// after `init()` succeeds. If the bring-up future is cancelled or times
@@ -3055,6 +3346,7 @@ impl Daemon {
     pub fn new(
         config: DcentraldConfig,
         config_path: String,
+        platform_identity: crate::daemon_lifecycle::PlatformIdentitySnapshot,
         shutdown_token: CancellationToken,
     ) -> Self {
         // Mining hardware ownership is intentionally independent of the global
@@ -3067,6 +3359,7 @@ impl Daemon {
         Self {
             config,
             config_path,
+            platform_identity,
             shutdown_token,
             mining_tasks,
             watchdog_tasks,
@@ -3083,8 +3376,14 @@ impl Daemon {
             pic_firmware: PicFirmware::Unknown,
             initialized_pic_addrs_final: Vec::new(),
             miner_profile: None,
+            standard_composition_admission: None,
+            asic_driver_execution_policy: ChipDriverExecutionPolicy::production_only(),
             heartbeat_shutdown_token: CancellationToken::new(),
             i2c_service: None,
+            bootstrap_eeprom_fingerprints: Vec::new(),
+            bootstrap_eeprom_preambles: Vec::new(),
+            bootstrap_hb_type: None,
+            resolved_pic_type: None,
             init_heartbeat_stop: None,
             init_heartbeat_handle: None,
             runtime_heartbeat_handle: None,
@@ -3472,14 +3771,15 @@ impl Daemon {
     /// Get the PIC type for the detected profile.
     ///
     /// The DECLARATIVE result is the model-string override → profile
-    /// `pic_type` → S9 default chain, exactly as before. When the
-    /// `DCENT_AM2_EEPROM_PIC_DETECT` gate is ON (default OFF), the chain
-    /// EEPROM preamble is consulted as the AUTHORITATIVE physical signal:
+    /// `pic_type` → S9 default chain, exactly as before. Before runtime
+    /// I2C ownership begins, `capture_bootstrap_i2c_observations` applies the
+    /// default-off `DCENT_AM2_EEPROM_PIC_DETECT` gate and caches the result.
+    /// The chain EEPROM preamble is then the AUTHORITATIVE physical signal:
     /// a clear NoPic preamble (BHB56902 / `0x05 0x11`) forces
     /// `PicType::NoPic` so a NoPic board is never driven as a dsPIC
-    /// (SET_VOLTAGE to a non-existent controller). With the gate OFF the
-    /// EEPROM is never read here and the result is byte-identical to
-    /// today. The EEPROM authority never overrides toward dsPIC on a
+    /// (SET_VOLTAGE to a non-existent controller). This getter never performs
+    /// I2C or sysfs I/O. With the gate off, the cached result is byte-identical
+    /// to the declarative result. The EEPROM authority never overrides toward dsPIC on a
     /// weak/absent signal — see
     /// [`crate::runtime::hardware_info::resolve_pic_type`].
     fn pic_type(&self) -> Result<PicType> {
@@ -3488,10 +3788,28 @@ impl Daemon {
         } else {
             self.required_topology_profile()?.pic_type
         };
-        Ok(resolve_pic_type_from_eeprom(
-            declarative,
+        Ok(self.resolved_pic_type.unwrap_or(declarative))
+    }
+
+    fn capture_bootstrap_i2c_observations(&mut self) -> Result<()> {
+        if self.i2c_service.is_some() {
+            anyhow::bail!(
+                "bootstrap I2C observations are forbidden after runtime fabric reservation"
+            );
+        }
+
+        const EEPROM_SLOT_CAPACITY: usize = 8;
+        let declarative_pic_type = self.pic_type()?;
+        self.resolved_pic_type = Some(resolve_pic_type_from_eeprom(
+            declarative_pic_type,
             self.chain_count()? as usize,
-        ))
+        ));
+        self.bootstrap_eeprom_fingerprints =
+            read_hashboard_eeprom_fingerprints(EEPROM_SLOT_CAPACITY);
+        self.bootstrap_eeprom_preambles = (0..EEPROM_SLOT_CAPACITY)
+            .map(read_hashboard_eeprom_preamble_for_slot)
+            .collect();
+        Ok(())
     }
 
     /// Get the I2C bus number for PIC controllers.
@@ -3626,9 +3944,7 @@ impl Daemon {
             return self.run_api_only().await;
         }
 
-        let platform_identity = crate::daemon_lifecycle::PlatformIdentitySource::capture_identity(
-            &SystemPlatformIdentitySource,
-        )?;
+        let platform_identity = self.platform_identity.clone();
 
         if let Some(refusal) = self.td003_destructive_write_refusal(&platform_identity) {
             warn!(
@@ -3639,6 +3955,13 @@ impl Daemon {
             );
             return self.run_api_only().await;
         }
+
+        // Capture I2C-backed identity and policy observations before runtime
+        // initialization can reserve I2C fabrics. The resulting values are
+        // immutable lifecycle input; post-init policy must not fall back to
+        // sysfs because an AT24 sysfs read is still a kernel I2C transfer.
+        let bootstrap_hardware_info = collect_hardware_info(&self.config);
+        self.bootstrap_hb_type = bootstrap_hardware_info.hb_type.clone();
 
         //  W5: shared boot-progress tracker. Records each
         // `BootPhase` transition with its wall-clock timestamp so
@@ -4189,9 +4512,8 @@ impl Daemon {
             expose_boot_timeline: self.config.api.expose_boot_timeline,
         };
 
-        // ---- Collect hardware info ----
-        let hardware_info = collect_hardware_info(&self.config);
-        let hardware_info = std::sync::Arc::new(std::sync::Mutex::new(hardware_info));
+        // ---- Publish the pre-initialization hardware snapshot ----
+        let hardware_info = std::sync::Arc::new(std::sync::Mutex::new(bootstrap_hardware_info));
 
         // Instantiate the curtailment controller for sleep/wake demand response.
         // Shared between the API (sleep/wake endpoints) and the thermal loop.
@@ -5959,7 +6281,14 @@ impl Daemon {
             PicFirmware::Unknown => None,
         };
         let chain_eeprom_fingerprints = if matches!(self.pic_type()?, PicType::NoPic) {
-            read_hashboard_eeprom_fingerprints(dispatch_chains.len())
+            (0..dispatch_chains.len())
+                .map(|slot| {
+                    self.bootstrap_eeprom_fingerprints
+                        .get(slot)
+                        .cloned()
+                        .flatten()
+                })
+                .collect()
         } else {
             Vec::new()
         };
@@ -5982,7 +6311,7 @@ impl Daemon {
         > = std::collections::HashMap::new();
         if matches!(self.pic_type()?, PicType::NoPic) {
             for slot in 0..dispatch_chains.len() {
-                match read_hashboard_eeprom_preamble_for_slot(slot) {
+                match self.bootstrap_eeprom_preambles.get(slot).copied().flatten() {
                     Some(preamble) => {
                         let sku =
                             dcentrald_silicon_profiles::hashboards::classify_by_eeprom_preamble(
@@ -6201,6 +6530,7 @@ impl Daemon {
             worker_name,
             dispatch_chains,
             dispatch_chip_id,
+            self.asic_driver_execution_policy,
             hw_difficulty,
             autotune_stats_tx,
             Some(freq_cmd_rx),
@@ -6857,11 +7187,10 @@ impl Daemon {
             // hash is left None here (read-only fingerprinting is a later wiring
             // step); a None hash simply means a fingerprint mismatch can't discard a
             // persisted blacklist — irrelevant while actuation is deferred.
-            let platform_key = std::fs::read_to_string("/etc/dcentos/platform")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "unknown".to_string());
+            let platform_key = match self.platform_identity.platform_marker() {
+                "" => "unknown".to_string(),
+                marker => marker.to_string(),
+            };
             let model_key = self
                 .config
                 .mining
@@ -6996,7 +7325,7 @@ impl Daemon {
                 // BHB42601 home unit keeps the 545 ceiling — the gate cannot
                 // auto-promote a board the EEPROM doesn't corroborate.
                 let sku_class = if am2_sku_aware_ceiling_enabled() {
-                    let label = crate::runtime::hardware_info::read_hb_type();
+                    let label = self.bootstrap_hb_type.clone();
                     let class = label
                         .as_deref()
                         .map(dcentrald_autotuner::Bm1362SkuClass::from_sku_label)
@@ -7101,7 +7430,8 @@ impl Daemon {
             let autotuner_telemetry_watch = autotuner_telemetry_tx.clone();
             let autotuner_command_rx = autotuner_command_rx;
             let chip_type = {
-                let registry = ChipRegistry::new();
+                let registry =
+                    ChipRegistry::with_execution_policy(self.asic_driver_execution_policy);
                 registry
                     .detect(self.chip_id)
                     .map(|d| d.chip_name().to_string())
@@ -7976,10 +8306,10 @@ impl Daemon {
             .as_ref()
             .map(|o| o.enabled)
             .unwrap_or(false);
-        let legacy_psu_board_target = read_first_trimmed(&["/etc/dcentos/board_target"]);
+        let legacy_psu_board_target = self.platform_identity.board_target();
         let legacy_psu_path_allowed = legacy_kernel_smart_psu_path_allowed(
             self.config.mining.model.as_deref(),
-            &legacy_psu_board_target,
+            legacy_psu_board_target,
             psu_override_active,
         );
         let mut detected_smart_psu_version: Option<String> = None;
@@ -8152,12 +8482,11 @@ impl Daemon {
         let thermal_pic_type = self.pic_type()?;
         let thermal_emergency_latch = thermal_emergency_latch.clone();
         let thermal_skip_board_temp = self.config.mining.skip_board_temp;
-        let thermal_has_xadc = !detect_control_board().starts_with("AML");
-        let thermal_platform_marker = read_first_trimmed(&[
-            "/etc/dcentos/platform",
-            "/etc/bos_platform",
-            "/etc/dcentos-platform",
-        ]);
+        let thermal_has_xadc = !self
+            .platform_identity
+            .observed_control_board
+            .starts_with("AML");
+        let thermal_platform_marker = self.platform_identity.platform_marker().to_string();
         let thermal_include_die_on_am2 = std::env::var(ENV_THERMAL_INCLUDE_DIE_ON_AM2)
             .map(|v| dcentrald_autotuner::config::env_flag_is_truthy(&v))
             .unwrap_or(false);
@@ -8204,7 +8533,7 @@ impl Daemon {
                 .mining
                 .model
                 .clone()
-                .unwrap_or_else(detect_control_board);
+                .unwrap_or_else(|| self.platform_identity.observed_control_board.clone());
             let platform =
                 dcentrald_thermal::supervisor::SupervisorPlatform::from_board_target(&marker);
             let on = dcentrald_thermal::supervisor::supervisor_default_enabled(platform, validated);
@@ -8714,12 +9043,9 @@ impl Daemon {
                                     false
                                 } else {
                                     match thermal_pic_type {
-                                    PicType::NoPic => match dcentrald_hal::platform::amlogic::enable_psu() {
-                                        Ok(()) => true,
-                                        Err(e) => {
-                                            error!(error = %e, "Curtailment wake: failed to enable NoPic PSU");
-                                            false
-                                        }
+                                    PicType::NoPic => {
+                                        error!("Curtailment wake: refusing NoPic re-energization because the standard daemon does not own the retained Amlogic power/thermal service");
+                                        false
                                     },
                                     _ => {
                                         let mut all_ok = true;
@@ -9826,7 +10152,7 @@ impl Daemon {
                                 match thermal_pic_type {
                                     PicType::NoPic => {
                                         warn!(
-                                            "Thermal restart: NoPic platforms require a full daemon restart to replay cold boot init"
+                                            "Thermal recovery requires a new NoPic hardware session; automatic process replacement is suspended until typed disposition receipts exist"
                                         );
                                         let _ = thermal_alert_tx.try_send(AlertEvent::ThermalRestart);
                                         let _ = crate::restart::schedule_daemon_restart(
@@ -9937,10 +10263,9 @@ impl Daemon {
         // platforms where a daemon restart is PROVEN to recover mining (am1-s9)
         // arm the ladder; every other platform stays alert-only.
         let publisher_recovery_platform_allowed = {
-            let pk = std::fs::read_to_string("/etc/dcentos/platform")
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
-            dcentrald_api_types::hashrate_recovery::platform_recovery_allowed(&pk)
+            dcentrald_api_types::hashrate_recovery::platform_recovery_allowed(
+                self.platform_identity.platform_marker(),
+            )
         };
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -10128,8 +10453,9 @@ impl Daemon {
                             match ladder.step(tick) {
                                 LadderOutcome::ScheduleRestart { reason, attempt } => {
                                     // Persist the per-episode budget BEFORE
-                                    // scheduling so it survives the respawn;
-                                    // fail-closed (no restart) if persistence fails.
+                                    // evaluating recovery so the per-episode
+                                    // budget survives any future safe re-admission;
+                                    // fail closed if persistence is not proven.
                                     match persist_recovery_ladder_state(
                                         &publisher_recovery_state_path,
                                         &ladder.persisted_state(),
@@ -10142,12 +10468,16 @@ impl Daemon {
                                                 floor_ghs,
                                                 persisted_bytes = outcome.bytes_written,
                                                 replaced_existing = outcome.replaced_existing,
-                                                "PH-3 auto-recovery: durable ladder budget published; scheduling graceful daemon restart"
+                                                "PH-3 recovery: durable ladder budget published; evaluating guarded daemon restart"
                                             );
-                                            crate::restart::schedule_daemon_restart(
+                                            if !crate::restart::schedule_daemon_restart(
                                                 reason,
                                                 Duration::from_secs(5),
-                                            );
+                                            ) {
+                                                tracing::error!(
+                                                    "PH-3 recovery: automatic restart remains suspended pending typed hardware disposition"
+                                                );
+                                            }
                                         }
                                         Err(error) => {
                                             log_recovery_state_persist_failure(
@@ -10210,6 +10540,13 @@ impl Daemon {
         &mut self,
         identity: &crate::daemon_lifecycle::PlatformIdentitySnapshot,
     ) -> Result<()> {
+        // Until this complete init generation reaches the explicit success
+        // receipt below, shutdown must assume an inherited/hot rail may exist.
+        // This is deliberately set before composition admission: a denial can
+        // occur before controller discovery, leaving no endpoints on which to
+        // issue disable commands. Such an empty command set is not safe-off.
+        self.preflight_hardware_state_unknown = true;
+
         // Initialization is a composition boundary even when it later fails.
         // Revoke the preceding engine lease before touching discovery state so
         // management-only recovery can never retain an earlier dispatcher's
@@ -10220,9 +10557,58 @@ impl Daemon {
                 "Could not revoke the preceding dispatcher composition at initialization start"
             );
         }
-        // An init retry is a new discovery generation. Never let successful
-        // receipts from an earlier, partially completed attempt survive it.
+        // An init retry is a new discovery and serialized-transport lifetime.
+        // Stop the preceding heartbeat owner and terminal-close the old worker
+        // before any address or generation-zero state can be reused. A detached
+        // worker clone still observes the terminal latch, while the hardware
+        // watchdog remains the independent cutoff if its current syscall never
+        // returns.
+        self.signal_init_heartbeat_stop();
+        let had_previous_i2c_lifetime = self.i2c_service.is_some();
+        if let Some(previous_i2c) = self.i2c_service.as_ref() {
+            let previous_i2c_fw = match self.pic_firmware {
+                PicFirmware::BraiinsOs => dcentrald_hal::i2c::I2cPicFirmware::BraiinsOs,
+                PicFirmware::Stock(_) => dcentrald_hal::i2c::I2cPicFirmware::Stock,
+                PicFirmware::Unknown => dcentrald_hal::i2c::I2cPicFirmware::Unknown,
+            };
+            for &address in &self.initialized_pic_addrs_final {
+                if (0x55..=0x57).contains(&address) {
+                    if let Err(error) = previous_i2c.disable_voltage(address, previous_i2c_fw) {
+                        warn!(
+                            address = format_args!("0x{address:02X}"),
+                            error = %error,
+                            "Previous PIC16 rail SafeOff was not proven before init-lifetime revocation; refusing in-process transport replacement and relying on watchdog cutoff"
+                        );
+                    }
+                } else {
+                    warn!(
+                        address = format_args!("0x{address:02X}"),
+                        "Previous controller is not a PIC16 safe-off target; refusing in-process transport replacement and relying on protocol-specific teardown/watchdog cutoff"
+                    );
+                }
+            }
+            let transition = previous_i2c.latch_terminal_safe_off();
+            info!(
+                generation = transition.generation(),
+                no_controller_mutation_stage_in_flight =
+                    transition.no_controller_mutation_stage_in_flight(),
+                "Revoked previous I2C service lifetime at initialization boundary"
+            );
+        }
+        let _previous_init_heartbeat_joined = self.stop_init_heartbeat_bounded().await;
+
+        // Never let successful receipts or address-only compatibility state
+        // from an earlier, partially completed attempt survive this boundary.
         self.asic_enumeration_receipts.clear();
+        self.initialized_pic_addrs_final.clear();
+        self.pic_firmware = PicFirmware::Unknown;
+        if had_previous_i2c_lifetime {
+            anyhow::bail!(
+                "previous serialized I2C service lifetime was revoked; in-process replacement is refused until worker shutdown/join can be proven (restart the daemon lifecycle after hardware watchdog reconciliation)"
+            );
+        }
+        self.standard_composition_admission = None;
+        self.asic_driver_execution_policy = ChipDriverExecutionPolicy::production_only();
 
         if let Some(refusal) = self.td003_destructive_write_refusal(identity) {
             anyhow::bail!(
@@ -10287,6 +10673,32 @@ impl Daemon {
             .unwrap_or(admitted_profile.pic_addrs);
         validate_profile_platform_authority(board_target_for_i2c, is_am1_s9, admitted_profile)?;
         validate_standard_daemon_topology(admitted_profile, admitted_pic_type, admitted_pic_addrs)?;
+
+        // Executable maturity is not inferred from recognition or a product
+        // name.  Experimental authority is an explicit, exact chip-ID opt-in;
+        // an opt-in for one family cannot authorize another.  This policy is
+        // then bound into the complete standard-route composition before any
+        // new-generation I2C, fan, GPIO, reset, rail, or FPGA access.
+        let experimental_config = crate::experimental::ExperimentalConfig::load();
+        self.asic_driver_execution_policy = if experimental_config
+            .executable_asic_chip_ids
+            .contains(&admitted_profile.chip_id)
+        {
+            ChipDriverExecutionPolicy::with_experimental_chip(admitted_profile.chip_id)
+        } else {
+            ChipDriverExecutionPolicy::production_only()
+        };
+        let i2c_transport = standard_i2c_transport(identity, is_am1_s9)?;
+        let registry = ChipRegistry::with_execution_policy(self.asic_driver_execution_policy);
+        let composition_admission = admit_standard_hardware_composition(
+            board_target_for_i2c,
+            admitted_profile,
+            admitted_pic_type,
+            admitted_pic_addrs,
+            i2c_transport,
+            self.config.mining.passthrough,
+            &registry,
+        )?;
         info!(
             board_target = %board_target_for_i2c,
             profile = admitted_profile.name,
@@ -10297,8 +10709,17 @@ impl Daemon {
             } else {
                 "authoritative-am1-s9-topology-only"
             },
-            "Model-specific topology admitted before hardware access"
+            driver_maturity = ?composition_admission.asic.recognition().maturity(),
+            admitted_board_target = %composition_admission.board_target,
+            ownership = ?composition_admission.ownership,
+            i2c_transport = ?composition_admission.i2c_transport,
+            pic_type = ?composition_admission.pic_type,
+            pic_addrs = ?composition_admission.pic_addrs,
+            "Complete standard hardware composition admitted before hardware access"
         );
+        self.standard_composition_admission = Some(composition_admission);
+
+        self.capture_bootstrap_i2c_observations()?;
 
         let preserve_passthrough_i2c =
             self.config.mining.passthrough && self.config.mining.model.is_none();
@@ -10321,7 +10742,7 @@ impl Daemon {
         // hash on S9 and the sustained-mining path on .39.
         //
         // CRITICAL (CE audit 06-ce.md #2, ):
-        // the S9 devmem path — and specifically `unbind_kernel_i2c_driver()` —
+        // the S9 devmem path — and specifically the HAL's kernel-driver unbind —
         // MUST NEVER run on am2. am2 shares I2C bus 0 with the APW PSU via
         // framed-I2C. Unbinding xiic-i2c + SOFTR'ing the controller kills the
         // PSU's framing session: output disabled or stuck at safe-mode voltage
@@ -10329,7 +10750,6 @@ impl Daemon {
         // gate let am2 (Zynq but not AML) through, which was the poisoning
         // vector. Switch to an explicit AM1/S9 allowlist: only boards we
         // positively identify as am1 take the unbind path.
-        let i2c_transport = standard_i2c_transport(identity, is_am1_s9)?;
         let use_devmem_i2c = i2c_transport == StandardI2cTransport::Am1S9Devmem;
         if use_devmem_i2c {
             info!(
@@ -10743,15 +11163,15 @@ impl Daemon {
             );
         }
 
-        // ---- Phase 0: ENDPOINT-SCOPED PIC16 HEARTBEATS ----
+        // ---- Phase 0: NON-MUTATING PIC16 TOPOLOGY CAPABILITIES ----
         // This runs only after cooling and positive per-slot presence evidence.
         // Only authoritative AM1/S9 board identity admits its canonical endpoint
-        // table. Config/model hints cannot mint early keepalive authority: a
-        // guessed keepalive can prolong an already-energized unknown rail or
-        // address a different protocol. Other endpoints wait for typed init.
-        info!("--- Phase 0: Endpoint-Scoped PIC16 Heartbeats (post-presence) ---");
-        let mut heartbeat_success = 0u8;
-        let mut heartbeat_endpoints = Vec::new();
+        // table. Config/model hints cannot mint early mutation authority. This
+        // phase performs no PIC I2C traffic so cold-boot admission retains the
+        // original raw-state evidence for its atomic exact-0xCC decision.
+        info!("--- Phase 0: Non-Mutating PIC16 Topology Capabilities (post-presence) ---");
+        let mut capability_success = 0u8;
+        let mut capability_endpoints = Vec::new();
         let mut pic16_endpoint_sessions = Vec::new();
         if is_am1_s9 {
             for &board_index in &self.detected_board_indices {
@@ -10762,27 +11182,25 @@ impl Daemon {
                     );
                     continue;
                 };
-                heartbeat_endpoints.push((board_index, addr));
-                match dcentrald_hal::platform::discover_system_pic16_endpoint_with_heartbeat(
-                    &i2c_svc, addr,
-                ) {
+                capability_endpoints.push((board_index, addr));
+                match dcentrald_hal::platform::discover_system_pic16_endpoint(&i2c_svc, addr) {
                     Ok(endpoint) => match Pic16EndpointSession::new(i2c_svc.clone(), endpoint) {
                         Ok(session) => {
-                            heartbeat_success += 1;
+                            capability_success += 1;
                             pic16_endpoint_sessions.push(session);
                         }
                         Err(error) => warn!(
                             board_index,
                             i2c_addr = format_args!("0x{:02X}", addr),
                             error = %error,
-                            "PIC16 heartbeat succeeded but endpoint session binding failed; address remains unauthorized"
+                            "PIC16 topology capability was issued but session binding failed; address remains unauthorized"
                         ),
                     },
                     Err(error) => warn!(
                         board_index,
                         i2c_addr = format_args!("0x{:02X}", addr),
                         error = %error,
-                        "PIC16 endpoint heartbeat did not establish authority; later init will not use a raw-address fallback"
+                        "PIC16 topology capability was not established; later init will not use a raw-address fallback"
                     ),
                 }
             }
@@ -10793,9 +11211,9 @@ impl Daemon {
             );
         }
         info!(
-            success_count = heartbeat_success,
-            endpoints = ?heartbeat_endpoints,
-            "Endpoint-scoped post-presence PIC16 keepalives complete"
+            success_count = capability_success,
+            endpoints = ?capability_endpoints,
+            "Non-mutating post-presence PIC16 capability issuance complete"
         );
 
         info!(
@@ -11022,6 +11440,17 @@ impl Daemon {
             chain.chip_count = assumed_chips;
             chain.chip_id = assumed_chip_id;
 
+            if self.config.mining.passthrough && assumed_chip_id != 0 && assumed_chips != 0 {
+                chain
+                    .admit_address_assignment_for_current_identity()
+                    .with_context(|| {
+                        format!(
+                            "hot-start chain {} lacks an admitted ASIC/board composition",
+                            chain.chain_id
+                        )
+                    })?;
+            }
+
             // AM2 model detection: cold boot vs passthrough.
             //
             // v0.19.1: passthrough=true IS supported on am2 (S19 Pro) when bosminer
@@ -11037,7 +11466,9 @@ impl Daemon {
                     chain_id = chain.chain_id,
                     "AM2 FULL COLD BOOT: pushing chain to cold boot path (BREAK + init_chain)",
                 );
-                cold_chain_indices.push(chain_idx);
+                if !cold_chain_indices.contains(&chain_idx) {
+                    cold_chain_indices.push(chain_idx);
+                }
                 continue;
             }
 
@@ -11196,41 +11627,25 @@ impl Daemon {
                 );
             }
 
-            // UART relay handling for BM1397/BM1398 chips.
-            //
-            // PASSTHROUGH MODE (SIGKILL from mining bosminer):
-            //   DO NOT write UART relay — SIGKILL preserves bosminer's relay state.
-            //   Writing 0x000F0000 to register 0x34 actually BREAKS the relay.
-            //   Evidence: 512 residual nonces then ZERO from our work when relay was written.
-            //
-            // COLD BOOT MODE (passthrough=false):
-            //   MUST write UART relay after serial ASIC init to switch from ttyS to FPGA path.
+            // BM1397/BM1398 relay programming is board-composition state, not
+            // a chip-family constant. The old generic register-0x34 broadcast
+            // was contradicted by both local runtime evidence and the stock
+            // NBP1901 sequence (twelve addressed register-0x2c writes). Keep
+            // passthrough state untouched and refuse a cold transition until
+            // the exact board composition owns an evidence-backed recipe.
             if (assumed_chip_id == 0x1398 || assumed_chip_id == 0x1397)
                 && !self.config.mining.passthrough
             {
-                let serial_path = match chain.chain_id {
-                    1 => "/dev/ttyS1",
-                    2 => "/dev/ttyS2",
-                    3 => "/dev/ttyS3",
-                    _ => "/dev/ttyS1",
-                };
-
-                if self.config.mining.model.is_some() {
-                    dcentrald_asic::drivers::bm1398::Bm1398Driver::enable_uart_relay_via_serial(
-                        serial_path,
-                        chain.chain_id,
-                    );
-                } else {
-                    dcentrald_asic::drivers::bm1398::Bm1398Driver::enable_uart_relay(
-                        &mut chain.fpga,
-                    );
-                }
+                anyhow::bail!(
+                    "chain {}: refusing generic BM1397/BM1398 cold relay transition; exact board-composition relay recipe is required",
+                    chain.chain_id
+                );
             } else if (assumed_chip_id == 0x1398 || assumed_chip_id == 0x1397)
                 && self.config.mining.passthrough
             {
                 info!(
                     chain_id = chain.chain_id,
-                    "Passthrough: SKIP UART relay write (SIGKILL preserves bosminer's relay state)",
+                    "Passthrough: retaining externally established board relay state without chip-generic writes",
                 );
             }
 
@@ -11250,7 +11665,7 @@ impl Daemon {
                 chain_id = chain.chain_id,
                 assumed_chip_id = format_args!("0x{:04X}", assumed_chip_id),
                 assumed_chips,
-                "Hot start: {} chips (ChipID 0x{:04X}), FIFOs reset, relay enabled, baud {} Hz",
+                "Hot start: {} chips (ChipID 0x{:04X}), FIFOs reset, relay state retained, baud {} Hz",
                 assumed_chips,
                 assumed_chip_id,
                 baud_hz,
@@ -11272,6 +11687,7 @@ impl Daemon {
 
         // Old Phase 4c enumeration code skipped — replaced by zero-change hot start above
 
+        let mut hot_controller_admitted_chain_indices: Vec<usize> = Vec::new();
         if !hot_chain_indices.is_empty() {
             info!(
                 hot = hot_chain_indices.len(),
@@ -11293,7 +11709,8 @@ impl Daemon {
             // All PIC16F1704 app-mode firmwares use heartbeat cmd 0x16.
             info!("Hot start: sending PIC16 heartbeats via kernel I2C to preserve the live handoff state.");
             {
-                for &idx in &self.detected_board_indices {
+                for &chain_idx in &hot_chain_indices {
+                    let idx = self.board_idx_for_chain(self.chains[chain_idx].chain_id)?;
                     let addr = self.pic_addr_for_board(idx)?;
 
                     if i2c_svc
@@ -11305,7 +11722,12 @@ impl Daemon {
                             pic_addr = format_args!("0x{:02X}", addr),
                             "PIC heartbeat sent (write-only)",
                         );
-                        self.initialized_pic_addrs_final.push(addr);
+                        if !self.initialized_pic_addrs_final.contains(&addr) {
+                            self.initialized_pic_addrs_final.push(addr);
+                        }
+                        if !hot_controller_admitted_chain_indices.contains(&chain_idx) {
+                            hot_controller_admitted_chain_indices.push(chain_idx);
+                        }
                     } else {
                         warn!(
                             chain_id = self.chain_id_for_board(idx)?,
@@ -11323,23 +11745,13 @@ impl Daemon {
         // snapshot — cold boot PICs never got heartbeats from the init thread.
         let initialized_pic_addrs =
             InitializedPicAddrs::new(self.initialized_pic_addrs_final.clone());
-        let mixed_chip_platform = read_first_trimmed(&[
-            "/etc/dcentos/platform",
-            "/etc/bos_platform",
-            "/etc/dcentos-platform",
-        ]);
+        let mixed_chip_platform = identity.platform_marker();
         let mixed_chip_board_target = identity.board_target();
-        let mixed_chip_psu_hardware_variant =
-            read_first_trimmed(&["/etc/dcentos/psu_hardware_variant"]);
         let mixed_chip_policy = divergent_chip_policy_for_platform(
             self.config.mining.enforce_mixed_chip_id_refusal_on_xil25,
-            &mixed_chip_platform,
+            mixed_chip_platform,
             mixed_chip_board_target,
-            if mixed_chip_psu_hardware_variant.is_empty() {
-                None
-            } else {
-                Some(mixed_chip_psu_hardware_variant.as_str())
-            },
+            identity.psu_hardware_variant(),
         );
 
         // Start a background OS thread to send heartbeats every 500ms during init.
@@ -11382,6 +11794,9 @@ impl Daemon {
             None
         };
 
+        // Cold controller admission is deliberately independent of hot
+        // keepalive membership and remains available to the Phase-7 gate.
+        let mut cold_pic_admitted_board_indices: Vec<usize> = Vec::new();
         if !cold_chain_indices.is_empty() {
             // Derive board indices for cold chains (for GPIO/PIC operations).
             // Uses profile-aware mapping: S9: chain 6→0, S19: chain 1→0, etc.
@@ -11416,7 +11831,7 @@ impl Daemon {
             // Devmem cold_boot_init bypasses the kernel anyway — unbinding is unnecessary
             // and kills /dev/i2c-0, forcing heartbeats to fall back to broken devmem path.
             // BraiinsOS keeps the kernel driver bound for the entire daemon lifetime.
-            // dcentrald_hal::i2c::unbind_kernel_i2c_driver();  // REMOVED
+            // The former direct kernel-driver unbind was removed.
 
             info!("--- Phase 5: Hash Board Reset for {} cold chain(s) (bosminer-matched sequence) ---", cold_chain_indices.len());
             info!("Sequence: PSU init -> disable IP core -> assert RESET -> PIC voltage init -> release RESET -> re-enable IP core -> enumerate");
@@ -11533,7 +11948,8 @@ impl Daemon {
             info!("Step 5.1: Disabling FPGA IP core on cold chains (bosminer enter_reset: IP core off BEFORE GPIO reset)");
             // Chip-aware CTRL value (BM1387=0x0C, BM1398=0x1C with BM139X bit).
             let ctrl_value_for_reconfigure = {
-                let registry = ChipRegistry::new();
+                let registry =
+                    ChipRegistry::with_execution_policy(self.asic_driver_execution_policy);
                 if let Some(drv) = registry.detect(self.chip_id) {
                     drv.ctrl_reg_value()
                 } else {
@@ -11611,11 +12027,10 @@ impl Daemon {
             // Give PICs 100ms to stabilize after GPIO change
             tokio::time::sleep(Duration::from_millis(100)).await;
 
-            // FIX (swarm review 2026-03-26): Send heartbeat to cold chain PICs BEFORE
-            // disabling voltage. Emergency heartbeats were at Phase 0 (~10+ seconds ago).
-            // BraiinsOS PIC watchdog is 10s. Without this, PICs may timeout and cut voltage
-            // before we even start cold_boot_init.
-            info!("Step 5.2a: Refreshing heartbeats on cold chain PICs (prevent watchdog timeout during init)");
+            // PIC16 cold-boot admission must be the first controller mutation:
+            // a pre-admission heartbeat would overwrite the raw SSPBUF evidence
+            // needed for the worker's exact-0xCC transition decision.
+            info!("Step 5.2a: Preserving cold PIC16 raw-state evidence until atomic admission");
             for &idx in &cold_board_indices {
                 let pic_addr = self.pic_addr_for_board(idx)?;
                 match self.pic_type()? {
@@ -11624,7 +12039,10 @@ impl Daemon {
                         let _ = dspic.send_heartbeat();
                     }
                     _ => {
-                        let _ = i2c_svc.heartbeat(pic_addr, i2c_fw_for(self.pic_firmware));
+                        info!(
+                            i2c_addr = format_args!("0x{:02X}", pic_addr),
+                            "PIC16 pre-admission heartbeat intentionally skipped"
+                        );
                     }
                 }
             }
@@ -11644,7 +12062,9 @@ impl Daemon {
             // corrupts the Zynq I2C adapter when PICs are dead (EIO). This corruption
             // is bus-wide — it prevents ALL subsequent I2C operations including heartbeats
             // to hot chain PICs, causing voltage cutoff on working hash boards.
-            if self.pic_firmware != PicFirmware::Unknown {
+            if self.pic_type()? != PicType::DsPic33EP {
+                info!("Step 5.2b: PIC16 detect/disable intentionally skipped; atomic cold-boot admission owns first controller mutation");
+            } else if self.pic_firmware != PicFirmware::Unknown {
                 info!("Step 5.2b: Skipping cold chain PIC probe — firmware already known ({}), avoiding I2C_RDWR bus corruption",
                 self.pic_firmware);
                 // Just try simple write-only disable_voltage on cold PICs (safe for I2C bus)
@@ -11757,13 +12177,12 @@ impl Daemon {
             }
 
             // Step 5.3: PIC Voltage Controller Init (I2C)
-            // BraiinsOS init sequence (from braiins_power.rs):
-            //   1. Send RESET (0x07) to each PIC — clears any stuck state
-            //   2. Wait 7s (warm boot) for PICs to enter bootloader
-            //   3. Read flash data (BADCORE, FREQ) — we skip this for now
-            //   4. JUMP to app — PIC starts running application firmware
-            //   5. get_version() — detect firmware type (Stock vs BraiinsOS)
-            //   6. set_voltage + enable_voltage + heartbeat
+            // PIC16 fail-closed admission:
+            //   1. Worker reads one exact raw-state byte.
+            //   2. Only same-worker exact 0xCC may emit fixed JUMP [55 AA 06].
+            //   3. Positive application evidence is required after any JUMP.
+            //   4. Five consecutive 1 Hz heartbeats precede one SET+ENABLE.
+            // RESET is intentionally absent from the production PIC16 path.
             //
             // CRITICAL TIMING: The BraiinsOS PIC watchdog fires at ~10s without heartbeats.
             // When we kill bosminer, the PIC watchdog starts counting down. We MUST complete
@@ -11798,22 +12217,14 @@ impl Daemon {
                             }
                         }
                         _ => {
-                            let pic =
-                                pic16_service_for_endpoint(&pic16_endpoint_sessions, addr, None)?;
-                            if let Ok(raw) = pic.read_raw() {
-                                info!(
-                                    i2c_addr = format_args!("0x{:02X}", addr),
-                                    response = format_args!("0x{:02X}", raw),
-                                    "PIC at 0x{:02X} responding after reset (raw: 0x{:02X})",
-                                    addr,
-                                    raw,
-                                );
-                                found_any = true;
-                            }
+                            info!(
+                                i2c_addr = format_args!("0x{:02X}", addr),
+                                "PIC16 diagnostic raw read deferred to atomic cold-boot admission"
+                            );
                         }
                     }
                 }
-                if !found_any {
+                if !found_any && self.pic_type()? == PicType::DsPic33EP {
                     warn!("No PICs responding after reset — hash boards may lack PSU power (12V from 6-pin connectors)");
                 }
             }
@@ -11910,6 +12321,9 @@ impl Daemon {
                 }
 
                 if pic_ok {
+                    if !cold_pic_admitted_board_indices.contains(&idx) {
+                        cold_pic_admitted_board_indices.push(idx);
+                    }
                     initialized_pic_addrs
                         .record_success(pic_addr, "phase 5.3 pass 1 PIC admission");
                     // Init heartbeat thread automatically picks up new PIC on next tick.
@@ -12066,6 +12480,9 @@ impl Daemon {
                         }
 
                         if pic_ok {
+                            if !cold_pic_admitted_board_indices.contains(&idx) {
+                                cold_pic_admitted_board_indices.push(idx);
+                            }
                             initialized_pic_addrs
                                 .record_success(pic_addr, "phase 5.3 retry PIC admission");
                         } else {
@@ -12076,12 +12493,30 @@ impl Daemon {
                 }
             }
 
-            // Report final PIC init results
-            let pic_addr_count = initialized_pic_addrs.len("phase 5.3 result accounting");
-            if pic_addr_count == 0 {
+            // From this point forward, shadow the cold board/chain lists with
+            // controller-admitted pairs. Failed PIC chains remain FPGA-disabled
+            // and cannot enter reset release, enumeration, or Phase 7.
+            let eligible_cold_pairs: Vec<(usize, usize)> = cold_board_indices
+                .iter()
+                .copied()
+                .zip(cold_chain_indices.iter().copied())
+                .filter(|(board_idx, _)| cold_pic_admitted_board_indices.contains(board_idx))
+                .collect();
+            let cold_board_indices: Vec<usize> = eligible_cold_pairs
+                .iter()
+                .map(|(board_idx, _)| *board_idx)
+                .collect();
+            let cold_chain_indices: Vec<usize> = eligible_cold_pairs
+                .iter()
+                .map(|(_, chain_idx)| *chain_idx)
+                .collect();
+
+            // Report final cold-controller admission results.
+            let admitted_cold_count = cold_pic_admitted_board_indices.len();
+            if admitted_cold_count == 0 {
                 error!("NO PICs initialized — all hash boards failed. Mining cannot proceed without voltage control.");
             } else {
-                let ok_count = pic_addr_count;
+                let ok_count = admitted_cold_count;
                 let fail_count = failed_indices.len();
                 info!(
                     initialized = ok_count,
@@ -12418,7 +12853,7 @@ impl Daemon {
             );
             info!("Sending GetAddress broadcast on each cold chain — every ASIC chip will respond with its ID");
 
-            let registry = ChipRegistry::new();
+            let registry = ChipRegistry::with_execution_policy(self.asic_driver_execution_policy);
 
             for &chain_idx in &cold_chain_indices {
                 let mut enumerated = false;
@@ -12689,6 +13124,31 @@ impl Daemon {
 
             // Select chip driver based on detected ChipID
             if self.chip_id != 0 {
+                let composition =
+                    self.standard_composition_admission
+                        .as_ref()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                        "standard hardware composition authority disappeared before ASIC adoption"
+                    )
+                        })?;
+                let divergent = self
+                    .chains
+                    .iter()
+                    .filter(|chain| chain.chip_id != 0)
+                    .find(|chain| !composition.admits_chip(chain.chip_id))
+                    .map(|chain| (chain.chain_id, chain.chip_id));
+                if let Some((chain_id, observed_chip_id)) = divergent {
+                    for chain in &mut self.chains {
+                        chain.mining = false;
+                    }
+                    anyhow::bail!(
+                        "enumerated chain {chain_id} ASIC 0x{observed_chip_id:04X} contradicts admitted {} / {} ASIC 0x{:04X}; revoking the generation before Phase 7 and entering safe teardown",
+                        composition.board_target,
+                        composition.profile.name,
+                        composition.asic.chip_id(),
+                    );
+                }
                 if let Some(driver) = registry.detect(self.chip_id) {
                     info!(
                     chip = driver.chip_name(),
@@ -12722,11 +13182,22 @@ impl Daemon {
             target_freq,
         );
 
-        let registry = ChipRegistry::new();
+        let registry = ChipRegistry::with_execution_policy(self.asic_driver_execution_policy);
+        let admitted_execution_chip_id = self
+            .standard_composition_admission
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "standard hardware composition authority disappeared before Phase 7"
+                )
+            })?
+            .asic
+            .chip_id();
 
         // Collect PIC addresses for heartbeat keepalive during Phase 7.
         // Must be a local variable to avoid borrow conflict with &mut self.chains loop.
-        let phase7_pic_addrs = self.initialized_pic_addrs_final.clone();
+        let phase7_pic_addrs =
+            initialized_pic_addrs.snapshot("phase 7 admitted controller heartbeat snapshot");
 
         // Convert PicFirmware to I2cPicFirmware for Phase 7 service heartbeats.
         let phase7_i2c_fw = if format!("{}", self.pic_firmware).contains("BraiinsOS") {
@@ -12756,7 +13227,26 @@ impl Daemon {
         let min_chip_fraction = self.config.mining.min_chip_fraction;
         let configured_chip_count_hint = self.configured_model_chip_count_hint();
 
-        for chain in &mut self.chains {
+        let mut controller_admitted_chain_indices = hot_controller_admitted_chain_indices;
+        for &chain_idx in &cold_chain_indices {
+            let board_idx = self.board_idx_for_chain(self.chains[chain_idx].chain_id)?;
+            if cold_pic_admitted_board_indices.contains(&board_idx)
+                && !controller_admitted_chain_indices.contains(&chain_idx)
+            {
+                controller_admitted_chain_indices.push(chain_idx);
+            }
+        }
+
+        for (chain_idx, chain) in self.chains.iter_mut().enumerate() {
+            if !controller_admitted_chain_indices.contains(&chain_idx) {
+                chain.mining = false;
+                warn!(
+                    chain_id = chain.chain_id,
+                    chain_index = chain_idx,
+                    "Phase 7: controller admission is absent; chain remains disabled"
+                );
+                continue;
+            }
             // For am2 passthrough: if enumeration failed but model hint is set,
             // use assumed chip_id instead of skipping. Bosminer already configured
             // the ASICs — we just need to mark them as mining.
@@ -12764,6 +13254,14 @@ impl Daemon {
                 if self.config.mining.model.is_some() && assumed_chip_id != 0 {
                     chain.chip_id = assumed_chip_id;
                     chain.chip_count = assumed_chips;
+                    chain
+                        .admit_address_assignment_for_current_identity()
+                        .with_context(|| {
+                            format!(
+                                "Phase 7 model-hint chain {} lacks an admitted address composition",
+                                chain.chain_id
+                            )
+                        })?;
                     tracing::info!(
                         chain_id = chain.chain_id,
                         chip_id = format_args!("0x{:04X}", chain.chip_id),
@@ -12773,6 +13271,17 @@ impl Daemon {
                 } else {
                     continue;
                 }
+            }
+
+            if chain.chip_id != admitted_execution_chip_id {
+                chain.mining = false;
+                error!(
+                    chain_id = chain.chain_id,
+                    admitted_chip_id = format_args!("0x{admitted_execution_chip_id:04X}"),
+                    observed_chip_id = format_args!("0x{:04X}", chain.chip_id),
+                    "Phase 7: chain identity contradicts the sealed standard composition; chain remains disabled"
+                );
+                continue;
             }
 
             match driver_for_chain_with_policy(assumed_chip_id, chain.chip_id, mixed_chip_policy) {
@@ -12899,6 +13408,30 @@ impl Daemon {
                         continue;
                     }
 
+                    // Board relay state belongs to the admitted composition,
+                    // not to the ASIC family. NBP1901/BM1398 consumes the exact
+                    // twelve addressed register-0x2c writes recovered from the
+                    // stock binary; BM1397 remains fail-closed until its board
+                    // topology provides an equally explicit recipe.
+                    match chain.apply_admitted_board_relay() {
+                        Ok(0) => {}
+                        Ok(relay_writes) => info!(
+                            chain_id = chain.chain_id,
+                            relay_writes, "Applied admitted board relay composition"
+                        ),
+                        Err(e) => {
+                            error!(
+                                chain_id = chain.chain_id,
+                                error = %e,
+                                "Board relay admission FAILED; refusing chip initialization"
+                            );
+                            if let Some(ref pause) = init_hb_pause {
+                                pause.store(false, std::sync::atomic::Ordering::Release);
+                            }
+                            continue;
+                        }
+                    }
+
                     // Step 2: Initialize chain (PLL → MiscCtrl+gate_block → WORK_TIME → baud upgrade → TicketMask)
                     if let Err(e) = chain.init_with_driver(driver, target_freq) {
                         error!(
@@ -12966,7 +13499,13 @@ impl Daemon {
                     dcentrald_hal::fpga_chain::flush_all_work_tx_devmem();
                     std::thread::sleep(std::time::Duration::from_millis(500));
 
-                    dcentrald_hal::i2c::bus_recovery_devmem();
+                    if let Err(error) = i2c_svc.recover_unmanaged_bus() {
+                        warn!(
+                            chain_id = chain.chain_id,
+                            %error,
+                            "Post-open-core whole-fabric recovery was refused or failed"
+                        );
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(50));
 
                     let addrs =
@@ -12990,7 +13529,14 @@ impl Daemon {
                                 pic_addr = format_args!("0x{:02X}", addr),
                                 "Post-open-core PIC NACK — bus recovery + retry",
                             );
-                            dcentrald_hal::i2c::bus_recovery_devmem();
+                            if let Err(error) = i2c_svc.recover_unmanaged_bus() {
+                                warn!(
+                                    chain_id = chain.chain_id,
+                                    attempt,
+                                    %error,
+                                    "Post-open-core retry recovery was refused or failed"
+                                );
+                            }
                             std::thread::sleep(std::time::Duration::from_millis(
                                 100 * (attempt as u64 + 1),
                             ));
@@ -13148,6 +13694,20 @@ impl Daemon {
                         }
                     }
                 }
+            } else {
+                // Driver selection is an execution authority, not merely a
+                // display lookup.  A chain can arrive here with inherited
+                // `mining=true` state (notably a passthrough/hot handoff), so
+                // absence of an admitted executable driver must actively
+                // revoke that state.  Leaving the old value untouched would
+                // let a recognized-but-unadmitted or unknown ASIC cross the
+                // WorkDispatcher hardware-write boundary.
+                chain.mining = false;
+                error!(
+                    chain_id = chain.chain_id,
+                    chip_id = format_args!("0x{:04X}", chain.chip_id),
+                    "Phase 7: no executable ASIC driver is admitted; chain remains disabled"
+                );
             }
         }
 
@@ -13210,71 +13770,15 @@ impl Daemon {
             active_chains, total_chips, target_freq,
         );
 
+        // Successful completion means slot presence, controller endpoints, and
+        // every hardware actor needed by shutdown are now known. Only this
+        // receipt may clear the conservative state installed at init entry.
+        self.preflight_hardware_state_unknown = false;
+
         // Ownership stays on `self` through the complete fallible runtime
         // heartbeat handoff. Error, cancellation, shutdown, and Drop therefore
         // retain the authority required to assert the stop flag.
         Ok(())
-    }
-
-    /// Recover the AM1 AXI-IIC transport without addressing any controller.
-    ///
-    /// This runs before cooling and slot presence are proven, so it may reset
-    /// the transport and generate clocks at the reserved recovery address but
-    /// must never send a keepalive to guessed/default PIC endpoints.
-    fn recover_am1_i2c_bus_without_keepalive() {
-        // Full I2C bus recovery sequence (3-agent design, 2026-04-08).
-        //
-        // When dcentrald is killed mid-I2C-transaction, two things can go wrong:
-        //   1. A PIC's MSSP slave holds SDA LOW (waiting for clocks that never came)
-        //   2. The kernel xiic driver's internal state desynchronizes from hardware
-        //
-        // The kernel 4.4 xiic driver's xiic_reinit() does SOFTR which zeros ALL
-        // timing registers. Since kernel 4.4 doesn't restore them (that's kernel 5.x+),
-        // ALL subsequent I2C runs at max speed → PICs NACK → appears "dead".
-        //
-        // Recovery sequence (EE + CE + Codex consensus):
-        //   Step 1: Unbind kernel xiic driver (exclusive hardware access)
-        //   Step 2: SOFTR reset + restore timing (via reset_axi_iic_controller)
-        //   Step 3: 9 SCL clock pulses (release stuck PIC SDA per I2C spec 3.1.16)
-        //   Step 4: Keep the kernel driver unbound for the devmem service
-        //   Step 5: Rebind kernel driver
-        //   Step 6: CRITICAL — restore timing AGAIN (rebind triggers xiic_probe →
-        //           xiic_reinit → SOFTR → zeros timing we just set)
-        //   Step 7: Restore GIE + IER for kernel interrupt handling
-
-        info!("--- I2C Bus Recovery (unbind → SOFTR → 9 SCL clocks; no endpoint keepalive) ---");
-
-        // Step 1: Unbind kernel xiic driver
-        let _ = std::fs::write("/sys/bus/platform/drivers/xiic-i2c/unbind", "41600000.i2c");
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        // Step 2: SOFTR reset + restore all 8 timing registers (safe — kernel unbound)
-        if let Err(e) = dcentrald_hal::i2c::reset_axi_iic_controller() {
-            error!("AXI IIC reset failed: {} — I2C may be broken", e);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-
-        // Step 3: 9 SCL clock recovery pulses via dummy reads.
-        // If a PIC is holding SDA LOW from a killed mid-transaction, 9 SCL clocks
-        // overflow its bit counter back to idle (I2C spec Section 3.1.16).
-        // Address 0x03 is unused on S9 — every read will NACK, generating SCL clocks.
-        info!("Sending 9 SCL recovery clocks (release any stuck PIC SDA)");
-        for i in 0..9 {
-            let mut dummy = [0u8; 1];
-            let _ = dcentrald_hal::i2c::devmem_i2c_read(0x03, &mut dummy);
-            std::thread::sleep(std::time::Duration::from_micros(500));
-            // Clear ISR TX_ERROR between attempts
-            let _ = dcentrald_hal::i2c::devmem_clear_isr_tx_error();
-        }
-
-        // v0.16.0: Do NOT rebind kernel xiic driver. The I2C service now runs in
-        // devmem mode exclusively. Rebinding would trigger xiic_reinit → SOFTR →
-        // zero timing registers, which is the root cause of the PIC heartbeat death
-        // spiral. The kernel driver stays unbound for the entire process lifetime.
-
-        info!(
-            "I2C bus recovery complete — controller reset and timing restored without addressing any PIC endpoint (kernel driver stays unbound)"
-        );
     }
 
     /// Start a background heartbeat thread that keeps PICs alive during init.
@@ -13579,11 +14083,11 @@ impl Daemon {
                 .await;
             if psu_stop.any_timed_out() {
                 psu_quiescence_failed = true;
-                let control_board = detect_control_board();
-                let board_target = read_first_trimmed(&["/etc/dcentos/board_target"]);
+                let control_board = self.platform_identity.observed_control_board.as_str();
+                let board_target = self.platform_identity.board_target();
                 if legacy_kernel_smart_psu_path_allowed(
                     self.config.mining.model.as_deref(),
-                    &board_target,
+                    board_target,
                     false,
                 ) {
                     match dcentrald_hal::platform::zynq::disable_psu_output() {
@@ -14153,8 +14657,9 @@ fn grpc_tuner_snapshot_from_config(
 //   * `set_pools` — bridges to `dcentrald_api::rest::grpc_bridge_set_pools`,
 //     the SAME `validate_and_write_pool_config` core `POST /api/pools` uses
 //     (≤3 pools, non-empty primary URL, V1 pool-URL support, atomic TOML write).
-//   * `reboot` — bridges to `dcentrald_api::rest::grpc_bridge_reboot`, the SAME
-//     `trigger_daemon_restart` action `POST /api/action/restart` performs.
+//   * `reboot` — bridges to `dcentrald_api::rest::grpc_bridge_reboot`, the same
+//     non-destructive persistent-session refusal `POST /api/action/restart`
+//     returns until typed hardware-disposition receipts exist.
 //
 // All three now return a real ack with applied values on success and a real
 // reject (the verbatim validation/cap/IO message) on rejection — never a silent
@@ -14364,11 +14869,10 @@ impl dcentrald_api_grpc::GrpcWriteDelegate for DaemonGrpcWriteDelegate {
     }
 
     async fn reboot(&self) -> Result<dcentrald_api_grpc::GrpcWriteOutcome, tonic::Status> {
-        // SW-02: bridge to the SAME restart action `POST /api/action/restart`
-        // performs (`dcentrald_api::rest::grpc_bridge_reboot` →
-        // `trigger_daemon_restart`: write the intentional-restart flag + spawn
-        // the init.d restart with a SIGTERM-self fallback). No independent
-        // shell-out that could diverge from the gated REST action.
+        // SW-02: bridge to the SAME persistent-session policy
+        // `POST /api/action/restart` enforces. It preserves the live owner and
+        // returns an explicit refusal; there is no independent shell-out that
+        // could diverge from the gated REST action.
         match dcentrald_api::rest::grpc_bridge_reboot(&self.app_state) {
             Ok(detail) => Ok(dcentrald_api_grpc::GrpcWriteOutcome::ack(detail)),
             Err(message) => Ok(dcentrald_api_grpc::GrpcWriteOutcome::reject(message)),
@@ -14483,6 +14987,8 @@ mod td003_destructive_write_guard_tests {
             .find("async fn run_lifecycle(&mut self)")
             .expect("run_lifecycle missing");
         let guard = offset_after(DAEMON_RS, start, "self.td003_destructive_write_refusal(");
+        let hardware_snapshot =
+            offset_after(DAEMON_RS, start, "collect_hardware_info(&self.config)");
         let boot_progress = offset_after(DAEMON_RS, start, "let boot_progress");
         let init_call = offset_after(DAEMON_RS, start, "initialize_or_recover(");
         assert!(
@@ -14493,11 +14999,37 @@ mod td003_destructive_write_guard_tests {
             guard < init_call,
             "TD-003 guard must run before the injected platform lifecycle"
         );
+        assert!(
+            guard < hardware_snapshot && hardware_snapshot < init_call,
+            "hardware-info probing must run after TD-003 refusal but before runtime fabric reservation"
+        );
 
         let guard_body = &DAEMON_RS[guard..boot_progress];
         assert!(
             guard_body.contains("return self.run_api_only().await"),
             "run_lifecycle TD-003 refusal must park API-only, not exit or continue"
+        );
+    }
+
+    #[test]
+    fn bootstrap_i2c_policy_capture_follows_topology_admission_and_precedes_service() {
+        let init_start = DAEMON_RS
+            .find("async fn init(")
+            .expect("init definition missing");
+        let profile_admission = offset_after(DAEMON_RS, init_start, "self.miner_profile = Some(");
+        let capture = offset_after(
+            DAEMON_RS,
+            init_start,
+            "self.capture_bootstrap_i2c_observations()?",
+        );
+        let service = offset_after(
+            DAEMON_RS,
+            init_start,
+            "ProductionSerializedI2cFactory.open_serialized_i2c",
+        );
+        assert!(
+            profile_admission < capture && capture < service,
+            "bootstrap sysfs I2C reads require admitted topology and must finish before service reservation"
         );
     }
 
@@ -14530,7 +15062,11 @@ mod td003_destructive_write_guard_tests {
         let factory_start = DAEMON_RS
             .find("impl SerializedI2cOperations for ProductionSerializedI2cOperations")
             .expect("production serialized-I2C operations missing");
-        let devmem = offset_after(DAEMON_RS, factory_start, "spawn_i2c_service(0, true)");
+        let devmem = offset_after(
+            DAEMON_RS,
+            factory_start,
+            "spawn_am1_s9_i2c0_service(recover_bus)",
+        );
         let amlogic = offset_after(
             DAEMON_RS,
             factory_start,
@@ -14550,6 +15086,25 @@ mod td003_destructive_write_guard_tests {
             DAEMON_RS[generic..].contains("HASHBOARD_EEPROM_WRITE_DENYLIST.to_vec()"),
             "standard non-S9 I2C service must register the 0x50-0x57 EEPROM write denylist"
         );
+    }
+
+    #[test]
+    fn daemon_has_no_direct_axi_iic_recovery_or_unbind_capability() {
+        for (prefix, suffix) in [
+            ("bus_recovery_", "devmem("),
+            ("reset_axi_iic_", "controller("),
+            ("devmem_i2c_", "read("),
+            ("devmem_clear_isr_", "tx_error("),
+            ("unbind_kernel_i2c_", "driver("),
+        ] {
+            let forbidden = [prefix, suffix].concat();
+            assert!(
+                !DAEMON_RS.contains(&forbidden),
+                "daemon must not bypass the HAL-owned fabric lifecycle via {forbidden}"
+            );
+        }
+        let worker_recovery = ["i2c_svc.recover_", "unmanaged_bus()"].concat();
+        assert!(DAEMON_RS.contains(&worker_recovery));
     }
 }
 

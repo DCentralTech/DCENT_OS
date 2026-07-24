@@ -23,10 +23,9 @@
       answers, and it silently does nothing if it does not.
     * NO secrets on the page. It states only that the default DEV login is
       root over SSH — it never prints a password, key, token, or nonce.
-    * NO destructive action is performed by this page. The single optional
-      button (Restart dcentrald) POSTs to server.py's existing always-local
-      /api/dashboard/restart-dcentrald handler, which is a safe, non-flashing,
-      non-NAND service restart. Everything else is copy-only instructions.
+    * NO lifecycle mutation is performed by this page. Amlogic automatic
+      restart is deliberately unavailable until electrical disposition and
+      readmission have a qualified resolver; the page provides manual steps.
 
   Reachable at /static/recovery.html (served by server.py's static handler with
   no routing change) and at the /recovery convenience route. Linked from the
@@ -136,13 +135,13 @@
 <div class="panel">
   <h2>Recover now</h2>
   <div class="row">
-    <button id="restart-btn" onclick="restartDaemon()">Restart dcentrald</button>
+    <a class="btnlink" href="#manual-recovery">Open manual resolver steps</a>
     <a class="btnlink" href="/diagnostic">Open full diagnostic</a>
     <a class="btnlink" href="/">Try the dashboard</a>
   </div>
-  <div class="note">Restart is a safe service restart only. It does NOT flash, write
-  NAND, or change your firmware slot. Mining pauses for about 5–30 seconds while
-  the daemon comes back up.</div>
+  <div class="note warn">Automatic Amlogic restart is intentionally disabled. A
+  process exit is not electrical SafeOff evidence, so an operator must resolve
+  physical state before requesting another start.</div>
 </div>
 
 <div class="panel">
@@ -156,16 +155,17 @@
 </div>
 
 <div class="panel">
-  <h2>2 · Restart the daemon</h2>
-  <p>Restart the mining daemon via its init script (or use the
-  <strong>Restart dcentrald</strong> button above):</p>
-  <pre>/etc/init.d/S82dcentrald restart</pre>
-  <p>Confirm it is running again:</p>
+  <h2>2 · Inspect guarded admission</h2>
+  <p>Inspect persistent hardware-session state. Do not clear it or request a
+  new start until the physical resolver in step 4 is complete:</p>
+  <pre>/bin/sh /usr/libexec/dcentos/dcentrald-session-latch.sh status
+/etc/init.d/S82dcentrald status</pre>
+  <p>If admission succeeds, confirm it is running:</p>
   <pre>pidof dcentrald
 /etc/init.d/S82dcentrald status</pre>
 </div>
 
-<div class="panel">
+<div class="panel" id="manual-recovery">
   <h2>3 · Check the logs</h2>
   <p>The daemon log shows why it stopped. Look at the tail and search for errors:</p>
   <pre>tail -n 100 /tmp/dcentrald.log
@@ -175,11 +175,33 @@ grep -i error /tmp/dcentrald.log | tail -20</pre>
 </div>
 
 <div class="panel">
-  <h2>4 · Re-flash or roll back (only if the daemon will not start)</h2>
+  <h2>4 · Resolve a latched hardware session</h2>
+  <p>A process exit code is not proof that hashboard rails are off. Before clearing
+  a marker, stop the service, remove AC power, allow the unit to cool, and verify
+  the PSU/hashboard rails are de-energized using the board's approved procedure.
+  Then, as root, remove only the session state and retry admission:</p>
+  <pre>/etc/init.d/S82dcentrald stop
+cat /data/dcent/dcentrald-hardware-session.* 2&gt;/dev/null
+rm -f /data/dcent/dcentrald-hardware-session.unresolved
+rm -f /data/dcent/dcentrald-hardware-session.crash-latched
+rm -f /data/dcent/.dcentrald-session-latch.lock/admission-token
+rmdir /data/dcent/.dcentrald-session-latch.lock 2&gt;/dev/null || true
+sync
+/etc/init.d/S37board_setup start
+/etc/init.d/S82dcentrald start</pre>
+  <div class="note warn">This is the interim operator resolver. Do not automate it.
+  <code>S37board_setup start</code> re-establishes the same-boot checked GPIO/PWM
+  baseline; its readback is still not a physical rail measurement. A future typed
+  disposition journal will replace this manual verification step.</div>
+</div>
+
+<div class="panel">
+  <h2>5 · Re-flash or roll back (only if the daemon will not start)</h2>
   <p>DCENT_OS keeps two firmware slots (A/B). If the active slot is broken, you can
-  roll back to the other, known-good slot from U-Boot environment. <span class="warn">An
-  upgrade always writes the INACTIVE slot and never the running one</span>, so rolling
-  back is safe. Check which slot is active first:</p>
+  roll back to the other slot from U-Boot environment. <span class="warn">Do not use
+  rollback to bypass an unresolved-session marker: Zynq state is currently slot-local,
+  and an older image may not enforce this latch.</span> Remove AC power and resolve
+  hardware state first. Then check which slot is active:</p>
   <pre>fw_printenv firmware
 fw_printenv upgrade_stage</pre>
   <p>To boot the other slot on the next reboot, ask the operator/team for the exact
@@ -202,17 +224,11 @@ fw_printenv upgrade_stage</pre>
 <script>
 // PROGRESSIVE ENHANCEMENT ONLY. The page above is fully functional with this
 // script removed. This block fills in live identity/status from server.py's
-// always-local health endpoint (which works even when dcentrald is dead) and
-// wires the optional safe-restart button. Any failure is swallowed silently —
-// the static instructions remain the source of truth.
+// always-local health endpoint (which works even when dcentrald is dead). Any
+// failure is swallowed silently; the static instructions remain the source of
+// truth.
 (function () {
   var $ = function (id) { return document.getElementById(id); };
-
-  function notify(msg) {
-    var n = $("notif"); if (!n) return;
-    n.textContent = msg; n.classList.add("show");
-    setTimeout(function () { n.classList.remove("show"); }, 2500);
-  }
 
   function fillIdentity() {
     fetch("/api/dashboard/health", { cache: "no-store" })
@@ -243,16 +259,6 @@ fw_printenv upgrade_stage</pre>
       })
       .catch(function () { /* health endpoint unreachable — keep static guidance */ });
   }
-
-  window.restartDaemon = function () {
-    if (!confirm("Restart dcentrald? This is a safe service restart (no flashing, no NAND write). Mining pauses for ~5-30s.")) return;
-    fetch("/api/dashboard/restart-dcentrald", { method: "POST" })
-      .then(function (r) { return r.json(); })
-      .then(function (d) { notify("Restart initiated · " + (d.status || "ok")); setTimeout(fillIdentity, 3000); })
-      .catch(function (e) {
-        notify("Could not reach the restart endpoint. Use SSH step 2 instead.");
-      });
-  };
 
   fillIdentity();
   setInterval(fillIdentity, 5000);

@@ -1,23 +1,27 @@
 #!/usr/bin/env bash
 #
-# Build a flashable Amlogic native-install rootfs image from the Buildroot
-# sysupgrade package. Destructive flashing remains operator-gated elsewhere.
+# Extract a flashable Amlogic native-install rootfs image from an existing,
+# validated Buildroot sysupgrade package. This helper does not build or publish
+# packages. Destructive flashing remains operator-gated elsewhere.
 #
 # Usage:
 #   scripts/build_amlogic_native_install.sh --variant s19jpro-aml
 #   scripts/build_amlogic_native_install.sh --variant s19kpro
 #   scripts/build_amlogic_native_install.sh --variant s21
 #   scripts/build_amlogic_native_install.sh --variant s21 --lab-unsigned
+#
+# The package must already exist under --output-dir (default: output/). Non-S9
+# packaging has no authenticated capsule yet; this helper cannot create it.
 
 set -euo pipefail
 
 VARIANT=""
 OUTPUT_DIR=""
 LAB_UNSIGNED=0
-AARCH64_TARGET="aarch64-unknown-linux-musl"
 
 usage() {
     echo "Usage: $(basename "$0") --variant s19jpro-aml|s19kpro|s21 [--output-dir DIR] [--lab-unsigned]" >&2
+    echo "       Extracts an existing validated sysupgrade tarball; does not build one." >&2
 }
 
 while [ $# -gt 0 ]; do
@@ -124,46 +128,18 @@ if is_truthy "$DCENT_ALLOW_UNSIGNED_SYSUPGRADE" && is_release_status "$DCENT_PAC
 fi
 export DCENT_ALLOW_UNSIGNED_SYSUPGRADE DCENT_PACKAGE_STATUS
 
-ensure_aarch64_dcentrald() {
-    local bin="$PROJECT_DIR/dcentrald/target/$AARCH64_TARGET/release/dcentrald"
-    if [ -f "$bin" ]; then
-        echo "Using existing dcentrald binary: $bin"
-        return 0
-    fi
-
-    command -v cargo >/dev/null 2>&1 || {
-        echo "ERROR: cargo not found and $bin does not exist" >&2
-        exit 1
-    }
-
-    echo "Building dcentrald for $AARCH64_TARGET..."
-    (
-        cd "$PROJECT_DIR/dcentrald"
-        if [ -z "${CC_aarch64_unknown_linux_musl:-}" ] && [ -f "zig-cc-aarch64.bat" ]; then
-            export CC_aarch64_unknown_linux_musl="$PWD/zig-cc-aarch64.bat"
-        fi
-        if [ -z "${AR_aarch64_unknown_linux_musl:-}" ] && [ -f "zig-ar-aarch64.bat" ]; then
-            export AR_aarch64_unknown_linux_musl="$PWD/zig-ar-aarch64.bat"
-        fi
-        cargo build --release --target "$AARCH64_TARGET" -p dcentrald
-    )
-}
-
-echo "=== DCENT_OS Amlogic native-install build ==="
+echo "=== DCENT_OS Amlogic native-install extraction ==="
 echo "Variant: $VARIANT"
 echo "Target:  $TARGET"
 echo "Output:  $OUTPUT_DIR/$BIN_NAME"
 echo ""
 
-ensure_aarch64_dcentrald
-BUILD_ARGS=(--target "$TARGET" --output-dir "$OUTPUT_DIR")
-if [ "$LAB_UNSIGNED" = "1" ]; then
-    BUILD_ARGS+=(--lab-unsigned)
-fi
-bash "$SCRIPT_DIR/build_in_docker.sh" "${BUILD_ARGS[@]}"
-
 TARBALL="$OUTPUT_DIR/$TAR_NAME"
-[ -f "$TARBALL" ] || { echo "ERROR: expected tarball missing: $TARBALL" >&2; exit 1; }
+[ -f "$TARBALL" ] || {
+    echo "ERROR: expected existing tarball missing: $TARBALL" >&2
+    echo "       this extractor does not invoke the disabled non-S9 packaging lane" >&2
+    exit 2
+}
 
 DCENT_ALLOW_UNSIGNED_SYSUPGRADE="${DCENT_ALLOW_UNSIGNED_SYSUPGRADE:-0}" \
 DCENT_PACKAGE_STATUS="${DCENT_PACKAGE_STATUS:-release}" \

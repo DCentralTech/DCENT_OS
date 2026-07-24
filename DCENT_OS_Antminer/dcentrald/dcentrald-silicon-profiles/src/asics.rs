@@ -26,9 +26,10 @@ pub enum ProcessNode {
     /// below (the chip→node DATA map is already correct; this doc previously
     /// mis-listed those SKUs here as a BM1387-template copy-paste).
     Nm16,
-    /// 7 nm — BM1391 (S11/S15/T15) / BM1393 / BM1396 / BM1397 (S17/T17).
+    /// 7 nm — BM1391 (S11/S15/T15) / BM1393 / BM1396 / BM1397
+    /// (S17/T17) / BM1398 (S19/S19 Pro/T19).
     Nm7,
-    /// 5 nm — BM1362 / BM1366 / BM1368 / BM1398.
+    /// 5 nm — BM1362 / BM1366 / BM1368.
     Nm5,
     /// 3 nm — BM1370 (S21 Pro / S21 XP / S21 XP-Hydro). Bleeding-edge
     /// BM137x family. Matches `dcentrald-api-types::MinerModel::AntminerS21Pro`
@@ -165,7 +166,9 @@ pub enum AsicChip {
     Bm1396,
     /// BM1397 — S17 / T17 / S17e / T17e (7 nm).
     Bm1397,
-    /// BM1398 - S19 / S19 Pro / S19+ / T19-class (5 nm). 16-bit work_id family.
+    /// BM1398 — S19 / S19 Pro / S19+ / T19-class (7 nm).
+    /// Logical ASIC work IDs remain 8-bit; some FPGA carriers extend the echo
+    /// with low midstate-slot bits and must not redefine the logical ring.
     Bm1398,
     /// BM1366 — S19j / S19 variants / S19k Pro (5 nm).
     /// **EEPROM preamble is `0x05 0x11`** on BHB56902 (S19k Pro)
@@ -203,10 +206,13 @@ impl AsicChip {
                 crc: CrcAlgorithm::HwCrc,
                 work_id_width: WorkIdWidth::Bits8,
                 nonce_bits: 32,
-                cores: 32,
-                used_in: &[
-                    "S9", "S9i", "S9 SE", "T9", "T9+", "S11", "S15", "S17", "T17",
-                ],
+                // 114 cores (AMTC Config.ini; == bm1387::BM1387_CORES_PER_CHIP,
+                // the live open-core requirement and diagnostics value). Was 32.
+                cores: 114,
+                // BM1387 ships in the S9/T9 family ONLY (this file's Nm16 doc +
+                // the 2026-07-02 correction). NOT S11 (BM1391), S15, S17 (BM1397,
+                // per the BhbS17 hashboards.rs fix), or T17.
+                used_in: &["S9", "S9i", "S9 SE", "T9", "T9+"],
             },
             AsicChip::Bm1387_54 => AsicCatalogEntry {
                 name: "BM1387_54",
@@ -217,8 +223,12 @@ impl AsicChip {
                 crc: CrcAlgorithm::Crc8,
                 work_id_width: WorkIdWidth::Bits8,
                 nonce_bits: 32,
-                cores: 54,
-                used_in: &["S11"],
+                // Still a BM1387 (114 cores). The "54" in the name is the S9++
+                // 54-chips-per-chain binning variant (AMTC
+                // `set_Voltage_S9_plus_plus_BM1387_54`), NOT a core count — it was
+                // misread as 54 cores and misattributed to the S11 (BM1391).
+                cores: 114,
+                used_in: &["S9++"],
             },
             AsicChip::Bm1391 => AsicCatalogEntry {
                 name: "BM1391",
@@ -283,14 +293,16 @@ impl AsicChip {
             },
             AsicChip::Bm1398 => AsicCatalogEntry {
                 name: "BM1398",
-                process: ProcessNode::Nm5,
+                process: ProcessNode::Nm7,
                 interface: WireInterface::Uart,
                 baud_min: 115_200,
-                // BM1398 runs at 6.25 Mbaud post-enum (BM1398_OPERATIONAL_BAUD =
-                // 6_250_000); 937_500 was a stale placeholder < the operating baud.
-                baud_max: 6_250_000,
+                // Current production recipes omit the composition-specific
+                // PLL3 transition and fail-safe at 3.125 Mbaud.
+                baud_max: 3_125_000,
                 crc: CrcAlgorithm::Crc8,
-                work_id_width: WorkIdWidth::Bits16,
+                // Logical job ID is one byte. A carrier may echo a 16-bit
+                // extended field after appending low midstate-slot bits.
+                work_id_width: WorkIdWidth::Bits8,
                 nonce_bits: 32,
                 cores: 0,
                 used_in: &["S19", "S19 Pro", "S19+", "T19"],
@@ -501,7 +513,7 @@ mod tests {
         assert_eq!(AsicChip::Bm1393.catalog().process, ProcessNode::Nm7);
         assert_eq!(AsicChip::Bm1397.catalog().process, ProcessNode::Nm7);
         assert_eq!(AsicChip::Bm1396.catalog().process, ProcessNode::Nm7);
-        assert_eq!(AsicChip::Bm1398.catalog().process, ProcessNode::Nm5);
+        assert_eq!(AsicChip::Bm1398.catalog().process, ProcessNode::Nm7);
         assert_eq!(AsicChip::Bm1362.catalog().process, ProcessNode::Nm5);
         assert_eq!(AsicChip::Bm1366.catalog().process, ProcessNode::Nm5);
         assert_eq!(AsicChip::Bm1368.catalog().process, ProcessNode::Nm5);
@@ -511,8 +523,9 @@ mod tests {
 
     #[test]
     fn work_id_width_split_pinned() {
-        // Per RE2 §4.1 + §4.2: BM1387/91/93/96/97 = 8-bit work_id,
-        // BM1398/1362/1366/1368 = 16-bit (modern 5nm family).
+        // Logical ASIC job IDs are 8-bit through BM1398. Do not confuse the
+        // BM1398 carrier's 16-bit extended echo (job ID plus low slot bits)
+        // with a 16-bit logical ring.
         for chip in [
             AsicChip::Bm1387,
             AsicChip::Bm1387_54,
@@ -520,6 +533,7 @@ mod tests {
             AsicChip::Bm1393,
             AsicChip::Bm1396,
             AsicChip::Bm1397,
+            AsicChip::Bm1398,
         ] {
             assert_eq!(
                 chip.catalog().work_id_width,
@@ -529,7 +543,6 @@ mod tests {
             );
         }
         for chip in [
-            AsicChip::Bm1398,
             AsicChip::Bm1362,
             AsicChip::Bm1366,
             AsicChip::Bm1368,
@@ -626,7 +639,7 @@ mod tests {
         ); // S17
         check(
             AsicChip::Bm1398,
-            6_250_000,
+            3_125_000,
             crate::bm1398::BM1398_OPERATIONAL_BAUD,
         ); // S19 / S19 Pro
            // BM1362 (S19j Pro): its operating baud lives in dcentrald-asic
@@ -680,14 +693,35 @@ mod tests {
     }
 
     #[test]
-    fn bm1387_54_is_distinct_from_bm1387_only_in_cores() {
-        // BM1387_54 is the S11 binning variant — same chip family,
-        // different core count.
+    fn metadata_contradictions_reconciled_to_ground_truth() {
+        // D4: BM1387 and its S9++ 54-chips-per-chain binning variant BM1387_54
+        // (the "54" is chips/chain, NOT cores) are BOTH 114-core BM1387s
+        // (== BM1387_CORES_PER_CHIP), differing in wire/CRC/used_in — not cores.
+        // Was mis-modeled as 32 vs 54 cores with S11 (BM1391) attribution.
         let std = AsicChip::Bm1387.catalog();
         let v54 = AsicChip::Bm1387_54.catalog();
         assert_eq!(std.process, v54.process);
-        assert_eq!(std.cores, 32);
-        assert_eq!(v54.cores, 54);
+        assert_eq!(std.cores, 114);
+        assert_eq!(v54.cores, 114);
+        assert_eq!(crate::bm1387::BM1387_CORES_PER_CHIP, 114);
+        assert!(
+            !std
+                .used_in
+                .iter()
+                .any(|m| ["S11", "S15", "S17", "T17"].contains(m)),
+            "BM1387 is S9/T9-family only (S17=BM1397, S11=BM1391)"
+        );
+        // D2: BHB42801 chips/chain reconciled to 88 across hashboards + bm1362.
+        assert_eq!(
+            crate::hashboards::Hashboard::Bhb42801.catalog().chips_per_chain,
+            88
+        );
+        assert_eq!(
+            crate::bm1362::Bm1362HashboardSku::Bhb42801.asics_per_chain(),
+            88
+        );
+        // D3: BM1370 cores reconciled to 1280 (operating_points + driver).
+        assert_eq!(crate::bm1370::BM1370_CORES_PER_CHIP, 1280);
     }
 
     #[test]

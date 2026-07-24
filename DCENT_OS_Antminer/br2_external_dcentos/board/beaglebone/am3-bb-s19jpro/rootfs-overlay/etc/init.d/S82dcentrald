@@ -27,11 +27,10 @@ CONFIG="/etc/dcentrald/dcentrald.toml"
 LOGFILE="/tmp/dcentrald.log"
 PIDFILE="/var/run/dcentrald.pid"
 CHILD_PIDFILE="/var/run/dcentrald-child.pid"
-EXPECTFILE="/tmp/dcentrald.expected_exit.pid"
+EXPECTFILE="/var/run/dcentrald.expected_exit.pid"
 API_PORT=8080
-MAX_CRASH_RESTARTS=5
-RESTART_DELAY=2
 SCRIPT="$0"
+SESSION_LATCH_HELPER="/usr/libexec/dcentos/dcentrald-session-latch.sh"
 
 # Production-readiness matrix §7 #4 (AM3-BB cold-boot management-only gate).
 #
@@ -237,69 +236,39 @@ case "$1" in
         esac
 
         migrate_legacy_api_port
-        fan_safety_override
 
-        ORPHAN_PIDS=$(pidof dcentrald 2>/dev/null || true)
-        [ -n "$ORPHAN_PIDS" ] && {
-            echo "  [WARN] Killing orphaned dcentrald PID(s): $ORPHAN_PIDS"
-            for ORPHAN_PID in $ORPHAN_PIDS; do
-                echo "$ORPHAN_PID" > "$EXPECTFILE"
-                kill -TERM "$ORPHAN_PID" 2>/dev/null
-            done
-            for i in $(seq 1 30); do
-                pidof dcentrald > /dev/null 2>&1 || break
-                sleep 1
-            done
-            REMAINING_PIDS=$(pidof dcentrald 2>/dev/null || true)
-            [ -n "$REMAINING_PIDS" ] && {
-                rm -f "$EXPECTFILE"
-                fan_safety_override
-                for ORPHAN_PID in $REMAINING_PIDS; do
-                    kill -9 "$ORPHAN_PID" 2>/dev/null
-                done
-                sleep 1
-            }
-            rm -f "$CHILD_PIDFILE"
+        RUNNING_PIDS=$(pidof dcentrald 2>/dev/null || true)
+        if [ -n "$RUNNING_PIDS" ]; then
+            echo "  [FAIL] Refusing a second dcentrald owner (PID(s): $RUNNING_PIDS)"
+            exit 1
+        fi
+        if [ ! -r "$SESSION_LATCH_HELPER" ]; then
+            echo "  [FAIL] Persistent hardware-session latch helper is missing"
+            fan_safety_override
+            exit 1
+        fi
+        SESSION_TOKEN=$(/bin/sh "$SESSION_LATCH_HELPER" prepare 2>> "$LOGFILE") || {
+            echo "  [FAIL] Hardware-session admission is blocked; see $LOGFILE"
+            fan_safety_override
+            exit 1
         }
+        fan_safety_override
 
         echo "  Starting dcentrald (platform=$PLATFORM)..."
         echo "  Config: $CONFIG"
         echo "  API: REST/WebSocket :$API_PORT"
         echo "  Dashboard: HTTP :80 via S80dashboard"
-        start-stop-daemon -S -b -m -p "$PIDFILE" \
-            -x /bin/sh -- -c "
-                CRASH_COUNT=0
-                while true; do
-                    $DAEMON $ARGS >>$LOGFILE 2>&1 &
-                    CHILD_PID=\$!
-                    echo \$CHILD_PID > $CHILD_PIDFILE
-                    wait \$CHILD_PID
-                    EXIT_CODE=\$?
-                    EXPECTED_PID=\$(cat $EXPECTFILE 2>/dev/null || true)
-                    rm -f $CHILD_PIDFILE
-
-                    if [ \"\$EXPECTED_PID\" = \"\$CHILD_PID\" ]; then
-                        rm -f $EXPECTFILE
-                        echo \"\$(date): expected dcentrald exit for PID \$CHILD_PID (code \$EXIT_CODE)\" >> $LOGFILE
-                        exit \$EXIT_CODE
-                    fi
-
-                    rm -f $EXPECTFILE
-                    if [ \$EXIT_CODE -eq 0 ]; then
-                        echo \"\$(date): dcentrald exited cleanly\" >> $LOGFILE
-                        exit 0
-                    fi
-
-                    CRASH_COUNT=\$((CRASH_COUNT + 1))
-                    echo \"\$(date): dcentrald exited with code \$EXIT_CODE (crash \$CRASH_COUNT/$MAX_CRASH_RESTARTS)\" >> $LOGFILE
-                    \"$SCRIPT\" safety
-                    if [ \$CRASH_COUNT -ge $MAX_CRASH_RESTARTS ]; then
-                        echo \"\$(date): dcentrald restart limit reached\" >> $LOGFILE
-                        exit \$EXIT_CODE
-                    fi
-                    sleep $RESTART_DELAY
-                done
-            "
+        set -- $ARGS
+        set -- "$DAEMON" "$@"
+        if ! start-stop-daemon -S -b -m -p "$PIDFILE" \
+            -x /bin/sh -- "$SESSION_LATCH_HELPER" supervise "$SESSION_TOKEN" \
+            "$SCRIPT" "$LOGFILE" "$CHILD_PIDFILE" "$EXPECTFILE" "$@"; then
+            /bin/sh "$SESSION_LATCH_HELPER" abandon "$SESSION_TOKEN" supervisor-launch-failed \
+                >> "$LOGFILE" 2>&1 || true
+            fan_safety_override
+            echo "  [FAIL] dcentrald supervisor did not start"
+            exit 1
+        fi
 
         sleep 3
         if pidof dcentrald > /dev/null 2>&1; then
@@ -307,6 +276,7 @@ case "$1" in
         else
             echo "  [FAIL] dcentrald not started"
             fan_safety_override
+            exit 1
         fi
         ;;
 
@@ -327,6 +297,7 @@ case "$1" in
         TIMED_OUT=0
         if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
             echo "  [WARN] dcentrald did not exit in 30s - force killing"
+            /bin/sh "$SESSION_LATCH_HELPER" latch forced-stop-timeout >> "$LOGFILE" 2>&1 || true
             rm -f "$EXPECTFILE"
             TIMED_OUT=1
             kill -9 "$CHILD_PID" 2>/dev/null
@@ -339,16 +310,14 @@ case "$1" in
         fi
 
         rm -f "$PIDFILE" "$CHILD_PIDFILE"
-        if [ "$TIMED_OUT" -eq 1 ]; then
-            fan_safety_override
-        fi
-        echo "  [OK] dcentrald stopped"
+        fan_safety_override
+        echo "  [OK] dcentrald stopped; hardware disposition remains unresolved"
         ;;
 
     restart)
-        $0 stop
+        "$0" stop || exit $?
         sleep 2
-        $0 start
+        exec "$0" start
         ;;
 
     safety)

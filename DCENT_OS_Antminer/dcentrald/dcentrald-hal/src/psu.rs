@@ -14,12 +14,27 @@
 //! handles per-byte ack). The `Apw121215a` struct in this module implements that
 //! variant..
 
-use crate::i2c::{I2cBus, I2cOperationIntent, I2cServiceHandle, I2cTransactionStep};
+use crate::i2c::{
+    I2cBus, I2cMutationLabel, I2cOperationIntent, I2cServiceHandle, I2cTransactionStep,
+};
 use crate::psu_gpio_gate::PsuGpioGate;
 use crate::psu_gpio_i2c::GpioBitBangI2c;
 use crate::HalError;
 use crate::Result;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// GPIO bit-bang is a transport fallback only when the requested kernel I2C
+/// adapter is genuinely absent. Ownership, permission, and I/O failures are
+/// control-plane or integrity failures and must propagate without touching an
+/// alternate master for the same physical fabric.
+fn kernel_i2c_absence_allows_gpio_fallback(error: &HalError) -> bool {
+    matches!(
+        error,
+        HalError::DeviceOpen { source, .. }
+            if source.kind() == std::io::ErrorKind::NotFound
+                || source.raw_os_error() == Some(libc::ENODEV)
+    )
+}
 
 /// Default PSU I2C bus (separate from hash board bus 0).
 pub const PSU_I2C_BUS: u8 = 1;
@@ -112,7 +127,7 @@ impl PsuController {
                 tracing::info!(bus, "PSU using kernel I2C /dev/i2c-{}", bus);
                 PsuBus::Kernel(i2c)
             }
-            Err(e) => {
+            Err(e) if kernel_i2c_absence_allows_gpio_fallback(&e) => {
                 tracing::warn!(
                     bus,
                     error = %e,
@@ -121,9 +136,10 @@ impl PsuController {
                     "Kernel I2C /dev/i2c-{} unavailable, falling back to GPIO bit-bang",
                     bus,
                 );
-                let gpio = GpioBitBangI2c::new(PSU_GPIO_SDA, PSU_GPIO_SCL)?;
+                let gpio = GpioBitBangI2c::new_am2()?;
                 PsuBus::Gpio(gpio)
             }
+            Err(e) => return Err(e),
         };
         Ok(Self {
             bus: psu_bus,
@@ -442,15 +458,27 @@ const APW12_REPLY_DELAY_MS: u64 = 50;
 // reply is the power/FW version used to select the DAC formula — so GET_FW_VERSION = 0x02 is correct
 // (the dspic-protocol-bible's "0x01 = GET_FW" is the errata, E5). Ghidra of the operator firmware drop;
 //
-pub const APW12_CMD_GET_HW_VERSION: u8 = 0x01;
+pub const APW12_CMD_GET_DEVICE_TYPE: u8 = 0x01;
 pub const APW12_CMD_GET_FW_VERSION: u8 = 0x02;
-pub const APW12_CMD_GET_CONF_VOLTAGE: u8 = 0x03;
-pub const APW12_CMD_READ_VOLTAGE: u8 = 0x04;
-pub const APW12_CMD_READ_POWER: u8 = 0x05;
-pub const APW12_CMD_READ_CALIBRATION: u8 = 0x06;
+pub const APW12_CMD_READ_COUNTER: u8 = 0x03;
+pub const APW12_CMD_READ_RAM_WORD: u8 = 0x05;
 pub const APW12_CMD_WATCHDOG: u8 = 0x81;
 pub const APW12_CMD_SET_VOLTAGE: u8 = 0x83;
 pub const APW12_CMD_HEARTBEAT: u8 = 0x84; // inferred (BIBLE + separate log type)
+
+/// Whether fw71 firmware disassembly proves `cmd` is observational.
+///
+/// This is deliberately dialect-specific. The same byte may have a different
+/// effect on APW121215f UART-tunnel or SMBus controllers.
+const fn apw121215a_is_observation_opcode(cmd: u8) -> bool {
+    matches!(
+        cmd,
+        APW12_CMD_GET_DEVICE_TYPE
+            | APW12_CMD_GET_FW_VERSION
+            | APW12_CMD_READ_COUNTER
+            | APW12_CMD_READ_RAM_WORD
+    )
+}
 
 // ---------------------------------------------------------------------------
 // APW121215a PIC16F1704 firmware-internal opcode catalog (gpdasm ground truth)
@@ -463,16 +491,14 @@ pub const APW12_CMD_HEARTBEAT: u8 = 0x84; // inferred (BIBLE + separate log type
 // HashSource `Antminer-APW12-Firmware`). Each cite is the dispatch-handler
 // label/address in that disassembly.
 //
-// These are ADDITIVE documentation constants: the opcode BYTES are identical to
-// the `APW12_CMD_*` set above and NO emitted frame changes. They exist to record
-// the firmware-internal NAMES, which DIVERGE from the DCENT/bosminer-facing
-// `APW12_CMD_*` names for opcodes 0x03-0x06 and 0x83. DO NOT "reconcile" the two
-// sets by editing either — the divergence is a documented fact, not a bug:
+// These documentation constants record the firmware-internal names. Several
+// former DCENT aliases diverged from the disassembly and were removed once the
+// mismatch proved safety-relevant:
 //
-//   byte | APW12_CMD_* (DCENT/bosminer-facing) | APW121215A_CMD_* (PIC disasm)
+//   byte | former DCENT alias                  | APW121215A_CMD_* (PIC disasm)
 //   -----|-------------------------------------|------------------------------
-//   0x01 | GET_HW_VERSION  (reads 0x10)        | DEVICE_TYPE       (returns 0x10)
-//   0x02 | GET_FW_VERSION  (reads 0x71)        | FW_VERSION        (returns 0x71)
+//   0x01 | GET_HW_VERSION                      | DEVICE_TYPE       (returns 0x10)
+//   0x02 | GET_FW_VERSION                      | FW_VERSION        (returns 0x71)
 //   0x03 | GET_CONF_VOLTAGE                    | READ_COUNTER      (tick low byte)
 //   0x04 | READ_VOLTAGE                        | WRITE_VOLT_CAL    (flash cal write)
 //   0x05 | READ_POWER                         | READ_RAM_WORD     (16-bit RAM read)
@@ -483,12 +509,11 @@ pub const APW12_CMD_HEARTBEAT: u8 = 0x84; // inferred (BIBLE + separate log type
 // DCENT's live am2 rail-set sends opcode 0x83 with a DAC byte — which the PIC
 // firmware handles as SET_VOLTAGE_TARGET (direct DAC-N), `label_034` @ 0x034E.
 // The mV-based 0x06 SET_VOLTAGE path (`label_033` @ 0x02FF) is NOT used by DCENT.
-// CAUTION (flag-for-review, NOT changed here): the disasm maps 0x06 to SET_VOLTAGE
-// and 0x04 to WRITE_VOLT_CAL, whereas DCENT labels them READ_CALIBRATION / READ_
-// VOLTAGE. DCENT only emits 0x06 on the  calibration-probe wake path, which
-// is default-OFF and FORBIDDEN on `a lab unit` (`DCENT_AM2_PSU_CALIBRATION_PROBE_WAKE` is
-// in the MUST-NOT-SET list) — so there is no live behavior risk; surfaced for a
-// future PSU-protocol review, not actioned in this catalog-only change.
+// SAFETY CONTAINMENT (2026-07-13): the older DCENT-facing aliases for 0x04
+// (`READ_VOLTAGE`) and 0x06 (`READ_CALIBRATION`) were removed. The firmware
+// disassembly proves those bytes are WRITE_VOLT_CAL and SET_VOLTAGE on fw71;
+// presenting them as observations let callers mutate hardware through a
+// read-only service intent. Only the truthful firmware names below remain.
 
 /// Opcode 0x01 — GET_DEVICE_TYPE. PIC returns the 0x10 device-class byte.
 /// s13 F-05: `label_028` @ 0x026B (`movlw 0x10; movwf 0x58`).
@@ -542,41 +567,10 @@ pub enum PsuModel {
     /// `PSU: version '0x76' (APW121215f) detected`. Same protocol family as
     /// 121215a for model dispatch.
     ///
-    /// **Telemetry capability is UNCHARACTERIZED.** Voltage / current /
-    /// power readback opcodes (`0x04 READ_VOLTAGE`, `0x05 READ_POWER`,
-    /// PMBus-style `0x8B READ_VOUT`, `0x8C READ_IOUT`, `0x96 READ_POUT`)
-    /// have not been verified against a live `a lab unit` unit. Treat as
-    /// **TELEMETRY-UNAVAILABLE** until proven otherwise.
-    ///
-    /// `Apw121215a::read_voltage()` / `read_power()` therefore return
-    /// `Err(PsuTelemetryUnavailable)` for this variant — explicit fail-
-    /// closed, NOT silent `Ok(None)` (which is reserved for `Apw121215a`
-    /// fw=0x71 where the absence of telemetry is electrically proven).
-    ///
-    /// **Operator probe procedure** (run on `a lab unit` during the stock-bosminer
-    /// retry-loop window, where it's already idle and we can borrow the
-    /// PSU bus without breaking the mining state):
-    ///
-    /// ```text
-    /// # 1. SSH to .78 and locate the PSU on /dev/i2c-1 @ 0x10:
-    /// ssh root@203.0.113.78 'i2cdetect -y 1 0x10 0x10'
-    ///
-    /// # 2. Standard PMBus telemetry registers (linear11 word format):
-    /// ssh root@203.0.113.78 'i2cget -y 1 0x10 0x8B w'   # READ_VOUT
-    /// ssh root@203.0.113.78 'i2cget -y 1 0x10 0x8C w'   # READ_IOUT
-    /// ssh root@203.0.113.78 'i2cget -y 1 0x10 0x96 w'   # READ_POUT
-    ///
-    /// # 3. APW framed-I2C READ_VOLTAGE (0x04) / READ_POWER (0x05):
-    /// #    Build frame: [0x55,0xAA,0x03,0x04,0x07] (CKSUM=LEN+CMD=0x03+0x04)
-    /// #    Send via dcentrald-hal apw12_probe example or raw i2cset+i2cget.
-    /// ```
-    ///
-    /// If any read returns a non-stub, non-0xFFFF value across multiple
-    /// consecutive reads, update `has_voltage_feedback()` / the new
-    /// `has_current_feedback()` / `has_power_feedback()` to return `true`
-    /// for `Apw121215f` and remove this XCONFIRM note. Until then, the
-    /// runtime emits a `tracing::warn!` on every successful probe so the
-    /// operator notices the gap.
+    /// **Telemetry capability is UNCHARACTERIZED.** Do not borrow fw71 opcode
+    /// names for this firmware and do not probe raw command bytes from this
+    /// catalog. A future protocol-identified adapter needs live evidence and
+    /// effect classification before it may expose telemetry operations.
     Apw121215f,
     /// APW121215g — FW byte `0x77`. Heuristic; not yet seen live.
     Apw121215g,
@@ -620,10 +614,8 @@ impl PsuModel {
         }
     }
 
-    /// Whether this model supports on-board voltage feedback (`ReadVoltage`
-    /// and `ReadPower`). 121215a does **not** (Agent A: "returns zeros").
-    /// APW121215f fw 0x76 is recognized but treated as no-feedback until
-    /// live .78 telemetry proves otherwise.
+    /// Informational telemetry capability metadata. This does not authorize a
+    /// framed command: fw71 bytes 0x04 and 0x06 are mutations, not reads.
     pub fn has_voltage_feedback(self) -> bool {
         matches!(
             self,
@@ -641,8 +633,8 @@ impl PsuModel {
     /// callers can intent-tag their queries and so we can split the answer
     /// later without breaking call sites.
     ///
-    /// `Apw121215f` returns `false` until the operator probe characterizes
-    /// READ_IOUT (`i2cget -y 1 0x10 0x8C w` on `a lab unit`).
+    /// `Apw121215f` remains false until a protocol-identified adapter is
+    /// characterized with authorized hardware evidence.
     pub fn has_current_feedback(self) -> bool {
         // Conservative: same as voltage. Variants with confirmed-no-ADC
         // (121215a fw=0x71) and uncharacterized variants (121215f fw=0x76)
@@ -652,10 +644,8 @@ impl PsuModel {
         self.has_voltage_feedback()
     }
 
-    /// Whether this model supports on-board power feedback (`ReadPower` or
-    /// PMBus `READ_POUT`). Same gating as `has_current_feedback()`.
-    /// `Apw121215f` returns `false` until the operator probe characterizes
-    /// READ_POUT (`i2cget -y 1 0x10 0x96 w` on `a lab unit`).
+    /// Whether this model has characterized on-board power feedback metadata.
+    /// Same gating as `has_current_feedback()`.
     pub fn has_power_feedback(self) -> bool {
         self.has_voltage_feedback()
     }
@@ -670,9 +660,7 @@ impl PsuModel {
     ///   live-confirmed on `a lab unit`; ADC commands not yet probed)
     /// - `Other(_)` / `Unknown` → `false`
     ///
-    /// Telemetry methods on `Apw121215a` use this to decide between
-    /// `Ok(None)` (characterized as absent) and `Err(PsuTelemetryUnavailable)`
-    /// (uncharacterized — caller MUST fail closed).
+    /// This is capability metadata, not command authority.
     pub fn is_telemetry_characterized(self) -> bool {
         match self {
             // Live-confirmed no-feedback on .139.
@@ -838,9 +826,6 @@ pub struct Apw121215a {
     model: PsuModel,
     /// Current DAC setpoint (last `set_voltage_dac` value).
     dac: Option<u8>,
-    /// Calibration EEPROM present and CRC-valid?  If None, driver falls back
-    /// to linear formula (121215a unprogrammed case, CRC mismatch is normal).
-    calibration_valid: bool,
     /// Number of successful heartbeat ticks since open. Atomic so the
     /// heartbeat loop (any thread) can increment while a config thread reads.
     heartbeat_ticks: AtomicU64,
@@ -936,7 +921,6 @@ impl Apw121215a {
             fw_byte: None,
             model: PsuModel::Unknown,
             dac: None,
-            calibration_valid: false,
             heartbeat_ticks: AtomicU64::new(0),
             watchdog_armed: false,
             heartbeat_mode: ApwHeartbeatMode::Primary84,
@@ -1075,17 +1059,18 @@ impl Apw121215a {
                     );
                     g
                 }
+                Err(error @ HalError::I2cFabricUnavailable { .. }) => return Err(error),
                 Err(e) => {
                     tracing::warn!(
                         addr = format_args!("0x{:02X}", addr),
                         error = %e,
                         "Wave-36 mmap backend open FAILED — falling back to sysfs"
                     );
-                    GpioBitBangI2c::new(PSU_GPIO_SDA, PSU_GPIO_SCL)?
+                    GpioBitBangI2c::new_am2()?
                 }
             }
         } else {
-            let g = GpioBitBangI2c::new(PSU_GPIO_SDA, PSU_GPIO_SCL)?;
+            let g = GpioBitBangI2c::new_am2()?;
             tracing::warn!(
                 addr = format_args!("0x{:02X}", addr),
                 sda = PSU_GPIO_SDA,
@@ -1258,6 +1243,19 @@ impl Apw121215a {
     pub fn assume_fw_byte(&mut self, fw: u8) {
         self.fw_byte = Some(fw);
         self.model = PsuModel::from_fw_byte(fw);
+    }
+
+    /// Require the exact fw71 dialect before emitting any command other than
+    /// the initial firmware-version observation.
+    fn require_fw71_dialect(&self, operation: &str) -> Result<()> {
+        if self.fw_byte == Some(0x71) && self.model == PsuModel::Apw121215a {
+            return Ok(());
+        }
+        Err(HalError::PsuUnsupported(format!(
+            "{operation} requires APW121215a fw71 framing; observed model={} fw={:?}",
+            self.model.name(),
+            self.fw_byte
+        )))
     }
 
     /// Detected PSU model (valid after `probe()`).
@@ -1438,8 +1436,9 @@ impl Apw121215a {
         Ok(())
     }
 
-    /// One attempt at the three-phase framed-reply read. Used by `txrx`
-    /// under a retry wrapper. Splitting this out lets us retry on EIO.
+    /// One attempt at the three-phase framed-reply read. Used only by
+    /// `txrx_observation` under a retry wrapper. Splitting this out lets us
+    /// retry on EIO while the command path remains effect-gated.
     fn txrx_once(&mut self, cmd: u8, payload: &[u8]) -> Result<Vec<u8>> {
         let frame = build_apw12_frame(cmd, payload);
         let bus = self.bus;
@@ -1585,8 +1584,8 @@ impl Apw121215a {
             }
             ApwIo::Service(service) => {
                 let reads = service
-                    .transaction_with_intent(
-                        I2cOperationIntent::ReadOnly,
+                    .transaction_mutating(
+                        I2cMutationLabel::QueryPrelude,
                         self.addr,
                         vec![
                             I2cTransactionStep::Write(frame),
@@ -1751,7 +1750,20 @@ impl Apw121215a {
     /// Honors NAK (0xF5) abort on the FIRST attempt: protocol-level errors
     /// are returned immediately (no retry). I²C layer errors retry with
     /// 100 ms backoff + best-effort flush between attempts.
-    fn txrx(&mut self, cmd: u8, payload: &[u8]) -> Result<Vec<u8>> {
+    fn txrx_observation(&mut self, cmd: u8, payload: &[u8]) -> Result<Vec<u8>> {
+        if !apw121215a_is_observation_opcode(cmd) {
+            return Err(HalError::PsuProtocolOwned(format!(
+                "APW121215a opcode 0x{cmd:02X} is not an observational fw71 command"
+            )));
+        }
+        if self.fw_byte.is_some() {
+            self.require_fw71_dialect("framed observation")?;
+        } else if cmd != APW12_CMD_GET_FW_VERSION {
+            return Err(HalError::PsuUnsupported(
+                "APW121215a identity must be established before non-identity observations"
+                    .to_string(),
+            ));
+        }
         let mut last_err: Option<HalError> = None;
         for attempt in 1..=3 {
             match self.txrx_once(cmd, payload) {
@@ -1777,8 +1789,8 @@ impl Apw121215a {
         Err(last_err.unwrap_or(HalError::PsuProtocol("txrx retry exhausted without error")))
     }
 
-    /// One attempt at a write-only send (no reply parsing). Used by `tx`
-    /// under the same 3× retry policy as `txrx`.
+    /// One attempt at a write-only send (no reply parsing). Used by `tx_with_intent`
+    /// under the same retry policy as `txrx_observation`.
     fn tx_once_with_intent(
         &mut self,
         intent: I2cOperationIntent,
@@ -1792,7 +1804,7 @@ impl Apw121215a {
         // : capture before the mutable borrow of self.io below.
         let loki_per_byte = self.loki_per_byte_mode;
         //  (2026-05-23): WRITE-side forensic for write-only ops
-        // (SetVoltage, Enable, Disable, Watchdog ARM, calibration probes).
+        // (SetVoltage, Enable, Disable, Watchdog ARM).
         // Same INFO-level log shape as `txrx_once` so a single grep on
         // `wave35_write_forensic` enumerates every byte the daemon puts on
         // the wire during a cold-boot sequence — usable as the input side
@@ -1884,19 +1896,13 @@ impl Apw121215a {
         Ok(())
     }
 
-    /// Send a write command with 3× retry on I²C-layer errors.
-    /// Matches bosminer's tokio-retry wrapper (phase13d Ghidra evidence:
-    /// `I2C transaction on hashboard X failed, retrying`).
-    fn tx(&mut self, cmd: u8, payload: &[u8]) -> Result<()> {
-        self.tx_with_intent(I2cOperationIntent::UnclassifiedMutation, cmd, payload)
-    }
-
     fn tx_with_intent(
         &mut self,
         intent: I2cOperationIntent,
         cmd: u8,
         payload: &[u8],
     ) -> Result<()> {
+        self.require_fw71_dialect("framed mutation")?;
         let mut last_err: Option<HalError> = None;
         for attempt in 1..=3 {
             match self.tx_once_with_intent(intent, cmd, payload) {
@@ -1919,10 +1925,10 @@ impl Apw121215a {
 
     // ---- Queries --------------------------------------------------------
 
-    /// GetFwVersion (0x01). Payload byte 0 = FW byte (e.g. 0x71 for 121215a).
+    /// GetFwVersion (0x02). Payload byte 0 = FW byte (e.g. 0x71 for 121215a).
     /// Subsequent bytes (when present) carry ASCII version text for logging.
     pub fn get_fw_version(&mut self) -> Result<(u8, String)> {
-        let payload = self.txrx(APW12_CMD_GET_FW_VERSION, &[])?;
+        let payload = self.txrx_observation(APW12_CMD_GET_FW_VERSION, &[])?;
         if payload.is_empty() {
             return Err(HalError::PsuProtocol("GetFwVersion empty payload"));
         }
@@ -1934,115 +1940,12 @@ impl Apw121215a {
         Ok((fw, ascii))
     }
 
-    /// GetHwVersion (0x02). Variable-length payload (serial/model ID).
-    /// Telemetry-only; never used to gate behavior.
-    pub fn get_hw_version(&mut self) -> Result<Vec<u8>> {
-        self.txrx(APW12_CMD_GET_HW_VERSION, &[])
-    }
-
-    /// GetConfiguredVoltage (0x03). Returns the current DAC code (the last
-    /// value written via SetVoltage, NOT measured output). Safe on all variants.
-    pub fn get_configured_voltage_dac(&mut self) -> Result<u8> {
-        let p = self.txrx(APW12_CMD_GET_CONF_VOLTAGE, &[])?;
-        if p.is_empty() {
-            return Err(HalError::PsuProtocol("GetConfiguredVoltage empty payload"));
-        }
-        // Payload is 2-byte BE DAC per spec; bosminer treats high-byte 0 on
-        // 121215a. Low byte is the DAC code we care about either way.
-        let dac = if p.len() >= 2 { p[1] } else { p[0] };
-        Ok(dac)
-    }
-
-    /// ReadVoltage (0x04).
+    /// Read the fw71 device-type byte (opcode 0x01).
     ///
-    /// Three-way return on the framed-I2C family:
-    /// - `Ok(Some(volts))` — feedback ADC present and characterized.
-    /// - `Ok(None)` — feedback ADC **proven absent** (e.g. `Apw121215a`
-    ///   fw=0x71 on `a lab unit` — Agent A: "returns zeros"). Caller may safely
-    ///   treat this as "no telemetry, fall back to multimeter / chain UART
-    ///   probe"..
-    /// - `Err(HalError::PsuTelemetryUnavailable)` — telemetry capability
-    ///   has **not yet been characterized** for this FW byte (e.g.
-    ///   `Apw121215f` fw=0x76 on `a lab unit`). Fail-closed so callers cannot
-    ///   silently treat unknown-state as "no ADC". Resolution: operator
-    ///   probe procedure documented on `PsuModel::Apw121215f`.
-    pub fn read_voltage(&mut self) -> Result<Option<f64>> {
-        if !self.model.has_voltage_feedback() {
-            // Fail-closed for uncharacterized variants — distinct from
-            // "characterized as absent" (Ok(None)).
-            if !self.model.is_telemetry_characterized() {
-                return Err(HalError::PsuTelemetryUnavailable(format!(
-                    "READ_VOLTAGE (0x04) not characterized for {} (fw byte {:?}); \
-                     run operator probe before relying on PSU voltage telemetry",
-                    self.model.name(),
-                    self.fw_byte
-                )));
-            }
-            return Ok(None);
-        }
-        let p = self.txrx(APW12_CMD_READ_VOLTAGE, &[])?;
-        if p.len() < 2 {
-            return Err(HalError::PsuProtocol("ReadVoltage short payload"));
-        }
-        let raw = ((p[0] as u16) << 8) | (p[1] as u16);
-        // ADC formula inherited from S17/S9 family: V = (raw + 0.8615) / 63.017.
-        Ok(Some(((raw as f64) + 0.8615) / 63.017))
-    }
-
-    /// ReadPower (0x05).
-    ///
-    /// Same three-way semantics as [`read_voltage`](Self::read_voltage):
-    /// `Ok(Some(_))` for characterized-with-ADC, `Ok(None)` for
-    /// characterized-no-ADC, `Err(PsuTelemetryUnavailable)` for
-    /// uncharacterized variants such as `Apw121215f` fw=0x76.
-    pub fn read_power(&mut self) -> Result<Option<u16>> {
-        if !self.model.has_power_feedback() {
-            if !self.model.is_telemetry_characterized() {
-                return Err(HalError::PsuTelemetryUnavailable(format!(
-                    "READ_POWER (0x05) not characterized for {} (fw byte {:?}); \
-                     run operator probe before relying on PSU power telemetry",
-                    self.model.name(),
-                    self.fw_byte
-                )));
-            }
-            return Ok(None);
-        }
-        let p = self.txrx(APW12_CMD_READ_POWER, &[])?;
-        if p.len() < 2 {
-            return Err(HalError::PsuProtocol("ReadPower short payload"));
-        }
-        Ok(Some(((p[0] as u16) << 8) | (p[1] as u16)))
-    }
-
-    /// ReadCalibrationCurve / Table (0x06 with `[page, count]`).
-    /// Returns `Ok(Some(bytes))` on match, `Ok(None)` on CRC mismatch (not
-    /// fatal — 121215a commonly ships unprogrammed).
-    pub fn read_calibration(&mut self, page: u8, count: u8) -> Result<Option<Vec<u8>>> {
-        let r = self.txrx(APW12_CMD_READ_CALIBRATION, &[page, count]);
-        match r {
-            Ok(p) => {
-                // A CRC-mismatch response comes back as valid framing with
-                // garbage trailing bytes; Agent A confirmed 121215a ships
-                // unprogrammed EEPROM (`ff 3f` where `c2 49` was expected).
-                // We do not reverse-decode the curve here — we only surface
-                // the bytes. Caller decides whether to use them.
-                self.calibration_valid = !p.iter().all(|&b| b == 0xFF);
-                Ok(if self.calibration_valid {
-                    Some(p)
-                } else {
-                    None
-                })
-            }
-            Err(HalError::PsuProtocol(reason)) => {
-                tracing::warn!(
-                    reason,
-                    "APW121215a calibration read failed — falling back to linear formula",
-                );
-                self.calibration_valid = false;
-                Ok(None)
-            }
-            Err(e) => Err(e),
-        }
+    /// Older code exposed this as `get_hw_version`; PIC disassembly proves the
+    /// handler returns the constant device class `0x10`, not a hardware version.
+    pub fn get_device_type(&mut self) -> Result<Vec<u8>> {
+        self.txrx_observation(APW12_CMD_GET_DEVICE_TYPE, &[])
     }
 
     // ---- Writes ---------------------------------------------------------
@@ -2427,29 +2330,20 @@ impl Apw121215a {
             fw,
             self.model.name(),
         );
-        if matches!(self.model, PsuModel::Other(_)) {
-            tracing::warn!(
-                fw = format_args!("0x{:02X}", fw),
-                "PSU FW byte not in known table — treating as APW12 family with 121215a linear formula",
-            );
-        }
-
-        // Per-variant telemetry-characterization warning. When a variant is
-        // recognized at the model-dispatch level but its ADC behavior has
-        // NOT been verified against a live unit, emit a loud warning so the
-        // operator notices the gap. Currently only `Apw121215f` (fw=0x76,
-        // live-confirmed on `a lab unit`) sits in this state. Without the warning,
-        // a silent `Err(PsuTelemetryUnavailable)` from later `read_voltage()`
-        // / `read_power()` calls is easy to miss in long log streams.
-        if matches!(self.model, PsuModel::Apw121215f) {
-            tracing::warn!(
+        // Identity may be observed here, but this driver owns exactly the fw71
+        // dialect. Other revisions require protocol-specific adapters; in
+        // particular APW121215f fw76 uses a distinct 16-bit checksum frame.
+        if self.model != PsuModel::Apw121215a {
+            tracing::error!(
                 fw = format_args!("0x{:02X}", fw),
                 model = self.model.name(),
-                "APW121215f fw=0x76 telemetry capability is not yet characterized. \
-                 Voltage/current/power feedback unavailable. Operator probe required \
-                 to confirm telemetry — see PsuModel::Apw121215f doc-comment for \
-                 the i2cget command sequence on .78."
+                "PSU identity is outside the APW121215a fw71 command dialect; \
+                 refusing all follow-on commands"
             );
+            return Err(HalError::PsuUnsupported(format!(
+                "{} fw=0x{fw:02X} is not compatible with APW121215a fw71 framing",
+                self.model.name()
+            )));
         }
 
         Ok(self.model)
@@ -2480,82 +2374,14 @@ impl Apw121215a {
 
         let _ = self.flush_buffer();
 
-        //  (2026-05-23): optional Loki spoof wake-sequence injection.
-        //
-        // /36/36b proved the bytes are byte-perfect AND timing is
-        // now within ~6× of true 10 kHz, but the spoof still NAKs every
-        // GetFwVersion probe. The remaining hypothesis (per
-        //  §"Bosminer cold-wake
-        // sequence the spoof must support"): bosminer sends
-        //   1. GetFwVersion (read)        ← we send this in Detect READ probe
-        //   2. Disable (write)            ← we send this
-        //   3. **Calibration probe × 4**  ← we SKIP —  injects this
-        //   4. Disable × 3                ← we send this
-        //   5. RampSlow                   ← we send this
-        //   6. Enable                     ← we send this
-        // The spoof's i2c slave state machine may require those 4 read
-        // attempts as a wake signal (even though they NAK on read). The
-        // WRITE half of a write-then-read transaction still puts the
-        // expected bytes on the bus.
-        //
-        // Default-off behind `DCENT_AM2_PSU_CALIBRATION_PROBE_WAKE=1`
-        // ( opt-in). When ON, the sequence becomes:
-        //   1× disable + 4× ReadCalibration write + 3× disable + ramp + enable
-        // (matches bosminer step order). When OFF, falls back to the
-        // pre- path: 3× disable + ramp + enable (byte-identical).
-        let inject_calibration = std::env::var("DCENT_AM2_PSU_CALIBRATION_PROBE_WAKE")
-            .map(|v| v.trim() == "1")
-            .unwrap_or(false);
-
-        if inject_calibration {
-            tracing::info!(
-                "Wave-37 ENABLED: injecting bosminer-pattern Disable + 4× ReadCalibration \
-                 + 3× Disable wake sequence (DCENT_AM2_PSU_CALIBRATION_PROBE_WAKE=1)"
-            );
-            // Step 2 of bosminer sequence: first Disable
+        // The retired  path emitted fw71 opcode 0x06 under a
+        // "ReadCalibration" name. Firmware disassembly proves 0x06 is a
+        // voltage mutation, so observational cold-wake experiments may never
+        // emit it. Preserve the established three-disable bootstrap only.
+        for i in 0..3 {
             self.disable()?;
-            tracing::info!(step = 1, "PSU: Disable (Wave-37 bosminer step 2)");
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            // Step 3 of bosminer sequence: ReadCalibration × 4 (write-only —
-            // tx() doesn't expect a reply, so the spoof's NAK on the read
-            // half doesn't matter; we just need the write bytes on the bus).
-            for probe in 1..=4 {
-                match self.tx(APW12_CMD_READ_CALIBRATION, &[0x40, 0x08]) {
-                    Ok(()) => tracing::info!(
-                        probe,
-                        cmd = format_args!("0x{:02X}", APW12_CMD_READ_CALIBRATION),
-                        payload = "[0x40, 0x08]",
-                        "Wave-37: ReadCalibration write {}/4 (bosminer cold-wake pattern)",
-                        probe
-                    ),
-                    Err(e) => tracing::warn!(
-                        probe,
-                        error = %e,
-                        "Wave-37: ReadCalibration write {}/4 failed at I²C layer \
-                         (continuing — write-only path tolerates this)",
-                        probe
-                    ),
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            // Step 4 of bosminer sequence: Disable × 3
-            for i in 0..3 {
-                self.disable()?;
-                tracing::info!(
-                    step = i + 1,
-                    "PSU: Disable (Wave-37 bosminer step 4, {}/3)",
-                    i + 1
-                );
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-        } else {
-            // Pre- path: 3× Disable only. Byte-identical to all
-            // prior waves on the disable+ramp+enable sequence.
-            for i in 0..3 {
-                self.disable()?;
-                tracing::info!(step = i + 1, "PSU: Disable (watchdog off, write-only)");
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
+            tracing::info!(step = i + 1, "PSU: Disable (watchdog off, write-only)");
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
 
         tracing::info!(
@@ -3076,352 +2902,6 @@ impl Apw121215a {
         Ok(spoof_responded)
     }
 
-    /// ** (2026-05-29): bosminer's STANDARD APW12 cold-engage procedure
-    /// over the Loki bit-bang transport.**
-    ///
-    /// This is the RE-established replacement for the partial  cold-wake
-    /// (`cold_boot_sequence_loki_standalone`). Two Ghidra passes of
-    /// `bosminer.bin` + the operator's "Loki spoofs APW12" insight proved that
-    /// on `a lab unit` the chip rail is engaged via the **standard APW12 power-on
-    /// protocol** (the Loki presents as a stock APW121215a fw=0x71), NOT via the
-    /// dsPIC `0x10`/`0x15` opcodes. See
-    ///  +
-    /// .
-    ///
-    /// The recovered ordering (implemented here, byte-for-byte over the EXISTING
-    /// Loki per-byte transport — we are changing the SEQUENCE of frames, not the
-    /// per-byte serialization):
-    ///
-    ///   1. **reset / flush the PSU bus** — `try_assert_psu_gate()` (PWR_CONTROL
-    ///      gpio907 asserted BEFORE any I²C frame) + `flush_buffer()`.
-    ///   2. **GetFwVersion handshake (opcode 0x02 — the codebase's RE-
-    ///      disambiguated FW opcode; the Loki literally returns `0x71` to this,
-    ///      see the const block @ `APW12_CMD_GET_FW_VERSION`)** — THE GATE. The
-    ///      Loki appears to reject SetVoltage/Enable until a valid GetFwVersion
-    ///      completes (the  "8/8 NAK" finding). Retried up to
-    ///      `fw_handshake_retries` (bosminer-tolerance pattern). The reply byte
-    ///      is logged LOUDLY (did we get 0x71, or a NAK 0xF5?).
-    ///   3. **Read calibration table (opcode 0x06, payload `[page=0x40, count]`)**
-    ///      — issued even though the Loki returns an empty/0xFF table. CRC
-    ///      mismatch is NON-fatal → fall back to `dac_offset_mv = 0`. The PSU
-    ///      state machine may require this read to advance.
-    ///   4. **SetVoltage MAX 15.200 V FIRST** (opcode 0x83, DAC=0x00) — bosminer
-    ///      does this every cold boot; 121215a OCP is less prone to trip at
-    ///      top-of-range on cold caps (spec §"Safety requirements" #8).
-    ///   5. **SetVoltage target 13.700 V** (opcode 0x83, DAC=0x6C) — ramped at
-    ///      ≤0.5 V/s. `dac_offset_mv` from calibration is added (0 on empty Loki).
-    ///   6. **output-Enable** — `enable()` (watchdog arm, opcode 0x81/[0x01]).
-    ///      This is the PSU output-on per the existing driver. **(Inferred: the
-    ///      stripped spec line 137 "3× Disable → Ramping → Enable" maps Enable
-    ///      to the watchdog-arm; we reuse the existing `enable()`/`disable()`
-    ///      that BB/AML mine with — confidence HIGH that this is the right
-    ///      driver entry-point, MEDIUM that the Loki's `0x81` semantics match a
-    ///      real APW12's output-on rather than only a watchdog tick.)**
-    ///   7. **Blind settle delay 300 ms** — the 121215a/Loki has NO voltage
-    ///      feedback (ReadVoltage returns zeros), so we do NOT poll-wait for
-    ///      measured≈target (spec line 85).
-    ///   8. **1 Hz heartbeat (opcode 0x84)** — primed here with one tick; the
-    ///      caller (Phase 0 orchestrator) spawns the sustained 1 Hz loop that
-    ///      feeds the PSU hardware watchdog (≤30 s or the PSU self-disables).
-    ///
-    /// Frame = `[0x55,0xAA,LEN,CMD,args...,CKSUM]`, CKSUM = `(LEN+CMD+Σargs)&0xFF`
-    /// (SUM, low byte) — all produced by the existing `build_apw12_frame` /
-    /// `tx` / `txrx` path under `loki_per_byte_mode`.
-    ///
-    /// **Default-OFF / fleet byte-inert.** Only reached when the Phase 0
-    /// orchestrator sees `DCENT_AM2_APW12_STANDARD_COLD_ENGAGE=1` on the
-    /// `a lab unit`-class gpio_bitbang path. When the env is unset, the orchestrator
-    /// runs the prior path → the rest of the fleet is byte-identical.
-    ///
-    /// Honors: EEPROM denylist untouched (no 0x50-0x57 writes here), PWR_CONTROL
-    /// asserted before the I²C frames, NO dsPIC SetVoltage/ENABLE (that's the
-    /// separate SENSOR_ONLY gate). PWM≤30 is a fan concern enforced elsewhere;
-    /// this method touches only the PSU rail.
-    pub fn cold_boot_sequence_apw12_standard_engage(&mut self, target_init_v: f64) -> Result<()> {
-        tracing::warn!(
-            target: "wave56_apw12_standard_engage",
-            target_v = format_args!("{:.3}V", target_init_v),
-            env_gate = "DCENT_AM2_APW12_STANDARD_COLD_ENGAGE=1",
-            "Wave-56: STANDARD APW12 cold-engage path START — bosminer's recovered \
-             power-on protocol over the Loki bit-bang transport (GetFwVersion gate → \
-             calibration read → SetVoltage MAX 15.2V → ramp to target → Enable → \
-             blind settle → heartbeat). This is the RE-established replacement for \
-             the partial Wave-38 cold-wake (cold_boot_sequence_loki_standalone)."
-        );
-
-        // The standard cold-engage uses the framed APW12 opcodes (GetFwVersion,
-        // SetVoltage, Watchdog, Heartbeat) — all of which route through `tx` /
-        // `txrx`, which on the gpio_bitbang transport require
-        // `loki_per_byte_mode = true` to emit the bosminer-ground-truth
-        // per-byte `[addr_W, 0x11, byte]` bus shape (the Loki spoof NAKs bulk
-        // writes). Force-enable it exactly like the  standalone path.
-        self.enable_loki_per_byte_mode_for_wave55b_standalone()
-            .map_err(|e| {
-                tracing::error!(
-                    target: "wave56_apw12_standard_engage",
-                    error = %e,
-                    "Wave-56: orchestrator FAILED to enable loki_per_byte_mode — \
-                     fatal: the framed APW12 opcodes cannot reach the Loki spoof \
-                     without it. Likely cause: PSU transport is not ApwIo::Gpio."
-                );
-                e
-            })?;
-
-        // We're talking to a Loki spoof presenting as APW121215a fw=0x71.
-        // Seed the model so the linear DAC formula + log strings are correct
-        // even before the GetFwVersion read confirms it.
-        const APW121215A_LOKI_SPOOF_FW: u8 = 0x71;
-        self.assume_fw_byte(APW121215A_LOKI_SPOOF_FW);
-
-        // -- Step 1: reset / flush the PSU bus -------------------------------
-        // PWR_CONTROL (gpio907) MUST be asserted BEFORE any I²C frame reaches
-        // the APW PSU. No-op when
-        // no gate spec was set (the PsuBypassGate already owns PWR_CONTROL on
-        // the `a lab unit` bypass path, in which case `gate_spec` is None and this is
-        // a no-op — preserving the existing single-owner ordering).
-        self.try_assert_psu_gate()?;
-        let _ = self.flush_buffer();
-        tracing::info!(
-            target: "wave56_apw12_standard_engage",
-            step = 1,
-            "Wave-56 step 1: PSU bus reset/flush complete (PWR_CONTROL asserted, buffer drained)"
-        );
-
-        // -- Step 2: GetFwVersion handshake — THE GATE ----------------------
-        // The Loki appears to reject SetVoltage/Enable until a valid
-        // GetFwVersion completes ( "8/8 NAK" finding). Retry on NAK per
-        // the bosminer-tolerance pattern (the spoof may need a few reads to
-        // settle after AC-cycle). Non-fatal on exhaustion: we log loudly and
-        // proceed best-effort (the chain-enum downstream is the true engage
-        // verdict), but we DO record whether we saw 0x71.
-        const FW_HANDSHAKE_RETRIES: u32 = 8;
-        const FW_HANDSHAKE_RETRY_DELAY_MS: u64 = 100;
-        let mut fw_seen: Option<u8> = None;
-        for attempt in 1..=FW_HANDSHAKE_RETRIES {
-            match self.get_fw_version() {
-                Ok((fw, ascii)) => {
-                    fw_seen = Some(fw);
-                    self.assume_fw_byte(fw);
-                    if fw == APW121215A_LOKI_SPOOF_FW {
-                        tracing::info!(
-                            target: "wave56_apw12_standard_engage",
-                            step = 2,
-                            attempt,
-                            fw = format_args!("0x{:02X}", fw),
-                            model = self.model.name(),
-                            ascii = %ascii,
-                            "Wave-56 step 2: GetFwVersion HANDSHAKE OK — Loki spoof \
-                             returned 0x71 (APW121215a). GATE PASSED — SetVoltage/Enable \
-                             should now be accepted."
-                        );
-                    } else {
-                        tracing::warn!(
-                            target: "wave56_apw12_standard_engage",
-                            step = 2,
-                            attempt,
-                            fw = format_args!("0x{:02X}", fw),
-                            model = self.model.name(),
-                            "Wave-56 step 2: GetFwVersion returned 0x{:02X} (expected 0x71). \
-                             Proceeding best-effort — the spoof responded with a non-NAK byte, \
-                             so the GATE is likely satisfied even if the FW byte differs.",
-                            fw
-                        );
-                    }
-                    break;
-                }
-                Err(e) => {
-                    let err_str = e.to_string();
-                    let is_nak = err_str.contains("PSU NAK") || err_str.contains("0xF5");
-                    if attempt < FW_HANDSHAKE_RETRIES {
-                        tracing::warn!(
-                            target: "wave56_apw12_standard_engage",
-                            step = 2,
-                            attempt,
-                            retries = FW_HANDSHAKE_RETRIES,
-                            is_nak,
-                            error = %e,
-                            "Wave-56 step 2: GetFwVersion attempt {} returned {} \
-                             ({}=NAK) — retrying in {} ms (bosminer-tolerance pattern; \
-                             the spoof may need a few reads to settle after AC-cycle)",
-                            attempt,
-                            if is_nak { "0xF5" } else { "error" },
-                            is_nak,
-                            FW_HANDSHAKE_RETRY_DELAY_MS
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(
-                            FW_HANDSHAKE_RETRY_DELAY_MS,
-                        ));
-                    } else {
-                        tracing::error!(
-                            target: "wave56_apw12_standard_engage",
-                            step = 2,
-                            attempt,
-                            retries = FW_HANDSHAKE_RETRIES,
-                            error = %e,
-                            "Wave-56 step 2: GetFwVersion handshake EXHAUSTED after {} \
-                             attempts — spoof never returned a valid frame (last reply: NAK \
-                             or short read). Proceeding best-effort to SetVoltage/Enable, \
-                             but the rail may NOT engage (chain-enum will reveal the truth). \
-                             This is the symptom the standard cold-engage is meant to fix — \
-                             if it persists, capture bosminer's exact GetFwVersion bytes via \
-                             ftrace (RE-018).",
-                            FW_HANDSHAKE_RETRIES
-                        );
-                    }
-                }
-            }
-        }
-
-        // -- Step 3: read calibration table (non-fatal) ---------------------
-        // Issue the calibration read even though the Loki returns an empty/0xFF
-        // table — the PSU state machine may require this read to advance. CRC
-        // mismatch / empty table is NON-fatal: fall back to dac_offset_mv = 0.
-        const CALIBRATION_PAGE: u8 = 0x40;
-        const CALIBRATION_COUNT: u8 = 0x08;
-        let dac_offset_mv: i32 = match self.read_calibration(CALIBRATION_PAGE, CALIBRATION_COUNT) {
-            Ok(Some(bytes)) => {
-                // The Loki ships unprogrammed; a real programmed table would
-                // carry a per-unit DAC trim. We do NOT reverse-decode the curve
-                // here (no validated decoder for the Loki). Log the bytes and
-                // fall back to a 0 offset — the linear formula is the proven
-                // path on this fleet. A future calibration decoder can replace
-                // this `0` without touching the rest of the sequence.
-                tracing::info!(
-                    target: "wave56_apw12_standard_engage",
-                    step = 3,
-                    bytes_hex = format_args!("{:02X?}", bytes.as_slice()),
-                    "Wave-56 step 3: calibration table read returned a non-0xFF table — \
-                     no validated Loki curve decoder, falling back to dac_offset_mv=0 \
-                     (linear formula is the fleet-proven path)"
-                );
-                0
-            }
-            Ok(None) => {
-                tracing::info!(
-                    target: "wave56_apw12_standard_engage",
-                    step = 3,
-                    "Wave-56 step 3: calibration table empty/0xFF (unprogrammed Loki, expected) \
-                     — falling back to dac_offset_mv=0, linear formula"
-                );
-                0
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "wave56_apw12_standard_engage",
-                    step = 3,
-                    error = %e,
-                    "Wave-56 step 3: calibration read errored at the I²C/protocol layer — \
-                     NON-fatal, the read's purpose is to advance the PSU state machine. \
-                     Falling back to dac_offset_mv=0."
-                );
-                0
-            }
-        };
-
-        // -- Step 4: SetVoltage MAX 15.200 V FIRST (DAC=0x00) ---------------
-        // bosminer ramps to top-of-range every cold boot (spec safety #8).
-        const APW12_MAX_V: f64 = 15.200;
-        let max_dac = Self::voltage_to_dac_linear(APW12_MAX_V); // 0x00
-        tracing::info!(
-            target: "wave56_apw12_standard_engage",
-            step = 4,
-            voltage = format_args!("{:.3}V", APW12_MAX_V),
-            dac = format_args!("0x{:02X}", max_dac),
-            opcode = "0x83",
-            "Wave-56 step 4: SetVoltage MAX 15.200 V (DAC=0x00) FIRST — bosminer cold-boot \
-             top-of-range (121215a OCP less prone to trip on cold caps)"
-        );
-        // init-bypass: heartbeat loop hasn't started yet, so the 5-tick gate
-        // is intentionally skipped here (mirrors cold_boot_sequence_write_only).
-        self.set_voltage_init_bypass(APW12_MAX_V)?;
-
-        // -- Step 5: ramp down to target 13.700 V (DAC=0x6C), ≤0.5 V/s ------
-        // Apply dac_offset_mv from calibration (0 on the empty Loki).
-        let target_v_with_offset =
-            (target_init_v + (dac_offset_mv as f64) / 1000.0).clamp(11.96, 15.20);
-        let target_dac = Self::voltage_to_dac_linear(target_v_with_offset);
-        tracing::info!(
-            target: "wave56_apw12_standard_engage",
-            step = 5,
-            from_v = format_args!("{:.3}V", APW12_MAX_V),
-            to_v = format_args!("{:.3}V", target_v_with_offset),
-            target_dac = format_args!("0x{:02X}", target_dac),
-            dac_offset_mv,
-            ramp_cap_v_per_s = 0.5,
-            opcode = "0x83",
-            "Wave-56 step 5: ramping SetVoltage 15.200 V → target (DAC=0x6C-class) at ≤0.5 V/s"
-        );
-        // Ramp in fixed-rate steps. ramp_cap = 0.5 V/s; we take ~0.1 V steps
-        // with a 200 ms inter-step sleep → 0.5 V/s, never faster. The total
-        // drop is ~1.5 V (15.2 → 13.7) ≈ 3 s — comfortably inside the spoof's
-        // ~30 s watchdog window (which we have NOT yet fed; the first feed is
-        // step 8 + the caller's heartbeat loop).
-        const RAMP_STEP_V: f64 = 0.1;
-        const RAMP_STEP_SLEEP_MS: u64 = 200; // 0.1 V / 0.2 s = 0.5 V/s
-        let mut cur_v = APW12_MAX_V;
-        while cur_v - target_v_with_offset > RAMP_STEP_V {
-            cur_v -= RAMP_STEP_V;
-            self.set_voltage_init_bypass(cur_v)?;
-            std::thread::sleep(std::time::Duration::from_millis(RAMP_STEP_SLEEP_MS));
-        }
-        // Final exact step to target.
-        self.set_voltage_init_bypass(target_v_with_offset)?;
-        std::thread::sleep(std::time::Duration::from_millis(RAMP_STEP_SLEEP_MS));
-
-        // -- Step 6: output-Enable (watchdog arm, opcode 0x81/[0x01]) -------
-        tracing::info!(
-            target: "wave56_apw12_standard_engage",
-            step = 6,
-            opcode = "0x81",
-            "Wave-56 step 6: output-Enable (watchdog arm) — PSU output-on"
-        );
-        self.enable()?;
-
-        // -- Step 7: blind settle 300 ms ------------------------------------
-        // 121215a/Loki has NO voltage feedback — do NOT poll-wait for
-        // measured≈target (spec line 85). Blind delay only.
-        const BLIND_SETTLE_MS: u64 = 300;
-        tracing::info!(
-            target: "wave56_apw12_standard_engage",
-            step = 7,
-            settle_ms = BLIND_SETTLE_MS,
-            "Wave-56 step 7: blind settle (no voltage feedback on 121215a/Loki — \
-             ReadVoltage returns zeros, so we delay instead of polling)"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(BLIND_SETTLE_MS));
-
-        // -- Step 8: prime the 1 Hz heartbeat -------------------------------
-        // Feed the PSU hardware watchdog once here so it doesn't self-disable
-        // in the window before the caller's 1 Hz heartbeat loop starts. The
-        // caller (Phase 0 orchestrator) spawns the sustained loop.
-        match self.heartbeat() {
-            Ok(()) => tracing::info!(
-                target: "wave56_apw12_standard_engage",
-                step = 8,
-                opcode = "0x84",
-                "Wave-56 step 8: primed first heartbeat (opcode 0x84) — caller spawns the \
-                 sustained 1 Hz loop (≤30 s feed cadence or the PSU self-disables)"
-            ),
-            Err(e) => tracing::warn!(
-                target: "wave56_apw12_standard_engage",
-                step = 8,
-                error = %e,
-                "Wave-56 step 8: first heartbeat after enable failed — heartbeat thread \
-                 will retry (the 0x84/0x81 fallback is handled in heartbeat())"
-            ),
-        }
-
-        tracing::warn!(
-            target: "wave56_apw12_standard_engage",
-            target_v = format_args!("{:.3}V", target_v_with_offset),
-            fw_seen = fw_seen.map(|b| format!("0x{:02X}", b)).unwrap_or_else(|| "none".to_string()),
-            "Wave-56: STANDARD APW12 cold-engage COMPLETE — GetFwVersion gate + calibration \
-             read + SetVoltage(15.2→target) + Enable + settle + heartbeat all emitted over the \
-             Loki bit-bang transport. Chain-enum downstream is the true rail-engage verdict."
-        );
-        Ok(())
-    }
-
     /// : standalone cold-boot for `a lab unit`-class Loki-spoof units.
     ///
     /// Runs the -derived cold-wake cycle BEFORE the standard
@@ -3691,10 +3171,10 @@ impl Apw121215a {
 
         // Step 2: probe PSU FW version with 3× retry at 100 ms apart
         // (bosminer `Failed to detect PSU version with any known protocol`
-        // wrapped in tokio-retry). If all three fail we log a warning and
-        // continue — bosminer occasionally sees CRC-mismatch on probe and
-        // still mines; the real test is whether the watchdog-disable
-        // writes that follow succeed.
+        // wrapped in tokio-retry). Transient reprobe failure may continue only
+        // when this adapter already holds an exact cached fw71 identity from
+        // an earlier successful probe. With no such identity, later writes
+        // have no command-dialect authority and the sequence fails closed.
         let mut probe_err = None;
         for attempt in 1..=3 {
             match self.probe() {
@@ -3716,11 +3196,22 @@ impl Apw121215a {
                 }
             }
         }
-        if let Some(e) = &probe_err {
+        if let Some(e) = probe_err {
+            if self
+                .require_fw71_dialect("cold boot after probe retry exhaustion")
+                .is_err()
+            {
+                tracing::error!(
+                    error = %e,
+                    "PSU probe exhausted 3 retries without cached fw71 identity — \
+                     refusing cold-boot writes"
+                );
+                return Err(e);
+            }
             tracing::warn!(
                 error = %e,
-                "PSU probe exhausted 3 retries — continuing with cold-boot sequence \
-                 (watchdog-disable will verify bus reachability)"
+                "PSU reprobe exhausted 3 retries, but exact fw71 identity was established \
+                 earlier in this adapter session — continuing the fw71 cold-boot sequence"
             );
         }
 
@@ -3816,6 +3307,31 @@ impl PsuBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpio_fallback_is_limited_to_proven_kernel_adapter_absence() {
+        let missing = HalError::DeviceOpen {
+            path: "/dev/i2c-3".to_string(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        };
+        let no_device = HalError::DeviceOpen {
+            path: "/dev/i2c-3".to_string(),
+            source: std::io::Error::from_raw_os_error(libc::ENODEV),
+        };
+        let permission_denied = HalError::DeviceOpen {
+            path: "/dev/i2c-3".to_string(),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+        let owned = HalError::I2cFabricUnavailable {
+            fabric: dcentrald_fabric_lease::PhysicalI2cFabricId::linux_adapter(3),
+            detail: "owned by another controller".to_string(),
+        };
+
+        assert!(kernel_i2c_absence_allows_gpio_fallback(&missing));
+        assert!(kernel_i2c_absence_allows_gpio_fallback(&no_device));
+        assert!(!kernel_i2c_absence_allows_gpio_fallback(&permission_denied));
+        assert!(!kernel_i2c_absence_allows_gpio_fallback(&owned));
+    }
 
     #[test]
     fn apw_per_version_dac_matches_jig_bitmain_convert_v_to_n() {
@@ -3946,11 +3462,6 @@ mod tests {
         // Heartbeat with empty payload: LEN=0x03, cksum=(0x03+0x84)=0x87.
         let hb = build_apw12_frame(APW12_CMD_HEARTBEAT, &[]);
         assert_eq!(hb, vec![0x55, 0xAA, 0x03, 0x84, 0x87]);
-
-        // ReadCalibration [page=0x40, count=0x08]: LEN=1+1+2+1=5,
-        // cksum = (5 + 6 + 0x40 + 8) & 0xFF = 0x53.
-        let cal = build_apw12_frame(APW12_CMD_READ_CALIBRATION, &[0x40, 0x08]);
-        assert_eq!(cal, vec![0x55, 0xAA, 0x05, 0x06, 0x40, 0x08, 0x53]);
     }
 
     /// A30 (knowledge-goldmine s13 F-14/F-15 / IC-02): pin the APW121215a
@@ -4079,57 +3590,44 @@ mod tests {
         );
     }
 
-    ///  (2026-05-23): pin the ReadCalibration frame bytes that
-    /// the  calibration-probe wake sequence injects.
-    ///
-    /// The bosminer cold-wake sequence per
-    ///  step 3 sends 4× ReadCalibration
-    /// with payload `[0x40, 0x08]` (page=0x40, count=0x08). The expected
-    /// wire frame is `build_apw12_frame(0x06, [0x40, 0x08])`:
-    ///   - Preamble:  `55 AA`
-    ///   - LEN:       `05`     (3 + 2 payload)
-    ///   - CMD:       `06`     (APW12_CMD_READ_CALIBRATION)
-    ///   - Payload:   `40 08`
-    ///   - CKSUM:     `53`     ((5 + 6 + 0x40 + 8) & 0xFF)
-    /// Total: `[55 AA 05 06 40 08 53]` (7 bytes)
-    ///
-    /// Pinning these so any future refactor of frame construction or
-    /// the  inject payload is caught BEFORE a live test. The
-    ///  live forensic ALREADY confirmed the same shape pinned
-    /// by `apw12_checksum_sum_not_xor`; this test adds the specific
-    /// `[0x40, 0x08]` payload variant used by .
     #[test]
-    fn wave37_read_calibration_probe_frame_pinned() {
-        let frame = build_apw12_frame(APW12_CMD_READ_CALIBRATION, &[0x40, 0x08]);
-        assert_eq!(
-            frame,
-            vec![0x55, 0xAA, 0x05, 0x06, 0x40, 0x08, 0x53],
-            "Wave-37 ReadCalibration probe frame drifted — bosminer cold-wake \
-             sequence requires this exact byte pattern"
-        );
-        // The opcode constant must stay 0x06 (matches PMBus
-        // READ_CALIBRATION). Drift here would mean  injects
-        // the wrong command entirely.
-        assert_eq!(APW12_CMD_READ_CALIBRATION, 0x06);
+    fn fw71_observation_classifier_rejects_voltage_and_calibration_mutations() {
+        for cmd in [
+            APW12_CMD_GET_DEVICE_TYPE,
+            APW12_CMD_GET_FW_VERSION,
+            APW12_CMD_READ_COUNTER,
+            APW12_CMD_READ_RAM_WORD,
+        ] {
+            assert!(apw121215a_is_observation_opcode(cmd));
+        }
+
+        for cmd in [
+            APW121215A_CMD_WRITE_VOLT_CAL,
+            APW121215A_CMD_SET_VOLTAGE,
+            APW121215A_CMD_SET_VOLTAGE_TARGET,
+            APW12_CMD_WATCHDOG,
+        ] {
+            assert!(
+                !apw121215a_is_observation_opcode(cmd),
+                "fw71 mutation 0x{cmd:02X} must never inherit ReadOnly intent"
+            );
+        }
     }
 
-    /// : pin the env gate name.  is opt-in until
-    /// operator-confirmed live success, then promotion to default-on
-    /// happens in a separate commit. If the env name drifts, the
-    /// live test won't engage the wake sequence and we'd misdiagnose
-    /// " didn't help" when in fact it never ran.
     #[test]
-    fn wave37_env_gate_name_pinned() {
-        // The constant lives inline at `cold_boot_sequence_write_only`;
-        // this test pins the string literal so a refactor that moves
-        // it to a const doesn't accidentally rename it.
-        let expected = "DCENT_AM2_PSU_CALIBRATION_PROBE_WAKE";
-        // Run-time check: read env var by this name should be safe
-        // (returns Err if unset — host CI default).
-        let _ = std::env::var(expected);
-        // Compile-time check: the literal must remain stable.
-        assert_eq!(expected.len(), 36);
-        assert!(expected.starts_with("DCENT_AM2_PSU"));
+    fn fw71_driver_rejects_unknown_and_foreign_identities() {
+        let (service, _requests) = I2cServiceHandle::for_unit_tests();
+        let mut psu = Apw121215a::open_service_at(service, 0, 0x10).unwrap();
+
+        assert!(psu.require_fw71_dialect("test").is_err());
+
+        psu.assume_fw_byte(0x76);
+        assert_eq!(psu.model(), PsuModel::Apw121215f);
+        assert!(psu.require_fw71_dialect("test").is_err());
+
+        psu.assume_fw_byte(0x71);
+        assert_eq!(psu.model(), PsuModel::Apw121215a);
+        assert!(psu.require_fw71_dialect("test").is_ok());
     }
 
     ///  (2026-05-23): pin GetFwVersion frame bytes for byte-format
@@ -4139,7 +3637,7 @@ mod tests {
     /// 0xF5 reply;  proved it's deterministic — 8/8 retries all
     /// NAK). Bosminer's same command on the same hardware gets an
     /// immediate ACK and reads back fw=0x71. The hypothesis under test
-    /// in : our build_apw12_frame output for cmd=0x01/payload=[]
+    /// in : our `build_apw12_frame` output for cmd=0x02/payload=[]
     /// differs from what bosminer puts on the wire.
     ///
     /// This test pins the bytes our forensic log will print, so any
@@ -4147,14 +3645,14 @@ mod tests {
     /// (a silent frame-format change here would make the forensic log
     /// useless for the byte-by-byte diff against bosminer's bytes).
     ///
-    /// Expected frame: `[55 AA 03 01 04]`
+    /// Expected frame: `[55 AA 03 02 05]`
     ///   - `55 AA`: preamble
     ///   - `03`:   LEN = 3 + payload_len(0) = 3
-    ///   - `01`:   CMD = APW12_CMD_GET_FW_VERSION
-    ///   - `04`:   CKSUM = (LEN + CMD + Σpayload) & 0xFF = (3 + 1 + 0) = 4
+    ///   - `02`:   CMD = APW12_CMD_GET_FW_VERSION
+    ///   - `05`:   CKSUM = (LEN + CMD + Σpayload) & 0xFF = (3 + 2 + 0) = 5
     ///
     /// On-wire (after I2C addressing for slave 0x10):
-    ///   `[START][0x20][0x55][0xAA][0x03][0x01][0x04][STOP]`
+    ///   `[START][0x20][0x55][0xAA][0x03][0x02][0x05][STOP]`
     ///   where `0x20 = (0x10 << 1) | 0` (write address).
     ///
     /// Compare to bosminer's GetFwVersion bytes ( deliverable:
@@ -4253,7 +3751,7 @@ mod tests {
         assert_eq!(PsuModel::from_fw_byte(0x74), PsuModel::Apw121215De);
         assert!(PsuModel::from_fw_byte(0x75).has_voltage_feedback());
         // 0x76 — APW121215f model dispatch is live-confirmed on .78, but
-        // telemetry is still unproven and must fail closed to Ok(None).
+        // telemetry remains uncharacterized and unavailable.
         assert_eq!(PsuModel::from_fw_byte(0x76), PsuModel::Apw121215f);
         assert!(!PsuModel::from_fw_byte(0x76).has_voltage_feedback());
         assert_eq!(PsuModel::Apw121215f.name(), "APW121215f");
@@ -4269,23 +3767,15 @@ mod tests {
     }
 
     /// W3.5: `Apw121215f` (fw=0x76) is recognized at the model-dispatch
-    /// level but telemetry is uncharacterized. The four contract points are:
+    /// level but telemetry is uncharacterized. The contract points are:
     ///
     /// 1. `PsuModel::from_fw_byte(0x76) == Apw121215f`
     /// 2. `has_voltage_feedback()` / `has_current_feedback()` /
     ///    `has_power_feedback()` all return `false` (no fake telemetry).
     /// 3. `is_telemetry_characterized() == false` — distinguishes 0x76 from
     ///    fw=0x71 (which IS characterized, just no-feedback).
-    /// 4. The READ_VOUT/IOUT/POUT semantics on the framed-I2C driver fail
-    ///    closed with `Err(PsuTelemetryUnavailable)`, NOT `Ok(None)` (which
-    ///    is reserved for characterized-no-feedback variants).
-    ///
-    /// Because we cannot open a real I2C bus in unit tests, we exercise
-    /// the model-dispatch and feedback-flag logic that drives the real
-    /// `read_voltage()` / `read_power()` short-circuits. This is the
-    /// branch that actually decides Ok(None) vs Err(PsuTelemetryUnavailable);
-    /// the I/O path beyond it is identical to APW121215a and covered by
-    /// `apw12_parse_reply_validates`.
+    /// No command opcode is inferred from these metadata flags. A future
+    /// protocol-identified adapter must supply its own effect classification.
     #[test]
     fn apw121215f_detection_returns_telemetry_unavailable() {
         // 1. Model dispatch routes 0x76 → Apw121215f.
@@ -4321,42 +3811,20 @@ mod tests {
             "Apw121215a IS characterized (fw=0x71 proven no-feedback on .139)"
         );
 
-        // 4. The combined gate (no-feedback AND uncharacterized) is the
-        //    exact predicate that triggers PsuTelemetryUnavailable inside
-        //    Apw121215a::read_voltage() / read_power(). Verify the boolean
-        //    holds for 0x76 (Err path) but not for 0x71 (Ok(None) path).
+        // Metadata distinguishes uncharacterized 0x76 from the characterized
+        // no-feedback 0x71 without fabricating a command path.
         let f76_uncharacterized =
             !model.has_voltage_feedback() && !model.is_telemetry_characterized();
         assert!(
             f76_uncharacterized,
-            "0x76 must take the Err(PsuTelemetryUnavailable) branch, not Ok(None)"
+            "0x76 telemetry must remain unavailable until characterized"
         );
         let a71 = PsuModel::Apw121215a;
         let a71_no_telem_but_known =
             !a71.has_voltage_feedback() && a71.is_telemetry_characterized();
         assert!(
             a71_no_telem_but_known,
-            "0x71 must keep its existing Ok(None) semantics (no regression on .139)"
-        );
-
-        // 5. Construct the same HalError shape that the runtime emits, and
-        //    verify it formats with the FW byte and model name so log
-        //    forensics can identify the offending variant after the fact.
-        let err = HalError::PsuTelemetryUnavailable(format!(
-            "READ_VOLTAGE (0x04) not characterized for {} (fw byte {:?})",
-            model.name(),
-            Some(0x76u8),
-        ));
-        let s = format!("{}", err);
-        assert!(
-            s.contains("APW121215f"),
-            "telemetry error must name the variant: {}",
-            s
-        );
-        assert!(
-            s.contains("0x04") || s.contains("READ_VOLTAGE"),
-            "error must name the opcode: {}",
-            s
+            "0x71 must remain characterized as having no feedback"
         );
     }
 

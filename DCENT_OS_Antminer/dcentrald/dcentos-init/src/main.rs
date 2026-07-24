@@ -23,6 +23,7 @@ use std::io;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::time::{Duration, Instant};
 
 // Signal flags — set by signal handlers, checked by main loop
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -33,6 +34,11 @@ const EARLY_INIT: &str = "/etc/dcentos-early-init.sh";
 const INIT_D: &str = "/etc/init.d";
 const GETTY_TTY: &str = "ttyPS0";
 const GETTY_BAUD: &str = "115200";
+/// Upper bound for an orderly shutdown before PID 1 invokes the kernel's
+/// emergency reboot path.  S82dcentrald alone permits a 30-second typed
+/// teardown, so the former 30-second global deadline could kill the machine
+/// while the hardware owner was still producing its SafeOff evidence.
+const SHUTDOWN_WATCHDOG_MS: u64 = 60_000;
 
 fn main() {
     // Safety check: we MUST be PID 1
@@ -119,10 +125,10 @@ fn main() {
         // the blocked waitpid (EINTR -> waited == -1), so we fall straight here.
         if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
             let sig = SHUTDOWN_SIGNAL.load(Ordering::Relaxed);
-            // Map the requested signal to the final reboot(2) action up front so
-            // the emergency-timeout fallback (armed inside do_shutdown) drops the
-            // unit the right way even if an init/stop script hangs.
+            // Map and arm the one terminal deadline before console output or any
+            // stop path can block. From this point forward PID 1 owns escalation.
             let rb_action = shutdown_action_for_signal(sig);
+            arm_emergency_watchdog(rb_action, SHUTDOWN_WATCHDOG_MS);
             println!(
                 "[init] Shutdown requested (signal {} -> {})",
                 sig,
@@ -132,7 +138,7 @@ fn main() {
                     "reboot"
                 }
             );
-            do_shutdown(rb_action);
+            do_shutdown();
             // After shutdown scripts complete, perform the real kernel action.
             unsafe {
                 libc::sync();
@@ -181,24 +187,43 @@ fn shutdown_action_for_signal(sig: libc::c_int) -> libc::c_int {
 
 /// Force the kernel's own reboot/poweroff path, bypassing any further userspace.
 /// Used as a fallback if `reboot(2)` returns (it normally never does) or if the
-/// orderly shutdown sequence stalls. Mirrors `echo b > /proc/sysrq-trigger`,
-/// which is the manual escape hatch operators have had to use when init failed
-/// to reboot.
+/// orderly shutdown sequence stalls. This path deliberately performs no sync,
+/// logging, allocation, receipt write, or lock acquisition before immediate
+/// sysrq: it is the liveness escape from orderly reboot operations hanging.
 fn emergency_kernel_action(rb_action: libc::c_int) {
-    unsafe {
-        libc::sync();
-    }
-    // sysrq must be enabled to honor the trigger; force-enable it first.
-    let _ = fs::write("/proc/sys/kernel/sysrq", "1");
+    // The shutdown watchdog pre-enables sysrq before any stop script can block.
+    // Trigger the immediate kernel path first: orderly reboot(2) can itself hang
+    // in device shutdown or a reboot notifier.
     let trigger = if rb_action == libc::RB_POWER_OFF {
-        "o" // sysrq power-off
+        b'o' // sysrq power-off
     } else {
-        "b" // sysrq immediate reboot
+        b'b' // sysrq immediate reboot
     };
-    let _ = fs::write("/proc/sysrq-trigger", trigger);
-    // If even sysrq is unavailable, try the raw syscall one more time.
+    write_kernel_control_byte(b"/proc/sysrq-trigger\0", trigger);
+
+    // If sysrq is unavailable or returned, try the raw syscall. No blocking
+    // userspace work is permitted before this point.
+    // SAFETY: PID 1 is privileged to invoke reboot(2), and rb_action is selected
+    // only from libc's RB_AUTOBOOT/RB_POWER_OFF constants.
     unsafe {
         libc::reboot(rb_action);
+    }
+}
+
+/// Best-effort one-byte write to a NUL-terminated procfs kernel-control path.
+/// This is intentionally libc-only so the emergency path does not allocate.
+fn write_kernel_control_byte(path: &'static [u8], byte: u8) {
+    if path.last() != Some(&0) {
+        return;
+    }
+    // SAFETY: `path` is a static NUL-terminated byte string; `byte` remains
+    // alive for the write; every nonnegative descriptor is closed exactly once.
+    unsafe {
+        let fd = libc::open(path.as_ptr().cast(), libc::O_WRONLY);
+        if fd >= 0 {
+            let _ = libc::write(fd, (&byte as *const u8).cast(), 1);
+            libc::close(fd);
+        }
     }
 }
 
@@ -705,25 +730,27 @@ fn fork_exec_with_tty(program: &str, args: &[&str], tty: &str) -> io::Result<i32
 
 /// Graceful shutdown: run init scripts with "stop", sync, unmount.
 ///
-/// `rb_action` is the kernel action this shutdown will end in (RB_AUTOBOOT or
-/// RB_POWER_OFF). It is captured by the emergency watchdog thread so that if
-/// any step here wedges (a hung `S##  stop` script, a stuck unmount), the unit
-/// is still forced down after a bounded deadline instead of stranding "up but
-/// asked to reboot" — which is precisely the live S9 failure this fixes.
-fn do_shutdown(rb_action: libc::c_int) {
-    // Arm an emergency-reboot watchdog FIRST, before running anything that
-    // could block. The whole orderly sequence (SIGTERM grace 3s + SIGKILL 1s +
-    // stop scripts + unmount) is expected to finish well under this deadline.
-    arm_emergency_watchdog(rb_action, 30_000);
-
+/// The caller arms the emergency watchdog before entering this function or
+/// performing any shutdown logging. Its deadline includes service-specific
+/// stop, residual-process cleanup, and filesystem teardown.
+fn do_shutdown() {
     println!("[init] Running shutdown sequence...");
 
-    // Kill all user processes (send SIGTERM, wait, then SIGKILL)
-    println!("[init] Sending SIGTERM to all processes...");
+    // Give each service its typed shutdown path before the global kill sweep.
+    // In particular, dcentrald must fence API mutations, join its mining
+    // owner, obtain checked GPIO-gate command/readback, and close its watchdog while it is
+    // still alive.  The old order SIGTERM'd everything, waited only 3 seconds,
+    // SIGKILL'd survivors, and *then* called S82dcentrald stop, making the stop
+    // script incapable of obtaining any in-process hardware disposition.
+    println!("[init] Running stop scripts...");
+    run_init_scripts("stop");
+
+    // Terminate only processes left behind after service-specific teardown.
+    println!("[init] Sending SIGTERM to remaining processes...");
     unsafe {
         libc::kill(-1, libc::SIGTERM);
     }
-    // Wait a few seconds for graceful shutdown
+    // Wait a few seconds for residual processes to exit gracefully.
     sleep_ms(3000);
 
     println!("[init] Sending SIGKILL to remaining processes...");
@@ -731,10 +758,6 @@ fn do_shutdown(rb_action: libc::c_int) {
         libc::kill(-1, libc::SIGKILL);
     }
     sleep_ms(1000);
-
-    // Run stop scripts in reverse order
-    println!("[init] Running stop scripts...");
-    run_init_scripts("stop");
 
     // Save entropy seed if possible
     println!("[init] Syncing filesystems...");
@@ -753,24 +776,31 @@ fn do_shutdown(rb_action: libc::c_int) {
 }
 
 /// Spawn a detached watchdog thread that forces the kernel reboot/poweroff
-/// action after `deadline_ms` if the orderly shutdown sequence has not already
-/// reached `reboot(2)`. This guarantees a unit that was asked to reboot ALWAYS
-/// goes down, even if a stop script or unmount wedges. Cheap insurance: the
-/// thread sleeps the whole time and only fires on the pathological path.
+/// action after one absolute monotonic deadline if the orderly shutdown
+/// sequence has not already reached `reboot(2)`. EINTR retries reuse the same
+/// deadline, so signals can neither fire the watchdog early nor extend it.
 fn arm_emergency_watchdog(rb_action: libc::c_int, deadline_ms: u64) {
-    std::thread::spawn(move || {
-        sleep_ms(deadline_ms);
-        eprintln!(
-            "[init] EMERGENCY: shutdown exceeded {} ms — forcing kernel {} via sysrq",
-            deadline_ms,
-            if rb_action == libc::RB_POWER_OFF {
-                "poweroff"
-            } else {
-                "reboot"
-            }
-        );
+    let deadline = monotonic_deadline_after(deadline_ms);
+    let fallback_deadline = Instant::now() + Duration::from_millis(deadline_ms);
+    let watchdog = std::thread::Builder::new().spawn(move || {
+        let absolute_wait_completed = deadline.map(sleep_until_monotonic).unwrap_or(false);
+        if !absolute_wait_completed {
+            std::thread::sleep(fallback_deadline.saturating_duration_since(Instant::now()));
+        }
+        // Nothing that can block on logging, storage, locks, or allocation may
+        // precede the emergency kernel action after the deadline is reached.
         emergency_kernel_action(rb_action);
     });
+    if watchdog.is_err() {
+        // No deadline exists if thread creation failed. Do not log, allocate, or
+        // enter the unbounded orderly path while falsely claiming otherwise.
+        emergency_kernel_action(rb_action);
+        return;
+    }
+    // The deadline thread now exists. Prepare immediate sysrq before generic
+    // stop scripts can block; even if this best-effort procfs write misbehaves,
+    // the watchdog can still reach its raw reboot(2) fallback.
+    write_kernel_control_byte(b"/proc/sys/kernel/sysrq\0", b'1');
 }
 
 /// Unmount all filesystems in reverse order (except /, /proc, /sys, /dev).
@@ -876,14 +906,93 @@ fn do_mount(
     }
 }
 
-/// Sleep for a given number of milliseconds using nanosleep.
+/// Compute one normalized absolute CLOCK_MONOTONIC deadline.
+fn monotonic_deadline_after(ms: u64) -> Option<libc::timespec> {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` points to initialized writable storage for clock_gettime.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
+        return None;
+    }
+    add_millis_to_timespec(now, ms)
+}
+
+/// Pure normalized timespec arithmetic, split out for boundary tests.
+fn add_millis_to_timespec(now: libc::timespec, ms: u64) -> Option<libc::timespec> {
+    // Use the smallest shipped tv_sec width as the portable input bound. This
+    // avoids a target-dependent libc::time_t alias while compiling correctly
+    // for both 32-bit ARM and 64-bit AArch64 musl.
+    let seconds = i32::try_from(ms / 1000).ok()?;
+    let nanos = (ms % 1000) * 1_000_000;
+    let total_nanos = now.tv_nsec as u64 + nanos;
+    let carry = i32::try_from(total_nanos / 1_000_000_000).ok()?;
+    Some(libc::timespec {
+        tv_sec: now
+            .tv_sec
+            .saturating_add(seconds.into())
+            .saturating_add(carry.into()),
+        tv_nsec: (total_nanos % 1_000_000_000) as libc::c_long,
+    })
+}
+
+/// Retry an absolute wait only for EINTR. The closure seam lets unit tests
+/// inject repeated signals without sleeping or touching the host clock.
+fn retry_absolute_wait(mut wait: impl FnMut() -> libc::c_int) -> libc::c_int {
+    loop {
+        let result = wait();
+        if result == libc::EINTR {
+            continue;
+        }
+        return result;
+    }
+}
+
+fn sleep_until_monotonic(deadline: libc::timespec) -> bool {
+    retry_absolute_wait(|| {
+        // SAFETY: `deadline` is a normalized initialized timespec. Linux
+        // clock_nanosleep returns an errno value directly and does not mutate it
+        // when TIMER_ABSTIME is used.
+        unsafe {
+            libc::clock_nanosleep(
+                libc::CLOCK_MONOTONIC,
+                libc::TIMER_ABSTIME,
+                &deadline,
+                std::ptr::null_mut(),
+            )
+        }
+    }) == 0
+}
+
+/// Sleep for a given number of milliseconds against an absolute monotonic
+/// deadline. The relative nanosleep fallback still retries EINTR and therefore
+/// cannot return early if CLOCK_MONOTONIC acquisition unexpectedly fails.
 fn sleep_ms(ms: u64) {
-    let ts = libc::timespec {
+    if let Some(deadline) = monotonic_deadline_after(ms) {
+        if sleep_until_monotonic(deadline) {
+            return;
+        }
+    }
+
+    relative_sleep_ms(ms);
+}
+
+fn relative_sleep_ms(ms: u64) {
+    let mut remaining = libc::timespec {
         tv_sec: (ms / 1000) as _,
         tv_nsec: ((ms % 1000) * 1_000_000) as libc::c_long,
     };
-    unsafe {
-        libc::nanosleep(&ts, std::ptr::null_mut());
+    loop {
+        let requested = remaining;
+        // SAFETY: both pointers reference initialized writable timespec storage.
+        let result = unsafe { libc::nanosleep(&requested, &mut remaining) };
+        if result == 0 {
+            return;
+        }
+        if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return;
+        }
     }
 }
 
@@ -1056,5 +1165,125 @@ mod tests {
         // Any unexpected signal defaults to reboot — for a headless miner a
         // stray reboot is far safer than a stuck "halt".
         assert_eq!(shutdown_action_for_signal(libc::SIGHUP), libc::RB_AUTOBOOT);
+    }
+
+    #[test]
+    fn shutdown_runs_service_teardown_before_global_kill_sweep() {
+        let source = include_str!("main.rs");
+        let shutdown = source
+            .split_once("fn do_shutdown")
+            .expect("do_shutdown definition")
+            .1
+            .split_once("fn arm_emergency_watchdog")
+            .expect("bounded do_shutdown body")
+            .0;
+        let stop = shutdown
+            .find("run_init_scripts(\"stop\");")
+            .expect("service stop pass");
+        let global_term = shutdown
+            .find("libc::kill(-1, libc::SIGTERM)")
+            .expect("residual-process SIGTERM sweep");
+        let global_kill = shutdown
+            .find("libc::kill(-1, libc::SIGKILL)")
+            .expect("residual-process SIGKILL sweep");
+
+        assert!(
+            stop < global_term && global_term < global_kill,
+            "typed service shutdown must precede TERM/KILL of residual processes"
+        );
+    }
+
+    #[test]
+    fn shutdown_watchdog_exceeds_daemon_typed_teardown_budget() {
+        assert!(
+            SHUTDOWN_WATCHDOG_MS > 36_000,
+            "PID 1 must exceed S82's 30s TERM, 5s death check, and 1s receipt retry budget"
+        );
+    }
+
+    #[test]
+    fn monotonic_deadline_arithmetic_normalizes_nanosecond_carry() {
+        let deadline = add_millis_to_timespec(
+            libc::timespec {
+                tv_sec: 10,
+                tv_nsec: 900_000_000,
+            },
+            2_500,
+        )
+        .expect("2.5 seconds is representable on every shipped target");
+        assert_eq!(deadline.tv_sec, 13);
+        assert_eq!(deadline.tv_nsec, 400_000_000);
+    }
+
+    #[test]
+    fn absolute_deadline_wait_retries_every_eintr() {
+        let mut outcomes = [libc::EINTR, libc::EINTR, 0].into_iter();
+        let mut calls = 0;
+        let result = retry_absolute_wait(|| {
+            calls += 1;
+            outcomes.next().unwrap_or(0)
+        });
+        assert_eq!(result, 0);
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn emergency_path_has_no_blocking_userspace_work_before_reboot() {
+        let source = include_str!("main.rs");
+        let emergency = source
+            .split_once("fn emergency_kernel_action")
+            .expect("emergency kernel action")
+            .1
+            .split_once("fn install_signal_handlers")
+            .expect("bounded emergency section")
+            .0;
+
+        let immediate_sysrq = emergency
+            .find("write_kernel_control_byte(b\"/proc/sysrq-trigger")
+            .expect("immediate sysrq is the first terminal action");
+        let reboot_fallback = emergency
+            .find("libc::reboot(rb_action)")
+            .expect("raw reboot fallback remains available");
+        assert!(immediate_sysrq < reboot_fallback);
+        assert!(!emergency.contains("libc::sync"));
+        assert!(!emergency.contains("fs::write"));
+        assert!(!emergency.contains("println!"));
+        assert!(!emergency.contains("eprintln!"));
+
+        let watchdog = source
+            .split_once("fn arm_emergency_watchdog")
+            .expect("watchdog definition")
+            .1
+            .split_once("fn unmount_all")
+            .expect("bounded watchdog section")
+            .0;
+        let spawn = watchdog
+            .find(".spawn(move ||")
+            .expect("deadline thread is created");
+        let enable_sysrq = watchdog
+            .find("write_kernel_control_byte(b\"/proc/sys/kernel/sysrq")
+            .expect("sysrq preparation remains available");
+        assert!(spawn < enable_sysrq);
+        assert!(watchdog.contains("sleep_until_monotonic"));
+        assert!(watchdog.contains("fallback_deadline.saturating_duration_since"));
+        assert!(!watchdog.contains("eprintln!"));
+
+        let shutdown_entry = source
+            .split_once("if SHUTDOWN_REQUESTED.load")
+            .expect("main shutdown branch")
+            .1
+            .split_once("fn shutdown_action_for_signal")
+            .expect("bounded main shutdown branch")
+            .0;
+        let arm = shutdown_entry
+            .find("arm_emergency_watchdog")
+            .expect("deadline armed from main");
+        let log = shutdown_entry
+            .find("println!(")
+            .expect("shutdown request log");
+        let orderly = shutdown_entry
+            .find("do_shutdown();")
+            .expect("orderly shutdown");
+        assert!(arm < log && log < orderly);
     }
 }

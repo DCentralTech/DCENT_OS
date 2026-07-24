@@ -447,6 +447,16 @@ fn is_valid_btc_address(addr: &str) -> bool {
     addr.starts_with("bc1") || addr.starts_with('1') || addr.starts_with('3')
 }
 
+#[cfg(feature = "lora")]
+fn base_worker_address(worker: &str) -> String {
+    worker
+        .split('.')
+        .next()
+        .unwrap_or(worker)
+        .trim()
+        .to_string()
+}
+
 fn build_submission(
     ssid: String,
     password: String,
@@ -459,6 +469,9 @@ fn build_submission(
     voltage: u16,
     owner_password: String,
     owner_password_confirm: Option<String>,
+    mining_mode: crate::config::MiningMode,
+    donation_enabled: bool,
+    donation_percent: f32,
 ) -> Result<ProvisioningSubmission, String> {
     if ssid.is_empty() {
         return Err("WiFi SSID is required".into());
@@ -482,6 +495,13 @@ fn build_submission(
     }
     crate::auth::validate_owner_password(&owner_password).map_err(|detail| detail.to_string())?;
 
+    if mining_mode.requires_lora() && !cfg!(feature = "lora") {
+        return Err(format!(
+            "{} requires a LoRa-enabled firmware image; choose pool/solo or flash the matching LoRa build",
+            mining_mode.as_str()
+        ));
+    }
+
     // Validate BTC address format — warning only (some pools use custom worker name formats).
     // If the worker name contains a dot (e.g. "bc1q...address.workername"), validate the part before the dot.
     {
@@ -502,6 +522,13 @@ fn build_submission(
     let resolved_model = validate_provisioning_board_model(&board_model)?;
     let resolved_profile = BoardVersionProfile::default_for_model(resolved_model);
     let resolved_board = BoardConfig::for_profile(resolved_profile);
+    let mut donation = crate::config::DonationConfig::default();
+    donation.enabled = donation_enabled;
+    donation.percent = donation_percent;
+    donation.validate()?;
+    #[cfg(feature = "lora")]
+    let mesh_payout = base_worker_address(&worker);
+
     let base_config = DcentAxeConfig {
         wifi_ssid: ssid,
         wifi_password: password,
@@ -517,6 +544,7 @@ fn build_submission(
             // second hardcoded source of truth).
             version_rolling: crate::config::chip_rolls_versions(resolved_profile.asic_model),
         },
+        mining_mode,
         board_model: resolved_model.canonical_key().to_string(),
         board_version: resolved_profile.board_version.to_string(),
         asic_model: resolved_profile.asic_model.to_string(),
@@ -531,8 +559,24 @@ fn build_submission(
         fallback_pool: None,
         sv2_own_templates: crate::config::Sv2OwnTemplateConfig::default(),
         sv2_authority_pubkey: None,
+        donation,
         // MQTT/HA is opt-in from Settings, not the first-run provisioning form.
         mqtt: crate::config::MqttConfig::default(),
+        notifications: crate::config::NotificationsConfig::default(),
+        // W5500 LAN (PLAN-E): Ethernet-dark on first-run provisioning.
+        network: crate::config::NetworkConfig::default(),
+        #[cfg(feature = "lora")]
+        mesh: {
+            let mut mesh = dcentaxe_lora::config::MeshConfig::default();
+            if mining_mode.requires_lora() {
+                mesh.enabled = true;
+                mesh.solo_relay_enabled = true;
+                mesh.mining_source = "solo_mesh_empty".to_string();
+                mesh.solo_payout_address = mesh_payout.clone();
+                mesh.is_gateway = mining_mode == crate::config::MiningMode::GatewaySolo;
+            }
+            mesh
+        },
         metrics_require_auth: true,
         allow_unsigned_ota: false,
         split_pool: None,
@@ -652,6 +696,43 @@ fn parse_json_submission(body: &str) -> Result<ProvisioningSubmission, String> {
             .map(|v| v as f32)
             .unwrap_or(0.0)
     };
+    let get_bool = |keys: &[&str], default: bool| -> bool {
+        keys.iter()
+            .find_map(|key| json.get(*key))
+            .and_then(|value| {
+                value
+                    .as_bool()
+                    .or_else(|| value.as_u64().map(|number| number != 0))
+                    .or_else(|| {
+                        value.as_str().map(|text| {
+                            matches!(text.to_ascii_lowercase().as_str(), "1" | "true" | "on")
+                        })
+                    })
+            })
+            .unwrap_or(default)
+    };
+    let donation_enabled = json
+        .get("donation")
+        .and_then(|donation| donation.get("enabled"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or_else(|| {
+            get_bool(
+                &["donation.enabled", "donation_enabled", "donationEnabled"],
+                true,
+            )
+        });
+    let donation_percent = json
+        .get("donation")
+        .and_then(|donation| donation.get("percent"))
+        .and_then(|value| value.as_f64())
+        .map(|value| value as f32)
+        .or_else(|| {
+            ["donation.percent", "donation_percent", "donationPercent"]
+                .iter()
+                .find_map(|key| json.get(*key).and_then(|value| value.as_f64()))
+                .map(|value| value as f32)
+        })
+        .unwrap_or(2.0);
 
     build_submission(
         get_str(&["ssid"]),
@@ -679,6 +760,9 @@ fn parse_json_submission(body: &str) -> Result<ProvisioningSubmission, String> {
         get_u16(&["voltage"], 0),
         get_str(&["owner_password", "ownerPassword"]),
         Some(get_str(&["owner_password_confirm", "ownerPasswordConfirm"])),
+        crate::config::MiningMode::from_token(&get_str(&["mining_mode", "miningMode"]))?,
+        donation_enabled,
+        donation_percent,
     )
 }
 
@@ -696,6 +780,9 @@ fn parse_form_submission(body: &str) -> Result<ProvisioningSubmission, String> {
     let mut voltage: u16 = 0;
     let mut owner_password = String::new();
     let mut owner_password_confirm = String::new();
+    let mut mining_mode = crate::config::MiningMode::Pool;
+    let mut donation_enabled = false;
+    let mut donation_percent = 2.0_f32;
 
     for pair in body.split('&') {
         let mut kv = pair.splitn(2, '=');
@@ -717,6 +804,18 @@ fn parse_form_submission(body: &str) -> Result<ProvisioningSubmission, String> {
             "voltage" => voltage = value.parse().unwrap_or(0),
             "owner_password" | "ownerPassword" => owner_password = value,
             "owner_password_confirm" | "ownerPasswordConfirm" => owner_password_confirm = value,
+            "mining_mode" | "miningMode" => {
+                mining_mode = crate::config::MiningMode::from_token(&value)?
+            }
+            "donation.enabled" | "donation_enabled" | "donationEnabled" => {
+                donation_enabled = matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            }
+            "donation.percent" | "donation_percent" | "donationPercent" => {
+                donation_percent = value.parse().unwrap_or(f32::NAN)
+            }
             _ => {}
         }
     }
@@ -733,6 +832,9 @@ fn parse_form_submission(body: &str) -> Result<ProvisioningSubmission, String> {
         voltage,
         owner_password,
         Some(owner_password_confirm),
+        mining_mode,
+        donation_enabled,
+        donation_percent,
     )
 }
 
@@ -765,15 +867,49 @@ fn portal_html(ap_ssid: &str, ap_password: &str) -> String {
     // Sanitise before embedding — the SSID is derived from MAC and the
     // password from CSPRNG hex so injection is effectively impossible, but
     // escape ampersands + angle brackets defensively anyway.
-    PORTAL_HTML
+    PORTAL_WIZARD_HTML
         .replace("{{AP_SSID}}", &html_escape(ap_ssid))
         .replace("{{AP_PASSWORD}}", &html_escape(ap_password))
         .replace("{{DEFAULT_MODEL}}", &default_cfg.board_model)
         .replace("{{MODEL_OPTIONS}}", &portal_model_options())
         .replace("{{DEFAULT_FREQ}}", &stock.default_frequency.to_string())
         .replace("{{DEFAULT_VOLT}}", &stock.default_voltage_mv.to_string())
+        .replace(
+            "{{LORA_MODE_DISABLED}}",
+            if cfg!(feature = "lora") {
+                ""
+            } else {
+                "disabled"
+            },
+        )
 }
 
+const PORTAL_WIZARD_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DCENT_axe Setup</title><style>
+*{box-sizing:border-box}body{margin:0;background:#070710;color:#f4f4f5;font:15px system-ui,sans-serif;min-height:100vh;padding:24px}.shell{max-width:820px;margin:auto;background:#101019;border:1px solid #2b2b39;border-radius:16px;overflow:hidden;box-shadow:0 18px 70px #000}.head{padding:22px 26px;border-bottom:1px solid #2b2b39}.brand{color:#FAA500;font-weight:800;letter-spacing:.08em}.sub,.hint{color:#a1a1aa;font-size:13px}.rail{display:grid;grid-template-columns:repeat(8,1fr);gap:4px;padding:14px;background:#0b0b12}.rail span{font-size:11px;text-align:center;color:#71717a}.rail span.on{color:#FAA500}.rail b{display:block;margin:auto auto 5px;width:24px;height:24px;line-height:24px;border-radius:50%;background:#222230}.rail .on b{background:#FAA500;color:#070710}.content{padding:28px;min-height:410px}.step{display:none}.step.on{display:block}.step h2{color:#FAA500;margin-top:0}label{display:block;color:#d4d4d8;font-size:13px;margin:12px 0 5px}input,select{width:100%;border:1px solid #3f3f50;border-radius:8px;background:#09090f;color:#fff;padding:11px}.row{display:grid;grid-template-columns:1fr 1fr;gap:14px}.callout{padding:14px;border:1px solid #4a3a12;background:#171307;border-radius:9px;margin:14px 0}.toggle{display:flex;align-items:center;gap:10px}.toggle input{width:auto}.pct{font:700 22px ui-monospace;color:#FAA500}.review{display:grid;grid-template-columns:170px 1fr;gap:9px}.review dt{color:#a1a1aa}.review dd{margin:0;word-break:break-word}.actions{display:flex;gap:10px;padding:18px 28px;border-top:1px solid #2b2b39}.actions button{border:1px solid #3f3f50;border-radius:8px;padding:11px 18px;background:#181822;color:#fff;font-weight:700}.actions .primary{margin-left:auto;background:#FAA500;color:#070710;border-color:#FAA500}.actions button:disabled{opacity:.35}.status{padding:0 28px 18px;color:#fca5a5}.ap{font:12px ui-monospace;background:#09090f;padding:10px;border-radius:8px}.ap code{color:#FAA500}@media(max-width:700px){.rail span{font-size:0}.rail{grid-template-columns:repeat(8,1fr)}.row{grid-template-columns:1fr}.review{grid-template-columns:1fr}.content{padding:22px}}
+</style></head><body><div class="shell"><div class="head"><div class="brand">DCENT_axe / FIRST BOOT</div><div class="sub">One onboarding contract, axe transport and amber skin.</div></div>
+<div class="rail" id="rail"></div><form id="configForm" action="/api/config" method="POST"><div class="content">
+<section class="step" data-label="Welcome"><h2>Welcome</h2><p>This wizard secures the device, joins your network, configures mining, and discloses the optional donation before anything is saved.</p><div class="ap">Hotspot: <code>{{AP_SSID}}</code><br>Password: <code>{{AP_PASSWORD}}</code></div><div class="callout">No live pool or wallet credentials are shown on read APIs. You can change every setting later.</div></section>
+<section class="step" data-label="Network"><h2>Network</h2><label for="ssid">WiFi SSID *</label><input id="ssid" name="ssid" required autocomplete="off"><label for="password">WiFi password</label><input type="password" id="password" name="password" autocomplete="new-password"></section>
+<section class="step" data-label="Password"><h2>Owner password</h2><p class="hint">Protects settings, MCP control, and firmware updates.</p><label for="owner_password">Owner password *</label><input type="password" id="owner_password" name="owner_password" required minlength="8"><label for="owner_password_confirm">Confirm password *</label><input type="password" id="owner_password_confirm" name="owner_password_confirm" required minlength="8"></section>
+<section class="step" data-label="Mode" data-skippable="true"><h2>Mining mode</h2><label for="mining_mode">Mode</label><select id="mining_mode" name="mining_mode"><option value="pool">Pool</option><option value="solo">Solo pool</option><option value="gateway-solo" {{LORA_MODE_DISABLED}}>Gateway-solo (LoRa build)</option><option value="mesh-solo" {{LORA_MODE_DISABLED}}>Mesh-solo (LoRa build)</option></select><p class="hint">Pool details on the next step remain the network fallback. LoRa solo modes are fail-closed unless the matching radio build is installed.</p></section>
+<section class="step" data-label="Pool"><h2>Pool</h2><label for="pool_url">Pool URL</label><input id="pool_url" name="pool_url" value="public-pool.io" required><div class="row"><div><label for="pool_port">Port</label><input type="number" id="pool_port" name="pool_port" value="21496" required></div><div><label for="pool_password">Password</label><input id="pool_password" name="pool_password" value="x"></div></div><label for="worker">Worker / payout address *</label><input id="worker" name="worker" required placeholder="bc1q..."><p class="hint">Your worker is masked on all read surfaces.</p></section>
+<section class="step" data-label="Hardware" data-skippable="true"><h2>Hardware</h2><label for="model">Board model</label><select id="model" name="board_model">{{MODEL_OPTIONS}}</select><div class="row"><div><label for="frequency">Frequency (MHz)</label><input type="number" id="frequency" name="frequency" value="{{DEFAULT_FREQ}}" step="5"></div><div><label for="voltage">Voltage (mV)</label><input type="number" id="voltage" name="voltage" value="{{DEFAULT_VOLT}}" step="10"></div></div><p class="hint">Values are clamped through the board safety envelope at submission.</p></section>
+<section class="step" data-label="Donation"><h2>Donation</h2><div class="toggle"><input type="checkbox" id="donation_enabled" name="donation.enabled" value="1" checked><label for="donation_enabled">Enable voluntary donation</label></div><label for="donation_percent">Donation percent: <span class="pct" id="pct">2.0%</span></label><input type="range" id="donation_percent" name="donation.percent" min="0" max="5" step="0.1" value="2"><div class="callout"><b>No mandatory fee — turn it off anytime.</b><br>Time-sliced routing defaults to 72 seconds per hour at 2%. Payout: <code>bc1q04lzwddzgmtjex6jlsv2fwhe4se4jxje6rhzp6</code><br><a style="color:#FAA500" target="_blank" href="https://mempool.space/address/bc1q04lzwddzgmtjex6jlsv2fwhe4se4jxje6rhzp6">Verify payout history</a> · <a style="color:#FAA500" target="_blank" href="https://d-central.tech/donation/">Fund D-Central</a></div></section>
+<section class="step" data-label="Review"><h2>Review</h2><dl class="review"><dt>Network</dt><dd id="rSsid"></dd><dt>Mode</dt><dd id="rMode"></dd><dt>Pool</dt><dd id="rPool"></dd><dt>Worker</dt><dd id="rWorker"></dd><dt>Board</dt><dd id="rBoard"></dd><dt>Donation</dt><dd id="rDonation"></dd></dl><div class="callout">Saving reboots the device. Existing units that receive this release by OTA adopt the disclosed 2% default unless the toggle is turned off.</div></section>
+</div><div id="status" class="status"></div><div class="actions"><button type="button" id="back">Back</button><button type="button" id="skip">Skip</button><button type="button" class="primary" id="next">Next</button><button type="submit" class="primary" id="save" style="display:none">Secure &amp; connect</button></div></form></div>
+<script>
+const labels=['Welcome','Network','Password','Mode','Pool','Hardware','Donation','Review'];let at=0;const steps=[...document.querySelectorAll('.step')],rail=document.getElementById('rail');rail.innerHTML=labels.map((x,i)=>'<span><b>'+(i+1)+'</b>'+x+'</span>').join('');
+const E=id=>document.getElementById(id);function mask(v){v=v.trim();return v.length>12?v.slice(0,6)+'…'+v.slice(-4):v||'—'}function review(){E('rSsid').textContent=E('ssid').value||'—';E('rMode').textContent=E('mining_mode').value;E('rPool').textContent=E('pool_url').value+':'+E('pool_port').value;E('rWorker').textContent=mask(E('worker').value);E('rBoard').textContent=E('model').value;E('rDonation').textContent=E('donation_enabled').checked?E('donation_percent').value+'% voluntary':'Off'}
+function show(){steps.forEach((s,i)=>s.classList.toggle('on',i===at));[...rail.children].forEach((s,i)=>s.classList.toggle('on',i<=at));E('back').disabled=at===0;E('skip').style.display=steps[at].dataset.skippable?'block':'none';E('next').style.display=at===steps.length-1?'none':'block';E('save').style.display=at===steps.length-1?'block':'none';if(at===steps.length-1)review()}
+function valid(){const fields=[...steps[at].querySelectorAll('input,select')];for(const f of fields){if(!f.checkValidity()){f.reportValidity();return false}}if(at===2&&E('owner_password').value!==E('owner_password_confirm').value){E('status').textContent='Owner password confirmation does not match.';return false}return true}
+E('next').onclick=()=>{if(valid()){at++;show()}};E('back').onclick=()=>{if(at){at--;show()}};E('skip').onclick=()=>{at++;show()};E('donation_percent').oninput=e=>E('pct').textContent=Number(e.target.value).toFixed(1)+'%';
+const freq={max:425,ultra:485,hexultra:485,supra:490,hexsupra:490,gamma:525,gammaduo:400,gammaturbo:525},volt={max:1400,ultra:1200,hexultra:1200,supra:1166,hexsupra:1166,gamma:1150,gammaduo:1150,gammaturbo:1150};E('model').value='{{DEFAULT_MODEL}}';E('model').onchange=function(){if(freq[this.value])E('frequency').value=freq[this.value];if(volt[this.value])E('voltage').value=volt[this.value]};
+E('configForm').onsubmit=e=>{e.preventDefault();if(!valid())return;E('save').disabled=true;E('status').textContent='Saving configuration…';fetch('/api/config',{method:'POST',body:new URLSearchParams(new FormData(e.target))}).then(async r=>{if(!r.ok)throw new Error(await r.text());E('status').style.color='#86efac';E('status').textContent='Saved. Device is rebooting…';E('save').textContent='Rebooting…'}).catch(err=>{E('status').textContent=err.message;E('save').disabled=false})};show();
+</script></body></html>"#;
+
+#[allow(dead_code)]
 const PORTAL_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">
 <head>

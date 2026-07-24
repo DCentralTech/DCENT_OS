@@ -12,7 +12,7 @@
     "t17plus": {"tier": 1, "strictness": "structural"},
     "s17e": {"tier": 1, "strictness": "structural"},
     "s19": {"tier": 1, "strictness": "structural"},
-    "s19pro": {"tier": 3, "strictness": "exact"},
+    "s19pro": {"tier": 2, "strictness": "implementation_snapshot"},
     "s19jpro": {"tier": 3, "strictness": "structural"},
     "s19xp": {"tier": 3, "strictness": "structural"},
     "s19kpro": {"tier": 3, "strictness": "structural"},

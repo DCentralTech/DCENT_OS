@@ -24,37 +24,85 @@ dcent_release_provenance_required() {
         dcent_release_is_truthy "${DCENT_REQUIRE_RELEASE_PROVENANCE:-0}"
 }
 
+dcent_release_require_signed_authority_profile() {
+    dcent_release_signing_key="${1:-${DCENT_RELEASE_SIGNING_KEY:-}}"
+    [ -n "$dcent_release_signing_key" ] || return 0
+
+    if ! dcent_release_is_release_status "${DCENT_PACKAGE_STATUS:-release}"; then
+        dcent_release_error \
+            "release-root signing requires release, production, or stable package status"
+        return 1
+    fi
+    if ! dcent_release_is_truthy "${DCENT_RELEASE_IMAGE:-0}"; then
+        dcent_release_error \
+            "release-root signing requires DCENT_RELEASE_IMAGE=1 hardening"
+        return 1
+    fi
+    if dcent_release_is_truthy "${DCENT_ALLOW_UNSIGNED_SYSUPGRADE:-0}"; then
+        dcent_release_error \
+            "release-root signing cannot be combined with the unsigned-lab override"
+        return 1
+    fi
+    if ! dcent_release_is_truthy "${DCENT_REQUIRE_RELEASE_PROVENANCE:-0}"; then
+        dcent_release_error \
+            "release-root signing requires DCENT_REQUIRE_RELEASE_PROVENANCE=1"
+        return 1
+    fi
+}
+
 dcent_release_error() {
     echo "ERROR: release envelope provenance: $*" >&2
     return 1
 }
 
-# Remove the complete exact-name publication set for one release invocation.
-# Call before building and from every failed EXIT path so a late signer or
-# private-stage cleanup failure cannot leave a canonical alias plus release
-# metadata from either the current or a prior same-name run.
-dcent_release_remove_publication() {
-    dcent_release_publication_dir="$1"
-    dcent_release_publication_name="$2"
-    dcent_release_publication_ext="$3"
+dcent_release_run_python() {
+    if command -v python3 >/dev/null 2>&1 &&
+        python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' \
+            >/dev/null 2>&1; then
+        python3 "$@"
+    elif command -v python >/dev/null 2>&1 &&
+        python -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' \
+            >/dev/null 2>&1; then
+        python "$@"
+    elif command -v py >/dev/null 2>&1 &&
+        py -3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' \
+            >/dev/null 2>&1; then
+        py -3 "$@"
+    else
+        dcent_release_error "Python 3.10 or newer is required"
+        return 1
+    fi
+}
 
-    [ -d "$dcent_release_publication_dir" ] ||
-        dcent_release_error "release publication directory is missing" || return 1
-    case "$dcent_release_publication_name" in
-        ""|.|..|*/*|*\\*)
-            dcent_release_error "release publication name is not a flat basename" || return 1
-            ;;
-    esac
-    case "$dcent_release_publication_ext" in
-        tar|img) ;;
-        *) dcent_release_error "release publication extension is invalid" || return 1 ;;
-    esac
-    rm -f -- \
-        "$dcent_release_publication_dir/${dcent_release_publication_name}.${dcent_release_publication_ext}" \
-        "$dcent_release_publication_dir/${dcent_release_publication_name}.${dcent_release_publication_ext}.sig" \
-        "$dcent_release_publication_dir/${dcent_release_publication_name}-LAB-UNSIGNED-NOT-FOR-RELEASE.${dcent_release_publication_ext}" \
-        "$dcent_release_publication_dir/${dcent_release_publication_name}-LAB-UNSIGNED-NOT-FOR-RELEASE.${dcent_release_publication_ext}.sig" \
-        "$dcent_release_publication_dir/${dcent_release_publication_name}.release.txt"
+dcent_release_verify_exact_snapshot_provenance() {
+    [ -n "${DCENT_PROVENANCE_SOURCE_SNAPSHOT:-}" ] || {
+        dcent_release_error \
+            "exact snapshot provenance requires DCENT_PROVENANCE_SOURCE_SNAPSHOT"
+        return 1
+    }
+    [ -n "${DCENT_PROVENANCE_GIT_OBJECT_REPO:-}" ] || {
+        dcent_release_error \
+            "exact snapshot provenance requires DCENT_PROVENANCE_GIT_OBJECT_REPO"
+        return 1
+    }
+    [ -n "${DCENT_PROVENANCE_HELPER:-}" ] || {
+        dcent_release_error \
+            "exact snapshot provenance requires DCENT_PROVENANCE_HELPER"
+        return 1
+    }
+    [ -f "$DCENT_PROVENANCE_HELPER" ] || {
+        dcent_release_error \
+            "exact snapshot provenance helper is missing: $DCENT_PROVENANCE_HELPER"
+        return 1
+    }
+    dcent_release_run_python "$DCENT_PROVENANCE_HELPER" verify-against-git \
+        --repo-root "$DCENT_PROVENANCE_GIT_OBJECT_REPO" \
+        --commit "$DCENT_SOURCE_COMMIT" \
+        "$DCENT_PROVENANCE_SOURCE_SNAPSHOT" >/dev/null || {
+        dcent_release_error \
+            "exact snapshot provenance did not verify against Git objects"
+        return 1
+    }
 }
 
 dcent_release_require_publication_absent() {
@@ -72,31 +120,6 @@ dcent_release_require_publication_absent() {
                 "canonical publication already exists; archive it or choose a new source/channel: $dcent_release_candidate" || return 1
         fi
     done
-}
-
-# Serialize the global Buildroot work volume and shared output namespace. The
-# directory creation is the cross-platform atomic admission operation; callers
-# hold it for the complete build and release it from their EXIT trap.
-dcent_release_build_lock_acquire() {
-    dcent_release_lock_dir="$1"
-    if ! mkdir -- "$dcent_release_lock_dir" 2>/dev/null; then
-        dcent_release_error \
-            "another build owns the shared build/output lock: $dcent_release_lock_dir" || return 1
-    fi
-    chmod 0700 "$dcent_release_lock_dir" || {
-        rmdir -- "$dcent_release_lock_dir" 2>/dev/null || true
-        dcent_release_error "failed to make build lock private" || return 1
-    }
-}
-
-dcent_release_build_lock_release() {
-    dcent_release_lock_dir="$1"
-    [ ! -L "$dcent_release_lock_dir" ] ||
-        dcent_release_error "build lock was replaced by a symlink" || return 1
-    [ -d "$dcent_release_lock_dir" ] ||
-        dcent_release_error "build lock directory is missing" || return 1
-    rmdir -- "$dcent_release_lock_dir" ||
-        dcent_release_error "build lock directory is not empty or removable" || return 1
 }
 
 dcent_release_validate_identifier() {
@@ -168,6 +191,16 @@ dcent_release_provenance_init() {
                     "release provenance requires DCENT_SOURCE_TREE_STATE=clean or exact_git_object_snapshot" || return 1
                 ;;
         esac
+        if [ "${DCENT_SOURCE_TREE_STATE:-}" = "exact_git_object_snapshot" ]; then
+            if ! dcent_release_is_truthy "${DCENT_RELEASE_CAPSULE_MODE:-0}" ||
+                ! dcent_release_is_truthy \
+                    "${DCENT_CAPSULE_PROVENANCE_VERIFIED:-0}"; then
+                dcent_release_error \
+                    "exact_git_object_snapshot requires an authenticated release capsule"
+                return 1
+            fi
+            dcent_release_verify_exact_snapshot_provenance || return 1
+        fi
     else
         case "${DCENT_SOURCE_COMMIT:-}" in
             unbound) ;;
@@ -205,9 +238,8 @@ dcent_prepare_git_release_provenance() {
     dcent_release_git_commit=$(git -C "$dcent_release_repo" rev-parse HEAD) || return 1
     dcent_release_git_epoch=$(git -C "$dcent_release_repo" show -s --format=%ct HEAD) || return 1
     dcent_release_git_state=clean
-    if ! git -C "$dcent_release_repo" diff --quiet --ignore-submodules -- ||
-       ! git -C "$dcent_release_repo" diff --cached --quiet --ignore-submodules -- ||
-       [ -n "$(git -C "$dcent_release_repo" ls-files --others --exclude-standard | sed -n '1p')" ]; then
+    if [ -n "$(git -C "$dcent_release_repo" status --porcelain=v1 \
+        --untracked-files=normal --ignore-submodules=none)" ]; then
         dcent_release_git_state=dirty
     fi
 
@@ -234,40 +266,26 @@ dcent_create_deterministic_tar() {
     dcent_release_output="$1"
     dcent_release_base="$2"
     dcent_release_top="$3"
+    dcent_release_archiver="${4:-${DCENT_RELEASE_ENVELOPE_ARCHIVER:-}}"
 
     dcent_release_provenance_init || return 1
-    command -v tar >/dev/null 2>&1 || dcent_release_error "tar is required" || return 1
-    tar --help 2>/dev/null | grep -q -- '--sort' ||
-        dcent_release_error "GNU tar with --sort=name is required" || return 1
-    [ -d "$dcent_release_base/$dcent_release_top" ] ||
-        dcent_release_error "archive root is missing: $dcent_release_base/$dcent_release_top" || return 1
-
-    if ! dcent_release_unsafe_entry=$(find "$dcent_release_base/$dcent_release_top" \
-        ! -type f ! -type d -print -quit); then
-        dcent_release_error "failed to inspect archive member types" || return 1
+    [ -n "$dcent_release_archiver" ] ||
+        dcent_release_error "deterministic archive helper path is required" || return 1
+    [ -f "$dcent_release_archiver" ] ||
+        dcent_release_error \
+            "deterministic archive helper is missing: $dcent_release_archiver" ||
+        return 1
+    dcent_release_tar="$(command -v tar 2>/dev/null)" ||
+        dcent_release_error "GNU tar is required" || return 1
+    if command -v cygpath >/dev/null 2>&1; then
+        dcent_release_tar="$(cygpath -w "$dcent_release_tar")" ||
+            dcent_release_error "cannot normalize the GNU tar executable path" ||
+            return 1
     fi
-    [ -z "$dcent_release_unsafe_entry" ] ||
-        dcent_release_error "unsupported archive member type: $dcent_release_unsafe_entry" || return 1
-
-    # GNU tar can encode multiply-linked regular files as hardlink members,
-    # which the OTA parser intentionally refuses. Reject them at the producer.
-    if ! dcent_release_hardlinked_entry=$(find "$dcent_release_base/$dcent_release_top" \
-        -type f -links +1 -print -quit); then
-        dcent_release_error "failed to inspect archive link counts" || return 1
-    fi
-    [ -z "$dcent_release_hardlinked_entry" ] ||
-        dcent_release_error "multiply-linked archive member is forbidden: $dcent_release_hardlinked_entry" || return 1
-
-    find "$dcent_release_base/$dcent_release_top" -type d -exec chmod 0755 {} + ||
-        dcent_release_error "failed to normalize archive directory modes" || return 1
-    find "$dcent_release_base/$dcent_release_top" -type f -exec chmod 0644 {} + ||
-        dcent_release_error "failed to normalize archive file modes" || return 1
-    LC_ALL=C TZ=UTC tar \
-        --sort=name \
-        --format=ustar \
-        --mtime="@${SOURCE_DATE_EPOCH}" \
-        --owner=0 --group=0 --numeric-owner \
-        --mode='u+rwX,go+rX,go-w' \
-        -cf "$dcent_release_output" \
-        -C "$dcent_release_base" "$dcent_release_top"
+    LC_ALL=C TZ=UTC dcent_release_run_python "$dcent_release_archiver" \
+        --output "$dcent_release_output" \
+        --base "$dcent_release_base" \
+        --top "$dcent_release_top" \
+        --source-date-epoch "$SOURCE_DATE_EPOCH" \
+        --tar "$dcent_release_tar"
 }

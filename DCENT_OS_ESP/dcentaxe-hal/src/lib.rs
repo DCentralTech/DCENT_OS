@@ -64,13 +64,21 @@ pub mod tps546_guard;
 // max-cooling fan-duty bytes. No ESP-IDF dep — host-testable and the single
 // source of truth shared by the espidf-only panic hook and `gpio::enable_buck`.
 pub mod safety;
-// DCENT_axe on-board SX1262 LoRa radio pin map (PROVISIONAL — NEEDS-NETLIST-LOCK)
+// DCENT_axe on-board SX1262 LoRa radio pin map (LOCKED 9/9 vs BM1397 netlist)
 // + the esp-idf SPI3/HSPI bus builder. The pure pin map (const table + table
 // test) is host-testable; the `open_lora_bus` builder inside is esp-idf-gated
-// (integration seam, not host-tested). Default-OFF via the `pins-lora` feature —
-// a non-LoRa SKU never compiles this module.
+// (integration seam — NEEDS-VERIFY on silicon). Default-OFF via the `pins-lora`
+// feature — a non-LoRa SKU never compiles this module.
 #[cfg(feature = "pins-lora")]
 pub mod lora_pins;
+// W5500 SPI-Ethernet (DCENT LAN Mod, PLAN-E Phase 1) pin map + MAC-derivation
+// rule + clock/poll constants. PURE (no esp-idf dep) and host-testable — the
+// esp-idf `esp_eth` bring-up seam lives in the `dcentaxe` binary
+// (`eth_w5500.rs`), which is the only crate that propagates the required
+// `esp_idf_eth_spi_ethernet_w5500` sdkconfig cfg via its build.rs. Default-OFF
+// via the `eth-w5500` feature — a non-LAN SKU never compiles this module.
+#[cfg(feature = "eth-w5500")]
+pub mod eth;
 // The pure decode/register-map layer of the EMC2103 driver is host-testable via
 // the `dcentaxe-core` `#[path]` re-include (see emc2103.rs); the whole module is
 // gated here because its I2C-backed `Emc2103` struct links esp-idf-hal.

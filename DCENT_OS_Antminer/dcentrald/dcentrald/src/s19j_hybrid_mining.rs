@@ -91,8 +91,9 @@ use dcentrald_hal::platform::{
 use dcentrald_hal::xadc::Xadc;
 // W13.B1 (2026-05-10) merged glitch_monitor + uart_relay imports below.
 use dcentrald_hal::i2c::{
-    spawn_i2c_service_no_register_touch, spawn_i2c_service_no_register_touch_with_denylist,
-    I2cMutationLabel, I2cServiceHandle, I2cTransactionStep,
+    spawn_i2c_service_no_register_touch,
+    spawn_i2c_service_no_register_touch_with_denylist_and_reserved_preparation, I2cMutationLabel,
+    I2cServiceHandle, I2cTransactionStep,
 };
 use dcentrald_hal::psu::Apw121215a;
 // PsuGpioGate is now owned by `Apw121215a` and asserted automatically
@@ -297,6 +298,80 @@ const S19J_HYBRID_CHIP_RAIL_TARGET_MV: u16 = 13_700;
 /// `DCENT_AM2_ALLOW_LAB_OVERVOLT=1` lifts it — so anything above 14500 is
 /// SILENTLY clamped down at the rail boundary without the lab over-volt flag.
 const S19J_OPEN_CORE_MAX_MV: u16 = 15_140;
+
+const AM2_VOLTAGE_ENABLE_ALL_ACTIVE_PICS_ENV: &str = "DCENT_AM2_VOLTAGE_ENABLE_ALL_ACTIVE_PICS";
+
+/// One admitted rail target for the whole open-core experiment lifetime.
+///
+/// Resolving this once before each hashboard rail mutation prevents environment
+/// changes or duplicated gate logic from selecting a different demotion policy
+/// after the elevated rail has already been applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpenCoreRailPlan {
+    steady_mv: u16,
+    energization_mv: u16,
+}
+
+impl OpenCoreRailPlan {
+    const fn requires_demotion(self) -> bool {
+        self.energization_mv > self.steady_mv
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum OpenCoreRailAdmissionError {
+    #[error(
+        "open-core elevation cannot be combined with all-active-PIC voltage enable; one selected rail owner must remain authoritative"
+    )]
+    AllActiveVoltageEnable,
+    #[error(
+        "open-core target {requested_mv} mV must be strictly above steady target {steady_mv} mV"
+    )]
+    TargetNotElevated { requested_mv: u16, steady_mv: u16 },
+}
+
+const fn admit_open_core_rail_plan(
+    open_core_active: bool,
+    all_active_voltage_enable: bool,
+    steady_mv: u16,
+    requested_mv: u16,
+) -> std::result::Result<OpenCoreRailPlan, OpenCoreRailAdmissionError> {
+    if !open_core_active {
+        return Ok(OpenCoreRailPlan {
+            steady_mv,
+            energization_mv: steady_mv,
+        });
+    }
+    if all_active_voltage_enable {
+        return Err(OpenCoreRailAdmissionError::AllActiveVoltageEnable);
+    }
+    if requested_mv <= steady_mv {
+        return Err(OpenCoreRailAdmissionError::TargetNotElevated {
+            requested_mv,
+            steady_mv,
+        });
+    }
+    Ok(OpenCoreRailPlan {
+        steady_mv,
+        energization_mv: requested_mv,
+    })
+}
+
+const fn am2_hb_reset_attempt_budget(
+    faithful_retry_enabled: bool,
+    requested_attempts: u8,
+    elevated_rail: bool,
+) -> u8 {
+    if elevated_rail || !faithful_retry_enabled {
+        1
+    } else if requested_attempts < 1 {
+        1
+    } else if requested_attempts > 20 {
+        20
+    } else {
+        requested_attempts
+    }
+}
 
 pub(crate) fn psu_override_active(psu_override: Option<&crate::config::PsuOverride>) -> bool {
     psu_override.is_some_and(|o| o.enabled)
@@ -2699,40 +2774,6 @@ fn am2_psu_loki_cold_boot_full_enabled() -> bool {
     am2_env_flag("DCENT_AM2_PSU_LOKI_COLD_BOOT_FULL")
 }
 
-/// 2026-05-29 () — opt-in env gate for bosminer's STANDARD APW12
-/// cold-engage procedure on `a lab unit`-class XIL units (the RE-established
-/// replacement for the partial  Loki cold-wake).
-///
-/// When `DCENT_AM2_APW12_STANDARD_COLD_ENGAGE=1`, the `a lab unit`-class
-/// gpio_bitbang Phase-0 branch calls
-/// `Apw121215a::cold_boot_sequence_apw12_standard_engage` **in place of**
-/// `cold_boot_sequence_loki_standalone` / `cold_boot_sequence_write_only`.
-///
-/// **WHY:** Two Ghidra passes of `bosminer.bin` + the operator's "Loki
-/// spoofs APW12" insight proved that on `a lab unit` the chip rail engages via the
-/// STANDARD APW12 power-on protocol (GetFwVersion handshake gate →
-/// calibration read → SetVoltage 15.2V FIRST → ramp to 13.7V → output-Enable
-/// → blind settle → 1 Hz heartbeat), NOT via the dsPIC `0x10`/`0x15` opcodes.
-/// dcentrald's prior `a lab unit` Loki cold-wake is an INCOMPLETE/open-loop
-/// approximation that fails to engage the rail (chain enum=0). See
-///  +
-/// .
-///
-/// **Fleet safety:** ADDITIVE to the  PROVEN MINING RECIPE (NOT in the
-/// 4-forbidden list at `wave55a_recipe_guard.rs`). Default OFF → unset env
-/// preserves the prior path byte-identically. Only fires when ALL hold:
-///   1. `DCENT_AM2_APW12_STANDARD_COLD_ENGAGE=1` is set.
-///   2. PSU transport == `gpio_bitbang` (the Loki spoof transport).
-///   3. The `a lab unit`-class hardware fingerprint matches.
-///   4. `DCENT_AM2_TRUST_RAIL_FALLBACK != 1` (standalone, not handoff).
-///
-/// Takes precedence over `DCENT_AM2_PSU_LOKI_COLD_BOOT_FULL` () when
-/// both are set —  is the recovered standard procedure and supersedes
-/// the partial  cold-wake.
-fn am2_apw12_standard_cold_engage_enabled() -> bool {
-    am2_env_flag("DCENT_AM2_APW12_STANDARD_COLD_ENGAGE")
-}
-
 /// 2026-05-25 () — opt-in umbrella env gate for the Phase 2c RE
 /// finding fix on `a lab unit`-class XIL hardware (DCENT_OS-from-NAND
 /// standalone cold-boot).
@@ -3479,6 +3520,20 @@ fn bring_up_apw121215a_smart_lenient(
                     break;
                 }
                 Err(e) => {
+                    if let Some(fw) = psu.fw_byte() {
+                        if fw != APW12_139_ASSUMED_FW {
+                            error!(
+                                fw = format_args!("0x{:02X}", fw),
+                                error = %e,
+                                "smart-APW12 lenient observed a non-fw71 PSU dialect; \
+                                 refusing the write-only fallback"
+                            );
+                            return SmartApw12HandshakeOutcome {
+                                psu: None,
+                                heartbeat: None,
+                            };
+                        }
+                    }
                     let err_str = e.to_string();
                     let is_nak = err_str.contains("PSU NAK") || err_str.contains("0xF5");
                     if is_nak && attempt < PROBE_RETRY_BUDGET {
@@ -3517,45 +3572,10 @@ fn bring_up_apw121215a_smart_lenient(
         // (per-byte register-pointer init-frame + bare follow-frame + poll).
         // Without this fix, 's full_cycle never fires on the
         // gpio_bitbang transport and the Loki spoof never wakes up.
-        //  (2026-05-29): bosminer's STANDARD APW12 cold-engage takes
-        // precedence over the partial  cold-wake when its gate is set.
-        // This is the RE-established replacement (GetFwVersion handshake gate →
-        // calibration read → SetVoltage 15.2V FIRST → ramp to target →
-        // output-Enable → blind settle → heartbeat) — see
-        // `am2_apw12_standard_cold_engage_enabled` doc + the new HAL method
-        // `Apw121215a::cold_boot_sequence_apw12_standard_engage`.
-        let wave56_standard_engage_active = am2_apw12_standard_cold_engage_enabled()
-            && am2_xil_25_fingerprint_matches()
-            && !am2_env_flag("DCENT_AM2_TRUST_RAIL_FALLBACK");
         let wave55b_loki_cold_boot_active = am2_psu_loki_cold_boot_full_enabled()
             && am2_xil_25_fingerprint_matches()
             && !am2_env_flag("DCENT_AM2_TRUST_RAIL_FALLBACK");
-        if wave56_standard_engage_active {
-            warn!(
-                target_v = psu_target_rail_v,
-                env_gate = "DCENT_AM2_APW12_STANDARD_COLD_ENGAGE=1",
-                "Wave-56 STANDARD APW12 cold-engage ENGAGED (gpio_bitbang transport) — \
-                 running bosminer's recovered power-on protocol (GetFwVersion handshake gate \
-                 → calibration read → SetVoltage 15.2V FIRST → ramp to target → output-Enable \
-                 → blind settle → heartbeat) IN PLACE OF the partial Wave-38 cold-wake. \
-                 This is the RE-established standalone bring-up path for cold-cold .25-class XIL."
-            );
-            if let Err(e) = psu.cold_boot_sequence_apw12_standard_engage(psu_target_rail_v) {
-                warn!(
-                    error = %e,
-                    "Wave-56 STANDARD APW12 cold-engage FAILED on gpio_bitbang transport — \
-                     partial-handshake state; spawning heartbeat anyway to keep the spoof \
-                     acknowledged (PsuBypassGate still owns PWR_CONTROL)"
-                );
-            } else {
-                info!(
-                    target_rail_v = psu_target_rail_v,
-                    "Wave-56 STANDARD APW12 cold-engage complete on gpio_bitbang transport — \
-                     GetFwVersion gate + calibration read + SetVoltage(15.2→target) + Enable \
-                     + settle + heartbeat all emitted (chain-enum downstream is the rail verdict)"
-                );
-            }
-        } else if wave55b_loki_cold_boot_active {
+        if wave55b_loki_cold_boot_active {
             warn!(
                 target_v = psu_target_rail_v,
                 env_gate = "DCENT_AM2_PSU_LOKI_COLD_BOOT_FULL=1",
@@ -4835,7 +4855,7 @@ fn am2_post_reset_settle_ms() -> u64 {
 ///
 /// When `DCENT_AM2_OPEN_CORE_VOLTAGE=1` AND the `a lab unit` fingerprint matches AND
 /// the lab over-volt cap is lifted, the Phase-3 dsPIC `cold_boot_init` targets
-/// the elevated `s19j_open_core_mv()` (default 14920 mV) instead of the steady
+/// an explicitly configured elevated `s19j_open_core_mv()` instead of the steady
 /// 13700 mV — so the BM1362 chip string enumerates AT the open-core voltage,
 /// matching what LuxOS/`a lab unit` (same BM1362) + bosminer + the AMTC fixture do on
 /// every cold boot. After enum > 0, Phase 4-7 ramps the rail back DOWN to
@@ -4858,7 +4878,9 @@ fn am2_open_core_voltage_enabled() -> bool {
 /// experiment gate is active — `am2_open_core_voltage_enabled()` AND the
 /// `a lab unit` fingerprint matches. This keeps the elevated voltage strictly
 /// `a lab unit`-only and behind the explicit env flag; everything else stays at
-/// 13700 and the call sites remain byte-identical to today.
+/// 13700 and the call sites remain byte-identical to today. Admission later
+/// requires the resolved value to be strictly greater than steady, so merely
+/// enabling the experiment without an explicit elevated target fails closed.
 ///
 /// SAFETY: the returned value is later fed to `pic.cold_boot_init_with_options`
 /// / `pic.set_voltage`, where `clamp_dspic_voltage_to_hard_cap` SILENTLY clamps
@@ -6642,6 +6664,11 @@ fn bm1362_re018_cold_sequence(serial: &SerialChainBackend, chip_count: u8) -> Re
 // ---------------------------------------------------------------------------
 
 pub struct S19jHybridMiner {
+    /// One-shot proof that immutable startup identity, the exact AM2/Zynq
+    /// BoardDesc, configured BM1362 identity, and this runtime route agreed
+    /// before construction. Taken at `run()` entry so the same admission
+    /// cannot authorize a second hardware lifecycle.
+    route_admission: Option<crate::s19j_hybrid_admission::S19jHybridRouteAdmission>,
     config: DcentraldConfig,
     shutdown: CancellationToken,
     /// Long-lived `miner-glitch-monitor` UIO handle (Braiins-am2 only).
@@ -6681,14 +6708,25 @@ pub struct S19jHybridMiner {
 }
 
 impl S19jHybridMiner {
-    pub fn new(config: DcentraldConfig, shutdown: CancellationToken) -> Self {
-        Self {
+    /// Construct the BM1362-only hybrid engine after composition admission.
+    ///
+    /// The route-specific proof prevents a shared ASIC protocol or transport
+    /// facet from authorizing this engine on another control-board carrier.
+    /// No hardware is opened here, but rejecting before construction keeps
+    /// every future Phase-0 mutation behind the same invariant.
+    pub fn new(
+        config: DcentraldConfig,
+        shutdown: CancellationToken,
+        route_admission: crate::s19j_hybrid_admission::S19jHybridRouteAdmission,
+    ) -> Result<Self> {
+        Ok(Self {
+            route_admission: Some(route_admission),
             config,
             shutdown,
             glitch_monitor: None,
             state_tx: None,
             accepted_sku_bindings: Vec::new(),
-        }
+        })
     }
 
     /// AT-DASH: attach a live `MinerState` publisher so the hybrid mining loops
@@ -9247,7 +9285,15 @@ impl S19jHybridMiner {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        let _route_admission = self
+            .route_admission
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("AM2 hybrid route admission was already consumed"))?;
         info!("=== S19J PRO HYBRID MINING (Serial init + FPGA work, APW121215a PSU) ===");
+
+        if self.shutdown.is_cancelled() {
+            anyhow::bail!("AM2 hybrid run was cancelled before hardware admission");
+        }
 
         //  finding: hybrid mode bypasses `daemon.rs::Daemon::run()` so the
         // daemon-level Phase 2 fan init never runs. We re-anchor a cold-boot
@@ -9262,6 +9308,56 @@ impl S19jHybridMiner {
 
         am2_wave56_override_runtime_preflight(&self.config)?;
 
+        // Resolve the complete elevated-rail lifecycle before the first UART,
+        // I2C, PSU, or GPIO mutation. This gate depends only on immutable
+        // configuration, environment/fingerprint evidence, and passthrough
+        // policy, so invalid combinations have no reason to touch hardware.
+        let passthrough = self.config.mining.passthrough;
+        let all_active_voltage_enable = am2_env_flag(AM2_VOLTAGE_ENABLE_ALL_ACTIVE_PICS_ENV);
+        let open_core_active = !passthrough && am2_open_core_gate_active();
+        let steady_rail_mv =
+            s19j_hybrid_chip_rail_target_mv(self.config.power.psu_override.as_ref());
+        let requested_open_core_mv = if open_core_active {
+            s19j_open_core_mv()
+        } else {
+            steady_rail_mv
+        };
+        let open_core_rail_plan = admit_open_core_rail_plan(
+            open_core_active,
+            all_active_voltage_enable,
+            steady_rail_mv,
+            requested_open_core_mv,
+        )
+        .context("AM2 open-core rail plan was not admitted before hardware preparation")?;
+
+        let serial_devices = self.config.mining.resolved_serial_devices("/dev/ttyS2");
+        let planned_chain_contexts = build_am2_chain_plan(&serial_devices)?;
+        let serial_device = am2_phase1_select_serial_device(&serial_devices, "/dev/ttyS2");
+        let selected_pic_addr =
+            am2_pic_addr_from_serial_device(&serial_device).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cannot derive S19j dsPIC address from serial device '{}'",
+                    serial_device
+                )
+            })?;
+        let mut chain_uart_device = std::env::var("DCENT_AM2_CHAIN_UART_OVERRIDE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| serial_device.clone());
+        let effective_chain_dspic_addr = am2_pic_addr_from_serial_device(&chain_uart_device);
+        if open_core_rail_plan.requires_demotion()
+            && effective_chain_dspic_addr != Some(selected_pic_addr)
+        {
+            anyhow::bail!(
+                "AM2 open-core elevation requires one typed rail owner: selected dsPIC 0x{selected_pic_addr:02X} does not own effective chain UART {} ({:?})",
+                chain_uart_device,
+                effective_chain_dspic_addr
+            );
+        }
+        if self.shutdown.is_cancelled() {
+            anyhow::bail!("AM2 hybrid run was cancelled before the first hardware mutation");
+        }
+
         // .25 RE-018 kernel-UART transport: free IRQ 165 (unbind chain1-work-tx
         // from uio_pdrv_genirq) BEFORE the first SerialChainBackend::open so the
         // kernel of_serial can claim /dev/ttyS1 (selection=kernel-open). No-op
@@ -9269,9 +9365,6 @@ impl S19jHybridMiner {
         // SERIAL_WORK_DISPATCH all hold -> fleet/handoff byte-identical.
         am2_free_chain1_work_tx_irq_for_kernel_uart();
 
-        let serial_devices = self.config.mining.resolved_serial_devices("/dev/ttyS2");
-        let passthrough = self.config.mining.passthrough;
-        let planned_chain_contexts = build_am2_chain_plan(&serial_devices)?;
         let am2_controller_plan = if passthrough {
             None
         } else {
@@ -9281,7 +9374,6 @@ impl S19jHybridMiner {
             )
         };
         log_am2_planned_chain_contexts(&planned_chain_contexts);
-        let serial_device = am2_phase1_select_serial_device(&serial_devices, "/dev/ttyS2");
         if serial_devices.len() > 1 {
             warn!(
                 serial_devices = ?serial_devices,
@@ -9424,6 +9516,9 @@ impl S19jHybridMiner {
         // dsPIC + the EEPROM 0x50-0x57 write-denylist) — the override branch
         // simply never opens an `Apw121215a` on it.
         // ================================================================
+        if self.shutdown.is_cancelled() {
+            anyhow::bail!("AM2 hybrid run was cancelled before PSU/rail bring-up");
+        }
         let psu_arc: Option<Arc<Mutex<Apw121215a>>>;
         let mut runtime_threads = RuntimeThreadGuard::new(self.shutdown.clone());
         // RAII guard for the "Loki bypass" path: owns PWR_CONTROL when
@@ -9465,8 +9560,6 @@ impl S19jHybridMiner {
         let i2c0_service: Option<I2cServiceHandle> = if passthrough {
             None
         } else {
-            ensure_i2c0_kernel_bound()
-                .context("xiic-i2c bring-up failed before AM2 I2C service")?;
             // am2 hashboard EEPROM is at I²C addresses 0x50-0x57 (AT24C-series
             // standard). dcentrald NEVER writes to these — only bosminer reads
             // them at boot for board identity. Block writes at the bus layer to
@@ -9475,8 +9568,18 @@ impl S19jHybridMiner {
             // .74 hb2 EEPROM corruption incident motivated this gate).
             let am2_eeprom_denylist: Vec<u8> = (0x50u8..=0x57u8).collect();
             let service =
-                spawn_i2c_service_no_register_touch_with_denylist(0, am2_eeprom_denylist.clone())
-                    .context("Failed to spawn AM2 /dev/i2c-0 service")?;
+                spawn_i2c_service_no_register_touch_with_denylist_and_reserved_preparation(
+                    0,
+                    am2_eeprom_denylist.clone(),
+                    || {
+                        ensure_i2c0_kernel_bound().map_err(|error| {
+                            std::io::Error::other(format!(
+                                "xiic-i2c bring-up failed after fabric reservation: {error:#}"
+                            ))
+                        })
+                    },
+                )
+                .context("Failed to reserve, prepare, and spawn AM2 /dev/i2c-0 service")?;
             if let Err(e) = service.set_timeout(10) {
                 warn!(error = %e, "AM2 I2C service timeout setup failed; continuing with service default");
             }
@@ -9667,10 +9770,9 @@ impl S19jHybridMiner {
             // but the unintended-peer SMBus byte exposure is closed by
             // skipping the probe entirely.
             //
-            // Behavior on hard-skip: `psu = None; heartbeat = None;` — exactly
-            // the same scope state as the lenient-probe-deadline-expired
-            // fall-through, just ~200 ms faster. Daemon proceeds to
-            // PWR_CONTROL-only mode through to Phase 1 unchanged.
+            // Behavior on hard-skip: `psu_arc` remains `None` and the helper
+            // that can return a heartbeat handle is never called. The daemon
+            // proceeds to PWR_CONTROL-only mode through to Phase 1 unchanged.
             //
             //  (2026-05-26) — zero-PSU-byte diagnostic gate:
             //
@@ -9845,29 +9947,10 @@ impl S19jHybridMiner {
                     // PHASE2B-BYTE-LEVEL-GAPS.md` for the  →
                     // byte mapping. Regression-pinned by
                     // `tests/wave55b_loki_cold_boot_sequence.rs`.
-                    //  (2026-05-29): bosminer's STANDARD APW12 cold-engage
-                    // (GetFwVersion handshake gate → calibration read →
-                    // SetVoltage 15.2V FIRST → ramp to target → output-Enable →
-                    // blind settle → heartbeat). RE-established replacement for
-                    // the partial  cold-wake; takes precedence when set.
-                    // Same compound gate (env + `a lab unit` fingerprint + not-handoff).
-                    let wave56_standard_engage_active = am2_apw12_standard_cold_engage_enabled()
-                        && am2_xil_25_fingerprint_matches()
-                        && !am2_env_flag("DCENT_AM2_TRUST_RAIL_FALLBACK");
                     let wave55b_loki_cold_boot_active = am2_psu_loki_cold_boot_full_enabled()
                         && am2_xil_25_fingerprint_matches()
                         && !am2_env_flag("DCENT_AM2_TRUST_RAIL_FALLBACK");
-                    if wave56_standard_engage_active {
-                        warn!(
-                            target_v = psu_target_rail_v,
-                            env_gate = "DCENT_AM2_APW12_STANDARD_COLD_ENGAGE=1",
-                            "Wave-56 STANDARD APW12 cold-engage ENGAGED — running bosminer's \
-                             recovered power-on protocol IN PLACE OF the partial Wave-38 \
-                             cold-wake. RE-established standalone bring-up path for .25-class XIL."
-                        );
-                        psu.cold_boot_sequence_apw12_standard_engage(psu_target_rail_v)
-                            .context("Wave-56 standard APW12 cold-engage failed")?;
-                    } else if wave55b_loki_cold_boot_active {
+                    if wave55b_loki_cold_boot_active {
                         warn!(
                             target_v = psu_target_rail_v,
                             env_gate = "DCENT_AM2_PSU_LOKI_COLD_BOOT_FULL=1",
@@ -9892,23 +9975,39 @@ impl S19jHybridMiner {
                     let mut eeprom_ready = false;
                     while std::time::Instant::now() < deadline {
                         attempts += 1;
-                        let read_res = probe_i2c.read_bytes(0x50, 1);
+                        let read_res = probe_i2c.read_hashboard_eeprom_prefix_at(0x50, deadline);
                         info!(
                             attempt = attempts,
                             read_ok = read_res.is_ok(),
-                            "EEPROM probe 0x50 attempt"
+                            "EEPROM 0x50 identity-prefix read attempt"
                         );
-                        if read_res.is_ok() {
-                            info!(attempts, "Hashboard EEPROM 0x50 ACK — dsPICs ready");
-                            eeprom_ready = true;
+                        match read_res {
+                            Ok(_) => {
+                                info!(
+                                    attempts,
+                                    "Hashboard EEPROM 0x50 identity prefix readable — dsPICs ready"
+                                );
+                                eeprom_ready = true;
+                                break;
+                            }
+                            Err(dcentrald_hal::HalError::I2cEndpointNotReady { .. }) => {}
+                            Err(error) => {
+                                return Err(error).context(
+                                    "AM2 hashboard EEPROM bootstrap service failed terminally",
+                                );
+                            }
+                        }
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
+                        if remaining.is_zero() {
                             break;
                         }
-                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        std::thread::sleep(remaining.min(std::time::Duration::from_secs(3)));
                     }
                     if !eeprom_ready {
                         warn!(
                             attempts,
-                            "Hashboard EEPROM did not ACK within 60 s — proceeding with PSU init anyway"
+                            "Hashboard EEPROM identity prefix remained unreadable for 60 s — proceeding with PSU init anyway"
                         );
                     }
                     let mut psu = Apw121215a::open_service_at(probe_i2c.clone(), 0, psu_address)
@@ -9925,13 +10024,20 @@ impl S19jHybridMiner {
                             "PSU probe OK (expect APW121215a / FW 0x71)",
                         ),
                         Err(e) => {
-                            warn!(error = %e, "PSU probe failed — continuing; cold_boot will still run")
+                            return Err(e).context(
+                                "PSU identity probe failed or rejected a non-fw71 command dialect",
+                            )
                         }
                     }
 
-                    match psu.get_hw_version() {
-                        Ok(hw) => info!(hw_len = hw.len(), "PSU HW version bytes: {:02X?}", hw),
-                        Err(e) => warn!(error = %e, "PSU HW version read failed — non-fatal"),
+                    match psu.get_device_type() {
+                        Ok(device_type) => info!(
+                            response_len = device_type.len(),
+                            "PSU device-type bytes: {:02X?}", device_type
+                        ),
+                        Err(e) => {
+                            warn!(error = %e, "PSU device-type read failed — non-fatal")
+                        }
                     }
 
                     info!(
@@ -10082,8 +10188,8 @@ impl S19jHybridMiner {
         // chain reports:
         //   • malformed preamble (not 0x04 0x11 BHB42xxx, not 0x05 0x11
         //     BHB56902, not all-0x00/0xFF)
-        //   • EEPROM readiness timeout (sysfs node doesn't surface bytes
-        //     within DEFAULT_EEPROM_READINESS_BUDGET_MS)
+        //   • EEPROM readiness timeout (the owned bus-0 service cannot read
+        //     the fixed AT24 identity prefix within the readiness budget)
         //   • mixed-SKU pairing across chains (BHB42xxx + BHB56902 on the
         //     same unit — refuse all)
         //   • profile-bind failure (preamble readable but unknown family)
@@ -10100,8 +10206,8 @@ impl S19jHybridMiner {
         let mut am2_hashboard_presence: Vec<Am2HashboardPresence> = Vec::new();
         if !passthrough {
             use crate::runtime::hardware_info::{
-                read_hashboard_eeprom_for_energize_gate, EepromReadinessError,
-                DEFAULT_EEPROM_READINESS_BUDGET_MS,
+                read_hashboard_eeprom_prefix_via_service_for_energize_gate,
+                OwnedEepromReadinessError, DEFAULT_EEPROM_READINESS_BUDGET_MS,
             };
             use dcentrald_silicon_profiles::energize_gate::{
                 accept_degraded_hardware_enabled, classify_chain, gate_chains_for_energize,
@@ -10110,11 +10216,18 @@ impl S19jHybridMiner {
 
             let strict = strict_sku_refuse_enabled();
             let accept_degraded = accept_degraded_hardware_enabled();
+            let eeprom_service = i2c0_service
+                .as_ref()
+                .context("AM2 I2C service missing for serialized hashboard identity reads")?;
             let deadline = std::time::Instant::now()
                 + std::time::Duration::from_millis(DEFAULT_EEPROM_READINESS_BUDGET_MS);
             let mut probes: Vec<ChainProbe> = Vec::with_capacity(3);
             for slot in 0u8..=2u8 {
-                match read_hashboard_eeprom_for_energize_gate(slot as usize, deadline) {
+                match read_hashboard_eeprom_prefix_via_service_for_energize_gate(
+                    eeprom_service,
+                    slot as usize,
+                    deadline,
+                ) {
                     Ok(bytes) => {
                         if let Some((plan, context)) =
                             am2_controller_plan.as_ref().and_then(|plan| {
@@ -10132,14 +10245,29 @@ impl S19jHybridMiner {
                         }
                         probes.push(classify_chain(slot, Some(&bytes)));
                     }
-                    Err(EepromReadinessError::Timeout { .. }) => {
+                    Err(OwnedEepromReadinessError::Timeout { .. }) => {
                         probes.push(ChainProbe::Timeout { chain_id: slot });
                     }
-                    Err(EepromReadinessError::InvalidSlot { .. }) => {
+                    Err(OwnedEepromReadinessError::InvalidSlot { .. }) => {
                         // Programmatic bug — log + treat as read error
                         // (silently skipped by the gate so we never accidentally
                         // brick a healthy chain over a bookkeeping error).
                         probes.push(ChainProbe::ReadError { chain_id: slot });
+                    }
+                    Err(error @ OwnedEepromReadinessError::Terminal { .. }) => {
+                        tracing::error!(
+                            slot,
+                            error = %error,
+                            "AM2 hashboard identity service failed terminally; refusing energize"
+                        );
+                        force_am2_home_hard_stop(
+                            &self.config,
+                            "am2-hashboard-eeprom-service-terminal",
+                        );
+                        self.shutdown.cancel();
+                        anyhow::bail!(
+                            "AM2 hashboard identity service failed terminally on slot {slot}: {error}"
+                        );
                     }
                 }
             }
@@ -10315,13 +10443,6 @@ impl S19jHybridMiner {
         // Phase 7: Baud upgrade to 3.125 Mbaud (inside init_asic_chain)
         // ================================================================
         let mut post_init_serial: Option<SerialChainBackend> = None;
-        let selected_pic_addr =
-            am2_pic_addr_from_serial_device(&serial_device).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Cannot derive S19j dsPIC address from serial device '{}'",
-                    serial_device
-                )
-            })?;
         if !passthrough && !dspic_addr_active(active_chains, selected_pic_addr) {
             anyhow::bail!(
                 "Configured AM2 dsPIC chain 0x{:02X} for {} is inactive; active mask=0b{:03b} active_addrs={:02X?}",
@@ -10340,11 +10461,6 @@ impl S19jHybridMiner {
         // `selected_pic_addr` remains the selected PIC context derived from
         // TOML `serial_device`; this route is only for chain-side UART
         // observation and Phase 4-7 enum/work.
-        let mut chain_uart_device = std::env::var("DCENT_AM2_CHAIN_UART_OVERRIDE")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| serial_device.clone());
-        let effective_chain_dspic_addr = am2_pic_addr_from_serial_device(&chain_uart_device);
         if chain_uart_device != serial_device {
             info!(
                 selected_pic_addr = format_args!("0x{:02X}", selected_pic_addr),
@@ -10365,6 +10481,17 @@ impl S19jHybridMiner {
             planned_chain_contexts = planned_chain_contexts.len(),
             "AM2 route selection: selected PIC context vs effective chain UART"
         );
+
+        // The plan was admitted before hardware preparation. Log its typed
+        // owner now that the selected controller route is known.
+        if open_core_rail_plan.requires_demotion() {
+            warn!(
+                selected_pic_addr = format_args!("0x{:02X}", selected_pic_addr),
+                open_core_mv = open_core_rail_plan.energization_mv,
+                steady_mv = open_core_rail_plan.steady_mv,
+                "AM2 open-core rail plan admitted for one selected controller; any demotion failure will terminal-safe-off every dsPIC and hard-stop PWR_CONTROL"
+            );
+        }
 
         // SWARM-FIX #4: arm the run-scope hard-stop guard's dsPIC-disable leg
         // now that the single-owner `/dev/i2c-0` service is up and the active
@@ -10626,7 +10753,7 @@ impl S19jHybridMiner {
                 // ANY prior warmup, or per-slot health, not a specific 0x20→0x22
                 // sequence).
                 // §" B05 correction".
-                if am2_env_flag("DCENT_AM2_VOLTAGE_ENABLE_ALL_ACTIVE_PICS") {
+                if all_active_voltage_enable {
                     let other_pics =
                         am2_bus_prime_order(&active_dspic_addrs(active_chains), selected_pic_addr);
                     for prime_addr in other_pics {
@@ -11623,6 +11750,12 @@ impl S19jHybridMiner {
                                 "[T+{}] Phase 2b-ext(EBR): energizing chip rail (cold_boot_init: SetVoltage+ENABLE) WITH HB_RESET held LOW",
                                 t()
                             );
+                            if self.shutdown.is_cancelled() {
+                                let _ = bc.release_resets_high(reset_slots);
+                                anyhow::bail!(
+                                    "AM2 hybrid run was cancelled before early chip-rail enable"
+                                );
+                            }
                             if let Err(e) = pic.cold_boot_init_with_options(13_700, true) {
                                 let _ = bc.release_resets_high(reset_slots);
                                 force_pwr_control_low(
@@ -11631,6 +11764,23 @@ impl S19jHybridMiner {
                                 );
                                 anyhow::bail!(
                                     "Phase 2b-ext(EBR): rail enable under HB_RESET failed: {e}"
+                                );
+                            }
+                            if self.shutdown.is_cancelled() {
+                                pic_i2c.latch_terminal_safe_off();
+                                let _ = pic.disable_voltage();
+                                force_am2_home_hard_stop(
+                                    &self.config,
+                                    "cancelled-after-early-chip-rail-enable",
+                                );
+                                let _ = stop_am2_runtime_feeders_bounded(
+                                    &self.config,
+                                    &mut runtime_threads,
+                                    "cancelled-after-early-chip-rail-enable",
+                                )
+                                .await;
+                                anyhow::bail!(
+                                    "AM2 hybrid run was cancelled after early chip-rail enable; terminal safe-off requested"
                                 );
                             }
                             // 4. Short settle for the DC-DC to reach target with chip held in reset.
@@ -11985,8 +12135,7 @@ impl S19jHybridMiner {
                     );
                 }
             } else {
-                let mut chip_rail_target_mv =
-                    s19j_hybrid_chip_rail_target_mv(psu_override_cfg.as_ref());
+                let chip_rail_target_mv = open_core_rail_plan.energization_mv;
 
                 // 2026-05-31 — AM2 `a lab unit` open-core voltage-ramp experiment
                 // (Variant A: enumerate AT open-core, matching bosminer/AMTC,
@@ -11994,16 +12143,16 @@ impl S19jHybridMiner {
                 // When the compound gate is active (env
                 // `DCENT_AM2_OPEN_CORE_VOLTAGE=1` + `a lab unit` fingerprint + lab
                 // over-volt cap lifted), drive the chip string to the elevated
-                // `s19j_open_core_mv()` (default 14920 mV) for enumeration +
+                // the admitted elevated target for enumeration +
                 // core activation, then ramp back DOWN to 13700 mV after enum
                 // succeeds (Phase 4-7 post-enum ramp-down below). Default-OFF +
                 // `a lab unit`-only ⇒ byte-identical for every other unit (the gate
                 // helpers short-circuit to the steady 13700 target when unset).
-                if am2_open_core_gate_active() {
-                    let open_core_mv = s19j_open_core_mv();
+                if open_core_rail_plan.requires_demotion() {
+                    let open_core_mv = open_core_rail_plan.energization_mv;
                     warn!(
                         t_ms = t(),
-                        steady_mv = chip_rail_target_mv,
+                        steady_mv = open_core_rail_plan.steady_mv,
                         open_core_mv,
                         env_gate = "DCENT_AM2_OPEN_CORE_VOLTAGE=1 + .25 fingerprint + DCENT_AM2_ALLOW_LAB_OVERVOLT=1",
                         "[T+{}] AM2 .25 OPEN-CORE experiment ARMED: enumerating the BM1362 chip \
@@ -12011,10 +12160,9 @@ impl S19jHybridMiner {
                          {} mV after enum > 0. Matches LuxOS/.79 + bosminer + AMTC cold-boot.",
                         t(),
                         open_core_mv,
-                        chip_rail_target_mv,
-                        S19J_HYBRID_CHIP_RAIL_TARGET_MV
+                        open_core_rail_plan.steady_mv,
+                        open_core_rail_plan.steady_mv
                     );
-                    chip_rail_target_mv = open_core_mv;
                 }
                 // Layer 3 (2026-05-22 XIL `a lab unit` recovery): if Phase 0d
                 // bosminer-warmup + 5×1Hz idle heartbeats already proved 5
@@ -12210,6 +12358,18 @@ impl S19jHybridMiner {
                         "[T+{}] Phase 3: PIC cold_boot_init starting (GET_VERSION → HB gate → SetVoltage target_mv=13700 → ENABLE; RESET/JUMP banned)",
                         t()
                     );
+                    if self.shutdown.is_cancelled() {
+                        pic_i2c.latch_terminal_safe_off();
+                        let _ = pic.disable_voltage();
+                        force_am2_home_hard_stop(&self.config, "cancelled-before-chip-rail-enable");
+                        let _ = stop_am2_runtime_feeders_bounded(
+                            &self.config,
+                            &mut runtime_threads,
+                            "cancelled-before-chip-rail-enable",
+                        )
+                        .await;
+                        anyhow::bail!("AM2 hybrid run was cancelled before chip-rail enable");
+                    }
                     if let Err(e) =
                         pic.cold_boot_init_with_options(chip_rail_target_mv, skip_warmup_loop)
                     {
@@ -12217,6 +12377,20 @@ impl S19jHybridMiner {
                             "PIC cold_boot_init FAILED — without 13.7 V on the chain, ASICs are dead. \
                              Aborting init. error: {}",
                             e
+                        );
+                    }
+                    if self.shutdown.is_cancelled() {
+                        pic_i2c.latch_terminal_safe_off();
+                        let _ = pic.disable_voltage();
+                        force_am2_home_hard_stop(&self.config, "cancelled-after-chip-rail-enable");
+                        let _ = stop_am2_runtime_feeders_bounded(
+                            &self.config,
+                            &mut runtime_threads,
+                            "cancelled-after-chip-rail-enable",
+                        )
+                        .await;
+                        anyhow::bail!(
+                            "AM2 hybrid run was cancelled after chip-rail enable; terminal safe-off requested"
                         );
                     }
                     info!(
@@ -12241,7 +12415,7 @@ impl S19jHybridMiner {
                 // Default-OFF — preserves `a lab unit`/`a lab unit`/`a lab unit` byte-parity.
                 // Best-effort: each PIC's warmup AND init can fail independently
                 // without bailing the daemon.
-                if am2_env_flag("DCENT_AM2_VOLTAGE_ENABLE_ALL_ACTIVE_PICS") {
+                if all_active_voltage_enable {
                     let other_pics: Vec<u8> = active_dspic_addrs(active_chains)
                         .into_iter()
                         .filter(|&a| a != selected_pic_addr)
@@ -13354,7 +13528,9 @@ impl S19jHybridMiner {
                         allow_fallback_scan = am2_env_flag("DCENT_AM2_UART_FALLBACK_SCAN"),
                         "Configured chain UART RX gate failed"
                     );
-                    if am2_env_flag("DCENT_AM2_UART_FALLBACK_SCAN") {
+                    if am2_env_flag("DCENT_AM2_UART_FALLBACK_SCAN")
+                        && !open_core_rail_plan.requires_demotion()
+                    {
                         warn!(
                             selected_pic_serial_device = %serial_device,
                             effective_chain_uart_device = %chain_uart_device,
@@ -13410,7 +13586,9 @@ impl S19jHybridMiner {
                     } else {
                         warn!(
                             error = %e,
-                            "Post-ENABLE chain UART RX gate failed; fallback UART scan skipped (set DCENT_AM2_UART_FALLBACK_SCAN=1 for bounded lab sweep); tearing down PIC/PSU watchdog state before returning"
+                            elevated_rail_owner_locked = open_core_rail_plan.requires_demotion(),
+                            fallback_scan_requested = am2_env_flag("DCENT_AM2_UART_FALLBACK_SCAN"),
+                            "Post-ENABLE chain UART RX gate failed; fallback UART scan is disabled unless explicitly requested and is always refused while an elevated rail is owned by the selected PIC; tearing down PIC/PSU watchdog state before returning"
                         );
                         let _ = pic.send_heartbeat();
                         match pic.disable_voltage() {
@@ -13568,17 +13746,37 @@ impl S19jHybridMiner {
             // Bump the bosminer-faithful retry budget (env-tunable). Each retry
             // re-pulses the sysfs HB_RESET (REPOINT path) + re-runs the full RE-018
             // replay + PLL settle. Non-faithful path stays single-shot.
-            let hb_max_attempts: u8 = if hb_faithful {
-                am2_env_u64("DCENT_AM2_HB_RESET_MAX_ATTEMPTS", 6).clamp(1, 20) as u8
-            } else {
-                1
-            };
+            let requested_hb_attempts =
+                am2_env_u64("DCENT_AM2_HB_RESET_MAX_ATTEMPTS", 6).clamp(1, 20) as u8;
+            let hb_max_attempts = am2_hb_reset_attempt_budget(
+                hb_faithful,
+                requested_hb_attempts,
+                open_core_rail_plan.requires_demotion(),
+            );
+            if open_core_rail_plan.requires_demotion() && hb_faithful {
+                warn!(
+                    requested_attempts = requested_hb_attempts,
+                    admitted_attempts = hb_max_attempts,
+                    "AM2 open-core rail plan restricts ASIC init to one attempt because no evidence-backed elevated-rail dwell/retry budget exists"
+                );
+            }
             let mut hb_attempt: u8 = 0;
             let (mut s, init_unique_count) = loop {
                 hb_attempt += 1;
-                match Self::init_asic_chain(&chain_uart_device, chip_count, target_freq, pll_ramp) {
+                let init_result = if self.shutdown.is_cancelled() {
+                    Err(anyhow::anyhow!(
+                        "shutdown requested before BM1362 init attempt {hb_attempt}"
+                    ))
+                } else {
+                    Self::init_asic_chain(&chain_uart_device, chip_count, target_freq, pll_ramp)
+                };
+                match init_result {
                     Ok((serial, unique_count)) => break (serial, unique_count),
-                    Err(e) if hb_faithful && hb_attempt < hb_max_attempts => {
+                    Err(e)
+                        if hb_faithful
+                            && !self.shutdown.is_cancelled()
+                            && hb_attempt < hb_max_attempts =>
+                    {
                         warn!(
                             attempt = hb_attempt,
                             max_attempts = hb_max_attempts,
@@ -13657,14 +13855,13 @@ impl S19jHybridMiner {
                             }
                         }
                         if let Some(service) = i2c0_service.as_ref() {
-                            let mut disable_addrs =
-                                if am2_env_flag("DCENT_AM2_VOLTAGE_ENABLE_ALL_ACTIVE_PICS")
-                                    || am2_diag_stop_after_bm1362_enum_enabled()
-                                {
-                                    active_dspic_addrs(active_chains)
-                                } else {
-                                    vec![selected_pic_addr]
-                                };
+                            let mut disable_addrs = if all_active_voltage_enable
+                                || am2_diag_stop_after_bm1362_enum_enabled()
+                            {
+                                active_dspic_addrs(active_chains)
+                            } else {
+                                vec![selected_pic_addr]
+                            };
                             if !disable_addrs.contains(&selected_pic_addr) {
                                 disable_addrs.push(selected_pic_addr);
                             }
@@ -13796,15 +13993,56 @@ impl S19jHybridMiner {
             // open-core-mv -> hold -> steady-mv) on the same BM1362.
             //
             // Guard: only fire when the open-core gate is active AND enum > 0.
-            // If enum == 0 we never reach here (Phase 4-7 init-Err bails above),
-            // so the rail correctly stays at open-core for any later
-            // probe/retry. Default-OFF / non-`a lab unit` ⇒ the gate short-circuits and
-            // this whole block is a no-op (byte-identical to today).
-            if am2_open_core_gate_active() && init_unique_count > 0 {
-                let steady_mv = S19J_HYBRID_CHIP_RAIL_TARGET_MV;
+            // If enum == 0 we never reach here: Phase 4-7 takes the full
+            // safe-off path. Elevated mode admits only one init attempt because
+            // no evidence-backed dwell/retry budget exists. Default-OFF /
+            // non-`a lab unit` ⇒ this block is a no-op.
+            if open_core_rail_plan.requires_demotion() {
+                if init_unique_count == 0 {
+                    pic_i2c.latch_terminal_safe_off();
+                    if let Err(disable_err) = pic.disable_voltage() {
+                        warn!(
+                            error = %disable_err,
+                            addr = format_args!("0x{:02X}", selected_pic_addr),
+                            "Elevated open-core init returned zero chips; selected dsPIC safe-off failed before PWR_CONTROL hard-stop"
+                        );
+                    }
+                    force_am2_home_hard_stop(&self.config, "open-core-elevated-zero-enumeration");
+                    self.shutdown.cancel();
+                    let _ = stop_am2_runtime_feeders_bounded(
+                        &self.config,
+                        &mut runtime_threads,
+                        "open-core-elevated-zero-enumeration",
+                    )
+                    .await;
+                    anyhow::bail!(
+                        "elevated AM2 open-core initialization returned zero chips; terminal safe-off requested and work dispatch refused"
+                    );
+                }
+                let steady_mv = open_core_rail_plan.steady_mv;
+                if self.shutdown.is_cancelled() {
+                    pic_i2c.latch_terminal_safe_off();
+                    if let Err(disable_err) = pic.disable_voltage() {
+                        warn!(
+                            error = %disable_err,
+                            addr = format_args!("0x{:02X}", selected_pic_addr),
+                            "AM2 open-core demotion was cancelled; selected dsPIC safe-off also failed before PWR_CONTROL hard-stop"
+                        );
+                    }
+                    force_am2_home_hard_stop(&self.config, "open-core-demotion-cancelled");
+                    let _ = stop_am2_runtime_feeders_bounded(
+                        &self.config,
+                        &mut runtime_threads,
+                        "open-core-demotion-cancelled",
+                    )
+                    .await;
+                    anyhow::bail!(
+                        "AM2 open-core demotion cancelled before the elevated rail could be returned to steady; terminal safe-off asserted"
+                    );
+                }
                 info!(
                     t_ms = t(),
-                    open_core_mv = s19j_open_core_mv(),
+                    open_core_mv = open_core_rail_plan.energization_mv,
                     steady_mv,
                     unique_chip_replies = init_unique_count,
                     "[T+{}] AM2 .25 open-core ramp-DOWN: enum succeeded ({} chips) — ramping chip \
@@ -13813,25 +14051,74 @@ impl S19jHybridMiner {
                     init_unique_count,
                     steady_mv
                 );
-                match pic.set_voltage(steady_mv) {
-                    Ok(()) => info!(
+                // Sanctioned cold-boot init transition: enumeration has just
+                // proven the elevated open-core rail usable, and work remains
+                // fenced until this one-shot demotion reaches steady voltage.
+                if let Err(e) = pic.set_voltage(steady_mv) {
+                    error!(
                         t_ms = t(),
                         steady_mv,
-                        addr = format_args!("0x{:02X}", selected_pic_addr),
-                        "[T+{}] AM2 .25 open-core ramp-DOWN complete: chip rail set to steady {} mV",
-                        t(),
-                        steady_mv
-                    ),
-                    Err(e) => warn!(
-                        t_ms = t(),
-                        steady_mv,
+                        open_core_mv = open_core_rail_plan.energization_mv,
                         addr = format_args!("0x{:02X}", selected_pic_addr),
                         error = %e,
-                        "[T+{}] AM2 .25 open-core ramp-DOWN set_voltage({} mV) failed — continuing at \
-                         open-core voltage (non-fatal; chip already enumerated)",
-                        t(),
-                        steady_mv
-                    ),
+                        "[T+{}] AM2 .25 open-core ramp-DOWN failed; refusing work dispatch and entering terminal safe-off",
+                        t()
+                    );
+
+                    // Fence every queued/non-SafeOff I2C mutation before the
+                    // compensation command. The HAL request has a finite
+                    // admission/start/execution deadline; there is no retry
+                    // whose late completion could re-energize the rail.
+                    pic_i2c.latch_terminal_safe_off();
+                    if let Err(disable_err) = pic.disable_voltage() {
+                        warn!(
+                            error = %disable_err,
+                            addr = format_args!("0x{:02X}", selected_pic_addr),
+                            "Selected dsPIC voltage-disable failed after demotion failure; PWR_CONTROL hard-stop remains authoritative"
+                        );
+                    }
+                    force_am2_home_hard_stop(&self.config, "open-core-demotion-failed");
+                    self.shutdown.cancel();
+                    let _ = stop_am2_runtime_feeders_bounded(
+                        &self.config,
+                        &mut runtime_threads,
+                        "open-core-demotion-failed",
+                    )
+                    .await;
+                    return Err(e).context(
+                        "AM2 open-core rail demotion failed; terminal safe-off asserted and work dispatch refused",
+                    );
+                }
+                info!(
+                    t_ms = t(),
+                    steady_mv,
+                    addr = format_args!("0x{:02X}", selected_pic_addr),
+                    "[T+{}] AM2 .25 open-core ramp-DOWN complete: chip rail set to steady {} mV",
+                    t(),
+                    steady_mv
+                );
+                if self.shutdown.is_cancelled() {
+                    pic_i2c.latch_terminal_safe_off();
+                    if let Err(disable_err) = pic.disable_voltage() {
+                        warn!(
+                            error = %disable_err,
+                            addr = format_args!("0x{:02X}", selected_pic_addr),
+                            "Shutdown arrived during open-core demotion; selected dsPIC safe-off failed before PWR_CONTROL hard-stop"
+                        );
+                    }
+                    force_am2_home_hard_stop(
+                        &self.config,
+                        "open-core-demotion-post-command-cancelled",
+                    );
+                    let _ = stop_am2_runtime_feeders_bounded(
+                        &self.config,
+                        &mut runtime_threads,
+                        "open-core-demotion-post-command-cancelled",
+                    )
+                    .await;
+                    anyhow::bail!(
+                        "shutdown arrived while returning the open-core rail to steady; terminal safe-off asserted before work dispatch"
+                    );
                 }
             }
 
@@ -15207,6 +15494,7 @@ fn calculate_work_time_bm1362(freq_mhz: u16) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
+        admit_open_core_rail_plan,
         // RE-018 cold-wake byte-exact decode constants + cold-sequence gate.
         // Pre-existing module-scope items that `re018_decoded_register_values_are_byte_exact`
         // asserts on but were never imported into this test module, so the binary
@@ -15226,6 +15514,7 @@ mod tests {
         am2_freq_only_clamp_applied_mhz,
         am2_frequency_autotune_opted_in,
         am2_graded_throttle_target_mhz,
+        am2_hb_reset_attempt_budget,
         am2_hybrid_reconstruct_rolled_version,
         am2_mid_run_nonce_stall_timeout,
         am2_mid_run_nonce_stalled,
@@ -15253,6 +15542,7 @@ mod tests {
         Am2SerialChainState,
         Am2SerialChainStats,
         Am2ShareAccounting,
+        OpenCoreRailAdmissionError,
         S19jHybridMiner,
         WorkEntry,
         AM2_DUAL_CHAIN_SECOND_UART_DEFAULT,
@@ -15304,6 +15594,43 @@ mod tests {
     const S19J_SOURCE: &str = include_str!("s19j_hybrid_mining.rs");
 
     #[test]
+    fn open_core_rail_plan_is_atomic_and_fail_closed() {
+        let inactive = admit_open_core_rail_plan(false, true, 13_700, 15_000)
+            .expect("inactive experiment ignores unused elevated inputs");
+        assert_eq!(inactive.steady_mv, 13_700);
+        assert_eq!(inactive.energization_mv, 13_700);
+        assert!(!inactive.requires_demotion());
+
+        assert_eq!(
+            admit_open_core_rail_plan(true, true, 13_700, 15_000),
+            Err(OpenCoreRailAdmissionError::AllActiveVoltageEnable)
+        );
+        for requested_mv in [13_699, 13_700] {
+            assert_eq!(
+                admit_open_core_rail_plan(true, false, 13_700, requested_mv),
+                Err(OpenCoreRailAdmissionError::TargetNotElevated {
+                    requested_mv,
+                    steady_mv: 13_700,
+                })
+            );
+        }
+
+        let elevated = admit_open_core_rail_plan(true, false, 13_700, 15_000)
+            .expect("one selected elevated rail is admitted");
+        assert_eq!(elevated.energization_mv, 15_000);
+        assert!(elevated.requires_demotion());
+    }
+
+    #[test]
+    fn elevated_rail_has_one_asic_init_attempt_without_a_dwell_budget() {
+        assert_eq!(am2_hb_reset_attempt_budget(true, 20, true), 1);
+        assert_eq!(am2_hb_reset_attempt_budget(false, 20, false), 1);
+        assert_eq!(am2_hb_reset_attempt_budget(true, 0, false), 1);
+        assert_eq!(am2_hb_reset_attempt_budget(true, 6, false), 6);
+        assert_eq!(am2_hb_reset_attempt_budget(true, u8::MAX, false), 20);
+    }
+
+    #[test]
     fn am2_endpoint_migration_reuses_existing_eeprom_and_version_observations() {
         let run = S19J_SOURCE
             .split("pub async fn run(&mut self)")
@@ -15314,11 +15641,22 @@ mod tests {
             .next()
             .expect("bounded S19j run body");
         assert_eq!(
-            run.matches("read_hashboard_eeprom_for_energize_gate(")
+            run.matches("read_hashboard_eeprom_prefix_via_service_for_energize_gate(")
                 .count(),
             1,
-            "the existing per-slot reader remains the only EEPROM transaction source"
+            "the typed service reader remains the only hybrid EEPROM transaction source"
         );
+        assert_eq!(
+            run.matches("read_hashboard_eeprom_prefix_at(").count(),
+            1,
+            "the bootstrap readiness probe must use the same typed service operation"
+        );
+        assert!(!run.contains("read_bytes(0x50"));
+        assert!(run.contains("HalError::I2cEndpointNotReady"));
+        assert!(run.contains("AM2 hashboard EEPROM bootstrap service failed terminally"));
+        assert!(!run.contains("read_hashboard_eeprom_for_energize_gate("));
+        assert!(run.contains("OwnedEepromReadinessError::Terminal"));
+        assert!(run.contains("am2-hashboard-eeprom-service-terminal"));
         assert_eq!(run.matches("bind_am2_hashboard_presence(").count(), 1);
         assert!(!run.contains("observe_am2_hashboard_presence("));
         assert_eq!(run.matches("observe_am2_endpoint_firmware(").count(), 3);
@@ -17261,6 +17599,36 @@ worker = "test"
         .expect("minimal hybrid test config must deserialize")
     }
 
+    fn admitted_hybrid_route() -> crate::s19j_hybrid_admission::S19jHybridRouteAdmission {
+        let identity = crate::daemon_lifecycle::PlatformIdentitySnapshot {
+            declared_board_target: Some("am2-s19j".to_string()),
+            board_desc: dcentrald_common::BoardDesc::lookup("am2-s19j"),
+            declared_platform_marker: Some("zynq-bm3-am2".to_string()),
+            declared_subtype: None,
+            declared_psu_hardware_variant: None,
+            observed_control_board: "Zynq am2-s17".to_string(),
+        };
+        crate::s19j_hybrid_admission::admit_s19j_hybrid_route(
+            &identity,
+            crate::RuntimeDispatchKind::S19jHybrid,
+            Some(dcentrald_common::AsicProtocolIdentity::Bm1362),
+        )
+        .expect("canonical test composition must admit the hybrid route")
+    }
+
+    #[tokio::test]
+    async fn hybrid_route_admission_is_consumed_at_first_run_entry() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        shutdown.cancel();
+        let mut miner =
+            S19jHybridMiner::new(min_hybrid_config(), shutdown, admitted_hybrid_route()).unwrap();
+
+        let first = miner.run().await.unwrap_err().to_string();
+        assert!(first.contains("cancelled before hardware admission"));
+        let second = miner.run().await.unwrap_err().to_string();
+        assert!(second.contains("route admission was already consumed"));
+    }
+
     /// MINE-LIFE-2: the per-chain `ChainState.status` reverts to "stalled" when a
     /// chain produced nonces earlier but has gone quiet, and reads "mining" only
     /// while recently active (byte-equivalent to the prior contract on a healthy
@@ -17270,7 +17638,9 @@ worker = "test"
         let miner = S19jHybridMiner::new(
             min_hybrid_config(),
             tokio_util::sync::CancellationToken::new(),
-        );
+            admitted_hybrid_route(),
+        )
+        .unwrap();
 
         // Produced nonces + recently active ⇒ "mining" (unchanged healthy path).
         let active = miner.build_am2_chain_state(0x20, 126, 1000.0, 5, 0, true);
@@ -17297,7 +17667,9 @@ worker = "test"
         let miner = S19jHybridMiner::new(
             min_hybrid_config(),
             tokio_util::sync::CancellationToken::new(),
+            admitted_hybrid_route(),
         )
+        .unwrap()
         .with_state_tx(tx);
 
         let acct = Am2ShareAccounting::default();

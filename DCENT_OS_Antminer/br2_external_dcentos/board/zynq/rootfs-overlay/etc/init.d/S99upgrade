@@ -32,7 +32,7 @@
 #   (5) BOOT-SUCCESS WINDOW: after a settle of MIN_HEALTHY_UPTIME_S, the
 #       daemon is STILL the same running process (catches bind-then-crash
 #       loops, where the API answers once but the daemon then dies and the
-#       S82dcentrald wrapper restarts a fresh PID).
+#       S82dcentrald leaves an abnormal exit stopped pending resolution).
 #
 # BRICK-SAFETY (load-bearing — bias toward keeping the known-good slot):
 #   - The PREVIOUS slot is known-good. A *too-strict* gate that needlessly
@@ -284,8 +284,8 @@ check_health() {
 
     # Check 7 (W8 parity): BOOT-SUCCESS WINDOW. Require the daemon to stay up
     # for MIN_HEALTHY_UPTIME_S as the SAME process. This catches the
-    # bind-then-crash-loop: /api/status answers the instant the socket binds,
-    # but if the daemon then dies the S82dcentrald wrapper restarts a fresh PID.
+    # bind-then-exit failure: /api/status answers the instant the socket binds,
+    # and S82dcentrald leaves that abnormal exit stopped pending resolution.
     # Committing such a slot is exactly the W8 "defeated by S99" hole. We snap
     # the current PID, sleep the window, and re-confirm the SAME PID is alive.
     START_PID=$(pidof dcentrald 2>/dev/null | awk '{print $1}')
@@ -303,14 +303,14 @@ check_health() {
         sleep 1
         WINDOW_LEFT=$((WINDOW_LEFT - 1))
         if ! kill -0 "$START_PID" 2>/dev/null; then
-            echo "  [FAIL] dcentrald PID $START_PID died inside the boot-success window (crash-loop)"
+            echo "  [FAIL] dcentrald PID $START_PID died inside the boot-success window"
             HEALTH_OK=false
             return
         fi
     done
     NOW_PID=$(pidof dcentrald 2>/dev/null | awk '{print $1}')
     if [ "$NOW_PID" != "$START_PID" ]; then
-        echo "  [FAIL] dcentrald PID changed during the window ($START_PID -> ${NOW_PID:-none}); wrapper restarted it (crash-loop)"
+        echo "  [FAIL] dcentrald PID changed during the window ($START_PID -> ${NOW_PID:-none}); hardware-owner continuity was lost"
         HEALTH_OK=false
         return
     fi

@@ -10,8 +10,10 @@ part of normal release output.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
+import shutil
 import subprocess
 import unittest
 
@@ -19,6 +21,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORKSPACE = ROOT / "dcentrald"
 PACKAGE = WORKSPACE / "pic-recovery"
+FABRIC_PACKAGE = WORKSPACE / "dcentrald-fabric-lease"
 PIC_SOURCE = PACKAGE / "src/main.rs"
 DSPIC_SOURCE = PACKAGE / "src/dspic_flash_main.rs"
 BUILD_DRIVER = ROOT / "scripts/build-dcentrald.sh"
@@ -27,6 +30,7 @@ DASHBOARDS = (
     ROOT / "br2_external_dcentos/board/zynq/rootfs-overlay/root/web/server.py",
     ROOT / "br2_external_dcentos/board/amlogic/rootfs-overlay/root/web/server.py",
 )
+RUST_TOOLCHAIN = "1.90.0"
 
 
 def read(path: pathlib.Path) -> str:
@@ -44,11 +48,29 @@ def without_rust_comments(source: str) -> str:
     return re.sub(r"(?s)/\*.*?\*/", "", source)
 
 
+def cargo_command() -> list[str]:
+    """Resolve the pinned Cargo without accepting a Windows PATH impostor."""
+
+    configured = os.environ.get("CARGO")
+    if configured:
+        return [configured]
+    rustup = shutil.which("rustup")
+    if rustup is None:
+        candidate = pathlib.Path.home() / ".cargo" / "bin" / "rustup"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            rustup = str(candidate)
+    if rustup is not None:
+        return [rustup, "run", RUST_TOOLCHAIN, "cargo"]
+    cargo = shutil.which("cargo")
+    if cargo is None:
+        raise RuntimeError("neither rustup nor cargo is available")
+    return [cargo, f"+{RUST_TOOLCHAIN}"]
+
+
 def cargo_metadata() -> dict[str, object]:
     completed = subprocess.run(
-        [
-            "cargo",
-            "+1.90.0",
+        cargo_command()
+        + [
             "metadata",
             "--locked",
             "--offline",
@@ -91,21 +113,43 @@ class ControllerDiagnosticBoundary(unittest.TestCase):
             "release Cargo commands must honor workspace default-members",
         )
 
-    def test_controller_package_has_no_mutation_dependency_or_build_script(self) -> None:
+    def test_controller_package_depends_only_on_libc_and_the_leaf_lease(self) -> None:
         package = next(
             package
             for package in self.metadata["packages"]
             if package["name"] == "pic-recovery"
         )
         self.assertEqual(
-            [(dependency["name"], dependency["features"]) for dependency in package["dependencies"]],
-            [("libc", [])],
+            {
+                (dependency["name"], tuple(dependency["features"]))
+                for dependency in package["dependencies"]
+            },
+            {("dcentrald-fabric-lease", ()), ("libc", ())},
         )
         self.assertEqual(
             {(target["name"], tuple(target["kind"])) for target in package["targets"]},
             {("pic-recovery", ("bin",)), ("dspic-flash", ("bin",))},
         )
         self.assertFalse((PACKAGE / "build.rs").exists())
+
+        lease = next(
+            package
+            for package in self.metadata["packages"]
+            if package["name"] == "dcentrald-fabric-lease"
+        )
+        self.assertEqual(
+            {
+                (dependency["name"], tuple(dependency["features"]))
+                for dependency in lease["dependencies"]
+            },
+            {("libc", ())},
+            "the shared lease must remain a leaf instead of importing HAL mutation surfaces",
+        )
+        self.assertEqual(
+            {(target["name"], tuple(target["kind"])) for target in lease["targets"]},
+            {("dcentrald_fabric_lease", ("lib",))},
+        )
+        self.assertFalse((FABRIC_PACKAGE / "build.rs").exists())
 
     def test_pic16_inspector_has_one_fixed_read_only_device_route(self) -> None:
         source = production_source(PIC_SOURCE)

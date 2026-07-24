@@ -212,6 +212,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{sleep_until_cancelled, RuntimeThreadGuard, ThreadStopOutcome};
+    use crate::runtime::source_contract::compact_rust_source;
 
     #[test]
     fn long_worker_sleep_observes_cancellation_promptly() {
@@ -336,9 +337,14 @@ mod tests {
     fn stock_and_legacy_psu_feeders_keep_explicit_bounded_ownership() {
         let stock = include_str!("../stock_mining.rs");
         let daemon = include_str!("../daemon.rs");
+        let compact_stock = compact_rust_source(stock);
 
-        assert!(stock.contains("runtime_threads.push(\"stock-pic-heartbeat\""));
-        assert!(stock.contains("sleep_until_cancelled(\n                        &hb_shutdown"));
+        assert!(
+            compact_stock.contains("runtime_threads.push(\"stock-pic-heartbeat\",heartbeat_handle")
+        );
+        assert!(compact_stock.contains(
+            "sleep_until_cancelled(&hb_shutdown,Duration::from_millis(HEARTBEAT_INTERVAL_MS)"
+        ));
         assert!(!stock.contains("OnceLock<Vec<u8>>"));
         let guard_owner = stock
             .find("let mut run_safety = StockRunSafetyGuard::new")

@@ -110,7 +110,8 @@ RELEASE_INVOCATION_DESCRIPTOR_SHA256="$(sha256sum \
     "$RELEASE_INVOCATION/invocation.json" | awk '{print $1}')"
 RESULT_STAGE_RESULT="$(python3 "$RESULT_STAGE_HELPER" create \
     --stage-parent "$TMPDIR_TEST/result-stages" \
-    --invocation-stage "$RELEASE_INVOCATION")"
+    --invocation-stage "$RELEASE_INVOCATION" \
+    --result-output "$TMPDIR_TEST/result-stage-create.json")"
 RESULT_STAGE="$(printf '%s\n' "$RESULT_STAGE_RESULT" | \
     python3 "$RESULT_STAGE_HELPER" query-result --field stage)"
 RESULT_CAPABILITY="$(printf '%s\n' "$RESULT_STAGE_RESULT" | \
@@ -802,7 +803,6 @@ if openssl pkeyutl -verify -rawin -pubin \
     echo "ERROR: signed source closure accepted mutated receipt bytes" >&2
     exit 1
 fi
-printf 'stale signature bytes\n' > "$ARTIFACT_DIR/wrong-key.sig"
 if bash "$SCRIPT_DIR/sign_release_receipt.sh" \
     "$SIGNED_RECEIPT" "$PRIVATE_KEY" "$WRONG_PUBLIC_KEY" \
     "$ARTIFACT_DIR/wrong-key.sig" >/dev/null 2>&1; then
@@ -840,13 +840,13 @@ grep -Fq -- '--signature "$SOURCE_CLOSURE_SIGNATURE_PATH"' \
     "$SCRIPT_DIR/build_in_docker.sh"
 grep -Fq -- '--public-key "$DCENT_RELEASE_PUBKEY_FILE"' \
     "$SCRIPT_DIR/build_in_docker.sh"
-grep -Fq 'TMP_SIGNATURE=$(mktemp "${SIGNATURE}.tmp.XXXXXX")' \
-    "$SCRIPT_DIR/sign_release_receipt.sh"
-grep -Fq 'published release receipt signature failed final verification' \
-    "$SCRIPT_DIR/sign_release_receipt.sh"
-if grep -Fq 'TMP_SIGNATURE="${SIGNATURE}.tmp.$$"' \
+grep -Fq 'sign_release_receipt.py' "$SCRIPT_DIR/sign_release_receipt.sh"
+grep -Fq 'publish_regular_file_noreplace' \
+    "$SCRIPT_DIR/sign_release_receipt.py"
+grep -Fq 'share_write=False' "$SCRIPT_DIR/sign_release_receipt.py"
+if grep -Fq 'rm -f "$SIGNATURE"' \
     "$SCRIPT_DIR/sign_release_receipt.sh"; then
-    echo "ERROR: release receipt signer regressed to a predictable temp path" >&2
+    echo "ERROR: release receipt signer regressed to destructive output replacement" >&2
     exit 1
 fi
 
@@ -1428,9 +1428,36 @@ PORTABLE_PACKAGE_ROOT="$TMPDIR_TEST/portable-package"
 mkdir -p "$PORTABLE_PACKAGE_ROOT/sysupgrade-am1-s9"
 printf 'kernel fixture\n' > "$PORTABLE_PACKAGE_ROOT/sysupgrade-am1-s9/kernel"
 printf 'root fixture\n' > "$PORTABLE_PACKAGE_ROOT/sysupgrade-am1-s9/root"
+printf 'board=am1-s9\n' > "$PORTABLE_PACKAGE_ROOT/sysupgrade-am1-s9/METADATA"
 cp "$PUBLIC_KEY" "$PORTABLE_PACKAGE_ROOT/sysupgrade-am1-s9/release_ed25519.pub"
-cat > "$PORTABLE_PACKAGE_ROOT/sysupgrade-am1-s9/MANIFEST.json" <<'EOF'
-{"board":"am1-s9","board_target":"am1-s9","package_type":"sysupgrade","product":"DCENT_OS","provenance":{"build_target":"s9"},"schema":1}
+PORTABLE_KERNEL_SIZE=$(wc -c < "$PORTABLE_PACKAGE_ROOT/sysupgrade-am1-s9/kernel" | tr -d ' ')
+PORTABLE_ROOT_SIZE=$(wc -c < "$PORTABLE_PACKAGE_ROOT/sysupgrade-am1-s9/root" | tr -d ' ')
+PORTABLE_METADATA_SIZE=$(wc -c < "$PORTABLE_PACKAGE_ROOT/sysupgrade-am1-s9/METADATA" | tr -d ' ')
+PORTABLE_KEY_SIZE=$(wc -c < "$PORTABLE_PACKAGE_ROOT/sysupgrade-am1-s9/release_ed25519.pub" | tr -d ' ')
+PORTABLE_KERNEL_SHA=$(sha256sum "$PORTABLE_PACKAGE_ROOT/sysupgrade-am1-s9/kernel" | awk '{print $1}')
+PORTABLE_ROOT_SHA=$(sha256sum "$PORTABLE_PACKAGE_ROOT/sysupgrade-am1-s9/root" | awk '{print $1}')
+PORTABLE_METADATA_SHA=$(sha256sum "$PORTABLE_PACKAGE_ROOT/sysupgrade-am1-s9/METADATA" | awk '{print $1}')
+PORTABLE_KEY_SHA=$(sha256sum "$PORTABLE_PACKAGE_ROOT/sysupgrade-am1-s9/release_ed25519.pub" | awk '{print $1}')
+cat > "$PORTABLE_PACKAGE_ROOT/sysupgrade-am1-s9/MANIFEST.json" <<EOF
+{
+  "artifact_maturity": "experimental",
+  "board": "am1-s9",
+  "board_target": "am1-s9",
+  "installable": true,
+  "manifest_profile": "dcentos.sysupgrade-authority/v1",
+  "package_type": "sysupgrade",
+  "payloads": {
+    "kernel": {"path": "sysupgrade-am1-s9/kernel", "size": $PORTABLE_KERNEL_SIZE, "sha256": "$PORTABLE_KERNEL_SHA"},
+    "rootfs": {"path": "sysupgrade-am1-s9/root", "size": $PORTABLE_ROOT_SIZE, "sha256": "$PORTABLE_ROOT_SHA"},
+    "metadata": {"path": "sysupgrade-am1-s9/METADATA", "size": $PORTABLE_METADATA_SIZE, "sha256": "$PORTABLE_METADATA_SHA"},
+    "verification_key": {"path": "sysupgrade-am1-s9/release_ed25519.pub", "size": $PORTABLE_KEY_SIZE, "sha256": "$PORTABLE_KEY_SHA"}
+  },
+  "product": "DCENT_OS",
+  "provenance": {"build_target": "s9"},
+  "schema": 1,
+  "status": "release",
+  "version": "test"
+}
 EOF
 openssl pkeyutl -sign -rawin -inkey "$PRIVATE_KEY" \
     -in "$PORTABLE_PACKAGE_ROOT/sysupgrade-am1-s9/MANIFEST.json" \
@@ -1463,6 +1490,7 @@ verify_closure --repo-root "$REPO" --artifact-dir "$ARTIFACT_DIR" \
 PORTABLE_STAGE_PARENT="$TMPDIR_TEST/portable-stage-parent"
 PORTABLE_OUTPUT_PARENT="$TMPDIR_TEST/portable-published"
 mkdir -p "$PORTABLE_STAGE_PARENT" "$PORTABLE_OUTPUT_PARENT"
+chmod 0700 "$PORTABLE_STAGE_PARENT"
 PORTABLE_CAPABILITY_JSON="$(python3 "$RELEASE_SET_HELPER" create-stage \
     --parent "$PORTABLE_STAGE_PARENT")"
 PORTABLE_CAPABILITY_FILE="$TMPDIR_TEST/portable-capability.json"

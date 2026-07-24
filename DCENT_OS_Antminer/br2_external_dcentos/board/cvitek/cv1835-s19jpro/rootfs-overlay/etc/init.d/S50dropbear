@@ -1,120 +1,23 @@
 #!/bin/sh
+# CV1835 network-service containment.
 #
-# S50dropbear - DCENT_OS gated dropbear SSH service (cv1835-s19jpro variant)
-#
-# Phase 4J (2026-05-15): cv1835 platform inherits the harmonized first-boot
-# grace from zynq/beaglebone/amlogic. Enable-by-default with persistent
-# operator opt-out via /data/dcent/.ssh-disabled. WARN emitted to syslog on
-# the default path so the operator is never surprised by SSH being open.
-#
-# Gates checked, in order:
-#   1. /data/dcent/.ssh-disabled present  → disabled-by-opt-out  (skip)
-#   2. /data/dcent/authorized_keys (non-empty) → enabled-by-keys (start)
-#   3. /data/dcent/auth.json present       → enabled-by-wizard   (start)
-#   4. otherwise                           → enabled-by-default  (start, WARN)
-#
-# POSIX shell only -- BusyBox ash, no bash.
+# This evidence scaffold is not an installable firmware. Do not expose SSH
+# with inherited/default credentials on an unvalidated board.
 
-NAME=dropbear
-DAEMON=/usr/sbin/dropbear
-PIDFILE=/var/run/dropbear.pid
-DROPBEAR_DEFAULTS=/etc/default/dropbear
-
-# Auth files written by dcentrald during first-boot wizard.
-DCENT_AUTH_FILE=/data/dcent/auth.json
-DCENT_SSH_ENABLED=/data/dcent/.ssh-enabled
-DCENT_AUTHORIZED_KEYS=/data/dcent/authorized_keys
-# Phase 4J (2026-05-15): explicit operator opt-out via persistent /data overlay.
-DCENT_SSH_DISABLED=/data/dcent/.ssh-disabled
-
-DROPBEAR_ARGS=""
-[ -r "$DROPBEAR_DEFAULTS" ] && . "$DROPBEAR_DEFAULTS"
-
-mkdir -p /etc/dropbear 2>/dev/null || true
-
-ssh_gate_state() {
-    # Echo one of: disabled-by-opt-out | enabled-by-wizard | enabled-by-keys |
-    # enabled-by-default
-    if [ -f "$DCENT_SSH_DISABLED" ]; then
-        echo "disabled-by-opt-out"
-        return
-    fi
-    if [ -s "$DCENT_AUTHORIZED_KEYS" ]; then
-        echo "enabled-by-keys"
-        return
-    fi
-    if [ -f "$DCENT_AUTH_FILE" ]; then
-        echo "enabled-by-wizard"
-        return
-    fi
-    echo "enabled-by-default"
-}
-
-start_disabled_msg() {
-    MSG="DCENT_OS: SSH disabled by operator (/data/dcent/.ssh-disabled present)"
-    if command -v logger >/dev/null 2>&1; then
-        logger -t dcent-ssh -p auth.warning "$MSG"
-    fi
-    echo "$MSG"
-}
-
-start_default_warn() {
-    MSG="DCENT_OS: first-boot SSH enabled by default; create /data/dcent/.ssh-disabled to opt out"
-    if command -v logger >/dev/null 2>&1; then
-        logger -t dcent-ssh -p auth.warning "$MSG"
-    fi
-    echo "$MSG"
-}
-
-start() {
-    STATE=$(ssh_gate_state)
-    if [ "$STATE" = "disabled-by-opt-out" ]; then
-        printf 'Starting %s: BLOCKED (gate=%s)\n' "$NAME" "$STATE"
-        start_disabled_msg
-        return 0
-    fi
-    if [ "$STATE" = "enabled-by-default" ]; then
-        start_default_warn
-    fi
-    printf 'Starting %s: ' "$NAME"
-    case " $DROPBEAR_ARGS " in
-        *" -R "*) ;;
-        *) DROPBEAR_ARGS="$DROPBEAR_ARGS -R" ;;
-    esac
-    # shellcheck disable=SC2086
-    start-stop-daemon -S -q -p "$PIDFILE" --exec "$DAEMON" -- $DROPBEAR_ARGS \
-        && echo "OK (gate=$STATE)" || { echo "FAIL"; return 1; }
-}
-
-stop() {
-    printf 'Stopping %s: ' "$NAME"
-    start-stop-daemon -K -q -p "$PIDFILE" 2>/dev/null && echo "OK" || echo "not running"
-}
-
-restart() {
-    stop
-    sleep 1
-    start
-}
-
-status() {
-    STATE=$(ssh_gate_state)
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
-        echo "$NAME: running (gate=$STATE)"
-        return 0
-    fi
-    echo "$NAME: stopped (gate=$STATE)"
-    return 3
-}
-
-case "$1" in
-    start) start ;;
-    stop) stop ;;
-    restart|reload) restart ;;
-    status) status ;;
+case "${1:-}" in
+    start|restart|reload)
+        printf '%s\n' 'S50dropbear cv1835-s19jpro: SSH start refused; target is evidence-only'
+        ;;
+    stop)
+        :
+        ;;
+    status)
+        printf '%s\n' 'dropbear is disabled on cv1835-s19jpro'
+        ;;
     *)
-        echo "Usage: $0 {start|stop|restart|status}"
+        printf 'Usage: %s {start|stop|restart|reload|status}\n' "$0" >&2
         exit 1
         ;;
 esac
-exit $?
+
+exit 0

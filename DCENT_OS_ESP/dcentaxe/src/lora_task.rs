@@ -713,13 +713,7 @@ fn beacon_netinfo_if_gateway(state: &SharedState) {
     // Difficulty from compact nBits (no HTTP). Use diff-1 placeholder until a
     // live job nBits field is plumbed through StratumStatus (operator follow-up).
     let nbits: u32 = 0x1d00_ffff;
-    let info = bitcoin::netinfo_from_stratum_nbits(
-        height as i64,
-        nbits,
-        0.0,
-        0,
-        now_unix_s(),
-    );
+    let info = bitcoin::netinfo_from_stratum_nbits(height as i64, nbits, 0.0, 0, now_unix_s());
     // A Meshtastic gateway pushes the ticker as a human-readable text broadcast
     // (any client renders it); native `$DCM` originates the structured NetInfo.
     #[cfg(feature = "meshtastic")]

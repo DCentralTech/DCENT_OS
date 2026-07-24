@@ -17,6 +17,43 @@ mkdir -p "${TARGET_DIR}/var/log"
 mkdir -p "${TARGET_DIR}/data"
 mkdir -p "${TARGET_DIR}/etc/dcentos"
 
+# Install the canonical host/target archive-admission policy.  Keeping one
+# source prevents the release verifier and on-device sysupgrade paths from
+# drifting on tar member safety.
+ARCHIVE_ADMISSION_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../scripts/lib/sysupgrade_archive_admission.sh"
+ARCHIVE_ADMISSION_DST="${TARGET_DIR}/usr/libexec/dcentos/sysupgrade-archive-admission.sh"
+[ -r "$ARCHIVE_ADMISSION_SRC" ] || {
+    echo "DCENTos post-build (zynq): ERROR: archive-admission helper not found at $ARCHIVE_ADMISSION_SRC" >&2
+    exit 1
+}
+mkdir -p "$(dirname "$ARCHIVE_ADMISSION_DST")"
+cp "$ARCHIVE_ADMISSION_SRC" "$ARCHIVE_ADMISSION_DST"
+chmod 0644 "$ARCHIVE_ADMISSION_DST"
+
+# Install the semantic JSON/version authority used by every Zynq consumer.
+# Python 3 is a required package in dcentos-common.fragment; missing either
+# side is a build-time error rather than a runtime downgrade in policy.
+MANIFEST_JSON_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../scripts/lib/sysupgrade_manifest_json.py"
+MANIFEST_JSON_DST="${TARGET_DIR}/usr/libexec/dcentos/sysupgrade-manifest-json.py"
+[ -r "$MANIFEST_JSON_SRC" ] || {
+    echo "DCENTos post-build: ERROR: manifest JSON helper not found at $MANIFEST_JSON_SRC" >&2
+    exit 1
+}
+cp "$MANIFEST_JSON_SRC" "$MANIFEST_JSON_DST"
+chmod 0755 "$MANIFEST_JSON_DST"
+
+# Install the evidence-backed payload geometry used by producers, host gates,
+# and target consumers. The host source is canonical; the target filename is
+# an installed ABI, not a second implementation.
+ZYNQ_GEOMETRY_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../scripts/lib/sysupgrade_zynq_geometry.sh"
+ZYNQ_GEOMETRY_DST="${TARGET_DIR}/usr/libexec/dcentos/sysupgrade-zynq-geometry.sh"
+[ -r "$ZYNQ_GEOMETRY_SRC" ] || {
+    echo "DCENTos post-build (zynq): ERROR: Zynq geometry helper not found at $ZYNQ_GEOMETRY_SRC" >&2
+    exit 1
+}
+cp "$ZYNQ_GEOMETRY_SRC" "$ZYNQ_GEOMETRY_DST"
+chmod 0644 "$ZYNQ_GEOMETRY_DST"
+
 # W1.5 (2026-05-07): pre-create /data/dcent/ with tight perms so the auth
 # file (/data/dcent/auth.json) lands in a 0700 root:root directory on first
 # boot. dcentrald-api::auth::save_auth() will also tighten on every write,
@@ -38,7 +75,6 @@ chmod +x "${TARGET_DIR}"/root/tools/*.py 2>/dev/null || true
 chmod +x "${TARGET_DIR}"/root/tools/*.sh 2>/dev/null || true
 chmod +x "${TARGET_DIR}"/usr/bin/dcent-shell 2>/dev/null || true
 chmod +x "${TARGET_DIR}"/usr/sbin/sysupgrade 2>/dev/null || true
-chmod +x "${TARGET_DIR}"/usr/sbin/switch_firmware.py 2>/dev/null || true
 # W1.1 default-credential lockdown: SSH gate helper must be mode 0755.
 # Called by dcentrald + first-boot wizard to flip the dropbear gate.
 chmod 0755 "${TARGET_DIR}"/usr/sbin/dcent-enable-ssh 2>/dev/null || true
@@ -50,20 +86,22 @@ chmod 0755 "${TARGET_DIR}"/usr/sbin/dcent-enable-ssh 2>/dev/null || true
 # These are the paths the daemon's restore_to_stock route probes at
 # runtime via PROFILE_TABLE.<sig>.revert_script.
 #
-# Zynq board only ships the S9 am1 script (the only zynq entry in
-# PROFILE_TABLE today). The legacy `revert_to_stock.sh` filename is
-# also installed as a backward-compat alias for any operator
-# tooling pinned to the wave-≤11 path.
+# The S9 canonical script is currently a fail-closed containment boundary.
+# Keep the legacy filename as a symlink so an old entry point cannot drift into
+# a second implementation or retain stale destructive behavior.
 REVERT_S9_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../scripts/revert_to_stock_s9.sh"
 REVERT_S17_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../scripts/revert_to_stock_s17.sh"
 REVERT_S19_AM2_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../scripts/revert_to_stock_s19_am2.sh"
-REVERT_LEGACY_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../scripts/revert_to_stock.sh"
+rm -f "${TARGET_DIR}/usr/sbin/revert_to_stock_s9.sh" \
+    "${TARGET_DIR}/usr/sbin/revert_to_stock.sh"
 if [ -f "$REVERT_S9_SRC" ]; then
     cp "$REVERT_S9_SRC" "${TARGET_DIR}/usr/sbin/revert_to_stock_s9.sh"
     chmod +x "${TARGET_DIR}/usr/sbin/revert_to_stock_s9.sh" 2>/dev/null || true
+    ln -s revert_to_stock_s9.sh "${TARGET_DIR}/usr/sbin/revert_to_stock.sh"
     echo "DCENTos post-build (zynq): installed revert_to_stock_s9.sh from scripts/"
 else
-    echo "DCENTos post-build (zynq): WARNING: revert_to_stock_s9.sh not found at $REVERT_S9_SRC" >&2
+    echo "DCENTos post-build (zynq): ERROR: S9 restore containment script not found at $REVERT_S9_SRC" >&2
+    exit 1
 fi
 #  W16: S17 am2-s17 (BM1397+) revert script. The same zynq
 # rootfs overlay ships both am1-s9 and am2-s17 because the runtime
@@ -93,12 +131,6 @@ if [ -f "$REVERT_S19_AM2_SRC" ]; then
 else
     echo "DCENTos post-build (zynq): WARNING: revert_to_stock_s19_am2.sh not found at $REVERT_S19_AM2_SRC" >&2
 fi
-if [ -f "$REVERT_LEGACY_SRC" ]; then
-    cp "$REVERT_LEGACY_SRC" "${TARGET_DIR}/usr/sbin/revert_to_stock.sh"
-    chmod +x "${TARGET_DIR}/usr/sbin/revert_to_stock.sh" 2>/dev/null || true
-    echo "DCENTos post-build (zynq): installed revert_to_stock.sh (wave-≤11 backward-compat alias)"
-fi
-
 #  W10-G: ship the stock-Bitmain manifest into the target rootfs.
 # `restore_to_stock::lookup_in_stock_manifest()` probes
 # /etc/dcentos/stock-bitmain-manifest.json first, then falls back to

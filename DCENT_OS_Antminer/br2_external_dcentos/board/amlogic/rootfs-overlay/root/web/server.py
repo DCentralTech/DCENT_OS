@@ -626,16 +626,10 @@ class DCENTosHandler(http.server.SimpleHTTPRequestHandler):
                         "error": "release image requires a valid Bearer token for dashboard-local control endpoints",
                     }, status=401)
                     return
-                # Fire-and-forget restart. /etc/init.d/S82dcentrald takes
-                # 5-30s to come up; we return immediately so the dashboard
-                # doesn't block.
-                subprocess.Popen(
-                    ["/etc/init.d/S82dcentrald", "restart"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-                self.send_json({"status": "restart_initiated", "ts": int(time.time())})
+                self.send_json({
+                    "status": "manual_resolution_required",
+                    "error": "automatic Amlogic restart is disabled; resolve electrical disposition through /recovery before a guarded start",
+                }, status=409)
                 return
             if self.path == "/api/dashboard/report-ip":
                 if not local_control_authorized(self.headers):

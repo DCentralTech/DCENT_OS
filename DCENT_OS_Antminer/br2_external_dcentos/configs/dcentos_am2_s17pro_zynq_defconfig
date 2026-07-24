@@ -100,7 +100,7 @@ BR2_TARGET_GENERIC_ISSUE="DCENTos for S17 / S17 Pro (am2-s17, BM1397) — RUNTIM
 # Overlay-on-overlay — shared zynq overlay first, am2-s17pro identity last.
 # Buildroot applies overlays left-to-right so per-board files win.
 # =============================================================================
-BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/am2-s17pro/rootfs-overlay"
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/common/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/am2-s17pro/rootfs-overlay"
 BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/am2-s17pro/post-build.sh $(BR2_EXTERNAL_DCENTOS_PATH)/board/common/prune-runtime-research-tools.sh"
 BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/am2-s17pro/post-image.sh"
 

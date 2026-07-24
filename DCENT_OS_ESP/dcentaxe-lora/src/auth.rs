@@ -51,21 +51,38 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 /// (the nonce) + the mutation (`verb`/`param`/`value`) means no field can be
 /// altered without invalidating the tag, and a tag minted for node A / seq N can
 /// never be replayed as node B or seq M.
-pub fn command_mac_message(src: NodeId, seq: u8, verb: &str, param: &str, value: &str) -> Vec<u8> {
-    format!("dcm-cmd:{}:{seq:02x}:{verb}:{param}:{value}", src.to_hex()).into_bytes()
+pub fn command_mac_message(
+    src: NodeId,
+    epoch: u16,
+    seq: u8,
+    verb: &str,
+    param: &str,
+    value: &str,
+) -> Vec<u8> {
+    // `epoch` is bound alongside the wrapping `u8` `seq`: it lets the receiver's
+    // ReplayGuard distinguish a genuine next-epoch `seq` from a captured frame
+    // whose `seq` re-enters the forward window after a full 256-message wrap, so
+    // the tag for an old-epoch command can never be replayed once the epoch
+    // advances. See `ReplayGuard::admit`.
+    format!(
+        "dcm-cmd:{}:{epoch:04x}:{seq:02x}:{verb}:{param}:{value}",
+        src.to_hex()
+    )
+    .into_bytes()
 }
 
 /// Compute the raw 32-byte owner tag for a command (used by senders and tests).
 pub fn command_mac(
     key: &[u8],
     src: NodeId,
+    epoch: u16,
     seq: u8,
     verb: &str,
     param: &str,
     value: &str,
 ) -> [u8; MAC_TAG_LEN] {
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(&command_mac_message(src, seq, verb, param, value));
+    mac.update(&command_mac_message(src, epoch, seq, verb, param, value));
     mac.finalize().into_bytes().into()
 }
 
@@ -120,7 +137,7 @@ pub fn verify_command_mac(
     let tag = hex_to_tag(tag_hex).ok_or(LoraError::Unauthorized)?;
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(&command_mac_message(
-        src, seq, &cmd.verb, &cmd.param, &cmd.value,
+        src, cmd.epoch, seq, &cmd.verb, &cmd.param, &cmd.value,
     ));
     // `verify_slice` performs a `subtle`-backed constant-time comparison.
     mac.verify_slice(&tag).map_err(|_| LoraError::Unauthorized)
@@ -137,7 +154,8 @@ pub fn verify_command_mac(
 /// through the same operating-point clamp as any owner write.
 #[derive(Debug, Clone)]
 pub struct ReplayGuard {
-    entries: Vec<(NodeId, u8)>,
+    /// Per source: `(node, high-water epoch, high-water seq)`.
+    entries: Vec<(NodeId, u16, u8)>,
     tracked: usize,
     window: u8,
 }
@@ -163,23 +181,39 @@ impl ReplayGuard {
         }
     }
 
-    /// Admit `(src, seq)` if it advances that source's sequence within the
-    /// forward window, recording the new high-water seq on success. Returns
-    /// `false` for an exact replay or a seq outside the window (too old / wrapped
-    /// backward). Idempotent on rejection — a rejected seq never mutates state.
-    pub fn admit(&mut self, src: NodeId, seq: u8) -> bool {
-        if let Some(entry) = self.entries.iter_mut().find(|(id, _)| *id == src) {
-            let forward = seq.wrapping_sub(entry.1);
+    /// Admit `(src, epoch, seq)` if it advances that source's high-water within
+    /// the combined `(epoch, seq)` ordering, recording the new high-water on
+    /// success. Idempotent on rejection — a rejected frame never mutates state.
+    ///
+    /// The `epoch` closes the `u8`-seq wrap replay: within one epoch the wrapping
+    /// forward window applies as before, but a **strictly-newer** epoch is adopted
+    /// (its tag is MAC-bound, so it was genuinely minted for that epoch, and every
+    /// older-epoch frame becomes stale), and an **older** epoch is refused outright
+    /// — so a captured command's tag can no longer be replayed once the sender's
+    /// seq has wrapped and bumped the epoch, even though its `u8` seq re-enters
+    /// the forward window. A newer epoch is bound to a fresh high-water seq, so an
+    /// immediate replay of that same frame then fails the same-epoch check.
+    pub fn admit(&mut self, src: NodeId, epoch: u16, seq: u8) -> bool {
+        if let Some(entry) = self.entries.iter_mut().find(|(id, _, _)| *id == src) {
+            if epoch > entry.1 {
+                entry.1 = epoch;
+                entry.2 = seq;
+                return true;
+            }
+            if epoch < entry.1 {
+                return false; // stale epoch → replay
+            }
+            let forward = seq.wrapping_sub(entry.2);
             if forward == 0 || forward > self.window {
                 return false;
             }
-            entry.1 = seq;
+            entry.2 = seq;
             return true;
         }
         if self.entries.len() >= self.tracked {
             self.entries.remove(0);
         }
-        self.entries.push((src, seq));
+        self.entries.push((src, epoch, seq));
         true
     }
 
@@ -229,7 +263,7 @@ impl MeshAuthenticator {
         seq: u8,
     ) -> Result<(), LoraError> {
         verify_command_mac(cmd, self.key.as_ref().map(|k| k.as_slice()), src, seq)?;
-        if self.replay.admit(src, seq) {
+        if self.replay.admit(src, cmd.epoch, seq) {
             Ok(())
         } else {
             Err(LoraError::Unauthorized)
@@ -252,11 +286,26 @@ mod tests {
         param: &str,
         value: &str,
     ) -> MeshCommand {
+        signed_epoch(key, src, 0, seq, verb, param, value)
+    }
+
+    fn signed_epoch(
+        key: &[u8],
+        src: NodeId,
+        epoch: u16,
+        seq: u8,
+        verb: &str,
+        param: &str,
+        value: &str,
+    ) -> MeshCommand {
         MeshCommand {
             verb: verb.into(),
             param: param.into(),
             value: value.into(),
-            auth: Some(tag_to_hex(&command_mac(key, src, seq, verb, param, value))),
+            epoch,
+            auth: Some(tag_to_hex(&command_mac(
+                key, src, epoch, seq, verb, param, value,
+            ))),
         }
     }
 
@@ -298,7 +347,7 @@ mod tests {
 
     #[test]
     fn tag_hex_round_trips() {
-        let tag = command_mac(&[0x11; 32], SRC, 7, "set", "region", "eu868");
+        let tag = command_mac(&[0x11; 32], SRC, 0, 7, "set", "region", "eu868");
         let hex = tag_to_hex(&tag);
         assert_eq!(hex.len(), MAC_HEX_LEN);
         assert_eq!(hex_to_tag(&hex), Some(tag));
@@ -358,6 +407,7 @@ mod tests {
             verb: "set".into(),
             param: "region".into(),
             value: "na915".into(),
+            epoch: 0,
             auth: None,
         };
         assert_eq!(
@@ -381,40 +431,83 @@ mod tests {
     #[test]
     fn replay_guard_admits_forward_rejects_repeat_and_old() {
         let mut g = ReplayGuard::with_params(8, 16);
-        assert!(g.admit(SRC, 5), "first frame establishes high-water");
-        assert!(!g.admit(SRC, 5), "exact replay rejected");
-        assert!(g.admit(SRC, 6), "next in sequence admitted");
-        assert!(!g.admit(SRC, 6), "replay of the new high-water rejected");
-        assert!(!g.admit(SRC, 4), "behind the high-water rejected");
-        assert!(g.admit(SRC, 20), "within forward window admitted");
-        assert!(!g.admit(SRC, 40), "beyond forward window rejected");
+        assert!(g.admit(SRC, 0, 5), "first frame establishes high-water");
+        assert!(!g.admit(SRC, 0, 5), "exact replay rejected");
+        assert!(g.admit(SRC, 0, 6), "next in sequence admitted");
+        assert!(!g.admit(SRC, 0, 6), "replay of the new high-water rejected");
+        assert!(!g.admit(SRC, 0, 4), "behind the high-water rejected");
+        assert!(g.admit(SRC, 0, 20), "within forward window admitted");
+        assert!(!g.admit(SRC, 0, 40), "beyond forward window rejected");
     }
 
     #[test]
     fn replay_guard_is_wrap_tolerant() {
         let mut g = ReplayGuard::with_params(8, 16);
-        assert!(g.admit(SRC, 250));
+        assert!(g.admit(SRC, 0, 250));
         assert!(
-            g.admit(SRC, 3),
+            g.admit(SRC, 0, 3),
             "250 -> 3 is +9 across the u8 wrap → admitted"
         );
         assert!(
-            !g.admit(SRC, 250),
+            !g.admit(SRC, 0, 250),
             "the pre-wrap value is now old → rejected"
+        );
+    }
+
+    #[test]
+    fn replay_guard_epoch_closes_the_u8_wrap_replay() {
+        let mut g = ReplayGuard::with_params(8, 32);
+        // Epoch 0: a command at seq 100 is accepted, then its exact replay refused.
+        assert!(g.admit(SRC, 0, 100), "epoch 0 seq 100 accepted");
+        assert!(!g.admit(SRC, 0, 100), "same (epoch,seq) replay rejected");
+        // The sender's u8 seq wraps a full ring and the epoch advances to 1; the
+        // next legitimate command (epoch 1) is adopted regardless of its seq.
+        assert!(g.admit(SRC, 1, 5), "a strictly-newer epoch is adopted");
+        // THE FIX: replay the captured epoch-0/seq-100 frame. Its u8 seq (100) is
+        // far ahead of the current high-water seq (5), so a u8-only guard would
+        // eventually re-admit it after the wrap. With the epoch bound into the MAC
+        // and tracked here, epoch 0 < current epoch 1 ⇒ STALE ⇒ rejected.
+        assert!(
+            !g.admit(SRC, 0, 100),
+            "a captured old-epoch command must be rejected as stale after the epoch advances"
+        );
+        // Forward progress within the current epoch still works.
+        assert!(!g.admit(SRC, 1, 5), "same (epoch,seq) replay rejected");
+        assert!(
+            g.admit(SRC, 1, 6),
+            "forward within the current epoch admitted"
+        );
+    }
+
+    #[test]
+    fn authenticator_rejects_replayed_command_after_epoch_advance() {
+        let key = [0x55u8; 32];
+        let mut auth = MeshAuthenticator::new(Some(key));
+        // Owner command captured off the air at epoch 0, seq 100.
+        let captured = signed_epoch(&key, SRC, 0, 100, "set", "region", "eu868");
+        assert!(auth.authorize_command(&captured, SRC, 100).is_ok());
+        // The sender wraps its seq and advances to epoch 1; a fresh command lands.
+        let fresh = signed_epoch(&key, SRC, 1, 5, "cmd", "identify", "");
+        assert!(auth.authorize_command(&fresh, SRC, 5).is_ok());
+        // Replaying the captured epoch-0 command (valid MAC, seq far ahead of the
+        // current high-water) must now be refused as stale — the wrap-replay hole.
+        assert_eq!(
+            auth.authorize_command(&captured, SRC, 100),
+            Err(LoraError::Unauthorized)
         );
     }
 
     #[test]
     fn replay_guard_tracks_per_source_and_is_bounded() {
         let mut g = ReplayGuard::with_params(2, 16);
-        assert!(g.admit(NodeId(0xA), 1));
-        assert!(g.admit(NodeId(0xB), 1));
+        assert!(g.admit(NodeId(0xA), 0, 1));
+        assert!(g.admit(NodeId(0xB), 0, 1));
         assert_eq!(g.tracked_len(), 2);
         // Third distinct source evicts the oldest-tracked (0xA).
-        assert!(g.admit(NodeId(0xC), 1));
+        assert!(g.admit(NodeId(0xC), 0, 1));
         assert_eq!(g.tracked_len(), 2);
         // 0xA was evicted → its seq-1 is treated as first-seen again.
-        assert!(g.admit(NodeId(0xA), 1));
+        assert!(g.admit(NodeId(0xA), 0, 1));
     }
 
     // ---- MeshAuthenticator: MAC + replay combined ----
@@ -445,6 +538,7 @@ mod tests {
             verb: "set".into(),
             param: "region".into(),
             value: "na915".into(),
+            epoch: 0,
             auth: Some("00".repeat(32)),
         };
         assert_eq!(

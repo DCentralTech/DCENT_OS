@@ -3,12 +3,12 @@
 // Do not edit by hand; run the generator instead.
 /* eslint-disable */
 
-export const CAPABILITY_SCHEMA_VERSION = 2 as const;
+export const CAPABILITY_SCHEMA_VERSION = 3 as const;
 
 export const RUNTIME_CAPABILITY_VALUES = ['detect', 'inventory', 'monitoring', 'pools-read', 'pools-rw', 'config-read', 'config-rw', 'reboot', 'logs-read', 'backup', 'restore', 'flash-ota', 'flash-otawww', 'nvs-gen', 'settings-patch', 'asic-options', 'statistics', 'identify', 'wifi-scan', 'power-control'] as const;
 export type RuntimeCapability = typeof RUNTIME_CAPABILITY_VALUES[number];
 
-export const INSTALL_CAPABILITY_VALUES = ['auth-ssh', 'root-ssh', 'persistent-install', 'runtime-install', 'restore-verified', 'recovery-staged', 'backup', 'physical-sd-card', 'luxos-uninstall', 'vnish-cgminer-detected', 'cv1835-emmc-proven', 'bcb100-accept-unverified', 'http-ota-or-usb-serial', 'manifest-board-match', 'stock-bmu-root-flasher'] as const;
+export const INSTALL_CAPABILITY_VALUES = ['auth-ssh', 'root-ssh', 'persistent-install', 'runtime-install', 'restore-verified', 'recovery-staged', 'backup', 'physical-sd-card', 'luxos-uninstall', 'vnish-cgminer-detected', 'target-sysupgrade-first-install-capsule', 'bcb100-accept-unverified', 'http-ota-or-usb-serial', 'manifest-board-match', 'stock-bmu-root-flasher'] as const;
 export type InstallCapability = typeof INSTALL_CAPABILITY_VALUES[number];
 
 export const PLANNER_OUTCOME_VALUES = ['supported', 'ota-supported', 'runtime-only', 'evidence-gap'] as const;

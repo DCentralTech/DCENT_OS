@@ -58,7 +58,7 @@
 //! `None` and the I²C probe returns `false`, so unit tests run without
 //! touching `/dev/`.
 
-use crate::i2c::{I2cPicFirmware, I2cServiceHandle};
+use crate::i2c::I2cServiceHandle;
 use crate::platform::config::VoltageControllerKind;
 
 /// Opaque authority to construct a voltage-controller service at one
@@ -119,6 +119,16 @@ impl VoltageControllerEndpoint {
             bus: 0,
             address,
             observed_firmware: Some(firmware),
+        }
+    }
+
+    #[cfg(feature = "sim-hal")]
+    pub(in crate::platform) fn from_simulated_pic16(bus: u8, address: u8) -> Self {
+        Self {
+            kind: VoltageControllerKind::Pic16f1704,
+            bus,
+            address,
+            observed_firmware: None,
         }
     }
 }
@@ -821,12 +831,11 @@ fn standard_pic16_discovery(
     }
 }
 
-fn bind_standard_pic16_endpoint_after_heartbeat(
+fn bind_standard_pic16_endpoint(
     board_target: Option<&str>,
     subtype: Option<&str>,
     bus: u8,
     address: u8,
-    heartbeat_succeeded: bool,
 ) -> Result<VoltageControllerEndpoint, VoltageControllerEndpointError> {
     let discovery = standard_pic16_discovery(board_target, subtype);
     let kind = match discovery.status() {
@@ -849,9 +858,6 @@ fn bind_standard_pic16_endpoint_after_heartbeat(
     if !(0x55..=0x57).contains(&address) {
         return Err(VoltageControllerEndpointError::AddressOutsideTopology { kind, address });
     }
-    if !heartbeat_succeeded {
-        return Err(VoltageControllerEndpointError::EndpointPresenceNotObserved { bus, address });
-    }
     Ok(VoltageControllerEndpoint {
         kind,
         bus,
@@ -860,16 +866,17 @@ fn bind_standard_pic16_endpoint_after_heartbeat(
     })
 }
 
-/// Bind one standard-daemon S9 PIC16 endpoint by consuming its existing first
-/// post-presence heartbeat.
+/// Bind one standard-daemon S9 PIC16 topology capability without mutating the
+/// controller before cold-boot admission observes its raw state.
 ///
 /// This issuer is deliberately narrower than the subtype/ACK issuer above.
 /// It independently reads the exact DCENT_OS `am1-s9` board target, rejects a
 /// contradictory `/etc/subtype`, pins bus 0 and addresses 0x55..=0x57, and only
-/// returns authority when the canonical `[55 AA 16]` heartbeat succeeds. The
-/// standard daemon calls it after cooling and slot-presence admission, in place
-/// of the legacy heartbeat, so endpoint migration adds no wire transaction.
-pub fn discover_system_pic16_endpoint_with_heartbeat(
+/// returns a topology capability only after the standard daemon has completed
+/// cooling and positive slot-presence admission. Controller presence and
+/// application eligibility are proven later by the atomic cold-boot request;
+/// this issuer deliberately performs no I2C transaction.
+pub fn discover_system_pic16_endpoint(
     service: &I2cServiceHandle,
     address: u8,
 ) -> Result<VoltageControllerEndpoint, VoltageControllerEndpointError> {
@@ -898,13 +905,11 @@ pub fn discover_system_pic16_endpoint_with_heartbeat(
         });
     }
 
-    let heartbeat_succeeded = service.heartbeat(address, I2cPicFirmware::Unknown).is_ok();
-    bind_standard_pic16_endpoint_after_heartbeat(
+    bind_standard_pic16_endpoint(
         board_target.as_deref(),
         subtype.as_deref(),
         service.bus(),
         address,
-        heartbeat_succeeded,
     )
 }
 
@@ -1187,16 +1192,10 @@ mod tests {
     }
 
     #[test]
-    fn standard_pic16_endpoint_consumes_exact_identity_and_successful_heartbeat() {
+    fn standard_pic16_endpoint_consumes_exact_identity_and_topology() {
         for subtype in [None, Some("S9"), Some("S9J"), Some("S9_BHB09001")] {
-            let endpoint = bind_standard_pic16_endpoint_after_heartbeat(
-                Some("am1-s9"),
-                subtype,
-                0,
-                0x56,
-                true,
-            )
-            .expect("exact S9 evidence and the existing heartbeat should issue authority");
+            let endpoint = bind_standard_pic16_endpoint(Some("am1-s9"), subtype, 0, 0x56)
+                .expect("exact S9 identity and topology should issue a capability");
             assert_eq!(endpoint.kind(), VoltageControllerKind::Pic16f1704);
             assert_eq!(endpoint.bus(), 0);
             assert_eq!(endpoint.address(), 0x56);
@@ -1204,44 +1203,36 @@ mod tests {
     }
 
     #[test]
-    fn standard_pic16_endpoint_refuses_guesses_contradictions_and_failed_heartbeats() {
-        for (board_target, subtype, bus, address, heartbeat) in [
-            (None, None, 0, 0x55, true),
-            (Some(""), None, 0, 0x55, true),
-            (Some("am1-s9-extra"), None, 0, 0x55, true),
-            (Some("am2-s19j"), Some("S9"), 0, 0x55, true),
-            (Some("am1-s9"), Some("AMLCtrl_BHB56902"), 0, 0x55, true),
-            (Some("am1-s9"), None, 1, 0x55, true),
-            (Some("am1-s9"), None, 0, 0x20, true),
-            (Some("am1-s9"), None, 0, 0x58, true),
-            (Some("am1-s9"), None, 0, 0x55, false),
+    fn standard_pic16_endpoint_refuses_guesses_and_contradictory_topologies() {
+        for (board_target, subtype, bus, address) in [
+            (None, None, 0, 0x55),
+            (Some(""), None, 0, 0x55),
+            (Some("am1-s9-extra"), None, 0, 0x55),
+            (Some("am2-s19j"), Some("S9"), 0, 0x55),
+            (Some("am1-s9"), Some("AMLCtrl_BHB56902"), 0, 0x55),
+            (Some("am1-s9"), None, 1, 0x55),
+            (Some("am1-s9"), None, 0, 0x20),
+            (Some("am1-s9"), None, 0, 0x58),
         ] {
             assert!(
-                bind_standard_pic16_endpoint_after_heartbeat(
-                    board_target,
-                    subtype,
-                    bus,
-                    address,
-                    heartbeat,
-                )
-                .is_err(),
-                "board_target={board_target:?} subtype={subtype:?} bus={bus} address={address:#04x} heartbeat={heartbeat}"
+                bind_standard_pic16_endpoint(board_target, subtype, bus, address).is_err(),
+                "board_target={board_target:?} subtype={subtype:?} bus={bus} address={address:#04x}"
             );
         }
     }
 
     #[test]
-    fn standard_pic16_issuer_reuses_one_heartbeat_without_an_extra_probe() {
+    fn standard_pic16_issuer_is_non_mutating() {
         let source = include_str!("subtype.rs");
         let start = source
-            .find("pub fn discover_system_pic16_endpoint_with_heartbeat(")
+            .find("pub fn discover_system_pic16_endpoint(")
             .expect("PIC16 system issuer");
         let body = &source[start..];
         let body = body
             .split("fn discover_voltage_controller_with_probe")
             .next()
             .expect("bounded PIC16 issuer body");
-        assert_eq!(body.matches("service.heartbeat(").count(), 1);
+        assert!(!body.contains("service.heartbeat("));
         assert!(!body.contains("probe_voltage_controller_address("));
         assert!(!body.contains("service.write_bytes("));
         assert!(!body.contains("service.read_bytes("));

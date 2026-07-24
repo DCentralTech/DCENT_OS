@@ -11,11 +11,11 @@
 #
 # This script is intentionally:
 #   - Dev-only. REFUSES to run if DCENT_RELEASE_SIGNING_KEY is set
-#     (the real-key build path is build_in_docker.sh with that env var;
-#     mixing them would risk a real key leaking into the rehearsal tmpdir).
-#   - Self-contained. Does NOT invoke build_in_docker.sh or Docker; the
-#     rehearsal is "does this host's openssl + verify script produce a
-#     passing round-trip?", not "does the full Buildroot pipeline run?".
+#     (the only admitted real-key path is the authenticated S9 capsule;
+#     mixing keys would risk a real key leaking into the rehearsal tmpdir).
+#   - Host-local. Does NOT invoke build_in_docker.sh or Docker; it exercises
+#     the same exact durable signer plus the target-side verifier without a
+#     full Buildroot run.
 #   - Auditable. Emits a rehearsal report with ephemeral pubkey SHA,
 #     manifest SHA, package SHA, and signature length so the operator can
 #     compare against their real-key run.
@@ -52,6 +52,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 DCENTOS_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$DCENTOS_DIR/../.." && pwd)
 VERIFY_SCRIPT="$SCRIPT_DIR/verify_sysupgrade_signature.sh"
+. "$SCRIPT_DIR/lib/release_envelope.sh"
 
 # --- arg parse ---
 TARGET=""
@@ -91,7 +92,7 @@ esac
 # --- safety rails ---
 # Refuse if the real-key env var is set. The dry-run must NEVER risk a
 # real key being mistaken for the ephemeral one (e.g. by a sourced .env or
-# direnv autoload). The real-key path is build_in_docker.sh, not this.
+# direnv autoload). The only admitted real-key path is the S9 release capsule.
 if [ -n "${DCENT_RELEASE_SIGNING_KEY:-}" ]; then
     echo "ERROR: DCENT_RELEASE_SIGNING_KEY is set." >&2
     echo "" >&2
@@ -99,9 +100,14 @@ if [ -n "${DCENT_RELEASE_SIGNING_KEY:-}" ]; then
     echo "run when a real signing key is configured, to prevent any chance of a" >&2
     echo "real key landing in the rehearsal tmpdir or being exposed to logs." >&2
     echo "" >&2
-    echo "To sign with the real key, use:" >&2
-    echo "  bash DCENT_OS_Antminer/scripts/build_in_docker.sh --target $TARGET" >&2
-    echo "(with DCENT_RELEASE_SIGNING_KEY pointing at your real key)." >&2
+    if [ "$TARGET" = "s9" ]; then
+        echo "To sign an admitted S9 release with the real key, use:" >&2
+        echo "  make -C DCENT_OS_Antminer release RELEASE_TARGET=s9" >&2
+        echo "(with the release signing key and manifest public-key pin exported)." >&2
+    else
+        echo "No real-key packaging command is admitted for target $TARGET." >&2
+        echo "A target-specific authenticated capsule must land first." >&2
+    fi
     echo "" >&2
     echo "To run this rehearsal anyway, unset DCENT_RELEASE_SIGNING_KEY first:" >&2
     echo "  unset DCENT_RELEASE_SIGNING_KEY" >&2
@@ -120,6 +126,10 @@ for cmd in openssl sha256sum tar awk sed mktemp; do
         exit 4
     }
 done
+dcent_release_run_python -c 'import sys' >/dev/null 2>&1 || {
+    echo "ERROR: Python 3.10 or newer is required" >&2
+    exit 4
+}
 
 # --- temp dir + trap cleanup ---
 TMPDIR_REHEARSAL=$(mktemp -d 2>/dev/null || mktemp -d -t dcent-dryrun) || {
@@ -160,6 +170,19 @@ PUB_HEX_FILE="$TMPDIR_REHEARSAL/ephemeral.pub.hex"
 
 openssl genpkey -algorithm Ed25519 -out "$KEY" >/dev/null 2>&1 || { echo "ERROR: openssl genpkey failed" >&2; exit 5; }
 openssl pkey -in "$KEY" -pubout -out "$PUB_PEM" >/dev/null 2>&1 || { echo "ERROR: openssl pkey -pubout failed" >&2; exit 5; }
+if [ "$(dcent_release_run_python -c 'import os; print(os.name)')" = nt ]; then
+    dcent_release_run_python - "$SCRIPT_DIR" "$KEY" <<'PY'
+from pathlib import Path
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import release_set_publication as release_io
+
+release_io.set_windows_file_acl(
+    Path(sys.argv[2]), release_io.WINDOWS_PRIVATE_FILE_SDDL
+)
+PY
+fi
 
 # Raw 32-byte hex (the at-rest pin format consumed by DCENT_MANIFEST_PUBLIC_KEY_HEX).
 # Mirrors the formula in DCENT_OS_Antminer/scripts/sign_stock_manifest.sh:24-25.
@@ -219,15 +242,20 @@ log "release_ed25519.pub:  size=$PUB_SIZE sha256=$PUB_SHA"
 log ""
 
 # --- 3. MANIFEST.json ---
-banner "Step 3 - emit MANIFEST.json (schema mirrors ci_offline_gates.sh:250-264)"
+banner "Step 3 - emit the schema-1 sysupgrade authority manifest"
 MANIFEST="$PKG_DIR/MANIFEST.json"
 cat > "$MANIFEST" <<EOF_MANIFEST
 {
+  "schema": 1,
+  "manifest_profile": "dcentos.sysupgrade-authority/v1",
   "product": "DCENT_OS",
   "package_type": "sysupgrade",
+  "installable": true,
+  "artifact_maturity": "experimental",
   "board": "$TARGET",
   "board_target": "$TARGET",
   "version": "dry-run-rehearsal",
+  "status": "release",
   "payloads": {
     "kernel": { "path": "sysupgrade-$TARGET/kernel", "size": $KERNEL_SIZE, "sha256": "$KERNEL_SHA" },
     "rootfs": { "path": "sysupgrade-$TARGET/root", "size": $ROOT_SIZE, "sha256": "$ROOT_SHA" },
@@ -249,8 +277,11 @@ log ""
 # --- 4. sign ---
 banner "Step 4 - sign MANIFEST.json with ephemeral key (raw ed25519)"
 SIG="$PKG_DIR/MANIFEST.sig"
-openssl pkeyutl -sign -rawin -inkey "$KEY" -in "$MANIFEST" -out "$SIG" >/dev/null 2>&1 \
-    || { echo "ERROR: openssl pkeyutl -sign failed" >&2; exit 5; }
+dcent_release_run_python "$SCRIPT_DIR/sign_release_artifact.py" "$MANIFEST" \
+    --key "$KEY" \
+    --pubkey "$PUB_PEM" \
+    --output-sig "$SIG" >/dev/null \
+    || { echo "ERROR: exact release artifact signing failed" >&2; exit 5; }
 SIG_SIZE=$(wc -c < "$SIG" | tr -d ' ')
 SIG_SHA=$(sha256sum -- "$SIG" | awk '{print $1}')
 if [ "$SIG_SIZE" != "64" ]; then
@@ -308,22 +339,28 @@ log "  - Your real Ed25519 key custody (HSM / Vault) is correct."
 log "  - dcentrald's at-rest DCENT_MANIFEST_PUBLIC_KEY_HEX pin matches your key."
 log "  - The signed package boots a real miner. That gate is Wave C (live HW)."
 log ""
-log "Operator next steps (T1 real-key run, from TODO-NEXT-WAVES.md T1 lines 35-51):"
-log "  1. Generate your real keypair in HSM/Vault:"
-log "       openssl genpkey -algorithm Ed25519 -out release_ed25519.key"
-log "       openssl pkey -in release_ed25519.key -pubout -outform DER \\"
-log "         | xxd -p -c 64 | tail -c 65 | head -c 64 > release_ed25519.pub.hex"
-log "  2. Build the signed package:"
-log "       DCENT_RELEASE_SIGNING_KEY=\$PWD/release_ed25519.key \\"
-log "         DCENT_MANIFEST_PUBLIC_KEY_HEX=\$(cat release_ed25519.pub.hex) \\"
-log "         bash DCENT_OS_Antminer/scripts/build_in_docker.sh --target $TARGET"
-log "  3. Verify independently:"
-log "       bash DCENT_OS_Antminer/scripts/verify_sysupgrade_signature.sh \\"
-log "         <pkg.tar> release_ed25519.pub.pem $TARGET"
-log "  4. Pin manifest SHA + package SHA into the operator inventory doc."
-log "  5. \`dcent install <ip> -f <pkg.tar>\` proceeds without"
-log "     \`--accept-unsigned-package-lab-only\` once both signed and"
-log "     DCENT_MANIFEST_PUBLIC_KEY_HEX-pinned binaries are deployed."
+log "Operator next steps:"
+if [ "$TARGET" = "s9" ]; then
+    log "  1. Generate your real keypair in HSM/Vault:"
+    log "       openssl genpkey -algorithm Ed25519 -out release_ed25519.key"
+    log "       openssl pkey -in release_ed25519.key -pubout -outform DER \\"
+    log "         | xxd -p -c 64 | tail -c 65 | head -c 64 > release_ed25519.pub.hex"
+    log "  2. Build through the authenticated S9 capsule:"
+    log "       DCENT_RELEASE_SIGNING_KEY=\$PWD/release_ed25519.key \\"
+    log "         DCENT_MANIFEST_PUBLIC_KEY_HEX=\$(cat release_ed25519.pub.hex) \\"
+    log "         make -C DCENT_OS_Antminer release RELEASE_TARGET=s9"
+    log "  3. Verify independently:"
+    log "       bash DCENT_OS_Antminer/scripts/verify_sysupgrade_signature.sh \\"
+    log "         <pkg.tar> release_ed25519.pub.pem s9"
+    log "  4. Pin manifest SHA + package SHA into the operator inventory doc."
+    log "  5. \`dcent install <ip> -f <pkg.tar>\` proceeds without"
+    log "     \`--accept-unsigned-package-lab-only\` once both signed and"
+    log "     DCENT_MANIFEST_PUBLIC_KEY_HEX-pinned binaries are deployed."
+else
+    log "  STOP: target $TARGET has no authenticated real-key packaging capsule."
+    log "  Do not invoke the inner packaging driver directly. Port the target to"
+    log "  the source/result/signing/publication capsule lifecycle first."
+fi
 log ""
 log "Rehearsal report saved at: $REPORT"
 

@@ -230,6 +230,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{RuntimeTaskGuard, TaskStopOutcome};
+    use crate::runtime::source_contract::compact_rust_source;
 
     #[tokio::test]
     async fn cooperative_tasks_are_cancelled_and_joined() {
@@ -386,6 +387,8 @@ mod tests {
     fn mining_hardware_tasks_are_owned_and_quiesced_before_hardware_teardown() {
         let daemon = include_str!("../daemon.rs");
         let dispatcher = include_str!("../work_dispatcher.rs");
+        let compact_daemon = compact_rust_source(daemon);
+        let compact_dispatcher = compact_rust_source(dispatcher);
 
         assert!(
             daemon.contains("let mining_tasks = RuntimeTaskGuard::new(CancellationToken::new())")
@@ -395,7 +398,7 @@ mod tests {
         assert!(daemon.contains("self.mining_tasks.spawn(\"work-dispatcher\""));
         assert!(daemon.contains("self.mining_tasks.spawn(\"thermal-controller\""));
         assert_eq!(daemon.matches("self.mining_tasks.spawn(").count(), 2);
-        assert!(!daemon.contains("tokio::spawn(async move {\n            dispatcher.run().await;"));
+        assert!(!compact_daemon.contains("tokio::spawn(asyncmove{dispatcher.run().await;"));
 
         let thermal_start = daemon
             .find("let thermal_liveness_loop = thermal_liveness.clone();")
@@ -488,6 +491,6 @@ mod tests {
         assert!(shutdown.contains("This daemon performed no SoC watchdog magic-close write"));
 
         assert_eq!(dispatcher.matches("voltage_reply_tasks.spawn(").count(), 2);
-        assert!(!dispatcher.contains("tokio::spawn(async move {\n                                                        let (timed_out, result)"));
+        assert!(!compact_dispatcher.contains("tokio::spawn(asyncmove{let(timed_out,result)"));
     }
 }

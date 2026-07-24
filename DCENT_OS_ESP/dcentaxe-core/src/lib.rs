@@ -54,6 +54,17 @@
 #[path = "../../dcentaxe/src/config.rs"]
 pub mod config;
 
+// PLAN-E W5500 LAN: the pure Wi-Fi⇄Ethernet failover FSM. Single source of
+// truth is `dcentaxe/src/net.rs` (feature-gated `eth-w5500` in the binary);
+// re-included here UNCONDITIONALLY so its decision-matrix / flap-telemetry
+// tests always host-run in the default gate (it only needs `crate::config`,
+// which is re-included above).
+#[path = "../../dcentaxe/src/net.rs"]
+pub mod net;
+
+#[path = "../../dcentaxe/src/notifications.rs"]
+pub mod notifications;
+
 // Same single-source-of-truth pattern: capabilities.rs physically lives in the
 // `dcentaxe` binary crate and builds the additive `/api/v1/capabilities`
 // descriptor from host-pure config/board metadata plus runtime bounds. Re-include
@@ -98,11 +109,11 @@ mod capability_api_route_guards {
     #[test]
     fn handler_count_includes_capability_endpoint() {
         assert!(
-            MAIN_RS.contains("api.rs              53"),
+            MAIN_RS.contains("api.rs              54"),
             "main.rs handler accounting must include /api/v1/capabilities"
         );
         assert!(
-            MAIN_RS.contains("const REGISTERED_HANDLER_ESTIMATE: usize = 72;"),
+            MAIN_RS.contains("const REGISTERED_HANDLER_ESTIMATE: usize = 73;"),
             "REGISTERED_HANDLER_ESTIMATE must include /api/v1/capabilities"
         );
     }
@@ -1037,8 +1048,8 @@ mod mainapi_guards {
         );
         // The const in main.rs must be >= the true api.rs contribution.
         assert!(
-            MAIN_RS.contains("const REGISTERED_HANDLER_ESTIMATE: usize = 72;"),
-            "REGISTERED_HANDLER_ESTIMATE should reflect the verified total (72)"
+            MAIN_RS.contains("const REGISTERED_HANDLER_ESTIMATE: usize = 73;"),
+            "REGISTERED_HANDLER_ESTIMATE should reflect the verified total (73)"
         );
     }
 
@@ -1549,7 +1560,7 @@ mod dcent_design_language_guards {
     // The host MUST stay handler-free: framework.js is loaded via the existing
     // `register_static(server, "/dashboard/framework.js", ...)` — a regression
     // that split the table into a NEW dashboard/glossary.js would cost +1
-    // register_static (72/96) and force bumping REGISTERED_HANDLER_ESTIMATE.
+    // register_static (73/96) and force bumping REGISTERED_HANDLER_ESTIMATE.
     #[test]
     fn term7_glossary_table_present_and_handler_free() {
         let fw = collapse_ws(FRAMEWORK_JS);
@@ -1576,7 +1587,7 @@ mod dcent_design_language_guards {
         assert!(
             !dash.contains("/dashboard/glossary.js"),
             "regression: glossary must stay inline in framework.js — no new glossary.js \
-             handler (would push REGISTERED_HANDLER_ESTIMATE 72 -> 73/96)"
+             handler (would push REGISTERED_HANDLER_ESTIMATE 73 -> 74/96)"
         );
     }
 
@@ -2971,8 +2982,8 @@ mod s4_axe_capability_port_guards {
             "G-S4-BUDGET: MAX_URI_HANDLERS must stay 96 (S4 ports add no handler)"
         );
         assert!(
-            MAIN_RS.contains("const REGISTERED_HANDLER_ESTIMATE: usize = 72;"),
-            "G-S4-BUDGET: REGISTERED_HANDLER_ESTIMATE must stay 72 (S4 fan-curve + wizard are \
+            MAIN_RS.contains("const REGISTERED_HANDLER_ESTIMATE: usize = 73;"),
+            "G-S4-BUDGET: REGISTERED_HANDLER_ESTIMATE must stay 73 (S4 fan-curve + wizard are \
              handler-free inline surfaces, +0 routes)"
         );
     }
@@ -3155,8 +3166,8 @@ mod s5_axe_mcp_superset_guards {
             "S5: MAX_URI_HANDLERS must stay 96 (MCP name alignment adds no handler)"
         );
         assert!(
-            MAIN_RS.contains("const REGISTERED_HANDLER_ESTIMATE: usize = 72;"),
-            "S5: REGISTERED_HANDLER_ESTIMATE must stay 72 (all 12 MCP tools share the single \
+            MAIN_RS.contains("const REGISTERED_HANDLER_ESTIMATE: usize = 73;"),
+            "S5: REGISTERED_HANDLER_ESTIMATE must stay 73 (all 12 MCP tools share the single \
              POST /mcp handler — name alignment is handler-free)"
         );
         let flat = collapse_ws(MCP_RS);

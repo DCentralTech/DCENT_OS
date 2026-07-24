@@ -31,6 +31,8 @@ set -u
 DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
 SCRIPTS_DIR=$(CDPATH= cd "$DIR/.." && pwd)
 CONF="$DIR/skus.conf"
+ENABLEMENT_MATRIX="$DIR/../../docs/architecture/hardware_enablement_matrix.json"
+ARTIFACT_PRODUCERS="$DIR/../../docs/architecture/artifact_producers.json"
 
 # shellcheck source=lib/accept_parse.sh
 . "$DIR/lib/accept_parse.sh"
@@ -140,6 +142,88 @@ board_targets_equivalent() {
         am2-s19jpro,am2-s19jpro-zynq|am2-s19jpro-zynq,am2-s19jpro) return 0 ;;
     esac
     return 1
+}
+
+canonical_board_desc_target() {
+    case "$1" in
+        am2-s19jpro-zynq|am2-s19jpro) printf '%s\n' am2-s19j ;;
+        am2-s19) printf '%s\n' am2-s19pro ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+artifact_filename_for() {
+    _producer_target=$1
+    if [ ! -r "$ARTIFACT_PRODUCERS" ]; then
+        err "artifact producer manifest is missing or unreadable: $ARTIFACT_PRODUCERS"
+        return 2
+    fi
+    if ! grep -Eq '^[[:space:]]*"schema":[[:space:]]*2,[[:space:]]*$' "$ARTIFACT_PRODUCERS"; then
+        err "artifact producer manifest schema is unsupported"
+        return 2
+    fi
+    _producer_needle="\"board_target\":\"$_producer_target\""
+    _producer_count=$(grep -Fc "$_producer_needle" "$ARTIFACT_PRODUCERS")
+    if [ "$_producer_count" -ne 1 ]; then
+        err "artifact producer for $_producer_target is not uniquely declared"
+        return 2
+    fi
+    _producer_row=$(grep -F "$_producer_needle" "$ARTIFACT_PRODUCERS")
+    _artifact_filename=$(printf '%s\n' "$_producer_row" |
+        sed -n 's/^.*"artifact_filename":"\([^"]*\)".*$/\1/p')
+    case "$_artifact_filename" in
+        ""|*/*|*\\*|*..*)
+            err "artifact producer for $_producer_target has an unsafe or malformed filename"
+            return 2
+            ;;
+    esac
+    printf '%s\n' "$_artifact_filename"
+}
+
+artifact_install_contract_for() {
+    _producer_target=$1
+    _producer_needle="\"board_target\":\"$_producer_target\""
+    _producer_count=$(grep -Fc "$_producer_needle" "$ARTIFACT_PRODUCERS")
+    if [ "$_producer_count" -ne 1 ]; then
+        err "artifact producer for $_producer_target is not uniquely declared"
+        return 2
+    fi
+    _producer_row=$(grep -F "$_producer_needle" "$ARTIFACT_PRODUCERS")
+    _install_contract=$(printf '%s\n' "$_producer_row" |
+        sed -n 's/^.*"install_contract":"\([^"]*\)"}.*$/\1/p')
+    case "$_install_contract" in
+        managed_s9_install|guarded_am2_self_update|guarded_amlogic_rootfs_window|external_media)
+            printf '%s\n' "$_install_contract"
+            ;;
+        *)
+            err "artifact producer for $_producer_target has an unknown install contract"
+            return 2
+            ;;
+    esac
+}
+
+install_hint_policy_allows() {
+    _policy_target=$(canonical_board_desc_target "$BOARD_TARGET")
+    if [ ! -r "$ENABLEMENT_MATRIX" ]; then
+        err "install policy matrix is missing or unreadable: $ENABLEMENT_MATRIX"
+        return 2
+    fi
+    _policy_needle="\"board_target\":\"$_policy_target\""
+    _policy_count=$(grep -Fc "$_policy_needle" "$ENABLEMENT_MATRIX")
+    if [ "$_policy_count" -ne 1 ]; then
+        err "install policy for $_policy_target is not uniquely declared"
+        return 2
+    fi
+    _policy_row=$(grep -F "$_policy_needle" "$ENABLEMENT_MATRIX")
+    case "$_policy_row" in
+        *'"install_authorization":"denied"'*|*'"artifact_kind":"none"'*)
+            info "PERSISTENT INSTALL REFUSED for $SKU ($BOARD_TARGET)"
+            say "  The typed hardware matrix denies install and declares no artifact for $_policy_target."
+            say "  This route is management/diagnostic only; do not infer an install image from its SoC family."
+            return 1
+            ;;
+    esac
+    return 0
 }
 
 # ---- phases ----------------------------------------------------------------
@@ -273,19 +357,52 @@ cmd_bench() {
 }
 
 cmd_install_hint() {
-    info "PERSISTENT INSTALL is operator-gated — this only PRINTS the exact steps (no writes)"
-    say "  1. Confirm 'backup' and 'shares' both PASSED on this exact unit first."
-    say "  2. Obtain a fresh independently verified signed image. New source builds are capsule-only; currently S9 only."
-    if [ "$BOOT_CHAIN" = "single-image" ]; then
-        say "  3. Amlogic (no A/B): efuse preflight (BP-AMLOGIC Step 0) MUST read UNLOCKED, then BP-2:"
-        say "       dcent install $IP -f output/dcentos-sysupgrade-$BOARD_TARGET.tar --accept-vnish-aml-rootfs-window --yes"
-        say "     recovery = 'fw_setenv bootcmd \"run storeboot\"' (there is no A/B rollback slot)."
-    else
-        say "  3. Zynq A/B (writes INACTIVE slot via fw_setenv, never raw dd on weak-ECC mtd):"
-        say "       dcent install $IP -f output/dcentos-sysupgrade-$BOARD_TARGET.tar --yes"
-        say "     rollback = 'dcent install $IP --revert-to-stock --yes' (atomic bootslot flip)."
+    install_hint_policy_allows
+    policy_rc=$?
+    [ "$policy_rc" -eq 0 ] || return "$policy_rc"
+    policy_target=$(canonical_board_desc_target "$BOARD_TARGET")
+    artifact_filename=$(artifact_filename_for "$policy_target") || return $?
+    install_contract=$(artifact_install_contract_for "$policy_target") || return $?
+
+    if [ "$install_contract" = "external_media" ]; then
+        info "PERSISTENT INSTALL REFUSED for $SKU ($BOARD_TARGET)"
+        say "  This Experimental external-media route is runtime/SD lab-only and has no admitted persistent-write transaction."
+        say "  Do not write NAND, run sysupgrade, call fw_setenv, or reuse the Zynq/Amlogic install paths."
+        say "  Physical payload: output/$artifact_filename"
+        say "  Follow only the witnessed procedure:"
+        say "    docs/dev/2026-07-02-antminer-production-readiness/hw-procedures/$PACKAGE.md"
+        return 0
     fi
-    say "  4. AC-cycle, then re-run:  ./dcent-accept.sh shares $SKU $IP --capstone"
+
+    info "PERSISTENT INSTALL is operator-gated — this only PRINTS the exact steps (no writes)"
+    say "  1. Confirm the route-specific backup/restore proof and 'shares' both PASSED on this exact unit."
+    say "  2. Use a fresh independently verified signed artifact; an artifact lane alone is not install authority."
+    case "$install_contract" in
+        managed_s9_install)
+            say "  3. Managed S9 package route (the Toolbox plan and preflight remain authoritative):"
+            say "       dcent install $IP -f output/$artifact_filename --yes"
+            say "     Dry-run any later revert-to-stock route and retain the exact-unit backup; no generic rollback is implied here."
+            ;;
+        guarded_am2_self_update)
+            say "  3. Guarded AM2 DCENT_OS self-update (inactive slot, exact restore evidence, physical recovery staged):"
+            say "       dcent install $IP -f output/$artifact_filename --artifact-dir <restore_verified_dir> --accept-am2-persistent-lab --i-have-recovery --yes"
+            say "     Vendor-source first install remains evidence-gap; this command is only executable from an admitted DCENT_OS self-update route."
+            say "     The writer flips the selected slot but does not auto-reboot. Retain the exact restore artifact and follow the witnessed recovery procedure."
+            ;;
+        guarded_amlogic_rootfs_window)
+            say "  3. Guarded Amlogic rootfs-window write: efuse preflight (BP-AMLOGIC Step 0) MUST read UNLOCKED."
+            say "     Stock source:"
+            say "       dcent install $IP -f output/$artifact_filename --artifact-dir <restore_verified_dir> --yes"
+            say "     VNish source (additional source-specific acknowledgement):"
+            say "       dcent install $IP -f output/$artifact_filename --artifact-dir <restore_verified_dir> --accept-vnish-aml-rootfs-window --yes"
+            say "     There is no A/B rollback slot and no automatic reboot; recovery requires the exact restore artifact plus the witnessed physical plan."
+            ;;
+        *)
+            err "unsupported install contract for $policy_target: $install_contract"
+            return 2
+            ;;
+    esac
+    say "  4. After the route-specific boot/recovery step, re-run:  ./dcent-accept.sh shares $SKU $IP --capstone"
     say "  Full procedure + checklist: docs/dev/2026-07-02-antminer-production-readiness/hw-procedures/$PACKAGE.md"
     return 0
 }
@@ -447,6 +564,19 @@ for a in "$@"; do
 done
 [ -z "$SKUARG" ] && { err "missing SKU (see: dcent-accept.sh list)"; exit 2; }
 if ! sku_lookup "$SKUARG"; then err "unknown SKU '$SKUARG' — see: dcent-accept.sh list"; exit 2; fi
+# A capture-first inventory row is not a runnable acceptance route. Keep the
+# offline boot-log parser available so new evidence can retire the row, but
+# refuse every live, deployment, install-guidance, and OTA path before argument
+# validation or transport. Otherwise a NOT-IMPLEMENTED label is merely cosmetic
+# and an operator can still reach SSH/dev_deploy with the scaffold.
+case "$RELEASE_STATE/$PHASE" in
+    NOT-IMPLEMENTED/bootlog) : ;;
+    NOT-IMPLEMENTED/*)
+        err "$PHASE is refused for NOT-IMPLEMENTED route $SKU ($BOARD_TARGET)"
+        err "capture-first rows admit only offline bootlog diagnosis; follow $PACKAGE to collect the missing hardware evidence"
+        exit 1
+        ;;
+esac
 
 case "$PHASE" in
     install-hint) IP=${IP:-<miner_ip>}; cmd_install_hint; exit $? ;;

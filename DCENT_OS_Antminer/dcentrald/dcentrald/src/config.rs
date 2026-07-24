@@ -272,9 +272,8 @@ impl DcentraldConfig {
     /// `mining.enabled = false` so the daemon enters management-only
     /// (`mining_start_enabled() == false`) — API / dashboard / wizard /
     /// re-flash-detection reachable, NO PSU or chain I/O — instead of
-    /// crash-looping to a permanent unmanageable brick when both config paths
-    /// are missing or corrupt (the `S82dcentrald` wrapper gives up after
-    /// `MAX_CRASH_RESTARTS`). The empty-document parse is infallible by
+    /// exiting into a persistent-session admission refusal when both config
+    /// paths are missing or corrupt. The empty-document parse is infallible by
     /// construction; `management_only_default_is_fail_closed` pins that invariant
     /// so a future field that drops `#[serde(default)]` fails CI rather than the
     /// `expect()` firing in the field on a real unit. (gap-swarm daemon-startup #1/#9)
@@ -1615,10 +1614,11 @@ pub struct MiningConfig {
     #[serde(default)]
     pub pipeline_snapshot: MiningPipelineSnapshotConfig,
 
-    /// PH-3 (/12): operator-gated, DEFAULT-OFF hashrate auto-recovery
+    /// PH-3 (/12): operator-gated, DEFAULT-OFF hashrate recovery
     /// ladder. Layers on the SAME resolved degraded floor (never a new
-    /// threshold); only arms on platforms where a daemon restart is PROVEN to
-    /// recover mining (`am1-s9`) — on AM2-Zynq/Amlogic/BB a restart leaves the
+    /// threshold). Automatic process replacement is currently suspended for
+    /// every platform until typed hardware-disposition receipts exist; the
+    /// historical allowlist remains data for that future resolver. On AM2-Zynq/Amlogic/BB a restart leaves the
     /// chip un-enumerable, so the ladder degrades to alert-only there. The pure
     /// FSM + every safety gate live in `dcentrald_api_types::hashrate_recovery`.
     #[serde(default)]
@@ -2786,8 +2786,9 @@ http_bind = "miner.local"
         );
     }
 
-    /// LANE R (PH-3 wiring): the hashrate auto-recovery ladder is SAFETY-CRITICAL
-    /// (it schedules a graceful daemon restart) and MUST ship DEFAULT-OFF so the
+    /// LANE R (PH-3 wiring): the hashrate recovery ladder is SAFETY-CRITICAL
+    /// (its restart request is currently refused at the shared policy boundary)
+    /// and MUST ship DEFAULT-OFF so the
     /// daemon's default behavior is byte-identical to a build without it. Pin the
     /// off-by-default invariant on every config surface — a future edit that flips
     /// the default ON fails CI here instead of silently arming auto-restart on a

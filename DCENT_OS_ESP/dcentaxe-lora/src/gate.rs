@@ -262,7 +262,9 @@ mod tests {
     const SRC: NodeId = NodeId(0x0000_beef);
 
     fn signed_frame(seq: u8, verb: &str, param: &str, value: &str) -> MeshFrame {
-        let auth = Some(tag_to_hex(&command_mac(&KEY, SRC, seq, verb, param, value)));
+        let auth = Some(tag_to_hex(&command_mac(
+            &KEY, SRC, 0, seq, verb, param, value,
+        )));
         MeshFrame {
             src: SRC,
             seq,
@@ -271,6 +273,7 @@ mod tests {
                 verb: verb.into(),
                 param: param.into(),
                 value: value.into(),
+                epoch: 0,
                 auth,
             }),
         }

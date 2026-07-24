@@ -231,7 +231,7 @@ impl AsicIdentityPublicationPort {
         dispatcher_chip_id: u16,
     ) -> Result<EnumerationConsensus, AsicIdentityPublicationError> {
         let registry = ChipRegistry::new();
-        let driver = registry.detect(dispatcher_chip_id).ok_or(
+        let recognition = registry.recognize(dispatcher_chip_id).ok_or(
             AsicIdentityPublicationError::UnsupportedChip(dispatcher_chip_id),
         )?;
         if self.receipts.len() != self.expected.len() {
@@ -276,7 +276,7 @@ impl AsicIdentityPublicationPort {
         Ok(EnumerationConsensus {
             token: self.token.clone(),
             chip_id: dispatcher_chip_id,
-            chip_label: driver.chip_name().to_string(),
+            chip_label: recognition.chip_name().to_string(),
         })
     }
 

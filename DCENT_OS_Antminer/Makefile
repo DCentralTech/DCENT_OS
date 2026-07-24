@@ -34,7 +34,7 @@ NPROC := $(shell nproc 2>/dev/null || echo 4)
 BUILDROOT_REPO := https://github.com/buildroot/buildroot.git
 BUILDROOT_COMMIT := 7c8edc1b402efcd7bba2dabfe0b3be877adaed7a
 
-.PHONY: all setup defconfig merge-defconfig menuconfig busybox-menuconfig clean distclean help sd-image sd-image-standalone sd-image-piggyback sd-disk-image sd-disk-image-piggyback am3-bb-sd-disk-image flash-braiinsos release dev test test-host test-api test-waves test-clippy-input verify install-hooks
+.PHONY: all setup defconfig merge-defconfig menuconfig busybox-menuconfig clean distclean help sd-image sd-image-standalone sd-image-piggyback sd-disk-image sd-disk-image-piggyback am3-bb-sd-disk-image flash-braiinsos release dev test test-host test-api test-waves test-clippy-input test-dashboard test-python-safety verify install-hooks
 
 all:
 	@if [ ! -d "$(BUILDROOT_DIR)" ]; then \
@@ -235,28 +235,27 @@ test:
 	bash "$$@"
 
 # Bug-hunt follow-up (2026-05-28): RUN (not just compile-gate) the no-HAL,
-# host-testable crate tests directly on the dev host. `make test` only
-# COMPILE-GATES (--no-run) in Docker — and the Docker `--run` mode is broken by
-# the cortex-a9 RUSTFLAGS — so a RED host test (e.g. the wave24 `thermal_model::
-# safety_cap_never_exceeds_mode_cap` regression) rotted unnoticed for waves.
+# host-testable crate tests directly on the dev host. `make test` compile-gates
+# the target ABI by default; `RUN_TESTS=1` uses the wrapper's host-test backend.
+# Keep this smaller native loop as a fast contributor signal.
 # These crates execute on the Linux/WSL host, so they ARE a fast, real
 # verification signal. No Docker, no hardware.
 HOST_TEST_CRATES := dcentrald-api-types dcentrald-common dcentrald-stratum dcentrald-silicon-profiles dcentrald-asic
 test-host:
 	@cd "$(CURDIR)/dcentrald" && for c in $(HOST_TEST_CRATES); do \
 		echo "[test-host] cargo test -p $$c"; \
-		rustup run 1.90.0 cargo test -p $$c --quiet || { echo "[test-host] FAILED: $$c"; exit 1; }; \
+		rustup run 1.90.0 cargo test --locked -p $$c --quiet || { echo "[test-host] FAILED: $$c"; exit 1; }; \
 	done; \
 	echo "[test-host] cargo test -p dcentrald-thermal --no-default-features"; \
-	rustup run 1.90.0 cargo test -p dcentrald-thermal --no-default-features --quiet || { echo "[test-host] FAILED: dcentrald-thermal"; exit 1; }; \
+	rustup run 1.90.0 cargo test --locked -p dcentrald-thermal --no-default-features --quiet || { echo "[test-host] FAILED: dcentrald-thermal"; exit 1; }; \
 	echo "[test-host] all host-testable crates GREEN"
 
 test-api:
 	@cd "$(CURDIR)/dcentrald" && \
 	echo "[test-api] cargo test -p dcentrald-api --tests"; \
-	rustup run 1.90.0 cargo test -p dcentrald-api --tests --quiet || { echo "[test-api] FAILED: dcentrald-api"; exit 1; }; \
+	rustup run 1.90.0 cargo test --locked -p dcentrald-api --tests --quiet || { echo "[test-api] FAILED: dcentrald-api"; exit 1; }; \
 	echo "[test-api] cargo test -p dcentrald --bin dcentrald"; \
-	rustup run 1.90.0 cargo test -p dcentrald --bin dcentrald --quiet || { echo "[test-api] FAILED: dcentrald"; exit 1; }; \
+	rustup run 1.90.0 cargo test --locked -p dcentrald --bin dcentrald --quiet || { echo "[test-api] FAILED: dcentrald"; exit 1; }; \
 	echo "[test-api] API and daemon tests GREEN"
 
 test-waves:
@@ -269,12 +268,28 @@ test-clippy-input:
 	echo "[test-clippy-input] dcentrald-asic unwrap/expect/panic deny"; \
 	rustup run 1.90.0 cargo clippy --no-deps -p dcentrald-asic --lib -- -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic
 
+test-dashboard:
+	@command -v npm >/dev/null 2>&1 || { echo "ERROR: npm is required for test-dashboard" >&2; exit 1; }
+	@cd "$(CURDIR)/dashboard" && npm run build
+	@cd "$(CURDIR)/dashboard" && npm test
+
+test-python-safety:
+	@PYTHON_BIN="$$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"; \
+	if [ -z "$$PYTHON_BIN" ]; then \
+		echo "ERROR: python3 or python is required for test-python-safety" >&2; \
+		exit 1; \
+	fi; \
+	"$$PYTHON_BIN" "$(CURDIR)/scripts/test_python_safety_gate_wiring.py" && \
+	"$$PYTHON_BIN" "$(CURDIR)/scripts/run_python_safety_tests.py"
+
 # Full offline verification loop: static offline gates + workspace test
 # compile-gate. This is what a CI runner / pre-push hook SHOULD run. The repo
 # has no git remote today, so the committed .github workflows never fire (SB-2);
 # `make verify` is the local stand-in until a remote/hook is wired. No hardware.
 verify:
 	@bash "$(CURDIR)/scripts/ci_offline_gates.sh"
+	@$(MAKE) test-python-safety
+	@$(MAKE) test-dashboard
 	@$(MAKE) test-host
 	@$(MAKE) test-api
 	@$(MAKE) test-waves
@@ -328,16 +343,18 @@ help:
 	@echo "  deploy             - Quick deploy dcentrald binary via SSH (MINER_IP=x.x.x.x)"
 	@echo "  deploy-passthrough - (removed) set [mining] passthrough = true in /data/dcentrald.toml"
 	@echo "  flash-braiinsos    - Legacy/lab BraiinsOS-rootfs compatibility path"
-	@echo "  release            - Production build (requires DCENT_MANIFEST_PUBLIC_KEY_HEX +"
-	@echo "                       DCENT_RELEASE_SIGNING_KEY; RELEASE_TARGET=s9|am2-s19jpro|...)"
-	@echo "  dev                - Unsigned dev/lab build (DEV_TARGET=s9|am2-s19jpro|...)"
+	@echo "  release            - Production S9 capsule only (requires signing key +"
+	@echo "                       manifest public-key pin; RELEASE_TARGET=s9)"
+	@echo "  dev                - Image packaging disabled until a separate lab capsule exists"
 	@echo "  test               - Compile-gate all dcentrald workspace tests in Docker"
 	@echo "                       (RUN_TESTS=1 to execute; TEST_PACKAGE=<crate> to scope)"
 	@echo "  test-host          - RUN the no-HAL host-testable crate tests on the host"
 	@echo "                       (api-types/common/stratum/silicon-profiles/asic + thermal --no-default-features)"
 	@echo "  test-api           - RUN dcentrald-api tests + dcentrald binary tests on the host"
 	@echo "  test-waves         - RUN the wave48/54/55 host regression suite"
-	@echo "  verify             - Offline loop: ci_offline_gates.sh + test-host (run) + test (compile-gate)"
+	@echo "  test-dashboard     - Build the dashboard and RUN its Vitest suite"
+	@echo "  test-python-safety - RUN explicitly owned DCENTos Python safety suites"
+	@echo "  verify             - Release gate: offline + Python/dashboard/Rust tests + compile-gate"
 	@echo "  install-hooks      - Install local pre-commit/pre-push verification hooks"
 	@echo "  clean              - Clean build artifacts"
 	@echo "  distclean          - Full clean (removes downloads too)"

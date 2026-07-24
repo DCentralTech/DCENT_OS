@@ -62,7 +62,25 @@ pub fn f32_to_pmbus_linear11(value: f32) -> u16 {
         exponent -= 1;
     }
 
-    let mantissa_int = mantissa.round() as i16;
+    // Round in i32 to avoid an i16 saturation-to-negative on huge inputs.
+    let mut mantissa_int = mantissa.round() as i32;
+
+    // Rounding can push a positive mantissa to exactly 1024 (e.g. 1023.6 -> 1024),
+    // which is OUTSIDE the signed 11-bit range [-1024, 1023]: masking 1024 with
+    // 0x07FF decodes as -1024 — a SIGN FLIP that would write a NEGATIVE protection
+    // limit (VIN_OV / IOUT_OC / OT / FREQUENCY_SWITCH) and trip an instant FALSE
+    // fault. Re-normalize (halve mantissa, bump exponent); if the exponent is
+    // already saturated (huge input), clamp to the max positive mantissa instead
+    // of letting the cast wrap to a negative value.
+    if mantissa_int >= 1024 {
+        if exponent < 15 {
+            mantissa_int /= 2;
+            exponent += 1;
+        } else {
+            mantissa_int = 1023;
+        }
+    }
+    let mantissa_int = mantissa_int.clamp(-1024, 1023) as i16;
 
     // Encode: 5-bit exponent (two's complement) | 11-bit mantissa (two's complement)
     let exp_bits = ((exponent as u16) & 0x1F) << 11;
@@ -130,7 +148,8 @@ pub fn ds4432u_magnitude_code(voltage_mv: u16) -> u8 {
 /// Byte-identical to `Ds4432u::set_voltage_mv`'s inline math:
 /// 1. fail-closed (`None`) when `vout < 0` (defensive; `u16` is never negative)
 ///    or `voltage_mv > ceiling_mv` (the HALPWR-3 absolute driver ceiling), then
-/// 2. `reg = ceil(change) as u8`, then
+/// 2. `reg = ceil(change) as u8`, and fail-closed (`None`) when that magnitude
+///    reaches `0x80` — it would collide with the direction bit (low-side guard), then
 /// 3. set the `0x80` source bit when `Vout > VREF` (true for any mining setpoint).
 ///
 /// NOTE: this preserves the EXISTING Rust behavior. It intentionally diverges
@@ -148,9 +167,24 @@ pub fn ds4432u_dac_code(voltage_mv: u16, ceiling_mv: u16) -> Option<u8> {
         return None;
     }
 
-    let mut reg = ds4432u_magnitude_code(voltage_mv);
+    let magnitude = ds4432u_magnitude_code(voltage_mv);
 
-    // If Vout > VFB (which it always is for mining), set source bit.
+    // Fail CLOSED on a low-side magnitude collision. For low voltage requests
+    // (<= ~735 mV) the DS4432U "change" magnitude exceeds 127, so `ceil() as u8`
+    // sets/saturates bit 7 — a 0 mV request even lands on 0xFF (source bit + max
+    // magnitude = MAX rail-RAISE). Bit 7 is the source/sink DIRECTION bit ORed on
+    // below, so a colliding magnitude silently mis-sets the rail the WRONG way. On
+    // DS4432U boards (Max/Ultra/Supra) the rail cannot be disabled over I2C and has
+    // no PMBus over-current protection, so a corrupted DAC byte could over-volt the
+    // ASIC. Refuse it (power.rs maps None -> VoltageOutOfRange). In-range setpoints
+    // have magnitude < 128 (the real-board min clamp of 850-1000 mV sits far above
+    // this band), so this never rejects a legitimate voltage.
+    if magnitude >= 0x80 {
+        return None;
+    }
+
+    let mut reg = magnitude;
+    // If Vout > VFB (always true for a mining setpoint), set the source bit.
     if vout > DS4432U_VREF {
         reg |= 0x80;
     }
@@ -197,6 +231,31 @@ mod tests {
                 "linear11 round-trip {v} -> 0x{raw:04x} -> {back} exceeds tol {tol}"
             );
         }
+    }
+
+    #[test]
+    fn linear11_round_edge_does_not_sign_flip_protection_limit() {
+        // A mantissa that ROUNDS up to exactly 1024 is outside the signed 11-bit
+        // range; without the re-normalization guard it masks to -1024 — a SIGN
+        // FLIP that writes a NEGATIVE protection limit (VIN_OV / IOUT_OC / OT /
+        // FREQUENCY_SWITCH) and trips an instant FALSE fault. A positive input must
+        // never encode to a negative quantity (fails before the fix for 1023.6 and
+        // for the huge/exponent-saturated inputs).
+        for &v in &[1023.6f32, 1024.0, 1023.5, 2047.2, 4095.9, 1.0e9] {
+            let back = pmbus_linear11_to_f32(f32_to_pmbus_linear11(v));
+            assert!(
+                back >= 0.0,
+                "positive {v} must not encode to a NEGATIVE limit (sign flip): decoded {back}"
+            );
+        }
+        // 1023.6 must decode to ~1024, not -1024.
+        let back = pmbus_linear11_to_f32(f32_to_pmbus_linear11(1023.6));
+        assert!(
+            (back - 1024.0).abs() <= 2.0,
+            "1023.6 must round to ~1024, got {back}"
+        );
+        // The negative boundary stays negative (never flips positive).
+        assert!(pmbus_linear11_to_f32(f32_to_pmbus_linear11(-1023.6)) < 0.0);
     }
 
     #[test]
@@ -315,21 +374,46 @@ mod tests {
         // The source/sink direction bit decision (`Vout > VREF`) tested in
         // ISOLATION from the magnitude: ds4432u_dac_code ORs 0x80 on top of
         // ds4432u_magnitude_code iff Vout > VREF (0.6 V).
-        // Mining setpoint (1.2 V > 0.6 V): source bit ORed on.
+        // Mining setpoint (1.2 V > 0.6 V): source bit ORed on. In the reachable
+        // (magnitude < 128) range Vout is always > VREF, so the source bit is set.
         let mag = ds4432u_magnitude_code(1200);
+        assert!(mag < 0x80, "in-range magnitude must be < 128");
         assert_eq!(
             ds4432u_dac_code(1200, CEIL),
             Some(mag | 0x80),
             "Vout>VREF must OR the 0x80 source bit on top of the magnitude"
         );
-        // Exactly at VREF (600 mV): `Vout > VREF` is false (strict `>`), so the
-        // source OR is NOT applied — reg is the raw magnitude byte.
-        let mag600 = ds4432u_magnitude_code(600);
-        assert_eq!(
-            ds4432u_dac_code(600, CEIL),
-            Some(mag600),
-            "Vout==VREF must NOT OR the source bit (strict >)"
-        );
+    }
+
+    #[test]
+    fn ds4432u_low_side_request_fails_closed_not_max_boost() {
+        // Low-side fail-closed guard (safety). A voltage request whose DS4432U
+        // magnitude reaches 0x80 collides with the source/sink DIRECTION bit; the
+        // worst case (0 mV) previously encoded as 0xFF = source + max magnitude =
+        // MAX rail-RAISE on a board with no PMBus OC protection. These must all be
+        // REFUSED (None), never a corrupted DAC byte.
+        for mv in [0u16, 100, 500, 600, 700, 731] {
+            assert_eq!(
+                ds4432u_dac_code(mv, CEIL),
+                None,
+                "low-side request {mv} mV (magnitude >= 0x80) must fail closed, not encode a boost"
+            );
+            assert!(
+                ds4432u_magnitude_code(mv) >= 0x80,
+                "test vector {mv} mV must actually be in the colliding band"
+            );
+        }
+        // And every legitimate in-range setpoint is still accepted, byte-unchanged.
+        for mv in [850u16, 1000, 1200, 1550, 1600] {
+            let code = ds4432u_dac_code(mv, CEIL);
+            assert!(
+                code.is_some(),
+                "legitimate setpoint {mv} mV must be accepted"
+            );
+            // reg low bits equal the raw magnitude; only the source bit adds 0x80.
+            let reg = code.unwrap();
+            assert_eq!(reg & 0x7F, ds4432u_magnitude_code(mv));
+        }
     }
 
     #[test]

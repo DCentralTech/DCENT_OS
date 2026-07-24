@@ -34,6 +34,16 @@ pub const DEFAULT_PATH: &str = "/etc/dcentrald-experimental.toml";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExperimentalConfig {
+    /// Exact ASIC chip IDs whose Experimental protocol drivers may execute on
+    /// this boot.  Recognition remains available without this list, but no
+    /// voltage/reset/PLL/address/work authority is granted.
+    ///
+    /// The list is deliberately chip-specific rather than a global boolean:
+    /// opting into BM1398 must not silently authorize a future experimental
+    /// family.  The standard daemon further requires the configured hardware
+    /// composition to name the same chip ID.
+    pub executable_asic_chip_ids: Vec<u16>,
+
     /// Maximum number of bad / missing chip responses tolerated during
     /// BM136x chain enumeration. Default 0 = strict (every chip must
     /// reply with the correct chip-id), matches dcentrald's pre-2026-04
@@ -82,6 +92,7 @@ pub struct ExperimentalConfig {
 impl Default for ExperimentalConfig {
     fn default() -> Self {
         Self {
+            executable_asic_chip_ids: Vec::new(),
             rambo_mode_max_bad_responses: 0,
             allow_disabling_hashboards_on_nopic_miners: false,
             min_fan_pwm_floor: 25,
@@ -147,6 +158,7 @@ mod tests {
     fn default_is_strict() {
         let c = ExperimentalConfig::default();
         assert_eq!(c.rambo_mode_max_bad_responses, 0);
+        assert!(c.executable_asic_chip_ids.is_empty());
         assert!(!c.allow_disabling_hashboards_on_nopic_miners);
         assert_eq!(c.min_fan_pwm_floor, 25);
         assert!(!c.disable_bootstrap_check);
@@ -173,6 +185,15 @@ mod tests {
         assert_eq!(c.min_fan_pwm_floor, 30);
         // Other fields remain at defaults
         assert!(!c.allow_disabling_hashboards_on_nopic_miners);
+    }
+
+    #[test]
+    fn experimental_asic_authority_is_exact_and_default_off() {
+        let path = write_temp("asic_exact", "executable_asic_chip_ids = [5016]\n");
+        let c = ExperimentalConfig::load_from(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(c.executable_asic_chip_ids, vec![0x1398]);
+        assert!(!c.executable_asic_chip_ids.contains(&0x1387));
     }
 
     #[test]

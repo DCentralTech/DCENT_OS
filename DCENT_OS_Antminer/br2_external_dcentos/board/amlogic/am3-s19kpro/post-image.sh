@@ -304,8 +304,8 @@ cat > "$SUP_DIR/MANIFEST.json" << EOF
     }
   },
   "toolbox": {
-    "install_command": "dcent install <ip> -f dcentos-sysupgrade-am3-s19kpro.tar",
-    "update_command": "dcent install <ip> -f dcentos-sysupgrade-am3-s19kpro.tar",
+    "install_command": "dcent install <ip> -f dcentos-sysupgrade-am3-s19kpro.tar --artifact-dir <restore_verified_dir>",
+    "update_command": "dcent install <ip> -f dcentos-sysupgrade-am3-s19kpro.tar --artifact-dir <restore_verified_dir>",
     "upload_endpoint": null,
     "board_target_header": null,
     "requires_inactive_slot": false
@@ -313,31 +313,10 @@ cat > "$SUP_DIR/MANIFEST.json" << EOF
 }
 EOF
 
-# Optional signing (mirrors am2 + S9 pattern)
-if [ -n "${DCENT_RELEASE_SIGNING_KEY:-}" ] && [ -f "${DCENT_RELEASE_SIGNING_KEY}" ]; then
-    if command -v openssl >/dev/null 2>&1; then
-        PUBKEY="$STAGING/release_ed25519.pub"
-        openssl pkey -in "${DCENT_RELEASE_SIGNING_KEY}" -pubout -out "$PUBKEY" >/dev/null 2>&1 || true
-        if [ -f "$PUBKEY" ]; then
-            cp "$PUBKEY" "$SUP_DIR/release_ed25519.pub"
-            openssl pkeyutl -sign -rawin \
-                -inkey "${DCENT_RELEASE_SIGNING_KEY}" \
-                -in "$SUP_DIR/MANIFEST.json" \
-                -out "$SUP_DIR/MANIFEST.sig" \
-                && echo "Signed MANIFEST.json" \
-                || echo "WARNING: failed to sign MANIFEST.json (package will be unsigned)"
-        fi
-    else
-        echo "WARNING: openssl not available — package will be unsigned"
-    fi
-else
-    echo "WARNING: no signing key configured — package is unsigned (lab-only)"
-fi
-
 # Build tarball — directory MUST be sysupgrade-am3-s19k/ (brick-rule).
 # Final manifest/signature rewrite through shared AM2/AM3 helper. AM3 packages
 # are sysupgrade-shaped artifacts for host-driven rootfs-window tooling only.
-DCENT_TOOLBOX_INSTALL_COMMAND="dcent install <ip> -f dcentos-sysupgrade-am3-s19kpro.tar"
+DCENT_TOOLBOX_INSTALL_COMMAND="dcent install <ip> -f dcentos-sysupgrade-am3-s19kpro.tar --artifact-dir <restore_verified_dir>"
 DCENT_TOOLBOX_UPDATE_COMMAND=""
 DCENT_TOOLBOX_REQUIRES_INACTIVE_SLOT=false
 DCENT_TOOLBOX_INSTALL_MODE=host_driven_rootfs_window_lab

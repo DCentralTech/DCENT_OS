@@ -127,7 +127,10 @@ THIS IS NOT A NAND INSTALLER.
 - Incomplete / lab images must not be treated as production release media.
 
 Write with balenaEtcher or DCENT_OS_Antminer/scripts/write_sd_card.sh (dry-run first).
-After boot, optional: bash DCENT_OS_Antminer/scripts/am2_sd_recovery_probe.sh
+After boot, optional read-only proof:
+  bash DCENT_OS_Antminer/scripts/am2_sd_recovery_probe.sh <ip> \\
+    --known-hosts <pinned-known-hosts> \\
+    --expected-host-key-sha256 SHA256:<fingerprint>
 EOF
 
 cat >"$OUT_ROOT/BUILD_INFO.txt" <<EOF

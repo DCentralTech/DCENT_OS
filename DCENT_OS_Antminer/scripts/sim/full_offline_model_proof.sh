@@ -17,19 +17,24 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$MODEL" ] || usage
 
-stamp=$(date -u +%Y%m%dT%H%M%SZ)
-evidence="$PROJECT_DIR/output/sim-evidence/${MODEL}-${stamp}"
-mkdir -p "$evidence"
-
 case "$MODEL" in
     s9) nand_target=am1-s9 ;;
     s19jpro) nand_target=am2-s19jpro ;;
-    s17|s17pro|t17|s19pro|s19xp|s19kpro|s21|s21pro)
+    s19pro)
+        echo "$MODEL has T2 runtime evidence and an experimental init snapshot, but no T3 or model-bound nandsim/rootfs artifact; refusing a T4 claim" >&2
+        exit 1
+        ;;
+    s17|s17pro|t17|s19xp|s19kpro|s21|s21pro)
         echo "$MODEL has T2/T3 runtime evidence but no model-bound nandsim/rootfs artifact; refusing a T4 claim" >&2
         exit 1
         ;;
     *) echo "$MODEL has no integrated T4 runtime proof" >&2; exit 1 ;;
 esac
+
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+evidence_root="$PROJECT_DIR/output/sim-evidence"
+mkdir -p "$evidence_root"
+evidence=$(mktemp -d "$evidence_root/${MODEL}-${stamp}-XXXXXX")
 
 if [ "$SKIP_NANDSIM" != 1 ] && [ -n "$nand_target" ]; then
     "$PROJECT_DIR/scripts/sysupgrade_offline_virtme_nandsim_runner.sh" --target "$nand_target" \

@@ -2,16 +2,13 @@
 # run_all_gates.sh — the comprehensive local verification gate (TEST-CI-1).
 #
 # The repo has NO git remote, so the committed .github/workflows never fire.
-# `make verify` (the .git/hooks/pre-push stand-in) runs the offline safety/ban
-# gates + the HAL-free Rust crate tests + the Docker workspace compile-gate — but
-# it does NOT run the dashboard vitest suite or the toolbox pytest suite, so those
-# regressions can ship unnoticed. This script runs EVERYTHING a CI would, with
-# per-gate PASS/FAIL and a non-zero exit if any gate fails. Run it before a
-# release, or wire it into the pre-push hook.
+# `make verify` (the .git/hooks/pre-push stand-in) is the release gate. This
+# script additionally runs the toolbox pytest suite and reports every local
+# gate independently, with a non-zero exit if any gate fails.
 #
 # Usage:
 #   sh scripts/run_all_gates.sh           # all gates (needs Docker + python + npm)
-#   sh scripts/run_all_gates.sh --fast    # skip the slow gates (Docker compile + pytest)
+#   sh scripts/run_all_gates.sh --fast    # skip Docker compile + toolbox pytest
 #
 # Rust host tests default to the production-program baseline toolchain
 # (DCENT_RUST_TOOLCHAIN=1.90.0). Override only when deliberately refreshing
@@ -110,9 +107,12 @@ run_gate "offline-gates" sh "$SCRIPT_DIR/ci_offline_gates.sh"
 #    R3-A controller NaN fail-closed + safety_pwm_cap matrix run on the host too.
 #    dcentrald-asic is Linux/WSL-host-testable and carries the EEPROM denylist,
 #    recovery double-gate, and BIP320 behavioral pins.
-#    The other four crates are no-HAL by default and need no special flag.
+#    The fabric-lease crate is Linux-host-testable and carries the actual
+#    subprocess/SIGKILL ownership proof. pic-recovery is intentionally outside
+#    default-members, so it must be named explicitly here or its diagnostic
+#    boundary can silently stop compiling.
 if configure_cargo; then
-    run_gate "rust-host-tests" sh -c "cd '$DCENTOS_DIR/dcentrald' && for c in dcentrald-api-types dcentrald-common dcentrald-stratum dcentrald-silicon-profiles dcentrald-asic; do echo \"[host-test] \$c\"; $CARGO_RUN test -p \"\$c\" --quiet || exit 1; done && echo '[host-test] dcentrald-thermal (--no-default-features, HAL-free)' && $CARGO_RUN test -p dcentrald-thermal --no-default-features --quiet"
+    run_gate "rust-host-tests" sh -c "cd '$DCENTOS_DIR/dcentrald' && for c in dcentrald-api-types dcentrald-common dcentrald-stratum dcentrald-silicon-profiles dcentrald-asic dcentrald-fabric-lease; do echo \"[host-test] \$c\"; $CARGO_RUN test -p \"\$c\" --quiet || exit 1; done && echo '[host-test] pic-recovery (explicit diagnostic boundary)' && $CARGO_RUN test -p pic-recovery --quiet && echo '[host-test] dcentrald-thermal (--no-default-features, HAL-free)' && $CARGO_RUN test -p dcentrald-thermal --no-default-features --quiet"
     run_gate "rust-input-clippy" sh -c "cd '$DCENTOS_DIR/dcentrald' && $CARGO_RUN clippy --no-deps -p dcentrald-stratum --lib -- -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic && $CARGO_RUN clippy --no-deps -p dcentrald-asic --lib -- -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic"
 else
     run_gate "rust-host-tests" false
@@ -129,11 +129,22 @@ else
     run_gate "dashboard-vitest" false
 fi
 
+# 4. Explicitly owned Python safety suites. These run even in --fast mode so
+#    release-relevant dashboard and install-path regressions cannot be skipped.
+if have python3; then
+    run_gate "dcentos-python-safety" python3 "$SCRIPT_DIR/run_python_safety_tests.py"
+elif have python; then
+    run_gate "dcentos-python-safety" python "$SCRIPT_DIR/run_python_safety_tests.py"
+else
+    printf 'ERROR: python3 or python is required for dcentos-python-safety\n' >&2
+    run_gate "dcentos-python-safety" false
+fi
+
 if [ "$FAST" -eq 0 ]; then
-    # 4. Full workspace armv7-musl compile-gate (Docker — needs Docker running).
+    # 5. Full workspace armv7-musl compile-gate (Docker — needs Docker running).
     run_gate "rust-workspace-compile" sh "$SCRIPT_DIR/run_dcentrald_tests.sh"
 
-    # 5. Toolbox pytest (PC-side CLI / install-recovery).
+    # 6. Toolbox pytest (PC-side CLI / install-recovery).
     if have python; then
         run_gate "toolbox-pytest" sh -c "cd '$REPO_ROOT/projects/dcent-toolbox' && python -m pytest -q"
     elif have python3; then

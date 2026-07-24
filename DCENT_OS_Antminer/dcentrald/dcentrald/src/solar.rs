@@ -1352,7 +1352,7 @@ pub fn decide_policy(
         // Clamp the floor down to the ceiling: u16::clamp panics if min > max
         // (a valid eco config can set the mining ceiling below the off-grid floor,
         // e.g. frequency_mhz=50 vs the default 200 MHz floor), which would
-        // crash-loop the daemon under panic=abort. The operator's ceiling wins.
+        // abort the daemon and leave persistent session admission refused. The operator's ceiling wins.
         let target = target.clamp(min_freq_mhz.min(max_freq_mhz), max_freq_mhz);
 
         return SolarControlDecision {
@@ -1384,7 +1384,7 @@ pub fn decide_policy(
         // Clamp the floor down to the ceiling: u16::clamp panics if min > max
         // (a valid eco config can set the mining ceiling below the off-grid floor,
         // e.g. frequency_mhz=50 vs the default 200 MHz floor), which would
-        // crash-loop the daemon under panic=abort. The operator's ceiling wins.
+        // abort the daemon and leave persistent session admission refused. The operator's ceiling wins.
         let target = target.clamp(min_freq_mhz.min(max_freq_mhz), max_freq_mhz);
         let deadband_watts = config.hybrid_import_deadband_watts as i64;
         let action = if snapshot.net_grid_watts > deadband_watts {
@@ -1502,8 +1502,9 @@ mod tests {
     fn hybrid_policy_survives_inverted_freq_bounds() {
         // Regression: an eco config with mining.frequency_mhz below the off-grid
         // min (50 MHz ceiling vs the default 200 MHz floor) inverts (min,max).
-        // u16::clamp would panic on min>max and, under panic=abort, crash-loop the
-        // daemon. decide_policy must clamp the floor down to the ceiling instead.
+        // u16::clamp would panic on min>max and, under panic=abort, terminate the
+        // hardware owner and leave persistent re-admission refused. decide_policy
+        // must clamp the floor down to the ceiling instead.
         let config = base_config();
         let snapshot = base_snapshot();
 

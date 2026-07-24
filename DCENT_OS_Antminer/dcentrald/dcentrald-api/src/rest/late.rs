@@ -893,36 +893,18 @@ end_hour = 5
     // `/data/dcentrald.toml` atomic write remains path-bound and is covered
     // separately.)
 
-    // ── WAVE 0 STABILIZE (2026-06-05) ──────────────────────────────────────
-
-    /// Task 1 — RESTART-NO-RESPAWN: the API restart command MUST target the
-    /// REAL installed init script `/etc/init.d/S82dcentrald` (not the
-    /// nonexistent `/etc/init.d/dcentrald` the old code spawned, which always
-    /// failed → fell through to `kill -TERM self` → clean exit the wrapper read
-    /// as an intentional stop → daemon stayed DEAD). It must also keep the
-    /// SIGTERM respawn fallback for the case where the script is somehow absent.
-    /// Mirrors the daemon crate's `restart.rs` regression test.
+    /// A process exit cannot authorize a new hardware session. Pin the
+    /// non-destructive refusal until the restart path has a durable, typed
+    /// disposition receipt for every owned rail.
     #[test]
-    fn api_restart_command_targets_installed_init_script_not_the_dead_path() {
-        let cmd = build_daemon_restart_command(1234);
+    fn api_restart_is_refused_without_typed_hardware_disposition() {
         assert!(
-            cmd.contains("/etc/init.d/S82dcentrald restart"),
-            "API restart must target the installed init script: {cmd}"
+            DAEMON_RESTART_REFUSAL.contains("typed hardware disposition"),
+            "refusal must identify the missing proof: {DAEMON_RESTART_REFUSAL}"
         );
-        // Must NOT target the nonexistent /etc/init.d/dcentrald (note the
-        // trailing space rules out the S82dcentrald substring match).
         assert!(
-            !cmd.contains("/etc/init.d/dcentrald "),
-            "must NOT target the nonexistent /etc/init.d/dcentrald: {cmd}"
-        );
-        // SIGTERM respawn fallback only fires when the script fails (`||`).
-        assert!(
-            cmd.contains("|| kill -TERM 1234"),
-            "must keep the SIGTERM respawn fallback: {cmd}"
-        );
-        assert_eq!(
-            DAEMON_RESTART_INIT_SCRIPT, "/etc/init.d/S82dcentrald",
-            "the init-script constant must match the installed Buildroot overlay name"
+            DAEMON_RESTART_REFUSAL.contains("operator verification"),
+            "refusal must name the guarded resolution path: {DAEMON_RESTART_REFUSAL}"
         );
     }
 
@@ -1883,6 +1865,59 @@ end_hour = 5
         assert!(system_info.contains("\"identification_confidence\""));
         assert!(system_info.contains("\"identification\": &hw.identification"));
         assert!(!system_info.contains("\"power\": wall_watts"));
+    }
+
+    #[test]
+    fn reboot_api_leaves_all_escalation_to_pid1() {
+        let source = include_str!("late.rs");
+        let handler_start = source
+            .rfind("pub(super) async fn post_action_reboot")
+            .expect("reboot handler present");
+        let start = source
+            .rfind("pub(super) async fn trigger_system_reboot()")
+            .expect("reboot helper present");
+        let handler = &source[handler_start..start];
+        let end = start
+            + source[start..]
+                .find("/// POST /api/action/sleep")
+                .expect("sleep handler follows reboot helper");
+        let reboot = &source[start..end];
+
+        let request = handler
+            .find("trigger_system_reboot().await")
+            .expect("handler awaits init request acceptance");
+        let accepted = handler
+            .find("StatusCode::ACCEPTED")
+            .expect("accepted response exists");
+        assert!(request < accepted);
+        let before_transfer = &handler[..request];
+        assert!(!before_transfer.contains("push_rest_audit_free"));
+        assert!(!before_transfer.contains("tracing::"));
+        assert!(!handler.contains("tokio::spawn"));
+        assert!(!handler.contains("tokio::time::sleep"));
+        assert!(!handler.contains("Command::new(\"dd\")"));
+        assert!(!handler.contains("Command::new(\"sync\")"));
+
+        assert!(reboot.contains("trigger_system_reboot_with(\"reboot\")"));
+        assert!(reboot.contains("tokio::process::Command::new(program)"));
+        assert!(!reboot.contains("REBOOT_FALLBACK_GRACE_SECS"));
+        assert!(!reboot.contains("/proc/sysrq-trigger"));
+        assert!(!reboot.contains(".arg(\"-f\")"));
+        assert!(!reboot.contains("tokio::time::sleep"));
+        assert!(!reboot.contains("Command::new(\"sync\")"));
+    }
+
+    #[tokio::test]
+    async fn reboot_request_reports_acceptance_rejection_and_spawn_failure() {
+        assert!(trigger_system_reboot_with("/bin/true").await.is_ok());
+        assert!(matches!(
+            trigger_system_reboot_with("/bin/false").await,
+            Err(RebootRequestError::Rejected(_))
+        ));
+        assert!(matches!(
+            trigger_system_reboot_with("/no/such/dcentos-reboot-command").await,
+            Err(RebootRequestError::Spawn(_))
+        ));
     }
 
     #[test]
@@ -7251,7 +7286,7 @@ pub(super) async fn get_update_metadata(State(state): State<Arc<AppState>>) -> i
         .lock()
         .map(|g| g.clone())
         .unwrap_or_default();
-    Json(update_metadata_payload(&state, &miner, &hw))
+    Json(update_metadata_payload(&miner, &hw))
 }
 
 /// GET `/api/dashboard/version` — dashboard SPA build metadata.
@@ -10526,11 +10561,11 @@ pub(crate) async fn post_profiles(
 
 // ─── Action Handlers ───────────────────────────────────────────────────
 
-/// POST /api/action/restart -- Restart mining daemon.
+/// POST /api/action/restart -- Refuse an unsafe in-process daemon restart.
 ///
-/// Writes a restart flag file that the init system (procd) monitors,
-/// then sends SIGTERM to the daemon for a clean restart. The init system
-/// will respawn dcentrald automatically.
+/// A clean process exit is not a physical SafeOff receipt. Preserve the live
+/// hardware owner and return a conflict until a durable typed-disposition
+/// protocol can authorize supervisor re-admission.
 pub(super) async fn post_action_restart(State(state): State<Arc<AppState>>) -> Response {
     if let Err(response) = require_antminer_runtime_capability(
         &state,
@@ -10540,63 +10575,21 @@ pub(super) async fn post_action_restart(State(state): State<Arc<AppState>>) -> R
         return response;
     }
 
-    // W21 audit-coverage: record operator-initiated daemon restart.
-    push_rest_audit_free(&state, "system", "Daemon restart requested via API");
-    trigger_daemon_restart();
+    push_rest_audit_free(
+        &state,
+        "system",
+        "Daemon restart refused: typed hardware disposition unavailable",
+    );
+    tracing::warn!("{DAEMON_RESTART_REFUSAL}");
 
-    Json(serde_json::json!({
-        "status": "ok",
-        "message": "Mining restart initiated — daemon will restart in ~2 seconds",
-        "restart_flag": "/tmp/dcentrald_restart",
-    }))
-    .into_response()
-}
-
-/// Shared daemon-restart action used by both `POST /api/action/restart` and the
-/// gRPC `grpc_bridge_reboot` bridge, so the two control planes perform the
-/// identical restart (write the intentional-restart flag, then spawn the
-/// init.d restart with a SIGTERM-self fallback). Returns immediately; the actual
-/// restart happens ~2s later on a background task so any in-flight response can
-/// complete first.
-pub(super) fn trigger_daemon_restart() {
-    tracing::info!("Mining restart requested via API — writing restart flag");
-
-    // Write restart flag so the init system knows this was intentional
-    let _ = std::fs::write("/tmp/dcentrald_restart", "restart_requested");
-
-    // Spawn the restart in background to let the HTTP response complete.
-    //
-    // WAVE 0 STABILIZE: run the init.d restart AND its SIGTERM fallback as a
-    // single `/bin/sh -c "<script> restart || kill -TERM <pid>"` so the
-    // fallback only fires when the script actually fails — and target the REAL
-    // installed script `/etc/init.d/S82dcentrald`, not the nonexistent
-    // `/etc/init.d/dcentrald` the old code spawned (which always failed → fell
-    // through to `kill -TERM self` → clean exit the wrapper read as an
-    // intentional stop → respawn loop exited → daemon stayed DEAD until
-    // power-cycle). This mirrors the daemon crate's tested
-    // `restart.rs::schedule_daemon_restart`.
-    tokio::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        tracing::info!("Executing daemon restart via init.d ({DAEMON_RESTART_INIT_SCRIPT})...");
-        let command = build_daemon_restart_command(std::process::id());
-        match std::process::Command::new("/bin/sh")
-            .args(["-c", &command])
-            .spawn()
-        {
-            Ok(_) => {
-                tracing::info!("Daemon restart spawned via {DAEMON_RESTART_INIT_SCRIPT}");
-            }
-            Err(e) => {
-                // /bin/sh itself failed to spawn — extreme last resort: send
-                // SIGTERM directly so the supervisor wrapper can respawn.
-                tracing::warn!(error = %e, "Failed to spawn restart shell; sending SIGTERM directly");
-                let pid = std::process::id();
-                let _ = std::process::Command::new("kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .output();
-            }
-        }
-    });
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "status": "restart_refused",
+            "message": DAEMON_RESTART_REFUSAL,
+        })),
+    )
+        .into_response()
 }
 
 /// POST /api/action/reboot -- Reboot the miner.
@@ -10607,81 +10600,86 @@ pub(super) async fn post_action_reboot(State(state): State<Arc<AppState>>) -> Re
         return response;
     }
 
-    tracing::info!("System reboot requested via API");
-    // W21 audit-coverage: record operator-initiated system reboot.
-    push_rest_audit_free(&state, "system", "System reboot requested via API");
-
-    // Spawn reboot in background with delay to let HTTP response complete
-    tokio::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        tracing::info!("Executing system reboot...");
-        // Save entropy seed before reboot
-        let _ = std::process::Command::new("dd")
-            .args([
-                "if=/dev/urandom",
-                "of=/data/keys/random-seed",
-                "bs=512",
-                "count=1",
-            ])
-            .output();
-        // Use the robust reboot helper: it sends `reboot` (-> SIGTERM -> PID 1),
-        // and if the unit is still up after a grace period, escalates to the
-        // kernel sysrq path. This is what makes the setup-wizard "engage mining"
-        // reboot (and every other reboot call site) ACTUALLY reboot the S9 even
-        // if a userspace step stalls.
-        trigger_system_reboot().await;
-    });
-
-    Json(serde_json::json!({
-        "status": "ok",
-        "message": "System reboot initiated — device will restart in ~30 seconds",
-    }))
-    .into_response()
+    // Transfer authority before claiming acceptance. No delay, entropy write,
+    // sync, audit/log write, or detached task may stand between capability
+    // admission and the init request: any of those can block or disappear with
+    // this daemon while PID 1 remains unaware. Critical writes must establish
+    // their own durability at transaction time; PID 1 owns final shutdown sync
+    // and escalation.
+    match trigger_system_reboot().await {
+        Ok(()) => {
+            tracing::info!("System reboot requested via API and accepted by init");
+            // W21 audit coverage is best-effort after authority transfer. A
+            // persistent audit lock or storage stall must never prevent PID 1
+            // from observing the reboot request and arming its deadline.
+            push_rest_audit_free(
+                &state,
+                "system",
+                "System reboot requested via API and accepted by init",
+            );
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "status": "reboot_accepted",
+                    "message": "System init accepted the orderly reboot request",
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "system init did not accept the reboot request");
+            push_rest_audit_free(
+                &state,
+                "system",
+                format!("System reboot request failed before init acceptance: {error}"),
+            );
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "reboot_not_accepted",
+                    "message": "System init did not accept the reboot request; the miner remains online",
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
-/// Perform a real, full **system reboot** (not a daemon restart) with a
-/// kernel-level fallback.
+/// Submit one real, full **system reboot** request (not a daemon restart).
 ///
 /// The primary path runs `reboot`, which under DCENT_OS's custom PID 1
 /// (`dcentos-init`) sends SIGTERM to init -> orderly shutdown -> `reboot(2)`.
-/// On the live S9, the *userspace* reboot once silently stalled (an init handler
-/// installed with SA_RESTART never observed the shutdown request — fixed in
-/// `dcentos-init`). To make this control plane robust regardless, if the unit is
-/// still alive `REBOOT_FALLBACK_GRACE_SECS` after the `reboot` command, escalate
-/// to the kernel's own sysrq reboot (`echo b > /proc/sysrq-trigger`), which is
-/// exactly the manual escape hatch operators had to use. `sync()` is forced
-/// before each attempt so no buffered writes (e.g. an `fw_setenv firmware N`
-/// bootslot flip) are lost.
-pub(super) async fn trigger_system_reboot() {
-    /// How long to wait for the orderly `reboot` to actually take the unit down
-    /// before forcing the kernel sysrq path. The orderly path on the S9
-    /// (SIGTERM grace + stop scripts + unmount) completes in a few seconds; this
-    /// is deliberately generous so we never sysrq a unit that was about to go.
-    const REBOOT_FALLBACK_GRACE_SECS: u64 = 25;
+/// The live S9's former lost-signal bug is fixed in `dcentos-init`, which owns
+/// the one absolute shutdown watchdog. The API must never add an earlier sysrq
+/// or `reboot -f` deadline: a valid platform stop path may still be producing
+/// its terminal hardware disposition after this daemon submits the request.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum RebootRequestError {
+    #[error("failed to execute the system reboot command: {0}")]
+    Spawn(#[source] std::io::Error),
+    #[error("system init rejected the reboot request with status {0}")]
+    Rejected(std::process::ExitStatus),
+}
 
-    // Flush filesystem buffers first — critical so a just-written bootslot flip
-    // (fw_setenv) or config survives the reboot.
-    let _ = std::process::Command::new("sync").output();
+pub(super) async fn trigger_system_reboot() -> Result<(), RebootRequestError> {
+    trigger_system_reboot_with("reboot").await
+}
 
-    // Primary: the standard reboot command (SIGTERM -> PID 1 under dcentos-init,
-    // or the host init on a passthrough/BraiinsOS rootfs).
-    let _ = std::process::Command::new("reboot").output();
-
-    // If we're still running after the grace period, userspace init did not
-    // honor the reboot. Force the kernel path directly. This task is killed the
-    // instant the kernel actually reboots, so reaching here means it stalled.
-    tokio::time::sleep(std::time::Duration::from_secs(REBOOT_FALLBACK_GRACE_SECS)).await;
-    tracing::error!(
-        "reboot did not take effect after {}s — forcing kernel sysrq reboot",
-        REBOOT_FALLBACK_GRACE_SECS
-    );
-    let _ = std::process::Command::new("sync").output();
-    // sysrq must be enabled to honor the trigger.
-    let _ = std::fs::write("/proc/sys/kernel/sysrq", "1");
-    let _ = std::fs::write("/proc/sysrq-trigger", "b");
-    // Final fallback if sysrq is unavailable: try `reboot -f` (busybox -f
-    // bypasses init and calls reboot(2) directly).
-    let _ = std::process::Command::new("reboot").arg("-f").output();
+async fn trigger_system_reboot_with(program: &str) -> Result<(), RebootRequestError> {
+    // Standard reboot command: SIGTERM -> PID 1 under dcentos-init, or the host
+    // init on a passthrough/BraiinsOS rootfs. The command must return success
+    // before the API reports acceptance; the exact host-init deadline remains
+    // unqualified unless dcentos-init is PID 1.
+    let status = tokio::process::Command::new(program)
+        .status()
+        .await
+        .map_err(RebootRequestError::Spawn)?;
+    if status.success() {
+        tracing::info!("orderly reboot request accepted by system init");
+        Ok(())
+    } else {
+        Err(RebootRequestError::Rejected(status))
+    }
 }
 
 /// POST /api/action/sleep -- Enter curtailment sleep mode.
@@ -15952,35 +15950,16 @@ async fn post_debug_psu_control_recovery(
 
     match body.action.as_str() {
         "enable_output" | "disable_output" if hw.control_board.starts_with("AML") => {
-            let result = if body.action == "enable_output" {
-                dcentrald_hal::platform::amlogic::enable_psu()
-            } else {
-                dcentrald_hal::platform::amlogic::disable_psu()
-            };
-
-            return match result {
-                Ok(()) => Json(serde_json::json!({
-                    "status": "ok",
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "error",
                     "action": body.action,
-                    "control_mode": "gpio_enable",
-                    "output_enabled": dcentrald_hal::platform::amlogic::is_psu_enabled(),
-                    "message": if body.action == "enable_output" {
-                        "GPIO PSU output enabled"
-                    } else {
-                        "GPIO PSU output disabled"
-                    },
-                }))
-                .into_response(),
-                Err(e) => (
-                    StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({
-                        "status": "error",
-                        "action": body.action,
-                        "message": e.to_string(),
-                    })),
-                )
-                    .into_response(),
-            };
+                    "hardware_access_attempted": false,
+                    "message": "Amlogic PSU control requires the mining engine's retained power/thermal owner and terminal fence; this recovery route does not own either capability",
+                })),
+            )
+                .into_response();
         }
         "enable_output" | "disable_output" if hw.control_board.starts_with("Zynq am2-s17") => {
             let result = if body.action == "enable_output" {
@@ -17494,8 +17473,30 @@ pub(super) async fn get_diagnostics_state_machine() -> impl IntoResponse {
 /// cryptographic signature
 /// (`dcentrald-api-types::luxos_update::LuxosUpdateIntegrity::Md5Only`).
 /// Issues no update/flash/rollback action and no hardware I/O.
-pub(super) async fn get_system_update_capability() -> impl IntoResponse {
+pub(super) async fn get_system_update_capability(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     use dcentrald_api_types::luxos_update::LUXOS_DEFAULT_CHANNEL_URL;
+
+    let miner = state.state_rx.borrow().clone();
+    let hw = state
+        .hardware_info
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    let board_target = antminer_board_target(&hw);
+    let board_desc = antminer_board_desc(&hw);
+    let descriptor = build_antminer_capability_descriptor(&miner, &hw);
+    let update_authorized = descriptor
+        .runtime_caps
+        .contains(&RuntimeCapability::FlashOta);
+    let ab_slot_rollback = update_authorized
+        && board_desc
+            .map(|desc| {
+                desc.enablement.storage_topology
+                    == dcentrald_common::StorageTopology::RedundantSlots
+            })
+            .unwrap_or(false);
 
     Json(serde_json::json!({
         "schema": "dcentrald-api-types::update_capability v1",
@@ -17519,7 +17520,14 @@ pub(super) async fn get_system_update_capability() -> impl IntoResponse {
             "signature_state": crate::ota_signature::ota_signature_state().as_str(),
             "signature_required": crate::ota_signature::ota_signature_state().is_enforced(),
             "compiled_key_id": crate::ota_signature::honest_key_id(),
-            "ab_slot_rollback": true,
+            "board_target": board_target,
+            "update_authorized": update_authorized,
+            "upload_endpoint": update_authorized.then_some("/api/system/upgrade"),
+            "storage_topology": board_desc.map(|desc| desc.enablement.storage_topology.as_str()).unwrap_or("unknown"),
+            "update_mechanism": board_desc.map(|desc| desc.enablement.update_mechanism.as_str()).unwrap_or("none"),
+            "install_authorization": board_desc.map(|desc| desc.enablement.install_authorization.as_str()).unwrap_or("denied"),
+            "recovery_maturity": board_desc.map(|desc| desc.enablement.recovery_maturity.as_str()).unwrap_or("not_implemented"),
+            "ab_slot_rollback": ab_slot_rollback,
             "rollback_policy": {
                 "verdicts": ["allow_forward", "allow_reinstall", "allow_downgrade", "deny_older_version", "deny_malformed_version"],
                 "default_denies_downgrade": true,
@@ -20529,14 +20537,22 @@ pub(super) fn load_shared_install_intent() -> Option<InstallIntent> {
 }
 
 pub(super) fn update_metadata_payload(
-    _state: &AppState,
     miner: &crate::MinerState,
     hw: &crate::HardwareInfo,
 ) -> UpdateMetadata {
     let profile = chip_type_to_chip_id(&hw.chip_type).and_then(MinerProfile::for_chip);
     let board_target = antminer_board_target(hw);
-    let inactive_slot_supported = board_target.starts_with("antminer-zynq-");
-    let upload_endpoint = if inactive_slot_supported {
+    let board_desc = antminer_board_desc(hw);
+    let runtime_descriptor = build_antminer_capability_descriptor(miner, hw);
+    let update_authorized = runtime_descriptor
+        .runtime_caps
+        .contains(&RuntimeCapability::FlashOta);
+    let inactive_slot_supported = board_desc
+        .map(|desc| {
+            desc.enablement.storage_topology == dcentrald_common::StorageTopology::RedundantSlots
+        })
+        .unwrap_or(false);
+    let upload_endpoint = if update_authorized {
         Some("/api/system/upgrade".to_string())
     } else {
         None
@@ -20558,11 +20574,10 @@ pub(super) fn update_metadata_payload(
         device_model: profile.map(|p| p.name).unwrap_or("Antminer").to_string(),
         board_target: board_target.clone(),
         current_version: miner.firmware_version.clone(),
-        package_type: if inactive_slot_supported {
-            "sysupgrade".to_string()
-        } else {
-            "unsupported".to_string()
-        },
+        package_type: board_desc
+            .map(|desc| desc.enablement.artifact_kind.as_str())
+            .unwrap_or("unsupported")
+            .to_string(),
         upload_endpoint: upload_endpoint.clone(),
         board_target_header: None,
         device_model_header: None,
@@ -20578,8 +20593,16 @@ pub(super) fn update_metadata_payload(
         key_id: crate::ota_signature::honest_key_id().map(|s| s.to_string()),
         install_intent: load_shared_install_intent(),
         toolbox: ToolboxPackageInfo {
-            install_command: "dcent install <ip> -f dcentos-sysupgrade.tar".to_string(),
-            update_command: "dcent install <ip> -f dcentos-sysupgrade.tar".to_string(),
+            install_command: if update_authorized {
+                "dcent install <ip> -f dcentos-sysupgrade.tar".to_string()
+            } else {
+                String::new()
+            },
+            update_command: if update_authorized {
+                "dcent install <ip> -f dcentos-sysupgrade.tar".to_string()
+            } else {
+                String::new()
+            },
             upload_endpoint,
             board_target_header: None,
             device_model_header: None,
@@ -22592,6 +22615,36 @@ pub(super) fn read_fw_printenv_key(key: &str) -> Option<String> {
     }
 }
 
+async fn read_running_board_target_for_update() -> std::result::Result<String, String> {
+    let path = Path::new(SYSTEM_BOARD_TARGET_PATH);
+    let metadata = tokio::fs::symlink_metadata(path).await.map_err(|error| {
+        format!(
+            "OTA policy: failed to inspect canonical board target marker '{}': {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "OTA policy: canonical board target marker '{}' must be a direct regular file",
+            path.display()
+        ));
+    }
+    if metadata.len() > crate::ota_signature::MAX_BOARD_TARGET_MARKER_BYTES as u64 {
+        return Err(format!(
+            "OTA policy: canonical board target marker exceeds {} bytes",
+            crate::ota_signature::MAX_BOARD_TARGET_MARKER_BYTES
+        ));
+    }
+    let bytes = tokio::fs::read(path).await.map_err(|error| {
+        format!(
+            "OTA policy: failed to read canonical board target marker '{}': {error}",
+            path.display()
+        )
+    })?;
+    crate::ota_signature::parse_board_target_marker(&bytes)
+        .map_err(|error| format!("OTA policy: invalid canonical board target marker: {error}"))
+}
+
 pub(super) async fn post_system_upgrade(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
@@ -22603,6 +22656,18 @@ pub(super) async fn post_system_upgrade(
         "/api/system/upgrade",
     ) {
         return capability_error_tuple(error);
+    }
+
+    // Bind the endpoint to the immutable exact target before creating a stage
+    // directory or accepting bytes. Unknown, lab-only, single-slot, and
+    // offline-analysis policies fail without mutating local staging state.
+    let running_board_target = match read_running_board_target_for_update().await {
+        Ok(target) => target,
+        Err(message) => return system_upgrade_error(StatusCode::FORBIDDEN, message),
+    };
+    if let Err(message) = crate::ota_signature::require_public_update_policy(&running_board_target)
+    {
+        return system_upgrade_error(StatusCode::FORBIDDEN, message);
     }
 
     let mut apply_update = false;
@@ -22855,24 +22920,45 @@ pub(super) async fn post_system_upgrade(
         );
     }
 
-    if let Err(message) = crate::ota_signature::verify_sysupgrade_bundle(
+    let verified_bundle = match crate::ota_signature::verify_sysupgrade_bundle(
         Path::new(&staged_path),
         false,
         Some(Path::new(SYSTEM_UPGRADE_RELEASE_PUBKEY)),
     ) {
-        tracing::warn!(
-            staged_path = %staged_path,
-            verifier_error = %message,
-            "Browser sysupgrade in-Rust validation failed before sysupgrade --test"
-        );
-        return system_upgrade_error(
-            StatusCode::BAD_REQUEST,
-            format!("Package signature verification failed: {message}"),
-        );
-    }
+        Ok(bundle) => bundle,
+        Err(message) => {
+            tracing::warn!(
+                staged_path = %staged_path,
+                verifier_error = %message,
+                "Browser sysupgrade in-Rust validation failed before sysupgrade --test"
+            );
+            return system_upgrade_error(
+                StatusCode::BAD_REQUEST,
+                format!("Package signature verification failed: {message}"),
+            );
+        }
+    };
+    let authorized_sysupgrade = match verified_bundle.authorize_public_update(&running_board_target)
+    {
+        Ok(authorized) => authorized,
+        Err(message) => {
+            tracing::warn!(
+                staged_path = %staged_path,
+                running_board_target = %running_board_target,
+                authorization_error = %message,
+                "Browser sysupgrade policy authorization failed before sysupgrade --test"
+            );
+            return system_upgrade_error(
+                StatusCode::BAD_REQUEST,
+                format!("Package authorization failed: {message}"),
+            );
+        }
+    };
 
     tracing::info!(
         staged_path = %staged_path,
+        board_target = authorized_sysupgrade.board_target(),
+        candidate_version = authorized_sysupgrade.version(),
         "Browser sysupgrade in-Rust validation succeeded before sysupgrade --test"
     );
 
@@ -22888,23 +22974,23 @@ pub(super) async fn post_system_upgrade(
     // no flash scheduled. There
     // is no operator downgrade-override flag in the codebase today, so
     // allow_downgrade is hard-false (matches the advertised default).
-    match crate::ota_signature::read_manifest_version_from_bundle(Path::new(&staged_path)) {
-        Ok(Some(candidate_version)) => {
-            let current_version = env!("CARGO_PKG_VERSION");
-            let verdict = dcentrald_api_types::ota_rollback_protection::assess_rollback(
-                &candidate_version,
-                current_version,
-                false, // no operator downgrade-override exists; deny by default
+    let candidate_version = authorized_sysupgrade.version().to_string();
+    {
+        let current_version = env!("CARGO_PKG_VERSION");
+        let verdict = dcentrald_api_types::ota_rollback_protection::assess_rollback(
+            &candidate_version,
+            current_version,
+            false, // no operator downgrade-override exists; deny by default
+        );
+        if !verdict.is_allowed() {
+            tracing::warn!(
+                staged_path = %staged_path,
+                candidate_version = %candidate_version,
+                current_version = %current_version,
+                ?verdict,
+                "OTA rollback protection DENIED the sysupgrade on the write path"
             );
-            if !verdict.is_allowed() {
-                tracing::warn!(
-                    staged_path = %staged_path,
-                    candidate_version = %candidate_version,
-                    current_version = %current_version,
-                    ?verdict,
-                    "OTA rollback protection DENIED the sysupgrade on the write path"
-                );
-                let reason = match &verdict {
+            let reason = match &verdict {
                     dcentrald_api_types::ota_rollback_protection::RollbackVerdict::DenyOlderVersion {
                         candidate,
                         current,
@@ -22918,7 +23004,7 @@ pub(super) async fn post_system_upgrade(
                     } => format!("Refusing sysupgrade: unparseable firmware version ({problem})."),
                     _ => "Refusing sysupgrade: rollback protection denied the package.".to_string(),
                 };
-                crate::push_audit_event(
+            crate::push_audit_event(
                     &state,
                     "operator",
                     dcentrald_api_types::audit_log::AuditEvent::Free {
@@ -22928,59 +23014,15 @@ pub(super) async fn post_system_upgrade(
                         ),
                     },
                 );
-                return system_upgrade_error(StatusCode::BAD_REQUEST, reason);
-            }
-            tracing::info!(
-                staged_path = %staged_path,
-                candidate_version = %candidate_version,
-                current_version = %current_version,
-                ?verdict,
-                "OTA rollback protection ALLOWED the sysupgrade"
-            );
+            return system_upgrade_error(StatusCode::BAD_REQUEST, reason);
         }
-        Ok(None) => {
-            // FAIL-CLOSED (F2): a signed bundle whose MANIFEST.json has no
-            // `version` field cannot be evaluated against the rollback floor.
-            // The whole point of this gate (see the fail-closed contract above)
-            // is that a package we CANNOT prove is not a downgrade must be
-            // REFUSED, not waved through — a version-less-but-signed bundle was
-            // the one hole in the anti-rollback defense. Every DCENT bundle
-            // carries a version (`package_sysupgrade.sh` sets it), so a missing
-            // version is anomalous. Reject it, mirroring the `Err` branch and the
-            // `DenyOlderVersion` path.
-            tracing::warn!(
-                staged_path = %staged_path,
-                "OTA bundle MANIFEST.json has no version field — refusing (rollback floor cannot be evaluated)"
-            );
-            crate::push_audit_event(
-                &state,
-                "operator",
-                dcentrald_api_types::audit_log::AuditEvent::Free {
-                    category: "firmware_update".to_string(),
-                    message:
-                        "OTA rollback protection refused a signed bundle with no MANIFEST version field"
-                            .to_string(),
-                },
-            );
-            return system_upgrade_error(
-                StatusCode::BAD_REQUEST,
-                "Refusing sysupgrade: the signed package MANIFEST.json has no `version` field, so \
-                 DCENT_OS cannot verify it is not a downgrade (rollback protection is fail-closed). \
-                 Repackage with a version via package_sysupgrade.sh."
-                    .to_string(),
-            );
-        }
-        Err(message) => {
-            tracing::warn!(
-                staged_path = %staged_path,
-                error = %message,
-                "OTA rollback protection could not read the manifest version"
-            );
-            return system_upgrade_error(
-                StatusCode::BAD_REQUEST,
-                format!("Rollback protection check failed: {message}"),
-            );
-        }
+        tracing::info!(
+            staged_path = %staged_path,
+            candidate_version = %candidate_version,
+            current_version = %current_version,
+            ?verdict,
+            "OTA rollback protection ALLOWED the sysupgrade"
+        );
     }
 
     // Only signed sysupgrade .tar packages are accepted by the browser updater.
@@ -23292,6 +23334,8 @@ mod capability_contract_tests {
         assert_eq!(descriptor.family, DeviceFamily::Antminer);
         assert_eq!(descriptor.support, CapabilitySupportTier::Unknown);
         assert_eq!(descriptor.identity.confidence, IdentityConfidence::Unknown);
+        assert_eq!(descriptor.identity.board_target, None);
+        assert_eq!(descriptor.board.board_target, None);
         assert!(descriptor
             .runtime_caps
             .iter()
@@ -23388,6 +23432,9 @@ mod capability_contract_tests {
         assert!(descriptor
             .runtime_caps
             .contains(&RuntimeCapability::FlashOta));
+        assert!(!descriptor
+            .runtime_caps
+            .contains(&RuntimeCapability::Restore));
         assert!(descriptor.runtime_caps.contains(&RuntimeCapability::Reboot));
         assert!(descriptor
             .runtime_caps
@@ -23424,6 +23471,92 @@ mod capability_contract_tests {
         assert!(!descriptor
             .runtime_caps
             .contains(&RuntimeCapability::ConfigRw));
+        assert_eq!(descriptor.identity.board_target, None);
+    }
+
+    #[test]
+    fn conflicting_typed_board_targets_fail_closed_without_coarse_fallback() {
+        let hardware = crate::HardwareInfo {
+            chip_type: "BM1362".to_string(),
+            control_board: "Zynq am2".to_string(),
+            identification: crate::HardwareIdentification::from_evidence(
+                vec![
+                    crate::HardwareIdentityEvidence::declared_asic_board_target(
+                        "am2-s19j", "BM1362",
+                    ),
+                    crate::HardwareIdentityEvidence::declared_asic_board_target(
+                        "cv1835-s19jpro",
+                        "BM1362",
+                    ),
+                    crate::HardwareIdentityEvidence::measured_asic_enumeration(
+                        0x1362,
+                        "BM1362",
+                        crate::HardwareCompositionToken::new(1, "test:conflict"),
+                    ),
+                ],
+                Some("conflicting test declarations".to_string()),
+            ),
+            ..crate::HardwareInfo::default()
+        };
+        let descriptor = build_antminer_capability_descriptor(&empty_miner(), &hardware);
+
+        assert_eq!(antminer_board_target(&hardware), "unknown");
+        assert_eq!(descriptor.support, CapabilitySupportTier::Experimental);
+        assert!(descriptor.fail_safe.read_only);
+        assert_eq!(descriptor.identity.board_target, None);
+        assert!(!descriptor
+            .runtime_caps
+            .contains(&RuntimeCapability::ConfigRw));
+        assert!(!descriptor
+            .runtime_caps
+            .contains(&RuntimeCapability::FlashOta));
+        assert!(!descriptor
+            .runtime_caps
+            .contains(&RuntimeCapability::Restore));
+    }
+
+    #[test]
+    fn update_metadata_is_derived_from_exact_typed_enablement_policy() {
+        let public = measured_hardware("BM1362", 0x1362, "am2-s19j", "am2-s19j");
+        let public_metadata = update_metadata_payload(&empty_miner(), &public);
+        assert_eq!(public_metadata.board_target, "am2-s19j");
+        assert_eq!(public_metadata.package_type, "sysupgrade");
+        assert!(public_metadata.inactive_slot_supported);
+        assert_eq!(
+            public_metadata.upload_endpoint.as_deref(),
+            Some("/api/system/upgrade")
+        );
+        assert!(!public_metadata.toolbox.install_command.is_empty());
+
+        let lab_zynq = declared_hardware("BM1397", "am2-s19pro", "am2-s19pro");
+        let lab_metadata = update_metadata_payload(&empty_miner(), &lab_zynq);
+        assert_eq!(lab_metadata.board_target, "am2-s19pro");
+        assert_eq!(lab_metadata.package_type, "sysupgrade");
+        assert!(lab_metadata.inactive_slot_supported);
+        assert_eq!(lab_metadata.upload_endpoint, None);
+        assert!(lab_metadata.toolbox.install_command.is_empty());
+
+        let amlogic = declared_hardware("BM1368", "AML Amlogic", "am3-s21");
+        let amlogic_metadata = update_metadata_payload(&empty_miner(), &amlogic);
+        assert_eq!(amlogic_metadata.board_target, "am3-s21");
+        assert_eq!(amlogic_metadata.package_type, "sysupgrade");
+        assert!(!amlogic_metadata.inactive_slot_supported);
+        assert_eq!(amlogic_metadata.upload_endpoint, None);
+
+        let cv = declared_hardware("BM1362", "CVITEK CV1835", "cv1835-s19jpro");
+        let cv_metadata = update_metadata_payload(&empty_miner(), &cv);
+        assert_eq!(cv_metadata.board_target, "cv1835-s19jpro");
+        assert_eq!(cv_metadata.package_type, "offline_analysis");
+        assert!(!cv_metadata.inactive_slot_supported);
+        assert_eq!(cv_metadata.upload_endpoint, None);
+        assert!(cv_metadata.toolbox.install_command.is_empty());
+
+        let unknown_metadata =
+            update_metadata_payload(&empty_miner(), &crate::HardwareInfo::default());
+        assert_eq!(unknown_metadata.board_target, "unknown");
+        assert_eq!(unknown_metadata.package_type, "unsupported");
+        assert!(!unknown_metadata.inactive_slot_supported);
+        assert_eq!(unknown_metadata.upload_endpoint, None);
     }
 
     #[test]
@@ -23614,16 +23747,15 @@ mod capability_contract_tests {
     }
 
     /// CE-174: the restore-to-stock POST routes must require
-    /// `RuntimeCapability::Restore`. Beta-tier boards (am1-s9 + am2-s19jpro-zynq)
-    /// still grant it; read-only / unknown / experimental / Amlogic identities
-    /// fail closed.
+    /// `RuntimeCapability::Restore`. No registered BoardDesc currently has
+    /// verified recovery, so even exact public-beta targets must fail closed.
     #[test]
     fn ce174_restore_routes_require_restore_capability() {
         let restore = RuntimeCapability::Restore;
         let preflight_route = "/api/system/restore-to-stock/preflight";
         let restore_route = "/api/system/restore-to-stock";
 
-        // POSITIVE: both beta-tier boards grant Restore.
+        // Exact public-beta identity is insufficient without verified recovery.
         let am2 = build_antminer_capability_descriptor(
             &empty_miner(),
             &measured_hardware("BM1362", 0x1362, "am2-s19j", "am2-s19j"),
@@ -23633,14 +23765,8 @@ mod capability_contract_tests {
             &measured_hardware("BM1387", 0x1387, "am1-s9", "am1-s9"),
         );
         for descriptor in [&am2, &am1_s9] {
-            assert_eq!(
-                runtime_capability_guard_error(descriptor, restore, restore_route),
-                None
-            );
-            assert_eq!(
-                runtime_capability_guard_error(descriptor, restore, preflight_route),
-                None
-            );
+            assert!(runtime_capability_guard_error(descriptor, restore, restore_route).is_some());
+            assert!(runtime_capability_guard_error(descriptor, restore, preflight_route).is_some());
         }
 
         // NEGATIVE: unknown identity → 409 UnknownHardware.

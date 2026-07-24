@@ -103,6 +103,11 @@ pub trait BapAppState: Send {
     fn identify(&self) -> Result<(), String>;
 }
 
+/// Hard ceiling on buffered-but-unparsed RX bytes. A single frame that grows
+/// past this without a terminator is a runaway and gets dropped; complete
+/// frames are always drained out before this ceiling forces a drop.
+const MAX_RX_BUF: usize = 4096;
+
 /// The main service loop. Consumes a transport + app-state and services
 /// one frame-per-call. Callers spawn this in a thread with their own
 /// cadence (ESP-Miner polls roughly every 100 ms).
@@ -125,29 +130,54 @@ impl<T: BapTransport, S: BapAppState> BapServer<T, S> {
 
     /// Drain any pending RX bytes, parse complete frames, and dispatch each
     /// to the handler. Returns the number of frames dispatched this call.
-    pub fn poll_frames(&mut self) -> Result<usize, BapError> {
+    ///
+    /// Parsing is interleaved with reading: complete frames are drained as they
+    /// arrive so a long RX burst cannot overflow `rx_buf` and discard valid,
+    /// already-buffered frames. The earlier read-to-exhaustion-then-`clear()`
+    /// path silently lost every frame past `MAX_RX_BUF` bytes.
+    ///
+    /// `now_ms` is the caller's monotonic clock; it is threaded into dispatch so
+    /// keepalive/subscription timing shares ONE clock domain with
+    /// `tick_subscriptions(now_ms)` / `refresh_keepalive(now_ms)`. Drive all
+    /// three from the same clock each loop iteration.
+    pub fn poll_frames(&mut self, now_ms: u64) -> Result<usize, BapError> {
         let mut scratch = [0u8; 256];
+        let mut dispatched = 0usize;
         loop {
             let n = self.transport.read(&mut scratch)?;
             if n == 0 {
                 break;
             }
-            if self.rx_buf.len() + n > 4096 {
-                // Runaway buffer — drop and resync on the next `$BAP`.
-                self.rx_buf.clear();
+            if self.rx_buf.len() + n > MAX_RX_BUF {
+                // Drain complete frames before considering a drop, so a large
+                // but well-framed burst is never discarded.
+                dispatched += self.drain_and_dispatch(now_ms)?;
+                if self.rx_buf.len() + n > MAX_RX_BUF {
+                    // Still over budget => a single incomplete frame is running
+                    // away with no terminator. Drop it and resync on next `$BAP`.
+                    self.rx_buf.clear();
+                }
             }
             self.rx_buf.extend_from_slice(&scratch[..n]);
+            dispatched += self.drain_and_dispatch(now_ms)?;
         }
+        Ok(dispatched)
+    }
 
+    /// Parse and dispatch every complete frame currently in `rx_buf`, returning
+    /// the number dispatched. An `Incomplete` tail is left buffered for the next
+    /// read; a corrupt / over-long frame is `Skip`-drained.
+    ///
+    /// BAP-1: driving the scan with `next_frame_scan` means a complete-but-
+    /// corrupt or over-long frame is DRAINED (Skip) rather than re-presented
+    /// forever; `Incomplete` consumes 0 bytes and breaks to await more RX.
+    fn drain_and_dispatch(&mut self, now_ms: u64) -> Result<usize, BapError> {
         let mut dispatched = 0usize;
-        // BAP-1: drive the scan with `next_frame_scan` so a complete-but-corrupt
-        // or over-long frame is DRAINED (Skip) rather than re-presented forever.
-        // `Incomplete` consumes 0 bytes and breaks the loop to await more RX.
         loop {
             match protocol::next_frame_scan(&self.rx_buf) {
                 protocol::FrameScan::Frame { frame, consumed } => {
                     self.rx_buf.drain(..consumed);
-                    match handlers::dispatch(&self.app, &mut self.subscriptions, &frame) {
+                    match handlers::dispatch(&self.app, &mut self.subscriptions, &frame, now_ms) {
                         Ok(Some(reply)) => {
                             let bytes = reply.encode();
                             self.transport.write_all(&bytes)?;
@@ -292,7 +322,7 @@ mod server_tests {
         let transport = MockTransport::new(stream);
         let mut server = BapServer::new(transport, StubApp);
 
-        let dispatched = server.poll_frames().expect("poll");
+        let dispatched = server.poll_frames(0).expect("poll");
         // The good frame must have been dispatched even though a corrupt frame
         // sat in front of it (no wedge).
         assert!(
@@ -311,6 +341,75 @@ mod server_tests {
         assert_eq!(server.rx_buf.len(), 0, "rx_buf must be drained, not wedged");
     }
 
+    /// BAP RX burst: a run of valid frames whose total exceeds `MAX_RX_BUF` in a
+    /// single poll must ALL dispatch. The old read-to-exhaustion loop buffered
+    /// everything first and `clear()`d the whole buffer on overflow — silently
+    /// dropping every valid frame past 4096 B before the parser ever saw them.
+    /// The fix interleaves parsing with reading so a well-framed burst never
+    /// overflows and nothing is lost.
+    #[test]
+    fn poll_frames_dispatches_full_burst_exceeding_rx_cap() {
+        let one = BapFrame::new(BapCommand::Req, "hashrate", "").encode();
+        let count = 300usize;
+        let mut stream = Vec::new();
+        for _ in 0..count {
+            stream.extend_from_slice(&one);
+        }
+        assert!(
+            stream.len() > MAX_RX_BUF,
+            "test must exceed the RX cap to exercise the overflow path (len={})",
+            stream.len()
+        );
+
+        let transport = MockTransport::new(stream);
+        let mut server = BapServer::new(transport, StubApp);
+        let dispatched = server.poll_frames(0).expect("poll");
+        assert_eq!(
+            dispatched, count,
+            "every valid frame in a >cap burst must dispatch (regression: frames past 4096 B were dropped)"
+        );
+        assert_eq!(server.rx_buf.len(), 0, "rx_buf fully drained after burst");
+    }
+
+    #[test]
+    fn subscription_timing_uses_caller_clock_domain() {
+        use crate::subscription::IDLE_TIMEOUT_MS;
+        // Register a hashrate subscription (250 ms interval) at caller-clock T0
+        // through the real poll_frames path.
+        let t0 = 1_000u64;
+        let sub = BapFrame::new(BapCommand::Sub, "hashrate", "250").encode();
+        let transport = MockTransport::new(sub);
+        let mut server = BapServer::new(transport, StubApp);
+        assert_eq!(server.poll_frames(t0).expect("poll"), 1, "SUB dispatched");
+        let ack_len = server.transport.tx.borrow().len();
+
+        // Within the idle window the subscription emits on its interval — proving
+        // its keepalive/interval clock is the caller's T0, not an internal clock.
+        server.tick_subscriptions(t0 + 250).expect("tick");
+        assert!(
+            server.transport.tx.borrow().len() > ack_len,
+            "subscription must emit within the idle window on the caller clock"
+        );
+
+        // Past the AUX-9 idle window with no further activity the subscription
+        // MUST be dropped. Before the dual-clock fix, dispatch stamped keepalive
+        // from its own now_ms() (host unix-epoch ~1.75e12), so on a small caller
+        // clock `now - last_activity` saturated to 0 and the idle drop NEVER
+        // fired — the accessory got pushed forever after disconnecting.
+        server
+            .tick_subscriptions(t0 + IDLE_TIMEOUT_MS + 1)
+            .expect("idle tick");
+        let after_drop = server.transport.tx.borrow().len();
+        server
+            .tick_subscriptions(t0 + 2 * IDLE_TIMEOUT_MS + 10_000)
+            .expect("post-drop tick");
+        assert_eq!(
+            server.transport.tx.borrow().len(),
+            after_drop,
+            "an idle subscription must be dropped, not emit forever"
+        );
+    }
+
     /// A lone corrupt frame must be fully drained by `poll_frames` (Skip path),
     /// leaving an empty rx_buf — proving the buffer cannot accumulate a wedged
     /// bad frame across polls.
@@ -323,7 +422,7 @@ mod server_tests {
 
         let transport = MockTransport::new(bad);
         let mut server = BapServer::new(transport, StubApp);
-        let dispatched = server.poll_frames().expect("poll");
+        let dispatched = server.poll_frames(0).expect("poll");
         assert_eq!(dispatched, 0, "a corrupt frame dispatches nothing");
         assert_eq!(
             server.rx_buf.len(),
@@ -340,7 +439,7 @@ mod server_tests {
         let partial = b"$BAP,REQ,hashr".to_vec();
         let transport = MockTransport::new(partial.clone());
         let mut server = BapServer::new(transport, StubApp);
-        let dispatched = server.poll_frames().expect("poll");
+        let dispatched = server.poll_frames(0).expect("poll");
         assert_eq!(dispatched, 0);
         assert_eq!(
             server.rx_buf.len(),

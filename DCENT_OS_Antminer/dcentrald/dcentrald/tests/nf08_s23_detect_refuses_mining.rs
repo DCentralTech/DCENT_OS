@@ -111,24 +111,24 @@ fn s23_scaffold_driver_is_fail_closed() {
     assert_eq!(d.response_length(), 11);
 }
 
-/// Both ASIC-dispatch routes — the daemon and the work dispatcher — resolve a
-/// driver ONLY through the same env-gated `ChipRegistry`, and both refuse when
-/// no driver is found. So an S23 absent from `production()` yields no driver ->
-/// no work. Pinned at source because these routes live in HAL-heavy code that
-/// cannot be exercised host-side.
+/// Both ASIC-dispatch routes resolve drivers through the registry, while the
+/// dispatcher first requires its typed production-write identity. S23 scaffold
+/// IDs are runtime-tested against that typed boundary in `work_dispatcher.rs`.
 #[test]
-fn daemon_and_dispatcher_route_dispatch_only_through_registry_detect() {
-    assert!(DAEMON_RS.contains("let registry = ChipRegistry::new();"));
+fn daemon_and_dispatcher_gate_dispatch_through_registry_and_typed_identity() {
+    assert!(DAEMON_RS.contains("ChipRegistry::with_execution_policy("));
     assert!(DAEMON_RS.contains("registry.detect(self.chip_id)"));
     assert!(DAEMON_RS.contains("No built-in driver for ChipID"));
 
-    assert!(WORK_DISPATCHER_RS.contains("let registry = ChipRegistry::new();"));
-    assert!(WORK_DISPATCHER_RS.contains("registry.detect(self.chip_id)"));
+    assert!(WORK_DISPATCHER_RS.contains("ChipRegistry::with_execution_policy("));
+    assert!(WORK_DISPATCHER_RS.contains("normalize_dispatch_write_identity("));
+    assert!(WORK_DISPATCHER_RS.contains("registry.detect(chip.chip_id())"));
     assert!(WORK_DISPATCHER_RS.contains("if driver.is_none()"));
     assert!(WORK_DISPATCHER_RS.contains("cannot generate ASIC work for unknown chip type"));
 
     // The env-gated `new()` consumes the two-gate policy, and the S23 scaffold
     // is dual-keyed via `register_alias`.
     assert!(DRIVERS_MOD_RS.contains("should_register_scaffold_drivers(allow, ack)"));
-    assert!(DRIVERS_MOD_RS.contains("register_alias(bm1373::ENUM_CHIP_ID"));
+    assert!(DRIVERS_MOD_RS.contains("register_alias_with_maturity("));
+    assert!(DRIVERS_MOD_RS.contains("bm1373::ENUM_CHIP_ID,"));
 }

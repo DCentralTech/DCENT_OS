@@ -10,8 +10,12 @@ license = "GPL-3.0"
 # for fast unit-test cycles.
 
 [dependencies]
-# No external deps. Wallet-mask scanners are hand-rolled to avoid pulling in
-# `regex` (~500KB compiled, ~6s build cost) just for ~7 character-class checks.
+# Cross-firmware, host-safe hardware enablement contract. This is a local
+# schema dependency (no HAL, OS, async runtime, or hardware I/O).
+dcent-schema = { path = "../../../shared/dcent-schema" }
+
+# No regex dependency. Wallet-mask scanners stay hand-rolled to avoid pulling
+# in ~500KB of compiled regex machinery for ~7 character-class checks.
 
 [dev-dependencies]
 proptest = { workspace = true }

@@ -62,6 +62,7 @@ flate2 = "1"
 dcentrald-api-types = { path = "../dcentrald-api-types" }
 # HOME_FAN_PWM_SAFETY_MAX parity pin with FanCommand (cycle-3).
 dcentrald-common = { path = "../dcentrald-common" }
+dcentrald-fabric-lease = { path = "../dcentrald-fabric-lease" }
 dcentrald-silicon-profiles = { path = "../dcentrald-silicon-profiles", optional = true }
 
 # The PIC parser flush example uses raw bus access via the recovery escape

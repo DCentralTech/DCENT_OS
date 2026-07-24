@@ -1,0 +1,312 @@
+{
+  "schema": "dcentos.boot-artifact-catalog.v1",
+  "coverage": "declared_inputs_only",
+  "claim": "This report covers only the declared catalog entries listed below. It is not an exhaustive inventory of the workspace, firmware archive, or a miner's boot chain.",
+  "non_claims": [
+    "Artifact integrity SHA-256 values identify the bytes read during this run. They do not authenticate their origin, freshness, active-copy status, acquisition process, or product association. CRC consistency establishes only consistency under the explicitly declared layout.",
+    "Commands are lexical observations from captured bytes. This report does not prove command execution, the active U-Boot adapter, Linux adapter equivalence, wire transaction framing, device acknowledgement, GPIO polarity, APW output state, pad voltage, rail state, fan behavior, boot safety, or applicability to another product.",
+    "Equal artifact hashes establish byte equality only. Unequal hashes do not establish independent acquisition, origin, provenance, or corroboration."
+  ],
+  "artifacts": [
+    {
+      "id": "amlogic-current-s37-early-userspace-source",
+      "location": {
+        "root": "project",
+        "path": "br2_external_dcentos/board/amlogic/rootfs-overlay/etc/init.d/S37board_setup"
+      },
+      "presence_policy": "required",
+      "kind": "script_text",
+      "declared_boot_phase": "early_userspace",
+      "integrity": {
+        "size": 15060,
+        "sha256": "a9b27d2181fe4903e942a718e1e9ec41bb985becf43ce5bcee39d747fe233982"
+      },
+      "declared_context": {
+        "product_declaration": null,
+        "firmware_declaration": "DCENT_OS source tree",
+        "capture_id": null,
+        "provenance_grade": "repository_tracked",
+        "association": "tracked_source_current"
+      },
+      "format_profile": null,
+      "expected_findings": null
+    },
+    {
+      "id": "s19k-pro-78-bos-hashboard-context-20260429",
+      "location": {
+        "root": "workspace",
+        "path": ""
+      },
+      "presence_policy": "local_optional",
+      "kind": "context_record",
+      "declared_boot_phase": "context",
+      "integrity": {
+        "size": 2845,
+        "sha256": "47446fb6f9cf74024997319d5292ca4f15b596dc3ebbf1add5e7d22b174b5dea"
+      },
+      "declared_context": {
+        "product_declaration": "Antminer S19K Pro",
+        "firmware_declaration": "BraiinsOS+ 25.07-plus",
+        "capture_id": "live-probe-78-2026-04-29",
+        "provenance_grade": "operator_associated_unsealed",
+        "association": "same_capture_directory_unsealed"
+      },
+      "format_profile": null,
+      "expected_findings": null
+    },
+    {
+      "id": "s19k-pro-78-bos-model-context-20260429",
+      "location": {
+        "root": "workspace",
+        "path": ""
+      },
+      "presence_policy": "local_optional",
+      "kind": "context_record",
+      "declared_boot_phase": "context",
+      "integrity": {
+        "size": 2340,
+        "sha256": "c8310c33e7c32d87ed8486b7c1f7a5f6b2fcdcfb0927594300266062c8ae677c"
+      },
+      "declared_context": {
+        "product_declaration": "Antminer S19K Pro NoPic",
+        "firmware_declaration": "BraiinsOS+ 25.07-plus",
+        "capture_id": "live-probe-78-2026-04-29",
+        "provenance_grade": "operator_associated_unsealed",
+        "association": "same_capture_directory_unsealed"
+      },
+      "format_profile": null,
+      "expected_findings": null
+    },
+    {
+      "id": "s19k-pro-78-bos-nand-env-20260429",
+      "location": {
+        "root": "workspace",
+        "path": ""
+      },
+      "presence_policy": "local_optional",
+      "kind": "uboot_env_crc32_le",
+      "declared_boot_phase": "pre_linux",
+      "integrity": {
+        "size": 65536,
+        "sha256": "e589cfb5cc82a9f7803e2e1beb1cd85ff8c30c8bcb1c793fc35a4ceb0a442e70"
+      },
+      "declared_context": {
+        "product_declaration": "Antminer S19K Pro",
+        "firmware_declaration": "BraiinsOS+ 25.07-plus",
+        "capture_id": "live-probe-78-2026-04-29",
+        "provenance_grade": "operator_associated_unsealed",
+        "association": "same_capture_directory_unsealed"
+      },
+      "format_profile": {
+        "header_bytes": 4,
+        "crc32_byte_order": "little",
+        "redundancy_flag_bytes": 0,
+        "terminator": "double_nul",
+        "padding_byte": 0
+      },
+      "expected_findings": {
+        "crc_consistent": true,
+        "record_shape_status": "non_assignment_records_present",
+        "record_count": 81,
+        "assignment_count": 80,
+        "assignment_projection_sha256": "90a2f5d9adb5ce696e967671455ae11011f63419b20fee083b014fe20ccd57b7",
+        "non_assignment_record_sha256": [
+          "11a4790c120e6fedcf9bc054d64a6a1ba0d0eac95a4ab16984613513f5a47406"
+        ],
+        "preboot_present": true,
+        "preboot_value_length": 159,
+        "preboot_value_sha256": "1073fbe42669d5d0604899693b14d735ac410c248378225fd3864a0e2150dd94",
+        "preboot_segment_count": 8,
+        "direct_run_reference_count": 6,
+        "direct_run_target_name_present_count": 2,
+        "unresolved_run_target_sha256": [
+          "1ef92673ae2a5495fe5e95321fc521051d71c80d7901d27b48c09870e5bb017e",
+          "4836fead6145f0a89fc23fd05ab20d647a77ec07a65b65ace4b33e53286f072b",
+          "882970c68db8e0ae391a5b659e5741d2b2a829cae41d4bbc84a612fce802929c",
+          "9232a92de4a6346743b6905176eb3a4e9763c78fbb5aed32c078e223fabf1e8e"
+        ],
+        "literal_i2c_commands": [
+          "i2c mw 1f 1.1 fc 2",
+          "i2c mw 1f 3.1 0 2"
+        ],
+        "captured_table_literal_i2c_dev_count": 0,
+        "command_graph_complete": false,
+        "uboot_adapter_identity": "unknown",
+        "linux_adapter_equivalence": "not_inferred"
+      }
+    },
+    {
+      "id": "s19k-pro-78-bos-s37-20260429",
+      "location": {
+        "root": "workspace",
+        "path": ""
+      },
+      "presence_policy": "local_optional",
+      "kind": "script_text",
+      "declared_boot_phase": "early_userspace",
+      "integrity": {
+        "size": 3362,
+        "sha256": "2f4051da2e0ac63a983cf656a5f5e8150ca500ef4c32b31bef397208adef5c3d"
+      },
+      "declared_context": {
+        "product_declaration": "Antminer S19K Pro",
+        "firmware_declaration": "BraiinsOS+ 25.07-plus",
+        "capture_id": "live-probe-78-2026-04-29",
+        "provenance_grade": "operator_associated_unsealed",
+        "association": "same_capture_directory_unsealed"
+      },
+      "format_profile": null,
+      "expected_findings": null
+    },
+    {
+      "id": "s21-path-declared-init-script",
+      "location": {
+        "root": "project",
+        "path": "extractions/s21/init"
+      },
+      "presence_policy": "local_optional",
+      "kind": "script_text",
+      "declared_boot_phase": "early_userspace",
+      "integrity": {
+        "size": 4521,
+        "sha256": "b3439e7d63f50da6a355e422f633f3bb2de4a9e04ee4dabd174fe7e13a7e74c7"
+      },
+      "declared_context": {
+        "product_declaration": "S21 (directory declaration only)",
+        "firmware_declaration": null,
+        "capture_id": null,
+        "provenance_grade": "derived_unsealed",
+        "association": "path_label_only_unsealed"
+      },
+      "format_profile": null,
+      "expected_findings": null
+    },
+    {
+      "id": "s21-path-declared-nand-env-text",
+      "location": {
+        "root": "project",
+        "path": "extractions/s21/nand_env_bos.txt"
+      },
+      "presence_policy": "local_optional",
+      "kind": "uboot_env_text_export",
+      "declared_boot_phase": "pre_linux",
+      "integrity": {
+        "size": 4046,
+        "sha256": "2f7e621c01ba6865e6c74a7f7951c062a48d8ac9a69b3442bcd1218c35f0b857"
+      },
+      "declared_context": {
+        "product_declaration": "S21 (directory declaration only)",
+        "firmware_declaration": "BraiinsOS-derived text transcription",
+        "capture_id": null,
+        "provenance_grade": "derived_unsealed",
+        "association": "derived_transcription_unsealed"
+      },
+      "format_profile": {
+        "encoding": "ascii",
+        "line_ending": "lf",
+        "terminal_line_ending": "required"
+      },
+      "expected_findings": {
+        "crc_consistent": null,
+        "record_shape_status": "non_assignment_lines_present",
+        "record_count": 83,
+        "assignment_count": 80,
+        "assignment_projection_sha256": "122be7aa323eba7e0a0514694099970de9e6403d5f34740ea458d3cd4f723905",
+        "non_assignment_record_sha256": [
+          "a78f11e3e3a937bfac2f70206f1eb916046ac56473fbaba5c33e0b1f70150a92",
+          "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "fbb6f618e2cf8bc6a9bf8f029090d6054e3cebdd8aa570cc1c62768e18015c50"
+        ],
+        "preboot_present": true,
+        "preboot_value_length": 159,
+        "preboot_value_sha256": "1073fbe42669d5d0604899693b14d735ac410c248378225fd3864a0e2150dd94",
+        "preboot_segment_count": 8,
+        "direct_run_reference_count": 6,
+        "direct_run_target_name_present_count": 2,
+        "unresolved_run_target_sha256": [
+          "1ef92673ae2a5495fe5e95321fc521051d71c80d7901d27b48c09870e5bb017e",
+          "4836fead6145f0a89fc23fd05ab20d647a77ec07a65b65ace4b33e53286f072b",
+          "882970c68db8e0ae391a5b659e5741d2b2a829cae41d4bbc84a612fce802929c",
+          "9232a92de4a6346743b6905176eb3a4e9763c78fbb5aed32c078e223fabf1e8e"
+        ],
+        "literal_i2c_commands": [
+          "i2c mw 1f 1.1 fc 2",
+          "i2c mw 1f 3.1 0 2"
+        ],
+        "captured_table_literal_i2c_dev_count": 0,
+        "command_graph_complete": false,
+        "uboot_adapter_identity": "unknown",
+        "linux_adapter_equivalence": "not_inferred"
+      }
+    },
+    {
+      "id": "s21-path-declared-s37-alias",
+      "location": {
+        "root": "project",
+        "path": "extractions/s21/S37board_setup"
+      },
+      "presence_policy": "local_optional",
+      "kind": "script_text",
+      "declared_boot_phase": "early_userspace",
+      "integrity": {
+        "size": 3932,
+        "sha256": "dbb87a92c4f350b6fb2a9936a59b71f88914b4a514b37db8209e64f7108c0b53"
+      },
+      "declared_context": {
+        "product_declaration": "S21 (directory declaration only)",
+        "firmware_declaration": null,
+        "capture_id": null,
+        "provenance_grade": "derived_unsealed",
+        "association": "path_label_only_unsealed"
+      },
+      "format_profile": null,
+      "expected_findings": null
+    },
+    {
+      "id": "s21-path-declared-s37-knowledge-alias",
+      "location": {
+        "root": "workspace",
+        "path": ""
+      },
+      "presence_policy": "local_optional",
+      "kind": "script_text",
+      "declared_boot_phase": "early_userspace",
+      "integrity": {
+        "size": 3932,
+        "sha256": "dbb87a92c4f350b6fb2a9936a59b71f88914b4a514b37db8209e64f7108c0b53"
+      },
+      "declared_context": {
+        "product_declaration": "S21 (directory declaration only)",
+        "firmware_declaration": null,
+        "capture_id": null,
+        "provenance_grade": "derived_unsealed",
+        "association": "path_label_only_unsealed"
+      },
+      "format_profile": null,
+      "expected_findings": null
+    },
+    {
+      "id": "s21-path-declared-uboot-binary",
+      "location": {
+        "root": "project",
+        "path": "extractions/s21/uboot.bin"
+      },
+      "presence_policy": "local_optional",
+      "kind": "opaque_file",
+      "declared_boot_phase": "pre_linux",
+      "integrity": {
+        "size": 3145728,
+        "sha256": "8ce726f8fe5c363b0d68c87913071bb2d5700bfc56b94088e5e2d416d8c55fe0"
+      },
+      "declared_context": {
+        "product_declaration": "S21 (directory declaration only)",
+        "firmware_declaration": null,
+        "capture_id": null,
+        "provenance_grade": "derived_unsealed",
+        "association": "path_label_only_unsealed"
+      },
+      "format_profile": null,
+      "expected_findings": null
+    }
+  ]
+}

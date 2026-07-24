@@ -170,28 +170,40 @@ if [ $? -eq 0 ]; then
         /etc
     echo "[OK] Persistent /etc overlay active"
 
-    # Seed entropy pool from persistent storage (speeds up SSH startup)
-    # CRITICAL: Use RNDADDENTROPY ioctl to credit bits, not just write to urandom.
-    # Without crediting, the kernel still waits ~200s for "real" entropy.
-    # v0.2.9: C binary replaces Python3 — no interpreter overhead, no urandom
-    # reads during startup (Python3 hash randomization drains entropy).
-    if [ -f /data/keys/random-seed ]; then
+    # Reconcile the persistent saved-seed transaction.  The native helper
+    # verifies /dev/urandom identity, mixes trusted saved bytes through the
+    # normal write path, and accounts them separately with RNDADDENTROPY.
+    # Input-pool accounting is observability only; successor generation is
+    # independently gated on nonblocking-CRNG readiness.
+    if [ -e /data/keys/random-seed ] || [ -L /data/keys/random-seed ] || \
+       [ -e /data/keys/.random-seed.consumed ] || [ -L /data/keys/.random-seed.consumed ] || \
+       [ -e /data/keys/.random-seed.credited ] || [ -L /data/keys/.random-seed.credited ] || \
+       [ -e /data/keys/.random-seed.born ] || [ -L /data/keys/.random-seed.born ] || \
+       [ -e /data/keys/.random-seed.born.new ] || [ -L /data/keys/.random-seed.born.new ] || \
+       [ -e /data/keys/.random-seed.new ] || [ -L /data/keys/.random-seed.new ]; then
         _ent_before=$(cat /proc/sys/kernel/random/entropy_avail)
         if [ -x /usr/sbin/seed-entropy ]; then
-            /usr/sbin/seed-entropy /data/keys/random-seed
-            _rc=$?
+            if /usr/sbin/seed-entropy /data/keys/random-seed; then
+                _rc=0
+            else
+                _rc=$?
+            fi
             _ent_after=$(cat /proc/sys/kernel/random/entropy_avail)
             echo "seed-entropy: ${_ent_before} -> ${_ent_after} bits (rc=${_rc})" > /dev/kmsg 2>/dev/null
             echo "seed-entropy: ${_ent_before} -> ${_ent_after} bits (rc=${_rc})" >> /tmp/seed-debug.log
+            if [ "$_rc" -eq 0 ]; then
+                echo "[OK] Entropy lifecycle reconciled (${_ent_before} -> ${_ent_after} bits)"
+            else
+                echo "[!!] Entropy lifecycle incomplete; replay remains blocked (seed-entropy rc=$_rc)"
+            fi
         else
-            cat /data/keys/random-seed > /dev/urandom 2>/dev/null
             _ent_after=$(cat /proc/sys/kernel/random/entropy_avail)
-            echo "seed-fallback: ${_ent_before} -> ${_ent_after} bits" >> /tmp/seed-debug.log
+            echo "seed-entropy: helper missing; seed left untouched" >> /tmp/seed-debug.log
+            echo "[!!] Entropy helper missing; refusing uncredited seed fallback"
         fi
-        echo "[OK] Entropy pool seeded (${_ent_before} -> ${_ent_after} bits)"
     else
         echo "seed-entropy: NO SEED FILE" >> /tmp/seed-debug.log
-        echo "[!!] No entropy seed file — SSH will be slow on first boot"
+        echo "[!!] No saved entropy seed; relying on live kernel CRNG initialization"
     fi
 
     # Ensure /etc/dropbear/ exists (overlayfs whiteout cleanup)

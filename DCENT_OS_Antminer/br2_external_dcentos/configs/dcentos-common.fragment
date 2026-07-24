@@ -96,8 +96,8 @@ BR2_PACKAGE_LIBUBOOTENV=y
 BR2_PACKAGE_LIBUBOOTENV_TOOLS=y
 
 # =============================================================================
-# Python 3 — used by toolbox shims, switch_firmware.py, dashboard server.py,
-# and the post-build manifest hooks. CPython over MicroPython for stdlib
+# Python 3 — used by toolbox shims, dashboard server.py, and the post-build
+# manifest hooks. CPython over MicroPython for stdlib
 # compatibility (struct/json/collections/select/fcntl/socket/argparse).
 # ~3 MB cost is acceptable across the matrix.
 # =============================================================================
@@ -114,7 +114,7 @@ BR2_PACKAGE_LIBOPENSSL_BIN=y
 # =============================================================================
 # DCENT_OS userland packages — our custom Buildroot packages.
 # dcentos-tools : python toolbox subset shipped in the image.
-# seed-entropy  : fast SSH boot helper (ioctl-credits entropy from a hwrng).
+# seed-entropy  : one-time saved-seed consumption and rotation in native code.
 # =============================================================================
 BR2_PACKAGE_DCENTOS_TOOLS=y
 BR2_PACKAGE_SEED_ENTROPY=y

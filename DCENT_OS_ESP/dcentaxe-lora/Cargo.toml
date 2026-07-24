@@ -3,7 +3,7 @@ name = "dcentaxe-lora"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-description = "SX1262 LoRa driver + DCENT mesh stack for DCENT_axe (scaffold — NOT yet wired into the daemon)"
+description = "SX1262 LoRa driver + DCENT mesh stack for DCENT_axe (wired behind default-OFF dcentaxe lora feature; live RF unproven)"
 
 [dependencies]
 log = "0.4"

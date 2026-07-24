@@ -1,12 +1,17 @@
 config BR2_PACKAGE_SEED_ENTROPY
 	bool "seed-entropy"
 	help
-	  Tiny C binary that credits saved entropy to the kernel random pool
-	  using the RNDADDENTROPY ioctl. This makes SSH available immediately
-	  on boot instead of waiting ~200 seconds for hardware entropy.
+	  Native saved-seed lifecycle helper. It atomically consumes a
+	  single-use persistent seed, mixes it through the kernel write path,
+	  credits it separately with RNDADDENTROPY, and durably rotates a
+	  replacement without permitting replay or same-boot circular credit.
+	  Transactional boot-epoch and SHA-256 markers bind provenance to the
+	  exact generated seed until a later boot.
 
-	  Unlike a Python implementation, this binary does not read from
-	  /dev/urandom during startup, avoiding the entropy drain that
-	  Python's hash randomization causes.
+	  Its separate shutdown initializer only creates the first seed after
+	  an in-process CRNG readiness proof. Markerless seeds from older
+	  releases are mixed without credit and regenerated. Unsafe paths,
+	  metadata, device identity, partial lifecycle states, and concurrent
+	  invocations fail closed.
 
 	  https://d-central.tech/

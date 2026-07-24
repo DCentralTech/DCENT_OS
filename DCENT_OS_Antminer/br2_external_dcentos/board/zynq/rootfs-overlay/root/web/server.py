@@ -624,16 +624,42 @@ class DCENTosHandler(http.server.SimpleHTTPRequestHandler):
                         "error": "release image requires a valid Bearer token for dashboard-local control endpoints",
                     }, status=401)
                     return
-                # Fire-and-forget restart. /etc/init.d/S82dcentrald takes
-                # 5-30s to come up; we return immediately so the dashboard
-                # doesn't block.
-                subprocess.Popen(
-                    ["/etc/init.d/S82dcentrald", "restart"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-                self.send_json({"status": "restart_initiated", "ts": int(time.time())})
+                # The init wrapper is the hardware-admission authority. Wait for
+                # its result so a persistent unresolved-session latch is surfaced
+                # to the operator instead of being reported as a successful
+                # fire-and-forget restart.
+                try:
+                    result = subprocess.run(
+                        ["/etc/init.d/S82dcentrald", "restart"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        timeout=45,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    output = (exc.stdout or "")[-2000:]
+                    self.send_json({
+                        "status": "restart_timeout",
+                        "error": "guarded service restart did not finish within 45 seconds",
+                        "output": output,
+                    }, status=504)
+                    return
+                output = (result.stdout or "")[-2000:]
+                if result.returncode != 0:
+                    self.send_json({
+                        "status": "restart_refused",
+                        "error": "hardware-session admission remains blocked; operator disposition is required",
+                        "returncode": result.returncode,
+                        "output": output,
+                    }, status=409)
+                    return
+                self.send_json({
+                    "status": "restart_completed",
+                    "returncode": 0,
+                    "output": output,
+                    "ts": int(time.time()),
+                })
                 return
             if self.path == "/api/dashboard/report-ip":
                 if not local_control_authorized(self.headers):

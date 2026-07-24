@@ -3,7 +3,7 @@
 # switch_firmware.sh — POSIX sh + awk reimplementation of switch_firmware.py
 #
 # Byte-identical /tmp/uboot_env_patched.bin output to
-#   board/zynq/rootfs-overlay/usr/sbin/switch_firmware.py
+#   scripts/switch_firmware.py
 # for the same /tmp/uboot_env.bin input and the same args:
 #   sh switch_firmware.sh <1|2> --i-understand-this-is-not-fw-setenv [--with-stage]
 #
@@ -20,20 +20,19 @@
 # stand in for fw_setenv by accident.
 #
 # Why this exists: it is the dependency-free POSIX-sh+awk twin of the .py
-# CRC32 env patcher for a BraiinsOS source that has NEITHER python3 NOR
-# python. It is staged verbatim to /usr/sbin/ as a last-resort manual-
-# recovery env patcher. It mirrors the proven writer's manifest_field()
-# jsonfilter-over-python3 idiom only as a byte-READER cascade (od ->
-# hexdump), never as the live env flip.
+# CRC32 env patcher for offline analysis hosts that do not have Python. It is
+# deliberately absent from target images and must not be treated as a recovery
+# authority. Its byte-reader cascade is od -> hexdump; it never performs a live
+# environment flip.
 #
-# On-target tool budget (BraiinsOS BusyBox): sh, awk (/usr/bin/awk),
-# dd, od, printf, cut, the standard busybox set. NO python, NO perl,
-# NO lua, NO gawk-only features. Binary-safe: every byte (incl. 0x00
+# Host POSIX tool budget: sh, awk, dd, od, printf, cut, and the standard
+# BusyBox/POSIX set. NO python, NO perl, NO lua, NO gawk-only features.
+# Binary-safe: every byte (incl. 0x00
 # and 0xff and high bytes) is moved through awk as an integer 0..255.
 #
 # Same nonzero-exit-on-error contract as the python: a CRC-parse
-# failure on copy 1 -> exit 1 (NO output written -> the proven writer's
-# cmp -s readback gate fails closed -> env NOT flipped -> no brick).
+# failure on copy 1 -> exit 1 with no output written. Any offline caller must
+# treat that as a failed transform and must not use a partial output.
 #
 # Spec mirrored exactly (see switch_firmware.py):
 #   CRC32 = zlib/IEEE: table from poly 0xEDB88320, init 0xFFFFFFFF,
@@ -65,8 +64,8 @@
 # byte-faithful primitives the env rebuild + CRC + file write depend
 # on. Without this, a gawk host in a UTF-8 locale would multibyte-
 # encode bytes >=128 and silently corrupt the patched env (a brick).
-# busybox awk is always single-byte; this only hardens gawk hosts and
-# is harmless on the BraiinsOS busybox target.
+# busybox awk is always single-byte; this only hardens full gawk-based
+# analysis hosts.
 LC_ALL=C
 LANG=C
 export LC_ALL LANG
@@ -95,14 +94,15 @@ if [ -z "$TARGET_FW" ]; then
     echo "Usage: sh switch_firmware.sh <1|2> --i-understand-this-is-not-fw-setenv [--with-stage]"
     echo "  1 = firmware1 (mtd7)"
     echo "  2 = firmware2 (mtd8)"
-    echo "  --with-stage = set upgrade_stage=0 for auto_recovery"
+    echo "  --with-stage = set upgrade_stage=0 in the offline output image"
     exit 1
 fi
 
 # W24-OTA-2: refuse to run as a stand-in for fw_setenv (mirror
 # switch_firmware.py). The OTA/sysupgrade write path flips the live A/B
-# selector with fw_setenv (libubootenv) — this script is offline/forensic
-# recovery only and must never be the live env-flip mechanism. Argv-
+# selector with fw_setenv (libubootenv) — this script is a host-only
+# offline/forensic transformer and must never be the live env-flip or recovery
+# mechanism. Argv-
 # faithful to the .py gate so the two scripts AGREE: both REFUSE without
 # the ack flag (exit 2), both PROCEED with it.
 if [ "$ACK_NOT_FW_SETENV" -ne 1 ]; then
@@ -131,24 +131,21 @@ fi
 #
 # Byte-reader prefer/fallback cascade (mirrors the proven writer's
 # `manifest_field()` jsonfilter-over-python3 idiom):
-#   1. `od -An -v -tu1`           — preferred. Present on a DCENT_OS
-#                                    source rootfs (env re-flash path,
-#                                    behaviour UNCHANGED).
-#   2. `hexdump -v -e '1/1 "%u "'` — fallback. BraiinsOS BusyBox has
-#                                    NO `od` but DOES ship hexdump
-#                                    (/usr/bin/hexdump, confirmed on
-#                                    the live .109 unit). Verified
-#                                    byte-faithful: a 0x00/0xff/0x41
-#                                    input emits `0 255 65 `.
+#   1. `od -An -v -tu1`           — preferred on ordinary POSIX analysis
+#                                    hosts.
+#   2. `hexdump -v -e '1/1 "%u "'` — fallback retained from BraiinsOS `a lab unit`
+#                                    BusyBox evidence (no `od`, hexdump at
+#                                    /usr/bin/hexdump). Verified byte-faithful:
+#                                    a 0x00/0xff/0x41 input emits `0 255 65 `.
 # Both emit the SAME multiset of whitespace-separated 0..255 decimals
 # in the SAME order with the SAME count — only the separator run
 # differs (od: leading spaces + ~16/line newlines; hexdump: one
 # trailing space per byte, no newlines). The awk consumer below splits
 # on default FS/RS (any whitespace, leading/trailing ignored) and
 # accumulates $1..$NF per record into B[], so the two streams parse
-# byte-for-byte identically. No 3rd path is shipped: two readers are
-# sufficient (DCENT_OS has od, BraiinsOS has hexdump) and an unproven
-# xxd path is deliberately omitted.
+# byte-for-byte identically. No third path is shipped: `od` plus the
+# evidence-backed `hexdump` fallback cover the supported offline host budgets,
+# and an unproven xxd path is deliberately omitted.
 #
 # `SWITCH_FW_FORCE_BYTEREADER` (od|hexdump) forces one reader instead
 # of auto prefer/fallback — used ONLY here, ONLY by the byte-identity

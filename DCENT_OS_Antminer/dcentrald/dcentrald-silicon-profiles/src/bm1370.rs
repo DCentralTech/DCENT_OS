@@ -87,8 +87,13 @@ pub const BM1370_TABLE: SiliconTable = SiliconTable {
     live_status: crate::ChipStatus::RegisterMappedFromRE,
 };
 
-/// Per-chip cores per chip-init-sequences.md.
-pub const BM1370_CORES_PER_CHIP: u32 = 1024;
+/// Per-chip cores. 1280 = 80 domains x 16 small cores, matching this crate's
+/// own `operating_points.rs` BM1370 rows, the `dcentrald-asic` BM1370 driver
+/// (`CORES_PER_CHIP = 1280`), and the fixture-total ground truth — the same
+/// source-conflict `bm1368.rs` documents and resolves to the fixture total.
+/// (Was 1024 from a spec-block small-core-matrix misread, like the pre-fix
+/// BM1368; reconciled to 1280 so a future consumer can't import the wrong value.)
+pub const BM1370_CORES_PER_CHIP: u32 = 1280;
 
 /// Per-chip hashrate at S21 Pro nameplate (per BM1373_S23_RESEARCH.md
 /// line 79: 234 TH/s Ã· 195 chips â‰ˆ 1.2 TH/s per chip at 525 MHz).

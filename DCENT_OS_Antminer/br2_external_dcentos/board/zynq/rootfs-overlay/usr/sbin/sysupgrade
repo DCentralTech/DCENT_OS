@@ -45,6 +45,9 @@ BOARD_TARGET_PATH="/etc/dcentos/board_target"
 CONF_MINER_TYPE_PATH="/config/CONF_MINER_TYPE"
 CONF_HARDWARE_ID_PATH="/config/CONF_HARDWARE_ID"
 PROC_CMDLINE_PATH="/proc/cmdline"
+ARCHIVE_ADMISSION_HELPER="/usr/libexec/dcentos/sysupgrade-archive-admission.sh"
+MANIFEST_JSON_HELPER="/usr/libexec/dcentos/sysupgrade-manifest-json.py"
+ZYNQ_GEOMETRY_HELPER="/usr/libexec/dcentos/sysupgrade-zynq-geometry.sh"
 if [ "${DCENT_SYSUPGRADE_OFFLINE_HARNESS:-0}" = "1" ]; then
     SCRIPT_REALPATH=$(readlink -f "$0" 2>/dev/null || printf '%s\n' "$0")
     if [ "$SCRIPT_REALPATH" = "/usr/sbin/sysupgrade" ]; then
@@ -66,6 +69,25 @@ if [ "${DCENT_SYSUPGRADE_OFFLINE_HARNESS:-0}" = "1" ]; then
     CONF_MINER_TYPE_PATH="${DCENT_SYSUPGRADE_CONF_MINER_TYPE_PATH:-$CONF_MINER_TYPE_PATH}"
     CONF_HARDWARE_ID_PATH="${DCENT_SYSUPGRADE_CONF_HARDWARE_ID_PATH:-$CONF_HARDWARE_ID_PATH}"
     PROC_CMDLINE_PATH="${DCENT_SYSUPGRADE_PROC_CMDLINE_PATH:-$PROC_CMDLINE_PATH}"
+    ARCHIVE_ADMISSION_HELPER="${DCENT_SYSUPGRADE_ARCHIVE_ADMISSION_HELPER:-$ARCHIVE_ADMISSION_HELPER}"
+    MANIFEST_JSON_HELPER="${DCENT_SYSUPGRADE_MANIFEST_JSON_HELPER:-$MANIFEST_JSON_HELPER}"
+    ZYNQ_GEOMETRY_HELPER="${DCENT_SYSUPGRADE_ZYNQ_GEOMETRY_HELPER:-$ZYNQ_GEOMETRY_HELPER}"
+fi
+
+if [ ! -r "$ARCHIVE_ADMISSION_HELPER" ]; then
+    echo "Error: sysupgrade archive-admission helper is missing or unreadable: $ARCHIVE_ADMISSION_HELPER"
+    exit 1
+fi
+# shellcheck source=/usr/libexec/dcentos/sysupgrade-archive-admission.sh
+. "$ARCHIVE_ADMISSION_HELPER"
+if ! command -v dcent_sysupgrade_archive_admit >/dev/null 2>&1; then
+    echo "Error: sysupgrade archive-admission helper did not provide its required API"
+    exit 1
+fi
+
+if [ ! -r "$MANIFEST_JSON_HELPER" ] || ! command -v python3 >/dev/null 2>&1; then
+    echo "Error: semantic manifest admission requires python3 and $MANIFEST_JSON_HELPER"
+    exit 1
 fi
 
 cleanup_package() {
@@ -98,6 +120,42 @@ PY
     fi
 }
 
+manifest_string_field() {
+    file=$1
+    key=$2
+    [ "$(manifest_key_count "$file" "$key")" = "1" ] || return 1
+    sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$file" | head -n 1
+}
+
+manifest_key_count() {
+    file=$1
+    key=$2
+    awk -v needle="\"$key\"" '
+        {
+            line = $0
+            while ((position = index(line, needle)) > 0) {
+                count++
+                line = substr(line, position + length(needle))
+            }
+        }
+        END { print count + 0 }
+    ' "$file"
+}
+
+manifest_boolean_field() {
+    file=$1
+    key=$2
+    [ "$(manifest_key_count "$file" "$key")" = "1" ] || return 1
+    sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*\(true\|false\)[[:space:]]*[,}].*/\1/p' "$file" | head -n 1
+}
+
+manifest_integer_field() {
+    file=$1
+    key=$2
+    [ "$(manifest_key_count "$file" "$key")" = "1" ] || return 1
+    sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*[,}].*/\1/p' "$file" | head -n 1
+}
+
 is_release_status() {
     case "${1:-release}" in
         release|production|stable) return 0 ;;
@@ -124,119 +182,11 @@ else
 fi
 
 read_current_version() {
-    sed -n 's/^[[:space:]]*//;s/[[:space:]]*$//;/^$/!{p;q;}' "$VERSION_PATH" 2>/dev/null
+    python3 "$MANIFEST_JSON_HELPER" read-version-file "$VERSION_PATH"
 }
 
 compare_versions() {
-    awk -v candidate="$1" -v current="$2" '
-        function trim(s) {
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
-            return s
-        }
-        function clear_array(a,   k) {
-            for (k in a) {
-                delete a[k]
-            }
-        }
-        function prerelease_value(token,   i, c, chars, split_at, label, tail, score, pos) {
-            if (token ~ /^[0-9]+$/) {
-                return token + 0
-            }
-            split_at = length(token) + 1
-            for (i = 1; i <= length(token); i++) {
-                c = substr(token, i, 1)
-                if (c ~ /[0-9]/) {
-                    split_at = i
-                    break
-                }
-            }
-            label = substr(token, 1, split_at - 1)
-            tail = substr(token, split_at)
-            chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
-            score = 0
-            for (i = 1; i <= length(label); i++) {
-                c = substr(label, i, 1)
-                pos = index(chars, c)
-                score += pos ? pos : 200
-            }
-            if (tail !~ /^[0-9]+$/) {
-                tail = 0
-            }
-            return (score * 1000000) + tail
-        }
-        function parse_version(version, release, prerelease,   text, hyphen, release_part, prerelease_part, parts, preparts, count, pre_count, i, token) {
-            clear_array(release)
-            clear_array(prerelease)
-            text = trim(version)
-            if (substr(text, 1, 1) == "v") {
-                text = substr(text, 2)
-            }
-            hyphen = index(text, "-")
-            if (hyphen > 0) {
-                release_part = substr(text, 1, hyphen - 1)
-                prerelease_part = substr(text, hyphen + 1)
-            } else {
-                release_part = text
-                prerelease_part = ""
-            }
-            sub(/[+].*$/, "", release_part)
-            count = split(release_part, parts, ".")
-            release[0] = 0
-            for (i = 1; i <= count; i++) {
-                if (parts[i] == "" || parts[i] !~ /^[0-9]+$/) {
-                    return 0
-                }
-                release[++release[0]] = parts[i] + 0
-            }
-            if (release[0] == 0) {
-                return 0
-            }
-            prerelease[0] = 0
-            if (prerelease_part != "") {
-                pre_count = split(prerelease_part, preparts, /[.-]/)
-                for (i = 1; i <= pre_count; i++) {
-                    token = preparts[i]
-                    if (token != "") {
-                        prerelease[++prerelease[0]] = prerelease_value(token)
-                    }
-                }
-            }
-            return 1
-        }
-        function cmp_padded(a, b,   max, i, av, bv) {
-            max = (a[0] > b[0]) ? a[0] : b[0]
-            for (i = 1; i <= max; i++) {
-                av = (i in a) ? a[i] : 0
-                bv = (i in b) ? b[i] : 0
-                if (av > bv) {
-                    return 1
-                }
-                if (av < bv) {
-                    return -1
-                }
-            }
-            return 0
-        }
-        BEGIN {
-            if (!parse_version(candidate, cand_release, cand_pre) || !parse_version(current, current_release, current_pre)) {
-                exit 2
-            }
-            release_cmp = cmp_padded(cand_release, current_release)
-            if (release_cmp != 0) {
-                print release_cmp
-                exit 0
-            }
-            if (cand_pre[0] == 0 && current_pre[0] == 0) {
-                print 0
-            } else if (cand_pre[0] == 0) {
-                print 1
-            } else if (current_pre[0] == 0) {
-                print -1
-            } else {
-                print cmp_padded(cand_pre, current_pre)
-            }
-        }
-    '
+    python3 "$MANIFEST_JSON_HELPER" compare-version "$1" "$2"
 }
 
 allow_downgrade_override() {
@@ -244,9 +194,14 @@ allow_downgrade_override() {
 }
 
 enforce_sysupgrade_version_floor() {
-    candidate_version=$(manifest_field "$PACKAGE_MANIFEST" version 2>/dev/null || true)
+    candidate_version=$(manifest_string_field "$PACKAGE_MANIFEST" version 2>/dev/null || true)
     if [ -z "$candidate_version" ]; then
-        echo "Error: Refusing sysupgrade: signed package MANIFEST.json has no version field; rollback floor cannot be evaluated."
+        echo "Error: Refusing sysupgrade: package MANIFEST.json has no single non-empty string version; rollback floor cannot be evaluated."
+        return 1
+    fi
+    candidate_version_trimmed=$(printf '%s' "$candidate_version" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [ "$candidate_version" != "$candidate_version_trimmed" ]; then
+        echo "Error: Refusing sysupgrade: package version must not contain surrounding whitespace."
         return 1
     fi
 
@@ -288,56 +243,170 @@ verify_sha256() {
     [ "$actual" = "$2" ]
 }
 
-validate_sysupgrade_tar_members() {
-    local tarball=$1
-    tar tf "$tarball" | awk '
-        BEGIN { ok=1 }
-        {
-            name=$0
-            if (name == "" || name ~ /^\// || name ~ /(^|\/)\.\.(\/|$)/) {
-                printf "Error: unsafe tar member path: %s\n", name > "/dev/stderr"
-                ok=0
-            }
-            if (name !~ /^sysupgrade-[^\/]+(\/|$)/) {
-                printf "Error: unexpected tar top-level path: %s\n", name > "/dev/stderr"
-                ok=0
-            }
+manifest_payload_block() {
+    _payload_kind=$1
+    awk -v kind="$_payload_kind" '
+        BEGIN {
+            RS = "}"
+            declaration = "\"" kind "\"[[:space:]]*:[[:space:]]*\\{"
         }
-        END { exit ok ? 0 : 1 }
-    ' || return 1
+        $0 ~ declaration && index($0, "\"path\"") {
+            count++
+            block = $0 "}"
+        }
+        END {
+            if (count == 1) print block
+            exit count == 1 ? 0 : 1
+        }
+    ' "$PACKAGE_MANIFEST"
+}
 
-    tar tvf "$tarball" | awk '
-        BEGIN { ok=1 }
+manifest_payload_block_key_count() {
+    _payload_block=$1
+    _payload_field=$2
+    printf '%s\n' "$_payload_block" | awk -v needle="\"$_payload_field\"" '
         {
-            type=substr($0, 1, 1)
-            if (type != "-" && type != "d") {
-                printf "Error: unsafe tar member type: %s\n", $0 > "/dev/stderr"
-                ok=0
+            line = $0
+            while ((position = index(line, needle)) > 0) {
+                count++
+                line = substr(line, position + length(needle))
             }
         }
-        END { exit ok ? 0 : 1 }
+        END { print count + 0 }
     '
 }
 
-ZYNQ_UBI_LEB_SIZE_BYTES=$((124 * 1024))
-AM1_S9_KERNEL_MAX_BYTES=$((32 * ZYNQ_UBI_LEB_SIZE_BYTES))
-AM1_S9_ROOTFS_MAX_BYTES=$((134 * ZYNQ_UBI_LEB_SIZE_BYTES))
-AM2_ZYNQ_KERNEL_MAX_BYTES=$(((23 + 4) * ZYNQ_UBI_LEB_SIZE_BYTES))
-AM2_ZYNQ_ROOTFS_MAX_BYTES=$((179 * ZYNQ_UBI_LEB_SIZE_BYTES))
-SYSUPGRADE_TAR_SLACK_BYTES=$((8 * 1024 * 1024))
+manifest_payload_string_from_block() {
+    _payload_block=$1
+    _payload_field=$2
+    printf '%s\n' "$_payload_block" \
+        | sed -n 's/.*"'"$_payload_field"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | head -n 1
+}
 
-sysupgrade_tar_preextract_ceiling() {
-    case "$EXPECTED_BOARD" in
-        am1-s9)
-            echo $((AM1_S9_KERNEL_MAX_BYTES + AM1_S9_ROOTFS_MAX_BYTES + SYSUPGRADE_TAR_SLACK_BYTES))
-            ;;
-        am2-*)
-            echo $((AM2_ZYNQ_KERNEL_MAX_BYTES + AM2_ZYNQ_ROOTFS_MAX_BYTES + SYSUPGRADE_TAR_SLACK_BYTES))
-            ;;
-        *)
-            echo 0
+manifest_payload_integer_from_block() {
+    _payload_block=$1
+    _payload_field=$2
+    printf '%s\n' "$_payload_block" \
+        | sed -n 's/.*"'"$_payload_field"'"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*[,}].*/\1/p' \
+        | head -n 1
+}
+
+validate_extracted_package_leaves() {
+    _nested_entry=$(find "$PACKAGE_SUBDIR" -mindepth 2 -print 2>/dev/null | sed -n '1p')
+    if [ -n "$_nested_entry" ]; then
+        echo "Error: Extracted package contains nested payload entry '$_nested_entry'"
+        return 1
+    fi
+
+    _unknown_entry=$(find "$PACKAGE_SUBDIR" -mindepth 1 -maxdepth 1 -print 2>/dev/null | awk -F/ '
+        {
+            leaf = $NF
+            if (leaf != "kernel" && leaf != "root" && leaf != "METADATA" &&
+                leaf != "SHA256SUMS" && leaf != "MANIFEST.json" &&
+                leaf != "MANIFEST.sig" && leaf != "release_ed25519.pub" &&
+                leaf != "fpga_bitstream.bit") {
+                print
+                exit
+            }
+        }
+    ')
+    if [ -n "$_unknown_entry" ]; then
+        echo "Error: Extracted package contains unknown payload leaf '$_unknown_entry'"
+        return 1
+    fi
+
+    for _payload_leaf in kernel root METADATA SHA256SUMS MANIFEST.json MANIFEST.sig release_ed25519.pub fpga_bitstream.bit; do
+        _payload_file="$PACKAGE_SUBDIR/$_payload_leaf"
+        if [ -e "$_payload_file" ] || [ -L "$_payload_file" ]; then
+            if [ ! -f "$_payload_file" ] || [ -L "$_payload_file" ]; then
+                echo "Error: Extracted package leaf '$_payload_leaf' must be a direct regular file"
+                return 1
+            fi
+        fi
+    done
+    return 0
+}
+
+validate_manifest_payload_binding() {
+    _payload_kind=$1
+    _payload_leaf=$2
+    _payload_file=$3
+    _payload_block=$(manifest_payload_block "$_payload_kind") || {
+        echo "Error: Package manifest must contain one structured '$_payload_kind' payload"
+        return 1
+    }
+    for _payload_field in path size sha256; do
+        [ "$(manifest_payload_block_key_count "$_payload_block" "$_payload_field")" = "1" ] || {
+            echo "Error: Package '$_payload_kind' payload must contain exactly one '$_payload_field' field"
+            return 1
+        }
+    done
+
+    _payload_path=$(manifest_payload_string_from_block "$_payload_block" path)
+    _payload_expected_path="$PACKAGE_SUBDIR_NAME/$_payload_leaf"
+    [ "$_payload_path" = "$_payload_expected_path" ] || {
+        echo "Error: Package '$_payload_kind' payload path must be exactly '$_payload_expected_path'"
+        return 1
+    }
+
+    _payload_size=$(manifest_payload_integer_from_block "$_payload_block" size)
+    case "$_payload_size" in
+        ''|*[!0-9]*|0)
+            echo "Error: Package '$_payload_kind' payload size must be a positive JSON integer"
+            return 1
             ;;
     esac
+    if [ ! -f "$_payload_file" ] || [ -L "$_payload_file" ]; then
+        echo "Error: Package '$_payload_kind' payload must resolve to a direct regular file"
+        return 1
+    fi
+    _payload_actual_size=$(wc -c < "$_payload_file" | tr -d '[:space:]')
+    [ "$_payload_actual_size" = "$_payload_size" ] || {
+        echo "Error: Package '$_payload_kind' payload size does not match signed manifest"
+        return 1
+    }
+
+    _payload_sha=$(manifest_payload_string_from_block "$_payload_block" sha256)
+    _payload_sha_length=$(printf '%s' "$_payload_sha" | wc -c | tr -d '[:space:]')
+    if [ "$_payload_sha_length" != "64" ]; then
+        echo "Error: Package '$_payload_kind' payload sha256 must be exactly 64 lowercase hexadecimal characters"
+        return 1
+    fi
+    case "$_payload_sha" in
+        *[!0123456789abcdef]*)
+            echo "Error: Package '$_payload_kind' payload sha256 must be exactly 64 lowercase hexadecimal characters"
+            return 1
+            ;;
+    esac
+    if ! verify_sha256 "$_payload_file" "$_payload_sha"; then
+        echo "Error: Package '$_payload_kind' payload bytes do not match signed sha256"
+        return 1
+    fi
+    return 0
+}
+
+validate_sysupgrade_tar_members() {
+    dcent_sysupgrade_archive_admit \
+        "$1" "$EXPECTED_BOARD" \
+        "${DCENT_SYSUPGRADE_WORKSPACE:-${TMPDIR:-/tmp}}"
+}
+
+if [ ! -r "$ZYNQ_GEOMETRY_HELPER" ]; then
+    echo "Error: canonical Zynq geometry helper is missing or unreadable: $ZYNQ_GEOMETRY_HELPER"
+    exit 1
+fi
+# shellcheck source=/usr/libexec/dcentos/sysupgrade-zynq-geometry.sh
+. "$ZYNQ_GEOMETRY_HELPER"
+if ! command -v dcent_zynq_geometry_require_payload_fit >/dev/null 2>&1 ||
+   ! command -v dcent_zynq_geometry_tar_preextract_ceiling >/dev/null 2>&1; then
+    echo "Error: canonical Zynq geometry helper did not provide its required API"
+    exit 1
+fi
+SYSUPGRADE_TAR_SLACK_BYTES=$ZYNQ_SYSUPGRADE_TAR_SLACK_BYTES
+
+sysupgrade_tar_preextract_ceiling() {
+    dcent_zynq_geometry_tar_preextract_ceiling "$EXPECTED_BOARD"
 }
 
 validate_sysupgrade_tar_preextract() {
@@ -458,8 +527,8 @@ fi
 
 # Support verified sysupgrade tar packages in addition to raw squashfs images.
 if tar tf "$ROOTFS" >/dev/null 2>&1; then
-    validate_sysupgrade_tar_members "$ROOTFS" || exit 1
     validate_sysupgrade_tar_preextract "$ROOTFS" || exit 1
+    validate_sysupgrade_tar_members "$ROOTFS" || exit 1
     echo "Detected sysupgrade package tar — extracting and verifying manifest..."
     PACKAGE_DIR=$(mktemp -d /tmp/sysupgrade-pkg.XXXXXX 2>/dev/null || mktemp -d)
     if ! tar xf "$ROOTFS" -C "$PACKAGE_DIR"; then
@@ -492,31 +561,95 @@ if tar tf "$ROOTFS" >/dev/null 2>&1; then
     PACKAGE_RELEASE_KEY="$PACKAGE_SUBDIR/release_ed25519.pub"
     PACKAGE_KERNEL="$PACKAGE_SUBDIR/kernel"
     ROOTFS="$PACKAGE_SUBDIR/root"
+    PACKAGE_SUBDIR_NAME=${PACKAGE_SUBDIR##*/}
+    validate_extracted_package_leaves || exit 1
 
     if [ ! -f "$PACKAGE_MANIFEST" ]; then
         echo "Error: Package is missing MANIFEST.json"
         exit 1
     fi
-    PACKAGE_STATUS=$(manifest_field "$PACKAGE_MANIFEST" status 2>/dev/null || true)
-    [ -n "$PACKAGE_STATUS" ] || PACKAGE_STATUS=release
-    if [ ! -f "$PACKAGE_SIG" ] && [ "$ALLOW_LAB_UNSIGNED" != "1" ]; then
-        echo "Error: Package is missing MANIFEST.sig"
-        echo "Set DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 only for controlled lab recovery."
+    if ! python3 "$MANIFEST_JSON_HELPER" validate "$PACKAGE_MANIFEST"; then
+        echo "Error: Package manifest failed semantic/canonical JSON admission"
         exit 1
     fi
-    if [ ! -f "$PACKAGE_SIG" ] && is_release_status "$PACKAGE_STATUS"; then
-        echo "Error: unsigned release package is not allowed."
-        echo "Set manifest status to a non-release lab value plus DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 only for controlled lab recovery."
+    [ "$(manifest_key_count "$PACKAGE_MANIFEST" manifest_profile)" = "1" ] || {
+        echo "Error: Package manifest must contain exactly one 'manifest_profile' authority field"
         exit 1
-    fi
-    if [ -f "$PACKAGE_SIG" ] && [ ! -f "$PACKAGE_RELEASE_KEY" ]; then
-        echo "Error: Signed package is missing release_ed25519.pub"
+    }
+    PACKAGE_MANIFEST_PROFILE=$(manifest_string_field "$PACKAGE_MANIFEST" manifest_profile 2>/dev/null || true)
+    PACKAGE_STATUS_COUNT=$(manifest_key_count "$PACKAGE_MANIFEST" status)
+    [ "$PACKAGE_STATUS_COUNT" = "1" ] || {
+        echo "Error: Package manifest must contain exactly one 'status' authority field"
         exit 1
-    fi
+    }
+    PACKAGE_STATUS=$(manifest_string_field "$PACKAGE_MANIFEST" status 2>/dev/null || true)
+    [ -n "$PACKAGE_STATUS" ] || {
+        echo "Error: Package manifest status must be a non-empty string"
+        exit 1
+    }
+    PACKAGE_STATUS_TRIMMED=$(printf '%s' "$PACKAGE_STATUS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [ "$PACKAGE_STATUS" = "$PACKAGE_STATUS_TRIMMED" ] || {
+        echo "Error: Package manifest status must not contain surrounding whitespace"
+        exit 1
+    }
     if [ ! -f "$PACKAGE_KERNEL" ] || [ ! -f "$ROOTFS" ]; then
         echo "Error: Package must contain both kernel and root payloads"
         exit 1
     fi
+
+    for unsupported_chain_key in ota_intermediate_cert ota_revoked_intermediates; do
+        if [ "$(manifest_key_count "$PACKAGE_MANIFEST" "$unsupported_chain_key")" != "0" ]; then
+            echo "Error: Package profile '$PACKAGE_MANIFEST_PROFILE' forbids '$unsupported_chain_key'; certificate validity has no trusted-time authority on Zynq"
+            exit 1
+        fi
+    done
+
+    case "$PACKAGE_MANIFEST_PROFILE" in
+        dcentos.sysupgrade-authority/v1)
+            [ "$PACKAGE_STATUS" != "lab_unsigned" ] || {
+                echo "Error: Package authority-v1 forbids status=lab_unsigned"
+                exit 1
+            }
+            [ "$(manifest_key_count "$PACKAGE_MANIFEST" verification_key)" = "1" ] || {
+                echo "Error: Package authority-v1 must contain exactly one verification_key payload"
+                exit 1
+            }
+            [ -f "$PACKAGE_SIG" ] || {
+                echo "Error: Package authority-v1 is missing MANIFEST.sig"
+                exit 1
+            }
+            [ -f "$PACKAGE_RELEASE_KEY" ] || {
+                echo "Error: Package authority-v1 is missing release_ed25519.pub"
+                exit 1
+            }
+            ;;
+        dcentos.sysupgrade-unsigned-lab/v1)
+            [ "$ALLOW_LAB_UNSIGNED" = "1" ] || {
+                echo "Error: Package unsigned-lab/v1 requires DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1"
+                exit 1
+            }
+            [ "$PACKAGE_STATUS" = "lab_unsigned" ] || {
+                echo "Error: Package unsigned-lab/v1 requires exactly one status=lab_unsigned field"
+                exit 1
+            }
+            [ "$(manifest_key_count "$PACKAGE_MANIFEST" verification_key)" = "0" ] || {
+                echo "Error: Package unsigned-lab/v1 forbids a verification_key payload"
+                exit 1
+            }
+            [ ! -e "$PACKAGE_SIG" ] || {
+                echo "Error: Package unsigned-lab/v1 forbids MANIFEST.sig"
+                exit 1
+            }
+            [ ! -e "$PACKAGE_RELEASE_KEY" ] || {
+                echo "Error: Package unsigned-lab/v1 forbids release_ed25519.pub"
+                exit 1
+            }
+            ;;
+        *)
+            echo "Error: Package manifest profile '$PACKAGE_MANIFEST_PROFILE' is unsupported"
+            exit 1
+            ;;
+    esac
 
     if [ -f "$PACKAGE_SIG" ]; then
         if ! command -v openssl >/dev/null 2>&1; then
@@ -547,8 +680,85 @@ if tar tf "$ROOTFS" >/dev/null 2>&1; then
     ROOTFS_SHA=$(manifest_field "$PACKAGE_MANIFEST" payloads.rootfs.sha256 2>/dev/null || true)
     KERNEL_SHA=$(manifest_field "$PACKAGE_MANIFEST" payloads.kernel.sha256 2>/dev/null || true)
     RELEASE_KEY_SHA=$(manifest_field "$PACKAGE_MANIFEST" payloads.verification_key.sha256 2>/dev/null || true)
+    for authority_key in schema manifest_profile product package_type installable artifact_maturity board board_target version; do
+        [ "$(manifest_key_count "$PACKAGE_MANIFEST" "$authority_key")" = "1" ] || {
+            echo "Error: Package manifest must contain exactly one '$authority_key' authority field"
+            exit 1
+        }
+    done
+    for payload_key in kernel rootfs metadata; do
+        [ "$(manifest_key_count "$PACKAGE_MANIFEST" "$payload_key")" = "1" ] || {
+            echo "Error: Package manifest must contain exactly one '$payload_key' payload"
+            exit 1
+        }
+    done
+    PACKAGE_BITSTREAM="$PACKAGE_SUBDIR/fpga_bitstream.bit"
+    PACKAGE_BITSTREAM_COUNT=$(manifest_key_count "$PACKAGE_MANIFEST" bitstream)
+    if [ -e "$PACKAGE_BITSTREAM" ] || [ -L "$PACKAGE_BITSTREAM" ]; then
+        [ "$PACKAGE_BITSTREAM_COUNT" = "1" ] || {
+            echo "Error: Package contains fpga_bitstream.bit without exactly one signed bitstream declaration"
+            exit 1
+        }
+    else
+        [ "$PACKAGE_BITSTREAM_COUNT" = "0" ] || {
+            echo "Error: Package manifest declares bitstream but fpga_bitstream.bit is absent"
+            exit 1
+        }
+    fi
+    PACKAGE_SCHEMA=$(manifest_integer_field "$PACKAGE_MANIFEST" schema 2>/dev/null || true)
+    PACKAGE_MANIFEST_PROFILE=$(manifest_field "$PACKAGE_MANIFEST" manifest_profile 2>/dev/null || true)
+    PACKAGE_PRODUCT=$(manifest_field "$PACKAGE_MANIFEST" product 2>/dev/null || true)
+    PACKAGE_TYPE=$(manifest_field "$PACKAGE_MANIFEST" package_type 2>/dev/null || true)
+    PACKAGE_INSTALLABLE=$(manifest_boolean_field "$PACKAGE_MANIFEST" installable 2>/dev/null || true)
+    PACKAGE_ARTIFACT_MATURITY=$(manifest_field "$PACKAGE_MANIFEST" artifact_maturity 2>/dev/null || true)
     PACKAGE_BOARD=$(manifest_field "$PACKAGE_MANIFEST" board 2>/dev/null || true)
-    [ -n "$PACKAGE_BOARD" ] || PACKAGE_BOARD=$(manifest_field "$PACKAGE_MANIFEST" board_target 2>/dev/null || true)
+    PACKAGE_BOARD_TARGET=$(manifest_field "$PACKAGE_MANIFEST" board_target 2>/dev/null || true)
+
+    [ "$PACKAGE_SCHEMA" = "1" ] || {
+        echo "Error: Package manifest schema must be integer 1"
+        exit 1
+    }
+    case "$PACKAGE_MANIFEST_PROFILE" in
+        dcentos.sysupgrade-authority/v1|dcentos.sysupgrade-unsigned-lab/v1) ;;
+        *)
+            echo "Error: Package manifest lacks a supported sysupgrade mutation profile"
+            exit 1
+            ;;
+    esac
+    [ "$PACKAGE_PRODUCT" = "DCENT_OS" ] || {
+        echo "Error: Package manifest product must be DCENT_OS"
+        exit 1
+    }
+    [ "$PACKAGE_TYPE" = "sysupgrade" ] || {
+        echo "Error: Package manifest package_type must be sysupgrade"
+        exit 1
+    }
+    [ "$PACKAGE_INSTALLABLE" = "true" ] || {
+        echo "Error: Package manifest must explicitly declare installable=true"
+        exit 1
+    }
+    [ "$PACKAGE_ARTIFACT_MATURITY" = "experimental" ] || {
+        echo "Error: Package manifest artifact_maturity must match this target's experimental policy"
+        exit 1
+    }
+    [ -n "$PACKAGE_BOARD" ] && [ -n "$PACKAGE_BOARD_TARGET" ] && [ "$PACKAGE_BOARD" = "$PACKAGE_BOARD_TARGET" ] || {
+        echo "Error: Package manifest board and board_target must be present and identical"
+        exit 1
+    }
+    [ "$PACKAGE_SUBDIR_NAME" = "sysupgrade-$PACKAGE_BOARD_TARGET" ] || {
+        echo "Error: Package directory '$PACKAGE_SUBDIR_NAME' does not match signed target 'sysupgrade-$PACKAGE_BOARD_TARGET'"
+        exit 1
+    }
+
+    validate_manifest_payload_binding kernel kernel "$PACKAGE_KERNEL" || exit 1
+    validate_manifest_payload_binding rootfs root "$ROOTFS" || exit 1
+    validate_manifest_payload_binding metadata METADATA "$PACKAGE_SUBDIR/METADATA" || exit 1
+    if [ "$PACKAGE_MANIFEST_PROFILE" = "dcentos.sysupgrade-authority/v1" ]; then
+        validate_manifest_payload_binding verification_key release_ed25519.pub "$PACKAGE_RELEASE_KEY" || exit 1
+    fi
+    if [ "$PACKAGE_BITSTREAM_COUNT" = "1" ]; then
+        validate_manifest_payload_binding bitstream fpga_bitstream.bit "$PACKAGE_BITSTREAM" || exit 1
+    fi
 
     if [ -f "$BOARD_TARGET_PATH" ]; then
         DETECTED_BOARD=$(cat "$BOARD_TARGET_PATH" 2>/dev/null || echo unknown)
@@ -635,6 +845,17 @@ if [ "$MAGIC" != "68737173" ]; then
 fi
 
 ROOTFS_SIZE=$(wc -c < "$ROOTFS")
+if ! dcent_zynq_geometry_require_payload_fit "$EXPECTED_BOARD" rootfs "$ROOTFS_SIZE"; then
+    echo "Error: rootfs payload exceeds the evidence-backed package window."
+    exit 1
+fi
+if [ -n "$PACKAGE_KERNEL" ]; then
+    PACKAGE_KERNEL_SIZE=$(wc -c < "$PACKAGE_KERNEL" | tr -d '[:space:]')
+    if ! dcent_zynq_geometry_require_payload_fit "$EXPECTED_BOARD" kernel "$PACKAGE_KERNEL_SIZE"; then
+        echo "Error: package kernel exceeds the evidence-backed package window."
+        exit 1
+    fi
+fi
 
 echo "============================================"
 echo "  DCENTos Self-Update (A/B Slot)"

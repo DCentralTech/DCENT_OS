@@ -703,6 +703,51 @@ BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
 ROOTFS_SHA256=$(sha256sum "$ROOTFS_INPUT" | awk '{print $1}')
 URAMDISK_SHA256=$(sha256sum "$SD_OUTPUT_DIR/uramdisk.image.gz" | awk '{print $1}')
 
+if [ -f "$SD_OUTPUT_DIR/dcentos-sd.img" ]; then
+    S9_SD_IMAGE="$SD_OUTPUT_DIR/dcentos-sd.img"
+    S9_SD_MANIFEST="$S9_SD_IMAGE.manifest.json"
+    S9_SD_IMAGE_SIZE=$(stat -c%s "$S9_SD_IMAGE" 2>/dev/null || stat -f%z "$S9_SD_IMAGE")
+    S9_SD_IMAGE_SHA256=$(sha256sum "$S9_SD_IMAGE" | awk '{print $1}')
+    if $STANDALONE; then
+        S9_SD_TARGET="am1-s9-sd-standalone"
+    else
+        S9_SD_TARGET="am1-s9-sd-piggyback"
+    fi
+    s9_sd_artifact_bool() {
+        if [ -f "$SD_OUTPUT_DIR/$1" ]; then
+            printf 'true'
+        else
+            printf 'false'
+        fi
+    }
+    S9_SD_COMPLETE=true
+    for required in uImage devicetree.dtb uEnv.txt system.bit uramdisk.image.gz; do
+        [ -f "$SD_OUTPUT_DIR/$required" ] || S9_SD_COMPLETE=false
+    done
+    if $STANDALONE && [ ! -f "$SD_OUTPUT_DIR/BOOT.BIN" ]; then
+        S9_SD_COMPLETE=false
+    fi
+    cat > "$S9_SD_MANIFEST" <<EOF
+{
+  "schema": "dcentos.am1_s9_sd_image_manifest.v1",
+  "target": "$S9_SD_TARGET",
+  "image": "$(basename "$S9_SD_IMAGE")",
+  "image_size_bytes": $S9_SD_IMAGE_SIZE,
+  "image_sha256": "$S9_SD_IMAGE_SHA256",
+  "created_utc": "$BUILD_DATE",
+  "boot_artifacts_complete": $S9_SD_COMPLETE,
+  "artifacts": {
+    "BOOT.bin": $(s9_sd_artifact_bool BOOT.BIN),
+    "uImage": $(s9_sd_artifact_bool uImage),
+    "devicetree.dtb": $(s9_sd_artifact_bool devicetree.dtb),
+    "uEnv.txt": $(s9_sd_artifact_bool uEnv.txt),
+    "bitstream": $(s9_sd_artifact_bool system.bit),
+    "rootfs": $(s9_sd_artifact_bool uramdisk.image.gz)
+  }
+}
+EOF
+fi
+
 cat > "$SD_OUTPUT_DIR/BUILD_INFO.txt" << EOF
 === DCENT_OS S9 SD Card Boot ===
 Build date:       $BUILD_DATE
@@ -789,26 +834,22 @@ fi
 # S9 card is not the only unsigned DCENT_OS artifact. The sweep doc said
 # "wire S9 into build_in_docker.sh Phase-8c" — wrong target: the S9
 # Docker arm is BOARD_POST_IMAGE="internal" (tarball, no .img); the
-# proven S9 card comes from THIS standalone builder's --disk-image mode,
-# which never signed. Mirrors the Phase-8c contract exactly: reuse
-# scripts/sign_sd_image.sh (the same Ed25519 release key as
-# sysupgrade/OTA — NOT a separate SD key); lab/unsigned builds still
-# succeed (sign_sd_image.sh self-WARNs + exits 0 with no key; an
-# explicit DCENT_ALLOW_UNSIGNED_SYSUPGRADE skips with a note).
+# proven S9 card comes from THIS standalone builder's --disk-image mode. The
+# shared signer binds the exact image to a completeness manifest and the
+# trusted release public key. Unsigned lab intent is explicit and refuses a
+# stale sibling signature.
 if [ -f "$SD_OUTPUT_DIR/dcentos-sd.img" ]; then
     SIGN_SD="$SCRIPT_DIR/sign_sd_image.sh"
-    if [ ! -f "$SIGN_SD" ]; then
-        warn "sign_sd_image.sh not found at $SIGN_SD; SD .img left unsigned"
+    if [ ! -x "$SIGN_SD" ]; then
+        error "sign_sd_image.sh not executable at $SIGN_SD"
     elif [ -n "${DCENT_RELEASE_SIGNING_KEY:-}" ]; then
         info "Signing dcentos-sd.img (Ed25519, release key)"
         bash "$SIGN_SD" "$SD_OUTPUT_DIR/dcentos-sd.img" \
-            || warn "SD .img signing failed (see sign_sd_image.sh output)"
-    elif [ "${DCENT_ALLOW_UNSIGNED_SYSUPGRADE:-0}" = "1" ] \
-        || [ "${DCENT_ALLOW_UNSIGNED_SYSUPGRADE:-}" = "true" ]; then
-        info "Skipping SD .img signing (DCENT_ALLOW_UNSIGNED_SYSUPGRADE — lab build)"
+            || error "SD .img signing failed (see sign_sd_image.sh output)"
     else
-        # sign_sd_image.sh self-emits a WARN + exit 0 when no key is set.
-        bash "$SIGN_SD" "$SD_OUTPUT_DIR/dcentos-sd.img" || true
+        info "Recording explicit unsigned-lab SD .img state"
+        bash "$SIGN_SD" "$SD_OUTPUT_DIR/dcentos-sd.img" --allow-unsigned-lab \
+            || error "unsigned-lab SD .img admission failed"
     fi
 fi
 

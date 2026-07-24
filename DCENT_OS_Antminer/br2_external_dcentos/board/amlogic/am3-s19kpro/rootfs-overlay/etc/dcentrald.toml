@@ -60,7 +60,7 @@ cooldown_temp_c = 45.0
 min_fan_rpm = 2000
 #  B3: home-mining default. Industrial users opt-in via [mode] / [modes.standard].
 fan_max_pwm = 30
-fan_min_pwm = 0
+fan_min_pwm = 10
 
 [psu]
 model = "APW121215f"

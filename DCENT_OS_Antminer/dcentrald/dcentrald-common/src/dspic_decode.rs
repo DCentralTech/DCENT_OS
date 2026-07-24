@@ -399,3 +399,152 @@ mod tests {
         ));
     }
 }
+
+/// Property tests for the dsPIC voltage-reply decoders.
+///
+/// These decoders parse bytes off *known-degraded* hardware — `a lab unit`'s dsPIC
+/// (0x22) emits documented "framed noise", fw=0x86 chips echo garbage — and
+/// they run inside the teardown / safe-off path. A slice-index or
+/// length-arithmetic panic there would abort the safe-off sequence mid-flight,
+/// so the load-bearing invariant is that they NEVER panic and NEVER fabricate a
+/// plausible reading from a misframed reply. The functions are panic-free by
+/// construction today; these properties pin that structurally so a future
+/// refactor that reintroduces unchecked indexing is caught offline rather than
+/// on a live unit. See `dcentrald-common/src/dspic_decode.rs` module docs and
+/// memory rule .
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Fixed-point reference for the bosminer affine ADC fit
+    /// `volts = raw * 0.02448 - 0.35`  →  centi-mV = `(raw * 2448 + 50) / 100`.
+    /// Kept integer so the property does not depend on float rounding, exactly
+    /// like the decoder under test.
+    fn expected_framed_centi_mv(raw: u16) -> u32 {
+        (u32::from(raw) * 2448).saturating_add(50) / 100
+    }
+
+    proptest! {
+        /// Teardown-safety: none of the three decoders may panic on arbitrary
+        /// input for any `max` bound — a panic aborts the safe-off sequence.
+        #[test]
+        fn decoders_never_panic_on_arbitrary_bytes(
+            bytes in proptest::collection::vec(any::<u8>(), 0usize..32),
+            max in any::<u16>(),
+            cmd in any::<u8>(),
+            exp in any::<u8>(),
+            hi in any::<u8>(),
+            lo in any::<u8>(),
+        ) {
+            // Return values are intentionally discarded — the property is
+            // solely "these calls return, they do not panic".
+            let _ = decode_bare_voltage_reply(cmd, exp, hi, lo, max);
+            let _ = decode_framed_measure_voltage_reply(&bytes, max);
+            let _ = decode_framed_measure_voltage_i2c0_capture(&bytes, max);
+        }
+
+        /// Fail-closed + exact: a bare decode is `Ok(value)` IFF the command
+        /// echo matches AND the 16-bit value fits the physical max, and it then
+        /// equals exactly that value. It must never invent a reading from a
+        /// wrong-shape reply (the live 0xFCF8 → 64760 mV regression).
+        #[test]
+        fn bare_decode_is_exact_and_fail_closed(
+            cmd in any::<u8>(),
+            exp in any::<u8>(),
+            hi in any::<u8>(),
+            lo in any::<u8>(),
+            max in any::<u16>(),
+        ) {
+            let value = (u16::from(hi) << 8) | u16::from(lo);
+            let got = decode_bare_voltage_reply(cmd, exp, hi, lo, max);
+            if cmd != exp {
+                prop_assert_eq!(
+                    got,
+                    Err(BareVoltageReplyError::NotBareShape { cmd_echo: cmd, expected: exp })
+                );
+            } else if value > max {
+                prop_assert_eq!(
+                    got,
+                    Err(BareVoltageReplyError::ExceedsMax { mv: value, max_mv: max })
+                );
+            } else {
+                prop_assert_eq!(got, Ok(value));
+            }
+        }
+
+        /// The framed 0x3A ADC decode matches the exact fixed-point affine fit
+        /// on the `Ok` path, never exceeds `max` when `Ok`, and partitions the
+        /// sub-zero region into the EE-007 dead-rail band (`ZeroRail`, the
+        /// trustworthy "rail NOT energized" proxy) vs. ambiguous noise
+        /// (`BelowZero`).
+        #[test]
+        fn framed_decode_matches_affine_fit_and_dead_rail_band(
+            raw in any::<u16>(),
+            max in 0u16..=20_000,
+        ) {
+            let centi = expected_framed_centi_mv(raw);
+            match decode_framed_measure_voltage_reply(&raw.to_be_bytes(), max) {
+                Ok(mv) => {
+                    prop_assert!(centi >= 350);
+                    prop_assert_eq!(u32::from(mv), centi - 350);
+                    prop_assert!(mv <= max);
+                }
+                Err(FramedMeasureVoltageReplyError::ZeroRail { raw: r }) => {
+                    prop_assert_eq!(r, raw);
+                    prop_assert!(raw <= DEAD_RAIL_RAW_MAX);
+                    prop_assert!(centi < 350);
+                }
+                Err(FramedMeasureVoltageReplyError::BelowZero { raw: r }) => {
+                    prop_assert_eq!(r, raw);
+                    prop_assert!(raw > DEAD_RAIL_RAW_MAX);
+                    prop_assert!(centi < 350);
+                }
+                Err(FramedMeasureVoltageReplyError::ExceedsMax { mv, max_mv, raw: r }) => {
+                    prop_assert_eq!(r, raw);
+                    prop_assert_eq!(max_mv, max);
+                    prop_assert_eq!(mv, centi - 350);
+                    prop_assert!(mv > u32::from(max));
+                }
+                Err(FramedMeasureVoltageReplyError::TooShort { len }) => {
+                    prop_assert!(false, "2-byte input is never TooShort (len={})", len);
+                }
+            }
+        }
+
+        /// A higher raw ADC count never decodes to a lower voltage (the affine
+        /// fit is monotonic; pins that no future scaling change inverts it).
+        #[test]
+        fn framed_decode_is_monotonic(
+            a in any::<u16>(),
+            b in any::<u16>(),
+            max in 0u16..=20_000,
+        ) {
+            let (lo_raw, hi_raw) = if a <= b { (a, b) } else { (b, a) };
+            if let (Ok(mv_lo), Ok(mv_hi)) = (
+                decode_framed_measure_voltage_reply(&lo_raw.to_be_bytes(), max),
+                decode_framed_measure_voltage_reply(&hi_raw.to_be_bytes(), max),
+            ) {
+                prop_assert!(mv_lo <= mv_hi);
+            }
+        }
+
+        /// The i2c0-envelope capture decoder is exactly equivalent to the plain
+        /// ADC decoder once a well-formed 7-byte envelope is stripped — so the
+        /// capture-tooling path can never disagree with the runtime path.
+        #[test]
+        fn i2c0_envelope_strip_equals_plain_adc(
+            hi in any::<u8>(),
+            lo in any::<u8>(),
+            status in any::<u8>(),
+            max in 0u16..=20_000,
+        ) {
+            let mut env = [7u8, 0x3A, status, hi, lo, 0x00, 0u8];
+            env[6] = env[..6].iter().fold(0u8, |acc, b| acc.wrapping_add(*b));
+            prop_assert_eq!(
+                decode_framed_measure_voltage_i2c0_capture(&env, max),
+                decode_framed_measure_voltage_reply(&[hi, lo], max)
+            );
+        }
+    }
+}

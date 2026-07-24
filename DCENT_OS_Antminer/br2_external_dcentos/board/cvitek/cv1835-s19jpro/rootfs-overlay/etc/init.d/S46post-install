@@ -1,0 +1,17 @@
+#!/bin/sh
+# CV1835 shadow for the inherited Amlogic NAND post-install executor.
+
+case "$1" in
+    start|restart)
+        printf '%s\n' 'S46post-install cv1835-s19jpro: unavailable; no persistent-storage transaction is implemented'
+        ;;
+    stop)
+        :
+        ;;
+    *)
+        printf 'Usage: %s {start|stop|restart}\n' "$0" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

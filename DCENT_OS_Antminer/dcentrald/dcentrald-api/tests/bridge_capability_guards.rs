@@ -183,9 +183,9 @@ fn set_fan_rejects_closed_mutation_admission_before_hal() {
 
 #[test]
 fn reboot_rejected_on_unknown_identity_before_restart() {
-    // Plain `#[test]`: on denial the guard returns BEFORE `trigger_daemon_restart`
-    // (which would `tokio::spawn`), so no runtime is needed and no restart flag
-    // is written.
+    // The capability denial runs before the persistent-session policy, so an
+    // unknown identity cannot use the detailed refusal as an authorization
+    // oracle.
     let state = unknown_identity_state();
     let err = grpc_bridge_reboot(&state)
         .expect_err("Unknown identity must be denied Reboot before the restart flag");
@@ -195,21 +195,19 @@ fn reboot_rejected_on_unknown_identity_before_restart() {
     );
 }
 
-#[tokio::test]
-async fn reboot_passes_guard_on_granted_identity() {
-    // Needs a tokio runtime: the granted path clears the guard and reaches
-    // `trigger_daemon_restart`, which `tokio::spawn`s a 2s-delayed init.d
-    // restart. The spawned task is cancelled when this test's current-thread
-    // runtime is dropped on return (well under the 2s delay), so no restart is
-    // actually executed.
+#[test]
+fn reboot_passes_guard_then_refuses_unsafe_restart() {
     let state = granted_identity_state();
-    let result = grpc_bridge_reboot(&state);
+    let err = grpc_bridge_reboot(&state)
+        .expect_err("authorized reboot must still require typed hardware disposition");
     assert!(
-        result.is_ok(),
-        "granted identity must clear the Reboot guard, got: {result:?}"
+        !is_capability_denied(&err),
+        "granted identity must clear the Reboot guard, got: {err}"
     );
-    // The restart flag is a harmless temp file on the test host; remove it.
-    let _ = std::fs::remove_file("/tmp/dcentrald_restart");
+    assert!(
+        err.contains("typed hardware disposition") && err.contains("operator verification"),
+        "expected persistent-session safety refusal, got: {err}"
+    );
 }
 
 // ── AsicOptions guard (set_tuner_mode + mqtt:target_watts) ──────────────────

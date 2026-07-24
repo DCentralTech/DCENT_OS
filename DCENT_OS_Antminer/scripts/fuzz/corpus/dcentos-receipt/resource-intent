@@ -1,0 +1,14 @@
+schema=dcentos-sysupgrade-resource-intent-abi1
+binding_sha256=0000000000000000000000000000000000000000000000000000000000000000
+transaction_id=Tx-1
+kind=attachment
+resource_id=ubi-1
+provenance=created
+identity_a=7
+identity_b=1
+identity_c=-
+evidence_type=attachment-intent-v1
+evidence_size=14
+evidence_sha256=e918987f50d09776be7bd3bc22e29236c39faae2743376ca7d6fd20759df138b
+
+observed=true

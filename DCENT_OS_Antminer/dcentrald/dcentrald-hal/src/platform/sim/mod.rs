@@ -20,13 +20,14 @@ use std::time::Duration;
 
 use crate::i2c::{spawn_sim_i2c_service, I2cBus, I2cServiceHandle};
 use crate::platform::{
-    BoardType, ChainAccess, FanAccess, GpioAccess, Platform, VoltageControllerKind,
+    BoardType, ChainAccess, FanAccess, GpioAccess, Platform, VoltageControllerEndpoint,
+    VoltageControllerKind,
 };
 use crate::{HalError, Result};
 
-pub use chain::{SimBm1397PlusBackend, SimChain, SimNoncePolicy, TraceEvent};
+pub use chain::{SimBm1397PlusBackend, SimChain, SimNoncePolicy, SimPic16Operation, TraceEvent};
 pub use model_state::SimSiliconState;
-pub use psu_dspic::{SimControllerKind, SimI2cBackend};
+pub use psu_dspic::{SimControllerKind, SimI2cBackend, SimPic16Fault, SimPic16Snapshot};
 
 pub const SIM_ALLOW_ENV: &str = "DCENT_SIM_HAL";
 pub const SIM_ACK_ENV: &str = "DCENT_CONFIRM_SIM_HAL_IS_NOT_REAL_HARDWARE";
@@ -365,6 +366,63 @@ impl SimPlatform {
         self.i2c.controller_watchdog_expired()
     }
 
+    pub fn pic16_snapshot(&self, bus: u8, address: u8) -> Result<SimPic16Snapshot> {
+        self.i2c.pic16_snapshot(bus, address)
+    }
+
+    /// Explicitly establish simulator-only ASIC-chain liveness for one powered
+    /// PIC16 domain. Tests must call this after their simulated enumeration;
+    /// PIC application mode and voltage state do not imply a live chain.
+    pub fn establish_pic16_live_chain(&self, bus: u8, address: u8) -> Result<()> {
+        self.i2c.establish_pic16_live_chain(bus, address)?;
+        Ok(())
+    }
+
+    /// Revoke simulator ASIC-chain liveness without changing PIC mode,
+    /// setpoint, or rail state. This models chain-only failure independently
+    /// from controller and power-domain state.
+    pub fn invalidate_pic16_live_chain(&self, bus: u8, address: u8) -> Result<()> {
+        self.i2c.invalidate_pic16_live_chain(bus, address)
+    }
+
+    /// Mint simulated running-endpoint evidence from an explicit live-chain
+    /// lease and the exact I2C service allocation. Real platforms must bind the
+    /// same capability to authoritative ASIC enumeration/liveness evidence.
+    pub fn prove_running_pic16_endpoint(
+        &self,
+        service: &crate::i2c::I2cServiceHandle,
+        bus: u8,
+        address: u8,
+    ) -> Result<crate::i2c::Pic16RunningEndpoint> {
+        let live_chain_lease = self.i2c.pic16_live_chain_lease(bus, address)?;
+        crate::i2c::Pic16RunningEndpoint::from_verified_handoff(
+            self.pic16_endpoint(bus, address)?,
+            service,
+            live_chain_lease,
+        )
+    }
+
+    pub fn configure_pic16_raw_state(&self, bus: u8, address: u8, raw_state: u8) -> Result<()> {
+        self.i2c.configure_pic16_raw_state(bus, address, raw_state)
+    }
+
+    pub fn schedule_pic16_fault(
+        &self,
+        bus: u8,
+        address: u8,
+        operation: SimPic16Operation,
+        successful_matches_before_fault: u64,
+        effect: SimPic16Fault,
+    ) -> Result<()> {
+        self.i2c.schedule_pic16_fault(
+            bus,
+            address,
+            operation,
+            successful_matches_before_fault,
+            effect,
+        )
+    }
+
     /// Open the same serialized I2C service surface used by daemon-side PIC
     /// and PSU controllers, backed by the shared simulator fabric.
     pub fn open_i2c_service(&self, bus: u8) -> Result<I2cServiceHandle> {
@@ -388,6 +446,25 @@ impl SimPlatform {
             denylist,
         )?)
     }
+
+    /// Issue an opaque PIC16 endpoint for host-only simulator integration
+    /// tests. This constructor is unavailable without `sim-hal` and cannot
+    /// mint production hardware authority.
+    pub fn pic16_endpoint(&self, bus: u8, address: u8) -> Result<VoltageControllerEndpoint> {
+        // The production typed service currently admits only the standard S9
+        // topology. X17 endpoint state is modeled below the authority layer,
+        // but must not be advertised as usable until typed SafeOff and worker
+        // validators consume a profile-bound topology capability.
+        if self.profile.model != SimModel::S9 || bus != 0 || !(0x55..=0x57).contains(&address) {
+            return Err(HalError::Platform(format!(
+                "{} simulator has no service-authorized PIC16 endpoint at bus {bus} address 0x{address:02X}",
+                self.profile.model.slug()
+            )));
+        }
+        Ok(VoltageControllerEndpoint::from_simulated_pic16(
+            bus, address,
+        ))
+    }
 }
 
 impl Platform for SimPlatform {
@@ -408,7 +485,7 @@ impl Platform for SimPlatform {
     }
 
     fn open_i2c(&self, bus: u8) -> Result<I2cBus> {
-        let mut handle = I2cBus::open_sim(bus, std::sync::Arc::new(self.i2c.clone()));
+        let mut handle = I2cBus::try_open_sim(bus, std::sync::Arc::new(self.i2c.clone()))?;
         if !matches!(
             self.profile.model,
             SimModel::S9
@@ -600,5 +677,61 @@ mod tests {
             .write_bytes(0x20, &[0x55, 0xAA, 0x15, 0x01])
             .expect("service ENABLE");
         assert!(platform.i2c.voltage_enabled().expect("shared enable state"));
+    }
+
+    #[test]
+    fn simulated_service_rejects_pic16_heartbeat_outside_application_mode() {
+        let platform = SimPlatform::new(SimModel::S9);
+        platform
+            .configure_pic16_raw_state(0, 0x55, 0xCC)
+            .expect("configure bootloader endpoint");
+        let endpoint = platform
+            .pic16_endpoint(0, 0x55)
+            .expect("issue simulated endpoint");
+        let service = platform.open_i2c_service(0).expect("sim I2C service");
+
+        assert!(service.pic16_heartbeat(&endpoint).is_err());
+        assert_eq!(
+            platform
+                .pic16_snapshot(0, 0x55)
+                .expect("endpoint snapshot")
+                .heartbeat_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn pic16_profiles_pin_typed_endpoints_and_ordered_watchdog_traces() {
+        let s9 = SimPlatform::new(SimModel::S9);
+        assert!(s9.pic16_endpoint(0, 0x55).is_ok());
+        assert!(s9.pic16_endpoint(0, 0x50).is_err());
+
+        for model in [SimModel::T17, SimModel::S17Plus, SimModel::T17Plus] {
+            let platform = SimPlatform::new(model);
+            assert!(platform.pic16_snapshot(0, 0x50).is_ok());
+            assert!(platform.pic16_snapshot(0, 0x55).is_err());
+            assert!(platform.pic16_endpoint(0, 0x50).is_err());
+            assert!(platform.pic16_endpoint(0, 0x55).is_err());
+        }
+        for model in [SimModel::S11, SimModel::S15, SimModel::T15] {
+            let platform = SimPlatform::new(model);
+            assert!(platform.pic16_endpoint(0, 0x50).is_err());
+            assert!(platform.pic16_endpoint(0, 0x55).is_err());
+        }
+
+        s9.configure_controller_watchdog(Duration::from_millis(1))
+            .expect("configure S9 endpoint watchdogs");
+        s9.advance_i2c_time(Duration::from_millis(1))
+            .expect("expire S9 endpoint watchdogs");
+        let addresses: Vec<u8> = s9
+            .drain_i2c_trace()
+            .expect("ordered expiry trace")
+            .into_iter()
+            .filter_map(|event| match event {
+                TraceEvent::Pic16ControllerWatchdogExpired { addr, .. } => Some(addr),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(addresses, vec![0x55, 0x56, 0x57]);
     }
 }

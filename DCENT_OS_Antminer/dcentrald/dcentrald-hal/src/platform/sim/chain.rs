@@ -16,6 +16,19 @@ pub enum SimNoncePolicy {
     Silent,
 }
 
+/// Endpoint-semantic PIC16 operation shared by fault scheduling and traces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SimPic16Operation {
+    RawRead,
+    JumpFromLoader,
+    Heartbeat,
+    SetVoltage,
+    ReadVoltage,
+    EnableVoltage,
+    DisableVoltage,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum TraceEvent {
@@ -55,6 +68,7 @@ pub enum TraceEvent {
         chain_id: u8,
         valid: bool,
     },
+    /// Attempted I2C write. This is transport intent, not acceptance proof.
     I2cWrite {
         bus: u8,
         addr: u8,
@@ -79,6 +93,20 @@ pub enum TraceEvent {
         bus: u8,
     },
     ControllerWatchdogExpired {
+        at_ms: u64,
+    },
+    Pic16ControllerWatchdogExpired {
+        bus: u8,
+        addr: u8,
+        at_ms: u64,
+        generation: u64,
+    },
+    /// PIC16 operation accepted after endpoint-state and fault checks.
+    Pic16OperationAccepted {
+        bus: u8,
+        addr: u8,
+        operation: SimPic16Operation,
+        /// Simulator virtual service time at semantic acceptance.
         at_ms: u64,
     },
 }

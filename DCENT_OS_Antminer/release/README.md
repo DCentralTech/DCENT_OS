@@ -12,10 +12,13 @@ There are two independent ed25519 keypairs in the DCENT_OS supply chain:
 | **Release signing key** | Signs the sysupgrade `MANIFEST.json` produced by `scripts/package_sysupgrade.sh`. Verified at install time on the miner. | `DCENT_RELEASE_SIGNING_KEY` (private path) + `DCENT_RELEASE_PUBKEY_FILE` (public PEM) | `scripts/generate_release_keypair.sh` |
 | **Manifest pubkey pin** (this dir) | Compile-time-baked into `dcentrald` via `option_env!`. Verifies the at-rest stock-Bitmain manifest signature (`STOCK_MANIFEST_SIG_BAKED`) so the manifest can't be tampered with after the binary is built. | `DCENT_MANIFEST_PUBLIC_KEY_HEX` (raw 32-byte hex, 64 chars) + optional `DCENT_MANIFEST_KEY_ID` | this README's `openssl` recipe |
 
-A 2026-05-07 change added a **CI gate** in `scripts/build_in_docker.sh` and the
-`make release` target that **fails closed** when these are not set. Dev
-builds opt out via `DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1` (or `make dev` /
-`--lab-unsigned`).
+A 2026-05-07 change added a **CI gate** in the inner packaging driver and the
+`make release` target that **fails closed** when these are not set. The only
+admitted image-packaging entrypoint is currently the S9 release capsule.
+`make dev`, direct driver use, and the unsigned-lab option all fail closed
+until a separate authenticated lab capsule exists. The
+`DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1` switch remains available to scoped tests
+and lower-level lab validators; it does not grant packaging authority.
 
 ---
 
@@ -98,12 +101,29 @@ old key only after the replacement release has been verified.
 ## 3. Sign the stock-Bitmain manifest (release-time)
 
 ```bash
-# Sign the stock-Bitmain manifest.
-# Output is written to .../stock-bitmain-manifest.json.sig (raw 64-byte
-# ed25519 signature, exactly the shape `verify_manifest_signature` expects).
+# Generate a verified candidate without overwriting either tracked signature.
 bash DCENT_OS_Antminer/scripts/sign_stock_manifest.sh \
     /secure/path/release_ed25519.priv.pem
 ```
+
+The helper requires `DCENT_RELEASE_PUBKEY_FILE`, verifies the signature against
+that trusted key, and writes
+
+with no-replace semantics. After review, copy those exact 64 bytes to both
+tracked signature files:
+
+```bash
+cp  \
+    
+cp  \
+    DCENT_OS_Antminer/dcentrald/dcentrald-api/assets/stock-bitmain-manifest.json.sig
+cmp  \
+    DCENT_OS_Antminer/dcentrald/dcentrald-api/assets/stock-bitmain-manifest.json.sig
+```
+
+The candidate step never truncates a tracked placeholder or silently updates
+only one runtime copy. The offline gates require the promoted copies to remain
+byte-identical.
 
 ## 4. Build with the pin baked in
 
@@ -166,8 +186,9 @@ before shipment when this pin is absent.
 |---|---|
 | `DCENT_MANIFEST_PUBLIC_KEY_HEX` set at `cargo build` time | `manifest_signature_required` returns true; `STOCK_MANIFEST_SIG_BAKED` is verified at runtime; tampered manifests are rejected. |
 | `DCENT_MANIFEST_PUBLIC_KEY_HEX` unset at `cargo build` time | `manifest_signature_required` returns false; manifest is accepted as-baked (no signature gate). Acceptable for dev/lab; **NOT** acceptable for release. |
-| `make release` without the env var exported | Build fails at the CI signing gate before anything ships. |
-| `make dev` / `--lab-unsigned` / `DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1` | The CI signing gate is bypassed; produces a `lab_unsigned`-tagged package. |
+| `make release RELEASE_TARGET=s9` without the env var exported | The S9 capsule fails at the signing gate before anything ships. |
+| `make dev` or direct use of the inner driver, with or without `--lab-unsigned` | Packaging fails closed; no lab package is produced until a separate authenticated lab capsule exists. |
+| `DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1` in a scoped lower-level test/validator | Allows that test to exercise explicit `lab_unsigned` policy; does not authorize image building or publication. |
 
 ## 8. Files in this directory
 

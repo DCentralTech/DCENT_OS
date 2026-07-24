@@ -13,7 +13,7 @@
 //! - `server.py` (S80dashboard) stays up even when `dcentrald` is dead,
 //!   which is exactly when the operator needs the diagnostic UI. Embedding
 //!   the SPA in the daemon meant the SPA was unreachable during the
-//!   crash-loop windows it was designed to surface.
+//!   persistent-session refusal state it was designed to surface.
 //! - `dcentrald-api` no longer carries a `build.rs` artifact-size gate
 //!   for an HTML file that isn't part of its compilation unit.
 //!

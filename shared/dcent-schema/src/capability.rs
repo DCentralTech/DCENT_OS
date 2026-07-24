@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const CAPABILITY_SCHEMA_VERSION: u16 = 2;
+pub const CAPABILITY_SCHEMA_VERSION: u16 = 3;
 
 pub const RUNTIME_CAPABILITY_VALUES: &[&str] = &[
     "detect",
@@ -36,7 +36,7 @@ pub const INSTALL_CAPABILITY_VALUES: &[&str] = &[
     "physical-sd-card",
     "luxos-uninstall",
     "vnish-cgminer-detected",
-    "cv1835-emmc-proven",
+    "target-sysupgrade-first-install-capsule",
     "bcb100-accept-unverified",
     "http-ota-or-usb-serial",
     "manifest-board-match",
@@ -157,8 +157,8 @@ pub enum InstallCapability {
     LuxosUninstall,
     #[serde(rename = "vnish-cgminer-detected")]
     VnishCgminerDetected,
-    #[serde(rename = "cv1835-emmc-proven")]
-    Cv1835EmmcProven,
+    #[serde(rename = "target-sysupgrade-first-install-capsule")]
+    TargetSysupgradeFirstInstallCapsule,
     #[serde(rename = "bcb100-accept-unverified")]
     Bcb100AcceptUnverified,
     #[serde(rename = "http-ota-or-usb-serial")]
@@ -776,7 +776,7 @@ mod tests {
         let descriptor =
             DeviceCapabilityDescriptor::unknown(DeviceFamily::Antminer, "chip identity unknown");
         assert_eq!(descriptor.schema_version, CAPABILITY_SCHEMA_VERSION);
-        assert_eq!(CAPABILITY_SCHEMA_VERSION, 2);
+        assert_eq!(CAPABILITY_SCHEMA_VERSION, 3);
         assert_eq!(descriptor.support, SupportTier::Unknown);
         assert_eq!(descriptor.identity.confidence, IdentityConfidence::Unknown);
         assert_eq!(descriptor.asic.chip_model, None);

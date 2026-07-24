@@ -1,0 +1,64 @@
+#!/bin/sh
+
+set -eu
+
+exact_test=''
+subcommand=''
+is_list=0
+is_exact=0
+include_ignored=0
+locked=0
+package=''
+library=0
+target=''
+previous=''
+for argument in "$@"; do
+    case "$argument" in
+        test) [ -n "$subcommand" ] || subcommand=test ;;
+        *::*) exact_test=$argument ;;
+        --list) is_list=1 ;;
+        --exact) is_exact=1 ;;
+        --include-ignored) include_ignored=1 ;;
+        --locked) locked=1 ;;
+        --lib) library=1 ;;
+    esac
+    case "$previous" in
+        -p) package=$argument ;;
+        --target) target=$argument ;;
+    esac
+    previous=$argument
+done
+
+if [ "$subcommand" != test ] || [ "$locked" -ne 1 ] || \
+    [ "$package" != fixture-package ] || [ "$library" -ne 1 ] || \
+    [ "$target" != x86_64-unknown-linux-gnu ]; then
+    printf 'fake cargo did not receive the locked package/lib/target contract\n' >&2
+    exit 89
+fi
+
+if [ -z "$exact_test" ]; then
+    printf 'fake cargo did not receive a fully qualified test name\n' >&2
+    exit 90
+fi
+
+if [ "$is_list" -eq 1 ]; then
+    case "${FAKE_CARGO_MODE:?}" in
+        list_failure) exit 41 ;;
+        zero) printf '0 tests, 0 benchmarks\n' ;;
+        duplicate)
+            printf '%s: test\n' "$exact_test"
+            printf '%s: test\n' "$exact_test"
+            ;;
+        one|ignored|test_failure) printf '%s: test\n' "$exact_test" ;;
+        *) exit 91 ;;
+    esac
+    exit 0
+fi
+
+if [ "$is_exact" -ne 1 ] || [ "$include_ignored" -ne 1 ]; then
+    exit 43
+fi
+printf 'executed\n' >> "${FAKE_CARGO_LOG:?}"
+if [ "$FAKE_CARGO_MODE" = test_failure ]; then
+    exit 42
+fi

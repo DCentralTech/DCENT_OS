@@ -65,7 +65,6 @@ chmod +x "${TARGET_DIR}"/root/tools/*.py 2>/dev/null || true
 chmod +x "${TARGET_DIR}"/root/tools/*.sh 2>/dev/null || true
 chmod +x "${TARGET_DIR}"/usr/bin/dcent-shell 2>/dev/null || true
 chmod +x "${TARGET_DIR}"/usr/sbin/sysupgrade 2>/dev/null || true
-chmod +x "${TARGET_DIR}"/usr/sbin/switch_firmware.py 2>/dev/null || true
 
 # Make web server and MCP server executable
 chmod +x "${TARGET_DIR}"/root/web/server.py 2>/dev/null || true

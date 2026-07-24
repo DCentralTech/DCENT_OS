@@ -12,13 +12,55 @@ CONFIG="/etc/dcentrald/dcentrald.toml"
 LOGFILE="/tmp/dcentrald.log"
 PIDFILE="/var/run/dcentrald.pid"
 CHILD_PIDFILE="/var/run/dcentrald-child.pid"
-EXPECTFILE="/tmp/dcentrald.expected_exit.pid"
+EXPECTFILE="/var/run/dcentrald.expected_exit.pid"
 API_PORT=8080
-MAX_CRASH_RESTARTS=5
-RESTART_DELAY=2
 SCRIPT="$0"
+SESSION_LATCH_HELPER="/usr/libexec/dcentos/dcentrald-session-latch.sh"
+BOARD_SETUP="/etc/init.d/S37board_setup"
+OPERATION_LOCK="/run/dcentos/dcentrald-lifecycle-operation.lock"
+
+acquire_operation_lock() {
+    mkdir -p /run/dcentos 2>/dev/null || return 1
+    chmod 0700 /run/dcentos 2>/dev/null || return 1
+    mkdir "$OPERATION_LOCK" 2>/dev/null || {
+        echo "  [FAIL] Another dcentrald lifecycle operation is active or stale"
+        return 1
+    }
+    printf '%s\n' "$$" > "$OPERATION_LOCK/pid" 2>/dev/null || {
+        rmdir "$OPERATION_LOCK" 2>/dev/null || true
+        return 1
+    }
+    trap 'release_operation_lock' 0
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+}
+
+release_operation_lock() {
+    rm -f "$OPERATION_LOCK/pid" 2>/dev/null || true
+    rmdir "$OPERATION_LOCK" 2>/dev/null || true
+}
 
 detect_platform() {
+    IMAGE_PLATFORM=$(cat /etc/dcentos/platform 2>/dev/null || true)
+    IMAGE_TARGET=$(cat /etc/dcentos/board_target 2>/dev/null || true)
+    IMAGE_RAIL=$(cat /etc/dcentos/rail_gpio 2>/dev/null || true)
+    case "$IMAGE_PLATFORM:$IMAGE_TARGET" in
+        am3-aml-s19jpro:am3-s19jpro-aml|\
+        am3-aml-s19k:am3-s19k|\
+        am3-aml-s21:am3-s21|\
+        am3-aml-s21pro:am3-s21pro|\
+        am3-aml-s21xp:am3-s21xp|\
+        am3-aml-t21:am3-t21)
+            echo "amlogic"
+            return
+            ;;
+    esac
+    # A partial image may lose one identity marker. GPIO437 is a sealed fixed
+    # safety gate for this image family and remains sufficient to select the
+    # de-energize-only path, never to authorize mining.
+    [ "$IMAGE_RAIL" = 437 ] && { echo "amlogic"; return; }
+
     if [ -e /dev/uio0 ]; then
         echo "zynq"
     elif grep -qiE 'AM33XX|AM335x|TI AM335' /proc/cpuinfo 2>/dev/null || [ -e /dev/ttyO1 ]; then
@@ -28,6 +70,34 @@ detect_platform() {
     else
         echo "unknown"
     fi
+}
+
+child_identity_matches() {
+    PID=$1
+    START_TICKS=$2
+    [ -n "$PID" ] && [ -n "$START_TICKS" ] || return 1
+    case "$PID:$START_TICKS" in
+        *[!0-9:]*|:*) return 1 ;;
+    esac
+    [ "$(awk '{print $22}' "/proc/$PID/stat" 2>/dev/null)" = "$START_TICKS" ] || return 1
+    [ "$(readlink -f "/proc/$PID/exe" 2>/dev/null)" = "$DAEMON" ] || return 1
+}
+
+child_identity_is_live() {
+    child_identity_matches "$1" "$2" || return 1
+    STATE=$(awk '{print $3}' "/proc/$1/stat" 2>/dev/null) || return 1
+    [ "$STATE" != Z ]
+}
+
+dcentrald_may_execute() {
+    for PID in $(pidof dcentrald 2>/dev/null || true); do
+        case "$PID" in
+            ''|*[!0-9]*) return 0 ;;
+        esac
+        STATE=$(awk '{print $3}' "/proc/$PID/stat" 2>/dev/null) || return 0
+        [ "$STATE" = Z ] || return 0
+    done
+    return 1
 }
 
 migrate_legacy_api_port() {
@@ -64,6 +134,7 @@ migrate_legacy_api_port() {
 fan_safety_override() {
     FAN_PLATFORM=${PLATFORM:-$(detect_platform)}
     fan_detail="fans commanded to safe PWM (dcentrald exited)"
+    fan_result=0
     case "$FAN_PLATFORM" in
         amlogic)
             if [ -d /sys/class/pwm/pwmchip0/pwm0 ]; then
@@ -72,8 +143,22 @@ fan_safety_override() {
                 # amlogic_pwm_percent_to_duty_ns(pwm=30, period=100000) = 30000.
                 # NEVER above PWM 30 — see feedback_fan_max_30pwm /
                 # feedback_fan_never_blast.
-                echo 30000 > /sys/class/pwm/pwmchip0/pwm0/duty_cycle 2>/dev/null
-                echo 30000 > /sys/class/pwm/pwmchip0/pwm1/duty_cycle 2>/dev/null
+                for channel in 0 1; do
+                    duty=/sys/class/pwm/pwmchip0/pwm${channel}/duty_cycle
+                    period=/sys/class/pwm/pwmchip0/pwm${channel}/period
+                    enabled=/sys/class/pwm/pwmchip0/pwm${channel}/enable
+                    if [ ! -e "$duty" ] || [ ! -e "$period" ] || [ ! -e "$enabled" ] \
+                        || [ "$(cat "$period" 2>/dev/null)" != 100000 ] \
+                        || [ "$(cat "$enabled" 2>/dev/null)" != 1 ] \
+                        || ! printf '30000\n' > "$duty" 2>/dev/null \
+                        || [ "$(cat "$duty" 2>/dev/null)" != 30000 ]; then
+                        fan_result=1
+                        fan_detail="WARN: Amlogic PWM30 period/duty/enable evidence failed on channel $channel"
+                    fi
+                done
+            else
+                fan_result=1
+                fan_detail="WARN: Amlogic PWM controller is unavailable"
             fi
             ;;
         beaglebone)
@@ -115,12 +200,55 @@ fan_safety_override() {
             ;;
     esac
     echo "$(date): SAFETY: $fan_detail" >> "$LOGFILE"
+    return "$fan_result"
+}
+
+verify_amlogic_boot_safe_state() {
+    [ -x "$BOARD_SETUP" ] || {
+        echo "$(date): WARN: checked Amlogic board owner is missing" >> "$LOGFILE"
+        return 1
+    }
+    "$BOARD_SETUP" verify-safe-state >> "$LOGFILE" 2>&1
+}
+
+emergency_hardware_safe_state() {
+    SAFETY_PLATFORM=${PLATFORM:-$(detect_platform)}
+    case "$SAFETY_PLATFORM" in
+        amlogic)
+            [ -x "$BOARD_SETUP" ] || return 1
+            "$BOARD_SETUP" emergency-safe-off >> "$LOGFILE" 2>&1
+            ;;
+        *)
+            [ -x "$DAEMON" ] || return 1
+            "$DAEMON" --safe-off >> "$LOGFILE" 2>&1 || return 1
+            fan_safety_override
+            ;;
+    esac
 }
 
 case "$1" in
     start)
-        [ -x "$DAEMON" ] || { echo "  [SKIP] $DAEMON not found"; exit 0; }
-        [ -f "$CONFIG" ] || { echo "  [SKIP] $CONFIG not found"; exit 0; }
+        acquire_operation_lock || exit 1
+        PLATFORM=$(detect_platform)
+        [ "$PLATFORM" != unknown ] || {
+            echo "  [FAIL] Platform identity and device discovery are both unknown"
+            exit 1
+        }
+        if [ "$PLATFORM" = amlogic ] && ! verify_amlogic_boot_safe_state; then
+            echo "  [FAIL] Amlogic boot-safe receipt/revalidation is unavailable"
+            emergency_hardware_safe_state || true
+            exit 1
+        fi
+        [ -x "$DAEMON" ] || {
+            echo "  [FAIL] $DAEMON not found"
+            emergency_hardware_safe_state || true
+            exit 1
+        }
+        [ -f "$CONFIG" ] || {
+            echo "  [FAIL] $CONFIG not found"
+            emergency_hardware_safe_state || true
+            exit 1
+        }
 
         # W1.5 (2026-05-07): re-assert tight perms on /data/dcent/ + auth.json
         # before launching the daemon. dcentrald will also auto-correct via
@@ -133,144 +261,178 @@ case "$1" in
             chmod 0600 /data/dcent/auth.json 2>/dev/null
         fi
 
-        PLATFORM=$(detect_platform)
-        ARGS="--config $CONFIG"
-        case "$PLATFORM" in
-            amlogic|beaglebone) ARGS="--serial-mining $ARGS" ;;
-        esac
-
         migrate_legacy_api_port
-        fan_safety_override
 
-        ORPHAN_PIDS=$(pidof dcentrald 2>/dev/null || true)
-        [ -n "$ORPHAN_PIDS" ] && {
-            echo "  [WARN] Killing orphaned dcentrald PID(s): $ORPHAN_PIDS"
-            for ORPHAN_PID in $ORPHAN_PIDS; do
-                echo "$ORPHAN_PID" > "$EXPECTFILE"
-                kill -TERM "$ORPHAN_PID" 2>/dev/null
-            done
-            for i in $(seq 1 30); do
-                pidof dcentrald > /dev/null 2>&1 || break
-                sleep 1
-            done
-            REMAINING_PIDS=$(pidof dcentrald 2>/dev/null || true)
-            [ -n "$REMAINING_PIDS" ] && {
-                rm -f "$EXPECTFILE"
-                fan_safety_override
-                for ORPHAN_PID in $REMAINING_PIDS; do
-                    kill -9 "$ORPHAN_PID" 2>/dev/null
-                done
-                sleep 1
-            }
-            rm -f "$CHILD_PIDFILE"
+        RUNNING_PIDS=$(pidof dcentrald 2>/dev/null || true)
+        if [ -n "$RUNNING_PIDS" ]; then
+            echo "  [FAIL] Refusing a second dcentrald owner (PID(s): $RUNNING_PIDS)"
+            exit 1
+        fi
+        if [ ! -r "$SESSION_LATCH_HELPER" ]; then
+            echo "  [FAIL] Persistent hardware-session latch helper is missing"
+            emergency_hardware_safe_state || true
+            exit 1
+        fi
+        SESSION_TOKEN=$(/bin/sh "$SESSION_LATCH_HELPER" prepare 2>> "$LOGFILE") || {
+            echo "  [FAIL] Hardware-session admission is blocked; see $LOGFILE"
+            emergency_hardware_safe_state || true
+            exit 1
         }
+        if ! fan_safety_override; then
+            /bin/sh "$SESSION_LATCH_HELPER" abandon "$SESSION_TOKEN" prelaunch-cooling-failed \
+                >> "$LOGFILE" 2>&1 || true
+            emergency_hardware_safe_state || true
+            echo "  [FAIL] Prelaunch cooling command/readback failed"
+            exit 1
+        fi
+        if [ "$PLATFORM" = amlogic ] \
+            && ! "$BOARD_SETUP" mark-runtime-handoff >> "$LOGFILE" 2>&1; then
+            /bin/sh "$SESSION_LATCH_HELPER" abandon "$SESSION_TOKEN" boot-handoff-failed \
+                >> "$LOGFILE" 2>&1 || true
+            emergency_hardware_safe_state || true
+            echo "  [FAIL] Amlogic boot-to-runtime handoff failed"
+            exit 1
+        fi
 
         echo "  Starting dcentrald (platform=$PLATFORM)..."
         echo "  Config: $CONFIG"
         echo "  API: REST/WebSocket :$API_PORT"
         echo "  Dashboard: HTTP :80 via S80dashboard"
-        start-stop-daemon -S -b -m -p "$PIDFILE" \
-            -x /bin/sh -- -c "
-                CRASH_COUNT=0
-                while true; do
-                    $DAEMON $ARGS >>$LOGFILE 2>&1 &
-                    CHILD_PID=\$!
-                    echo \$CHILD_PID > $CHILD_PIDFILE
-                    wait \$CHILD_PID
-                    EXIT_CODE=\$?
-                    EXPECTED_PID=\$(cat $EXPECTFILE 2>/dev/null || true)
-                    rm -f $CHILD_PIDFILE
-
-                    if [ \"\$EXPECTED_PID\" = \"\$CHILD_PID\" ]; then
-                        rm -f $EXPECTFILE
-                        echo \"\$(date): expected dcentrald exit for PID \$CHILD_PID (code \$EXIT_CODE)\" >> $LOGFILE
-                        exit \$EXIT_CODE
-                    fi
-
-                    rm -f $EXPECTFILE
-                    if [ \$EXIT_CODE -eq 0 ]; then
-                        echo \"\$(date): dcentrald exited cleanly\" >> $LOGFILE
-                        exit 0
-                    fi
-
-                    CRASH_COUNT=\$((CRASH_COUNT + 1))
-                    echo \"\$(date): dcentrald exited with code \$EXIT_CODE (crash \$CRASH_COUNT/$MAX_CRASH_RESTARTS)\" >> $LOGFILE
-                    \"$SCRIPT\" safety
-                    if [ \$CRASH_COUNT -ge $MAX_CRASH_RESTARTS ]; then
-                        echo \"\$(date): dcentrald restart limit reached\" >> $LOGFILE
-                        exit \$EXIT_CODE
-                    fi
-                    sleep $RESTART_DELAY
-                done
-            "
+        case "$PLATFORM" in
+            amlogic|beaglebone) set -- "$DAEMON" --serial-mining --config "$CONFIG" ;;
+            *) set -- "$DAEMON" --config "$CONFIG" ;;
+        esac
+        if ! start-stop-daemon -S -b -m -p "$PIDFILE" \
+            -x /bin/sh -- "$SESSION_LATCH_HELPER" supervise "$SESSION_TOKEN" \
+            "$SCRIPT" "$LOGFILE" "$CHILD_PIDFILE" "$EXPECTFILE" "$@"; then
+            /bin/sh "$SESSION_LATCH_HELPER" abandon "$SESSION_TOKEN" supervisor-launch-failed \
+                >> "$LOGFILE" 2>&1 || true
+            emergency_hardware_safe_state || true
+            echo "  [FAIL] dcentrald supervisor did not start"
+            exit 1
+        fi
 
         sleep 3
         if pidof dcentrald > /dev/null 2>&1; then
             echo "  [OK] dcentrald running (PID $(pidof dcentrald), REST/WebSocket :$API_PORT)"
         else
             echo "  [FAIL] dcentrald not started"
-            fan_safety_override
+            emergency_hardware_safe_state || true
+            exit 1
         fi
         ;;
 
     stop)
+        acquire_operation_lock || exit 1
+        PLATFORM=$(detect_platform)
         echo "  Stopping dcentrald..."
-        CHILD_PID=$(cat "$CHILD_PIDFILE" 2>/dev/null || pidof dcentrald 2>/dev/null | awk '{print $1}')
-        WRAPPER_PID=$(cat "$PIDFILE" 2>/dev/null || true)
+        CHILD_RECORD=$(cat "$CHILD_PIDFILE" 2>/dev/null || true)
+        CHILD_PID=$(printf '%s\n' "$CHILD_RECORD" | awk '{print $1}')
+        CHILD_START_TICKS=$(printf '%s\n' "$CHILD_RECORD" | awk '{print $2}')
+        HAD_VERIFIED_CHILD=0
+        if [ -n "$CHILD_PID" ] \
+            && ! child_identity_matches "$CHILD_PID" "$CHILD_START_TICKS"; then
+            if dcentrald_may_execute; then
+                echo "  [FAIL] Refusing a live dcentrald with stale or mismatched child identity"
+                exit 1
+            fi
+            echo "  [WARN] Ignoring stale child identity; no process will be signaled"
+            CHILD_PID=
+            CHILD_START_TICKS=
+        fi
+        [ -n "$CHILD_PID" ] && HAD_VERIFIED_CHILD=1
+        if [ -z "$CHILD_PID" ] && dcentrald_may_execute; then
+            echo "  [FAIL] A live dcentrald exists without a verified supervisor identity"
+            exit 1
+        fi
         [ -n "$CHILD_PID" ] && echo "$CHILD_PID" > "$EXPECTFILE"
-        [ -n "$CHILD_PID" ] && kill -TERM "$CHILD_PID" 2>/dev/null
+        [ -n "$CHILD_PID" ] \
+            && child_identity_matches "$CHILD_PID" "$CHILD_START_TICKS" \
+            && kill -TERM "$CHILD_PID" 2>/dev/null
 
         for i in $(seq 1 30); do
-            if [ -z "$CHILD_PID" ] || ! kill -0 "$CHILD_PID" 2>/dev/null; then
+            if [ -z "$CHILD_PID" ] \
+                || ! child_identity_is_live "$CHILD_PID" "$CHILD_START_TICKS"; then
                 break
             fi
             sleep 1
         done
 
         TIMED_OUT=0
-        if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+        if [ -n "$CHILD_PID" ] \
+            && child_identity_is_live "$CHILD_PID" "$CHILD_START_TICKS"; then
             echo "  [WARN] dcentrald did not exit in 30s - force killing"
             rm -f "$EXPECTFILE"
             TIMED_OUT=1
-            kill -9 "$CHILD_PID" 2>/dev/null
+            child_identity_matches "$CHILD_PID" "$CHILD_START_TICKS" \
+                && kill -9 "$CHILD_PID" 2>/dev/null
         fi
 
-        if [ -n "$WRAPPER_PID" ] && kill -0 "$WRAPPER_PID" 2>/dev/null; then
-            kill -TERM "$WRAPPER_PID" 2>/dev/null
+        # SIGKILL delivery is not process-death evidence. Observe the exact
+        # PID as gone before permitting the monotonic emergency-cut custodian.
+        for i in 1 2 3 4 5; do
+            if [ -z "$CHILD_PID" ] \
+                || ! child_identity_is_live "$CHILD_PID" "$CHILD_START_TICKS"; then
+                break
+            fi
             sleep 1
-            kill -9 "$WRAPPER_PID" 2>/dev/null
+        done
+        if [ -n "$CHILD_PID" ] \
+            && child_identity_is_live "$CHILD_PID" "$CHILD_START_TICKS"; then
+            echo "  [FAIL] dcentrald PID $CHILD_PID remains live after SIGKILL"
+            exit 1
+        fi
+
+        # Give the verified child's parent one bounded scheduling interval to
+        # reap it and publish its serialized terminal receipt. A zombie cannot
+        # execute hardware operations, so the fallback custodian may proceed
+        # after that interval even if pidof still reports the unreaped name.
+        TERMINAL_SAFE=0
+        if [ "$PLATFORM" = amlogic ] && [ "$HAD_VERIFIED_CHILD" = 1 ]; then
+            for ATTEMPT in 1 2; do
+                if "$BOARD_SETUP" verify-terminal-safe-state >> "$LOGFILE" 2>&1; then
+                    TERMINAL_SAFE=1
+                    break
+                fi
+                [ "$ATTEMPT" = 2 ] || sleep 1
+            done
+        fi
+        # The raw start-stop-daemon wrapper PID is never signaled because it
+        # lacks a start-time identity record.
+        if [ "$TERMINAL_SAFE" != 1 ] && ! emergency_hardware_safe_state; then
+            echo "  [FAIL] dcentrald exited but emergency hardware SafeOff failed"
+            exit 1
+        fi
+
+        # The unresolved marker was durable before launch. Promote the reason
+        # only after the owner is dead and the emergency cut has completed so
+        # slow or failed persistence cannot delay containment.
+        if [ "$TIMED_OUT" = 1 ]; then
+            /bin/sh "$SESSION_LATCH_HELPER" latch forced-stop-timeout >> "$LOGFILE" 2>&1 || true
         fi
 
         rm -f "$PIDFILE" "$CHILD_PIDFILE"
-        if [ "$TIMED_OUT" -eq 1 ]; then
-            fan_safety_override
-        fi
-        echo "  [OK] dcentrald stopped"
+        echo "  [OK] dcentrald stopped; software SafeOff readback recorded, physical rail remains unmeasured"
         ;;
 
     restart)
-        $0 stop
-        sleep 2
-        $0 start
+        echo "  [FAIL] Amlogic restart is refused before stop: durable electrical disposition/readmission is not yet qualified"
+        exit 1
         ;;
 
     safety)
-        # G22 (no-brick safety, gap-swarm 2026-05-28): the emergency safety response
-        # must CUT HASH POWER, not just cap fans. Delegate to the daemon's audited
-        # per-platform one-shot `--safe-off` (amlogic -> disable PSU via GPIO437, then
-        # quiet fans — cut-hash-before-noise) instead of hardcoding the contested GPIO437
-        # polarity here. Falls back to the fan-only override if the binary is absent or
-        # the cut fails.
-        if [ -x "$DAEMON" ]; then
-            if "$DAEMON" --safe-off >> $LOGFILE 2>&1; then
-                echo "$(date): SAFETY: --safe-off completed (hash power cut + fans quiet) via $DAEMON" >> $LOGFILE
-            else
-                echo "$(date): WARN: $DAEMON --safe-off failed (rc=$?) — falling back to fan-only safety override" >> $LOGFILE
-                fan_safety_override
-            fi
+        # The common supervisor invokes this only after wait(2) observed the
+        # runtime owner exit. Never create a competing one-shot owner.
+        if dcentrald_may_execute; then
+            echo "$(date): WARN: refusing a competing one-shot safety owner while dcentrald is live" >> "$LOGFILE"
+            exit 1
+        fi
+        if emergency_hardware_safe_state; then
+            echo "$(date): SAFETY: command/readback SafeOff recorded; physical rail was not measured" >> "$LOGFILE"
         else
-            echo "$(date): WARN: $DAEMON absent — PSU cut unavailable, fan-only safety override" >> $LOGFILE
-            fan_safety_override
+            echo "$(date): FAIL: emergency hardware SafeOff failed; power disposition remains unknown" >> "$LOGFILE"
+            fan_safety_override || true
+            exit 1
         fi
         ;;
 

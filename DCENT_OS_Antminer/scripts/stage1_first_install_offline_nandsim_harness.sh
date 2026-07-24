@@ -11,6 +11,11 @@
 # Success prints OFFLINE_FIRST_INSTALL_PROOF_OK only after the generated
 # stage1.sh has run against nandsim-backed MTD/UBI devices and this harness has
 # read back the written bytes from those device nodes.
+#
+# This harness is intentionally S9-only. AM2 vendor-source first install has no
+# authenticated, versioned capsule with source-runtime dependency closure and
+# persistent-state migration. The AM2 on-device sysupgrade writer is covered by
+# sysupgrade_offline_nandsim_harness.sh only as a DCENT_OS-source A/B update.
 
 set -euo pipefail
 
@@ -23,9 +28,6 @@ TARGET=am1-s9
 ROUTE=both
 PACKAGE="$PROJECT_DIR/output/beta-xil-20260617/DCENTOS_XIL1_S9_beta20260617.tar"
 BRAIINS_PACKAGE="$TOOLBOX_DIR/packages/braiins-os_am1-s9_ssh_22.08.1-plus.tar.gz"
-# CE-026 AM2 first-install: the signed am2-s19jpro sysupgrade package written by
-# the guided-persistent writer onto the inactive slot (default = beta XIL3 tar).
-AM2_PACKAGE=${DCENT_STAGE1_AM2_PACKAGE:-$PROJECT_DIR/output/beta-xil-20260617/DCENTOS_XIL3_S19jPro_beta20260617.tar}
 WORKDIR=
 PROBE_ONLY=0
 REQUIRE_NANDSIM=${DCENT_REQUIRE_NANDSIM:-0}
@@ -47,11 +49,10 @@ usage() {
 Usage: stage1_first_install_offline_nandsim_harness.sh --package TAR --workdir DIR [options]
 
 Options:
-  --target TARGET          am1-s9 (S9 stage1 routes) or am2-s19jpro (AM2 first-install)
+  --target TARGET          am1-s9 (the only admitted first-install target)
   --route ROUTE            both, braiinsos-am1-s9-ubi_replace, stock-am1-s9-stock_phase1, or stock-am1-s9-stock_phase2
   --package TAR            Signed S9 beta sysupgrade tar
   --braiins-package TAR    Bundled BraiinsOS SSH package for stock_phase1
-  --am2-package TAR        Signed am2-s19jpro sysupgrade tar (--target am2-s19jpro)
   --workdir DIR            Clean work directory
   --python PATH            Python executable used to call stage1_builder
   --probe-only             Only check kernel/tool availability
@@ -468,150 +469,6 @@ run_stock_phase2() {
     echo "OFFLINE_FIRST_INSTALL_PROOF_OK target=am1-s9 route=$route"
 }
 
-# --- CE-026 AM2 FIRST-INSTALL PATH BEGIN ---
-# Models a guided first-install of the signed DCENT_OS am2-s19jpro package onto
-# the INACTIVE NAND slot from a BraiinsOS-shaped starting environment, driven by
-# the REAL on-device am2 sysupgrade writer (the guided-persistent writer's
-# device stage): ubiupdatevol into the freshly-created inactive UBI slot + the
-# atomic libubootenv fw_setenv boot-selector flip. Reusing the shipped
-# /usr/sbin/sysupgrade am2 overlay means this proof covers the exact code that
-# runs on the unit.
-#
-# LOAD-BEARING AM2 weak-ECC invariant:
-# on pl35x-nand the U-Boot env flip MUST go through fw_setenv (redundant-copy-
-# atomic), NEVER a raw dd/flash_erase/nandwrite of /dev/mtd4 (the .39/.139 brick
-# root cause). This path therefore performs NO raw mtd4 write: the initial
-# BraiinsOS-shaped env is seeded with fw_setenv onto the freshly-erased nandsim
-# mtd4, and the device write path is the am2 sysupgrade (ubiupdatevol + fw_setenv
-# only). The ci_offline_gates.sh CE-026 gate reject-scans this marked region.
-AM2_NANDSIM_PARTS=${DCENT_STAGE1_AM2_NANDSIM_PARTS:-1,1,1,1,4,1,1,900,900}
-AM2_ACTIVE_MTD=7
-AM2_INACTIVE_MTD=8
-
-am2_seed_bos_env_fixture() {
-    # BraiinsOS-shaped starting env: the running (active) slot is firmware=1
-    # (mtd7). Seed it with fw_setenv onto the freshly-modprobed (all-0xFF) nandsim
-    # env partition -- libubootenv writes a fresh CRC-valid redundant env pair on
-    # first write, so no mkenvimage + raw write is needed.
-    _work=$1
-    require_nandsim_partition 4 00080000
-    cat >/etc/fw_env.config <<EOF
-/dev/mtd4 0x00000 0x20000 0x20000
-/dev/mtd4 0x20000 0x20000 0x20000
-EOF
-    _seed="$_work/am2_bos_env.txt"
-    cat >"$_seed" <<EOF
-firmware=1
-bootcmd=run boot_dcent
-EOF
-    fw_setenv --script "$_seed" || skip_unavailable "fw_setenv cannot seed the offline am2 BraiinsOS env fixture"
-    fw_printenv firmware >/dev/null 2>&1 || skip_unavailable "fw_printenv cannot read the offline am2 fw_env fixture"
-}
-
-am2_prepare_inactive_slot() {
-    # Factory-blank inactive slot: fresh UBI with volumes_count=0 so the am2
-    # sysupgrade first-install branch auto-creates kernel/rootfs/rootfs_data.
-    _mtd=$1
-    require_nandsim_partition "$_mtd" ""
-    ubidetach -m "$_mtd" >/dev/null 2>&1 || true
-    ubidetach -d 1 >/dev/null 2>&1 || true
-    ubiformat "/dev/mtd$_mtd" -y >/dev/null
-}
-
-run_am2_first_install() {
-    local route sysupgrade workdir log pkgdir subdir cmdline marker bosplatform version shimdir
-    local fw stg
-    local -a env_args
-    route=am2-s19jpro-first_install
-    sysupgrade="$PROJECT_DIR/br2_external_dcentos/board/zynq/am2-s19jpro/rootfs-overlay/usr/sbin/sysupgrade"
-    workdir="$WORKDIR/$route"
-    log="$WORKDIR/$route.log"
-    pkgdir="$workdir/pkg"
-    subdir="$pkgdir/sysupgrade-am2-s19j"
-
-    need_tool fw_setenv
-    need_tool fw_printenv
-    need_tool openssl
-    need_tool hexdump
-    [ -f "$sysupgrade" ] || die "am2 sysupgrade overlay not found: $sysupgrade"
-    [ -f "$AM2_PACKAGE" ] || die "am2 signed package not found: $AM2_PACKAGE"
-
-    mkdir -p "$workdir" "$pkgdir"
-    tar xf "$AM2_PACKAGE" -C "$pkgdir"
-    [ -f "$subdir/kernel" ] || die "am2 package missing $subdir/kernel"
-    [ -f "$subdir/root" ] || die "am2 package missing $subdir/root"
-
-    # Fresh both-slots am2 layout: active mtd7 + factory-blank inactive mtd8.
-    load_nandsim_parts "$AM2_NANDSIM_PARTS"
-    require_nandsim_partition 4 00080000
-    require_nandsim_partition "$AM2_ACTIVE_MTD" ""
-    require_nandsim_partition "$AM2_INACTIVE_MTD" ""
-    am2_seed_bos_env_fixture "$workdir"
-    am2_prepare_inactive_slot "$AM2_INACTIVE_MTD"
-
-    cmdline="$workdir/proc_cmdline"
-    marker="$workdir/offline_harness.marker"
-    bosplatform="$workdir/bos_platform"
-    version="$workdir/dcentos-version"
-    shimdir="$workdir/shims"
-    # Active slot mtd7 => ubi.mtd=7 => CURRENT_MTD=7 => first-install writes the
-    # inactive mtd8 then flips firmware=1 -> firmware=2.
-    printf 'console=ttyPS0 ubi.mtd=%s root=ubi0:rootfs\n' "$AM2_ACTIVE_MTD" >"$cmdline"
-    printf 'dcent-sysupgrade-offline-nandsim-harness-v1\n' >"$marker"
-    # BraiinsOS-shaped identity: no /etc/dcentos/board_target; only the ambiguous
-    # zynq-bm3-am2 BOS marker, opted-in via the guided first-flash override below.
-    printf 'zynq-bm3-am2\n' >"$bosplatform"
-    # Guided-writer baseline version marker so the sysupgrade rollback floor can
-    # evaluate a pre-DCENT first install (0.0.0 < package version).
-    printf '0.0.0\n' >"$version"
-    mkdir -p "$shimdir"
-    cat >"$shimdir/reboot" <<'EOF'
-#!/bin/sh
-echo "OFFLINE_HARNESS_REBOOT_SHADOWED"
-exit 0
-EOF
-    chmod 0755 "$shimdir/reboot"
-
-    env_args=(
-        "PATH=$shimdir:$PATH"
-        DCENT_SYSUPGRADE_OFFLINE_HARNESS=1
-        "DCENT_SYSUPGRADE_OFFLINE_MARKER=$marker"
-        "DCENT_SYSUPGRADE_PROC_CMDLINE_PATH=$cmdline"
-        "DCENT_SYSUPGRADE_BOS_PLATFORM_PATH=$bosplatform"
-        "DCENT_SYSUPGRADE_VERSION_PATH=$version"
-        DCENT_ALLOW_AM2_S19J_AMBIGUOUS_BOS_PLATFORM=1
-        DCENT_ALLOW_DOWNGRADE=1
-    )
-    if [ -f "$subdir/MANIFEST.sig" ] && [ -f "$subdir/release_ed25519.pub" ]; then
-        env_args+=("DCENT_SYSUPGRADE_RELEASE_PUBKEY=$subdir/release_ed25519.pub")
-    else
-        env_args+=(DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 DCENT_PACKAGE_STATUS=lab)
-    fi
-
-    # THE DEVICE WRITE PATH: the real on-device am2 sysupgrade (ubiupdatevol into
-    # the inactive slot + fw_setenv boot-selector flip). No raw mtd4 write here.
-    if ! env "${env_args[@]}" sh "$sysupgrade" -f "$AM2_PACKAGE" >"$log" 2>&1; then
-        cat "$log" >&2 || true
-        die "am2 first-install sysupgrade writer failed; log=$log"
-    fi
-
-    # Read back the inactive slot UBI volumes to prove the bytes landed.
-    ubiattach /dev/ubi_ctrl -m "$AM2_INACTIVE_MTD" -d 1 >/dev/null
-    create_ubi_device_nodes
-    verify_written_volume "$route" kernel /dev/ubi1_0 "$subdir/kernel" "$workdir"
-    verify_written_volume "$route" rootfs /dev/ubi1_1 "$subdir/root" "$workdir"
-    ubidetach -d 1 >/dev/null 2>&1 || true
-
-    # Assert the fw_setenv boot-selector flip landed (inactive firmware=2, stage 0).
-    fw=$(fw_printenv firmware 2>/dev/null | sed -n 's/^firmware=//p')
-    stg=$(fw_printenv upgrade_stage 2>/dev/null | sed -n 's/^upgrade_stage=//p')
-    [ "$fw" = "2" ] || die "am2 first-install: post-flip firmware=$fw expected 2"
-    [ "$stg" = "0" ] || die "am2 first-install: post-flip upgrade_stage=$stg expected 0"
-
-    echo "OFFLINE_FIRST_INSTALL_PROOF_OK target=am2-s19jpro route=$route inactive_mtd=$AM2_INACTIVE_MTD"
-}
-# --- CE-026 AM2 FIRST-INSTALL PATH END ---
-
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --target) TARGET=${2:-}; shift 2 ;;
@@ -622,8 +479,6 @@ while [ "$#" -gt 0 ]; do
         --package=*) PACKAGE=${1#--package=}; shift ;;
         --braiins-package) BRAIINS_PACKAGE=${2:-}; shift 2 ;;
         --braiins-package=*) BRAIINS_PACKAGE=${1#--braiins-package=}; shift ;;
-        --am2-package) AM2_PACKAGE=${2:-}; shift 2 ;;
-        --am2-package=*) AM2_PACKAGE=${1#--am2-package=}; shift ;;
         --workdir) WORKDIR=${2:-}; shift 2 ;;
         --workdir=*) WORKDIR=${1#--workdir=}; shift ;;
         --python) PYTHON_BIN=${2:-}; shift 2 ;;
@@ -635,10 +490,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-case "$TARGET" in
-    am1-s9|am2-s19jpro) ;;
-    *) die "unsupported --target '$TARGET' (expected am1-s9 or am2-s19jpro)" ;;
-esac
+[ "$TARGET" = "am1-s9" ] || die "unsupported --target '$TARGET' (expected am1-s9)"
 case "$ROUTE" in
     both|braiinsos-am1-s9-ubi_replace|stock-am1-s9-stock_phase1|stock-am1-s9-stock_phase2) ;;
     *) die "unsupported --route '$ROUTE'" ;;
@@ -668,14 +520,6 @@ fi
 
 rm -rf "$WORKDIR"
 mkdir -p "$WORKDIR"
-
-# CE-026 AM2 first-install: uses its own signed am2 package (--am2-package) and
-# the on-device am2 sysupgrade writer; the S9 stage1 routes below do not apply.
-if [ "$TARGET" = "am2-s19jpro" ]; then
-    run_am2_first_install
-    unload_nandsim
-    exit 0
-fi
 
 [ -f "$PACKAGE" ] || die "S9 package not found: $PACKAGE"
 [ -f "$BRAIINS_PACKAGE" ] || die "BraiinsOS package not found: $BRAIINS_PACKAGE"

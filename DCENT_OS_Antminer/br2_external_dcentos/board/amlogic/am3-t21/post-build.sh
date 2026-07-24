@@ -55,7 +55,6 @@ chmod +x "${TARGET_DIR}"/root/tools/*.py 2>/dev/null || true
 chmod +x "${TARGET_DIR}"/root/tools/*.sh 2>/dev/null || true
 chmod +x "${TARGET_DIR}"/usr/bin/dcent-shell 2>/dev/null || true
 chmod +x "${TARGET_DIR}"/usr/sbin/sysupgrade 2>/dev/null || true
-chmod +x "${TARGET_DIR}"/usr/sbin/switch_firmware.py 2>/dev/null || true
 # W1.1 default-credential lockdown: SSH gate helper must be mode 0755.
 chmod 0755 "${TARGET_DIR}"/usr/sbin/dcent-enable-ssh 2>/dev/null || true
 chmod +x "${TARGET_DIR}"/root/web/server.py 2>/dev/null || true

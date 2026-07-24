@@ -309,7 +309,12 @@ impl BM1366 {
                 buffer[5]
             );
 
-            chip_counter += 1;
+            // Saturating so a looping / echoing chain or a noise stream that
+            // delivers >= 256 CRC5-valid CHIP_ID frames cannot overflow this u8
+            // (debug panic) or wrap to 0 / a small value (release: false
+            // NoAsicsFound or a mis-sized address_interval). 256+ chips is
+            // physically impossible; the expected-count mismatch below still warns.
+            chip_counter = chip_counter.saturating_add(1);
         }
 
         if chip_counter != expected_count {

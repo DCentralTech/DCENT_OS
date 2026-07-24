@@ -36,7 +36,7 @@
 DAEMON="/usr/local/bin/dcentrald"
 PIDFILE="/var/run/dcentrald.pid"
 CHILD_PIDFILE="/var/run/dcentrald-child.pid"
-EXPECTFILE="/tmp/dcentrald.expected_exit.pid"
+EXPECTFILE="/var/run/dcentrald.expected_exit.pid"
 LOGFILE="/tmp/dcentrald.log"
 FAN_BASE=0x42800000
 # AM2 persistent fan-custodian pidfile (see am2_start_fan_custodian below).
@@ -44,9 +44,8 @@ FANHOLD_PIDFILE="/var/run/dcentrald-fanhold.pid"
 DEFAULT_COMPAT="/etc/default/dcentos-compat"
 PERSISTENT_COMPAT="/data/dcentos-compat"
 API_PORT=8080
-MAX_CRASH_RESTARTS=5
-RESTART_DELAY=2
 SCRIPT="$0"
+SESSION_LATCH_HELPER="/usr/libexec/dcentos/dcentrald-session-latch.sh"
 
 # Use persistent config if available, otherwise default.
 #
@@ -268,7 +267,7 @@ ensure_i2c0_kernel_bound() {
 #     reads/writes are a proven NO-OP there (a /dev/mem shadow). The ONLY
 #     reliable am2 fan write is the fan-control UIO mmap path, exposed as the
 #     `dcentrald --set-fan <PWM>` one-shot (R2; fan-register-only, no
-#     PIC/PSU/I2C, synchronous, clamped <= 30). NOTE: the crash wrapper
+#     PIC/PSU/I2C, synchronous, clamped <= 30). NOTE: the safety response
 #     spawns a FRESH one-shot process here — safe precisely because the
 #     one-shot is fan-register-only and exits immediately.
 #   am1-s9: devmem to the fan IP works correctly — keep it (no regression).
@@ -345,6 +344,22 @@ case "$1" in
             exit 0
         fi
 
+        RUNNING_PIDS=$(pidof dcentrald 2>/dev/null || true)
+        if [ -n "$RUNNING_PIDS" ]; then
+            echo "  [FAIL] Refusing a second dcentrald owner (PID(s): $RUNNING_PIDS)"
+            exit 1
+        fi
+        if [ ! -r "$SESSION_LATCH_HELPER" ]; then
+            echo "  [FAIL] Persistent hardware-session latch helper is missing"
+            fan_safety_override
+            exit 1
+        fi
+        SESSION_TOKEN=$(/bin/sh "$SESSION_LATCH_HELPER" prepare 2>> "$LOGFILE") || {
+            echo "  [FAIL] Hardware-session admission is blocked; see $LOGFILE"
+            fan_safety_override
+            exit 1
+        }
+
         # Reap any persistent AM2 fan custodian left resident by a prior
         # stop/safety/clean-stop (am2_start_fan_custodian / --hold-fan). It
         # owns the uio16 fan mmap; the main daemon must own it for mining-fan
@@ -418,68 +433,20 @@ case "$1" in
         # otherwise survive and fight the new daemon over the single /dev/i2c-0
         # owner + PWR_CONTROL + chain UART (the single-I2C-owner violation that can
         # wedge the dsPIC/I2C bus). Mirrors the base zynq/amlogic/am3-bb wrappers.
-        ORPHAN_PIDS=$(pidof dcentrald 2>/dev/null || true)
-        [ -n "$ORPHAN_PIDS" ] && {
-            echo "  [WARN] Killing orphaned dcentrald PID(s): $ORPHAN_PIDS - waiting for graceful shutdown"
-            for ORPHAN_PID in $ORPHAN_PIDS; do
-                echo "$ORPHAN_PID" > "$EXPECTFILE"
-                kill -TERM "$ORPHAN_PID" 2>/dev/null
-            done
-            for i in $(seq 1 30); do
-                pidof dcentrald > /dev/null 2>&1 || break
-                sleep 1
-            done
-            REMAINING_PIDS=$(pidof dcentrald 2>/dev/null || true)
-            [ -n "$REMAINING_PIDS" ] && {
-                echo "  [WARN] Orphan PID(s) did not exit in 30s - force killing: $REMAINING_PIDS"
-                rm -f "$EXPECTFILE"
-                fan_safety_override
-                for ORPHAN_PID in $REMAINING_PIDS; do
-                    kill -9 "$ORPHAN_PID" 2>/dev/null
-                done
-                sleep 1
-            }
-            rm -f "$CHILD_PIDFILE"
-        }
+        # A live owner is refused above. Never kill-and-replace an orphan from
+        # the start path: its hardware disposition is unknown.
 
-        # Start dcentrald with a wrapper that distinguishes expected replacement
-        # from a real crash. $EXTRA_ARGS is quoted outside so platform-specific
-        # flags (e.g. --s19j-hybrid on am2) propagate to the shell.
-        start-stop-daemon -S -b -m -p "$PIDFILE" \
-            -x /bin/sh -- -c "
-                CRASH_COUNT=0
-                while true; do
-                    $DAEMON --config $CONFIG $EXTRA_ARGS >>$LOGFILE 2>&1 &
-                    CHILD_PID=\$!
-                    echo \$CHILD_PID > $CHILD_PIDFILE
-                    wait \$CHILD_PID
-                    EXIT_CODE=\$?
-                    EXPECTED_PID=\$(cat $EXPECTFILE 2>/dev/null || true)
-                    rm -f $CHILD_PIDFILE
-
-                    if [ \"\$EXPECTED_PID\" = \"\$CHILD_PID\" ]; then
-                        rm -f $EXPECTFILE
-                        echo \"\$(date): expected dcentrald exit for PID \$CHILD_PID (code \$EXIT_CODE)\" >> $LOGFILE
-                        exit \$EXIT_CODE
-                    fi
-
-                    rm -f $EXPECTFILE
-                    if [ \$EXIT_CODE -eq 0 ]; then
-                        echo \"\$(date): dcentrald exited cleanly\" >> $LOGFILE
-                        exit 0
-                    fi
-
-                    CRASH_COUNT=\$((CRASH_COUNT + 1))
-                    echo \"\$(date): dcentrald exited with code \$EXIT_CODE (crash \$CRASH_COUNT/$MAX_CRASH_RESTARTS)\" >> $LOGFILE
-                    \"$SCRIPT\" safety
-                    if [ \$CRASH_COUNT -ge $MAX_CRASH_RESTARTS ]; then
-                        echo \"\$(date): dcentrald restart limit reached — leaving persistent fan custodian\" >> $LOGFILE
-                        \"$SCRIPT\" safety-hold
-                        exit \$EXIT_CODE
-                    fi
-                    sleep $RESTART_DELAY
-                done
-            "
+        set -- $EXTRA_ARGS
+        set -- "$DAEMON" --config "$CONFIG" "$@"
+        if ! start-stop-daemon -S -b -m -p "$PIDFILE" \
+            -x /bin/sh -- "$SESSION_LATCH_HELPER" supervise "$SESSION_TOKEN" \
+            "$SCRIPT" "$LOGFILE" "$CHILD_PIDFILE" "$EXPECTFILE" "$@"; then
+            /bin/sh "$SESSION_LATCH_HELPER" abandon "$SESSION_TOKEN" supervisor-launch-failed \
+                >> "$LOGFILE" 2>&1 || true
+            fan_safety_override
+            echo "  [FAIL] dcentrald supervisor did not start"
+            exit 1
+        fi
         echo "  [OK] dcentrald started (REST/WebSocket :$API_PORT, CGMiner :4028)"
         echo "  Log: $LOGFILE"
         ;;
@@ -509,6 +476,7 @@ case "$1" in
             echo "  [WARN] dcentrald did not exit in 30s - force killing (I2C bus may need PSU power cycle)"
             rm -f "$EXPECTFILE"
             TIMED_OUT=1
+            /bin/sh "$SESSION_LATCH_HELPER" latch forced-stop-timeout >> "$LOGFILE" 2>&1 || true
         fi
         [ "$TIMED_OUT" -eq 1 ] && kill -9 "$CHILD_PID" 2>/dev/null
         if [ -n "$WRAPPER_PID" ] && kill -0 "$WRAPPER_PID" 2>/dev/null; then
@@ -517,43 +485,14 @@ case "$1" in
             kill -9 "$WRAPPER_PID" 2>/dev/null
         fi
         rm -f "$PIDFILE" "$CHILD_PIDFILE"
-        if [ "$TIMED_OUT" -eq 1 ]; then
-            "$SCRIPT" safety
-            echo "  [WARN] Forced-stop path ran safety cut path after SIGKILL"
-        else
-            # Clean stop: command fans to idle PWM 10. On AM2 the fan IP is
-            # UIO-bound (devmem is a no-op) AND reverts to full speed unless a
-            # process keeps re-commanding the mmap — so we leave a PERSISTENT
-            # custodian (dcentrald --hold-fan 10) resident after stop, not the
-            # exit-immediately --set-fan one-shot. The custodian is reaped on the
-            # next `start` (see the start path) and on the next `stop`/`safety`
-            # via am2_start_fan_custodian's kill-prior step.
-            # ( +
-            # ).
-            if [ "$IS_AM2" = "1" ]; then
-                if [ -x "$DAEMON" ]; then
-                    if am2_start_fan_custodian 10; then
-                        echo "  [OK] dcentrald stopped, am2 persistent fan custodian holding idle PWM 10 (--hold-fan)"
-                    else
-                        echo "  [WARN] dcentrald stopped, but am2 fan custodian failed to start"
-                    fi
-                else
-                    echo "  [WARN] dcentrald stopped but binary absent — am2 fans NOT lowered (devmem is a no-op on am2)"
-                fi
-            else
-                if command -v devmem > /dev/null 2>&1; then
-                    devmem $((FAN_BASE + 0x10)) 32 10 2>/dev/null
-                    devmem $((FAN_BASE + 0x14)) 32 10 2>/dev/null
-                fi
-                echo "  [OK] dcentrald stopped, fans at idle"
-            fi
-        fi
+        "$SCRIPT" safety
+        echo "  [OK] dcentrald stopped; any active hardware session remains unresolved"
         ;;
 
     restart)
-        $0 stop
+        "$0" stop || exit $?
         sleep 2
-        $0 start
+        exec "$0" start
         ;;
 
     safety)
@@ -571,7 +510,7 @@ case "$1" in
         fi
         if [ -x "$DAEMON" ]; then
             if "$DAEMON" --safe-off >> $LOGFILE 2>&1; then
-                echo "$(date): SAFETY: --safe-off completed (hash power cut + fans quiet) via $DAEMON" >> $LOGFILE
+                echo "$(date): SAFETY: --safe-off returned command/readback evidence; physical rail state was not measured" >> $LOGFILE
             else
                 echo "$(date): WARN: $DAEMON --safe-off failed (rc=$?) — falling back to fan-only safety override" >> $LOGFILE
                 fan_safety_override

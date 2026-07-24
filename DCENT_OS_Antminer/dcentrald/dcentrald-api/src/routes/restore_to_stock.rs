@@ -1,10 +1,9 @@
 //! Restore-to-Stock backend (wave-8 W8-F).
 //!
-//! Flashes Bitmain stock firmware to the **inactive** sysupgrade slot, sets
-//! the boot-slot env, and schedules a reboot. After the operator harvests
-//! per-(BHB, level) data from the booted stock firmware, the recommended
-//! return path is `fw_setenv bootslot <prev>` from inside stock Bitmain
-//! (or via serial-console U-Boot prompt). Per
+//! Flashes Bitmain stock firmware to a proven target, applies the
+//! platform-specific boot selector, and schedules a reboot. Recovery must use
+//! the selector and transaction proven for that platform; there is no universal
+//! environment-key recipe. Per
 //! , U-Boot `auto_recovery` is real but
 //! defeated by both DCENT_OS and stock Bitmain S99upgrade scripts (each
 //! unconditionally clears `upgrade_stage` on first boot) — so a plain
@@ -76,9 +75,9 @@
 //!   `inactive_mtd_for_active_slot` — same logic as
 //!   `scripts/revert_to_stock.sh`).
 //! - NEVER skip the safety preflight (`PreflightVerdict::Critical` ->
-//!   `400 Bad Request`, no override flag honored — `no_override:true`
-//!   IOCs match the Python detector contract in
-//!   `projects/security-audit/data/iocs.json`).
+//!   `400 Bad Request`). Every `no_override:true` finding also blocks
+//!   destructive restore regardless of severity or HIGH acknowledgement;
+//!   this covers both irreversible IOCs and unproven image admission.
 //! - NEVER skip the operator serial typed-confirm (`400 serial_mismatch`).
 //! - NEVER skip the NAND backup (return `500 nand_backup_failed`,
 //!   refuse to schedule reboot).
@@ -278,12 +277,11 @@ const RECENT_LOG_LINE_MAX_LEN: usize = 1024;
 //
 // Plan: internal W12-B planning notes.
 //
-// `verified_revertable: true` means a wave-≤11 live practical-test
-// proved end-to-end revert on this platform. Today only S9 am1 has
-// that proof. Other entries are CODE-COMPLETE — the destructive
-// handler refuses confirm:true on them via the new 2-layer gate
-// (`profile_for_current_platform()` returns Some, then
-// `verified_revertable == false` triggers
+// `verified_revertable: true` admits a profile only after evidence review and
+// an end-to-end practical test. No profile is admitted today: S9 was demoted
+// when local evidence invalidated its selector contract, and the other entries
+// remain unvalidated. The 2-layer gate rejects every
+// `verified_revertable == false` profile with
 // `rejected_unsupported_platform_pending_live_test`).
 // ---------------------------------------------------------------------------
 
@@ -308,10 +306,8 @@ pub struct PlatformProfile {
     /// gate entirely.
     pub ubi_expected_lebs: Option<&'static [(&'static str, u32)]>,
     /// U-Boot env keys probed (in priority order) by [`read_slot_plan`]
-    /// to discover the active firmware slot. S9 am1 stock uses
-    /// `bootslot=a|b`, BraiinsOS / DCENT_OS Buildroot uses
-    /// `firmware=1|2`, am3-aml uses `dcent_boot_slot` / `firstboot`,
-    /// AM335x BB uses `firmware` / `bootslot`.
+    /// to discover the active firmware slot. DCENT_OS S9 live evidence uses
+    /// `firmware=1|2`; other platforms retain their separately evidenced keys.
     pub bootslot_env_keys: &'static [&'static str],
     /// Path to the per-platform revert script installed by the
     /// Buildroot post-build hook. Probed at runtime; falls back to
@@ -323,16 +319,20 @@ pub struct PlatformProfile {
     pub min_free_bytes: u64,
     /// Has this platform been live-tested end-to-end (preflight + NAND
     /// backup + flash + reboot + revert) on real hardware?
-    /// `verified_revertable: false` means CODE-PATH-COMPLETE but not
-    /// hardware-proven; the destructive handler refuses confirm:true
-    /// until an operator flips this flag in source after a successful
-    /// live test (and re-runs the cargo test pin).
+    /// `verified_revertable: false` means the destructive handler refuses
+    /// confirm:true. It can represent either missing validation or an
+    /// invalidated safety assumption; promotion requires a fresh evidence
+    /// review as well as an end-to-end practical test.
     pub verified_revertable: bool,
 }
 
-/// S9 am1 (Zynq XC7Z010, BM1387). -11 home-S9 first practical
-/// test GO. The destructive constants below match the wave-8-11
-/// hardcoded values exactly — no behavior change at this point.
+/// S9 am1 (Zynq XC7Z010, BM1387).
+///
+/// Local U-Boot inspection and live DCENT_OS evidence identify `firmware=1|2`
+/// as the selector. The former restore helper instead inferred authority from
+/// absent `bootslot` / `active_slot` keys and could target the running slot.
+/// Keep the profile non-revertable until a new restore transaction is designed
+/// and validated from that evidence; the shipped helper is fail-closed.
 const S9_AM1_NAND_BACKUP_MTDS: &[&str] = &["/dev/mtd4", "/dev/mtd7", "/dev/mtd8"];
 const S9_AM1_FIRMWARE_SLOT_MTDS: &[&str] = &["/dev/mtd7", "/dev/mtd8"];
 /// Expected LEB counts per UBI volume on the S9 am1 firmware slots.
@@ -341,7 +341,7 @@ const S9_AM1_FIRMWARE_SLOT_MTDS: &[&str] = &["/dev/mtd7", "/dev/mtd8"];
 /// rootfs_data=525 LEBs.
 const S9_UBI_EXPECTED_LEBS: &[(&str, u32)] =
     &[("kernel", 25), ("rootfs", 166), ("rootfs_data", 525)];
-const S9_AM1_BOOTSLOT_ENV_KEYS: &[&str] = &["bootslot", "active_slot"];
+const S9_AM1_BOOTSLOT_ENV_KEYS: &[&str] = &["firmware"];
 
 /// S17 am2-s17 (Zynq XC7Z010, BM1397+, 3 hashboards × 48 chips).
 /// W16 code-only port: BM1397+ driver in `dcentrald-asic` already
@@ -481,25 +481,6 @@ const AM3_AML_S21PRO_FIRMWARE_SLOT_MTDS: &[&str] = &["/dev/mtd5"];
 const AM3_AML_S21XP_NAND_BACKUP_MTDS: &[&str] = &["/dev/nand_env", "/dev/mtd5"];
 const AM3_AML_S21XP_FIRMWARE_SLOT_MTDS: &[&str] = &["/dev/mtd5"];
 
-/// cv1835-S19j Pro (Sophgo CV1835, BM1362). W2B B1 entry (2026-05-09).
-/// Sourced from the dev-kit RE deliverable
-/// (`DCENT_OS_DEVELOPMENT_KIT_FROMRE1/.../DOCS/multi_platform_master.md` §4
-/// + `DCENT_OS_ §4/§11). CV1835 boots from eMMC, NOT
-/// NAND — the rootfs lives on `/dev/mmcblk0p2` with U-Boot env on
-/// `/dev/mmcblk0boot0`. The mtd-style placeholders below match the
-/// dev-kit's BMU sysupgrade conventions; B5 (CV1835 eMMC sysupgrade +
-/// BMU parser) wires the actual block-device path discovery. Until
-/// then, the entry is `verified_revertable: false` and `runtime-only`
-/// in dcent-toolbox install routing — same posture as am3-aml on its
-/// pre-live-test wave. NO live CV1835 unit on the fleet (2026-05-09);
-/// promotion gate = 24-devmem replay match against fresh hardware.
-const CV1835_S19J_NAND_BACKUP_MTDS: &[&str] = &["/dev/mmcblk0boot0", "/dev/mmcblk0p2"];
-const CV1835_S19J_FIRMWARE_SLOT_MTDS: &[&str] = &["/dev/mmcblk0p2"];
-const CV1835_BOOTSLOT_ENV_KEYS: &[&str] = &["dcent_boot_slot", "bootcmd"];
-/// Minimum-free-space tier — CV1835 (eMMC ~4 GiB; rootfs ~150 MiB +
-/// 100 MiB headroom for sysupgrade staging).
-const CV1835_MIN_FREE_BYTES: u64 = 250 * 1024 * 1024;
-
 /// Minimum-free-space tier — S9 am1 (mtd4 + mtd7 + mtd8 ≈ 190 MiB
 /// raw; 250 MiB headroom for sha + ubinfo + fwenv + fw_setenv copy).
 const S9_AM1_MIN_FREE_BYTES: u64 = 250 * 1024 * 1024;
@@ -535,7 +516,8 @@ const AM335X_BB_MIN_FREE_BYTES: u64 = 200 * 1024 * 1024;
 /// S19j Pro entry reuses `revert_to_stock_am3_aml_s21.sh` until
 /// BM1362-specific differences emerge from live testing.
 pub const PROFILE_TABLE: &[PlatformProfile] = &[
-    // 1. S9 am1 — wave-8-11 home-S9 first practical test GO.
+    // 1. S9 am1 — contained after local evidence invalidated the former
+    //    restore helper's selector assumptions. See S9 constants above.
     PlatformProfile {
         signature: "zynq-am1-bm1387",
         nand_backup_mtds: S9_AM1_NAND_BACKUP_MTDS,
@@ -544,7 +526,7 @@ pub const PROFILE_TABLE: &[PlatformProfile] = &[
         bootslot_env_keys: S9_AM1_BOOTSLOT_ENV_KEYS,
         revert_script: "/usr/sbin/revert_to_stock_s9.sh",
         min_free_bytes: S9_AM1_MIN_FREE_BYTES,
-        verified_revertable: true,
+        verified_revertable: false,
     },
     // 2. AM335x BB stock-Bitmain S19j Pro (TI Sitara, BM1362).
     PlatformProfile {
@@ -687,31 +669,10 @@ pub const PROFILE_TABLE: &[PlatformProfile] = &[
         min_free_bytes: AM3_AML_MIN_FREE_BYTES,
         verified_revertable: false,
     },
-    // 8. cv1835-S19j Pro (Sophgo CV1835, BM1362). W2B B1 NEW entry
-    //    (2026-05-09). Code-only platform port — no live CV1835 unit
-    //    on the fleet. Profile entry exists so the platform router
-    //    doesn't refuse with `rejected_unsupported_platform` once the
-    //    first CV1835 ships. eMMC-rooted (mmcblk0p2), NOT NAND — the
-    //    `nand_backup_mtds` field is reused as the eMMC block-device
-    //    list per the dev-kit BMU sysupgrade convention. Reuses the
-    //    placeholder revert script name `revert_to_stock_cv1835_s19j.sh`
-    //    that B5 will populate with the actual eMMC dd-flow.
-    //    `verified_revertable: false` until live test promotion via
-    //    24-devmem replay match.
-    PlatformProfile {
-        signature: "cv1835-bm1362",
-        nand_backup_mtds: CV1835_S19J_NAND_BACKUP_MTDS,
-        firmware_slot_mtds: CV1835_S19J_FIRMWARE_SLOT_MTDS,
-        ubi_expected_lebs: None, // eMMC ext4 rootfs, no UBI
-        bootslot_env_keys: CV1835_BOOTSLOT_ENV_KEYS,
-        revert_script: "/usr/sbin/revert_to_stock_cv1835_s19j.sh",
-        min_free_bytes: CV1835_MIN_FREE_BYTES,
-        verified_revertable: false,
-    },
 ];
 
 /// Look up a platform profile by signature. Linear scan over
-/// [`PROFILE_TABLE`] — 8 entries (W16 added S17 am2-s17, W19 added
+/// [`PROFILE_TABLE`] — 9 evidence-backed entries (W16 added S17 am2-s17, W19 added
 /// S19 Pro / S19j Pro Zynq am2, W23 added S19j Pro Amlogic
 /// `amlogic-a113d-bm1362` and renamed Amlogic keys to match the
 /// detector output).
@@ -1382,14 +1343,15 @@ pub struct RestoreToStockBody {
     #[serde(default)]
     pub confirm: bool,
 
-    /// Operator acknowledgement that they have reviewed any HIGH-severity
-    /// safety findings and accept them for this restore.  W9-G
+    /// Operator acknowledgement that they have reviewed any overrideable
+    /// HIGH-severity safety findings and accept them for this restore.  W9-G
     /// (R5-MEDIUM, mirrors R1 H-5 pattern): the dashboard `highAcknowledged`
     /// checkbox now rounds to the wire so a direct curl with `confirm:true`
     /// cannot bypass the HIGH-findings acknowledgement gate. When the
-    /// preflight returns ≥1 HIGH-severity finding and this field is
-    /// `false`, the backend refuses with
+    /// preflight returns ≥1 overrideable HIGH-severity finding and this
+    /// field is `false`, the backend refuses with
     /// `rejected_high_findings_require_acknowledgement`.
+    /// Findings marked `no_override` are never authorized by this field.
     #[serde(default)]
     pub acknowledge_high_findings: bool,
 }
@@ -1427,8 +1389,8 @@ pub struct RestoreToStockResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reboot_at_ms: Option<u64>,
     /// Per-detector findings from the safety preflight. `Critical`
-    /// entries fail the request with `400`; `High`/`Medium`/`Low`
-    /// entries are reported but do not block.
+    /// entries fail the request with `400`; any `no_override` entry also
+    /// blocks destructive restore regardless of severity or acknowledgement.
     pub safety_findings: Vec<SafetyFinding>,
     /// Computed SHA-256 of the staged tarball (always returned).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1453,7 +1415,8 @@ pub struct SafetyFinding {
     pub matched_path: Option<String>,
     pub remediation: String,
     /// `true` when the operator cannot override this finding even with
-    /// `confirm:true`. Currently only SECURE_BOOT_SET sets this.
+    /// `confirm:true` and `acknowledge_high_findings:true`. This includes
+    /// destructive image-admission failures as well as irreversible IOCs.
     pub no_override: bool,
 }
 
@@ -1684,7 +1647,34 @@ async fn restore_to_stock_impl(
         return (StatusCode::OK, Json(resp));
     }
 
-    // 1b.  W9-G (R5-MEDIUM): refuse `confirm:true` against
+    // 1b. Image admission and irreversible-IOC boundary. A dry-run can
+    //     report these findings, but no acknowledgement authorizes a
+    //     destructive request carrying a `no_override` finding. Manifest
+    //     conversion marks every verdict except an exact VerifiedSafe match
+    //     this way, so unknown, unavailable, non-revertable, invalid-schema,
+    //     invalid-signature, and composition-mismatch states fail closed.
+    if let Some(blocker) = destructive_admission_blocker(&preflight.safety_findings) {
+        let reason = format!(
+            "Non-overrideable safety finding {} blocks destructive restore: {}. \
+             `acknowledge_high_findings` cannot authorize this condition.",
+            blocker.id, blocker.title
+        );
+        let resp = RestoreToStockResponse {
+            status: "rejected_non_overrideable_safety_finding".to_string(),
+            reason: Some(reason),
+            backup_path: None,
+            reboot_at_ms: None,
+            safety_findings: preflight.safety_findings,
+            staged_sha256: preflight.staged_sha256,
+            slot_plan: preflight.slot_plan,
+            hashboard_count_to_use: body.hashboard_count_to_use,
+            dry_run: false,
+        };
+        drop(restore_guard);
+        return (StatusCode::BAD_REQUEST, Json(resp));
+    }
+
+    // 1c.  W9-G (R5-MEDIUM): refuse `confirm:true` against
     //     unacknowledged HIGH-severity safety findings. Mirrors R1 H-5
     //     pattern (the slider/breaker-ack gates also round to the wire
     //     so a direct curl can't skip them). The dashboard requires the
@@ -1716,7 +1706,7 @@ async fn restore_to_stock_impl(
         return (StatusCode::BAD_REQUEST, Json(resp));
     }
 
-    // 1c.  R3'-M1: refuse `confirm:true` on non-S9-am1
+    // 1d.  R3'-M1: refuse `confirm:true` on non-S9-am1
     //     platforms. The destructive path hardcodes mtd4/7/8 + UBI
     //     LEB counts (25/166/525) that are S9-am1-specific; running
     //     against an Amlogic am2/am3 miner would silently corrupt
@@ -1733,12 +1723,12 @@ async fn restore_to_stock_impl(
     //   code-supported (no PlatformProfile entry); reject with
     //   `rejected_unsupported_platform`.
     //
-    //   Layer 2 — `verified_revertable: false` means CODE-PATH-COMPLETE
-    //   but not hardware-proven on this platform. Reject with
+    //   Layer 2 — `verified_revertable: false` means the destructive path
+    //   is not admitted on this platform. Reject with
     //   `rejected_unsupported_platform_pending_live_test` so the
-    //   operator (and the dashboard) can distinguish the two. Flipping
-    //   `verified_revertable` to true requires an in-source code
-    //   change after a successful live test.
+    //   operator (and the dashboard) can distinguish the two. Promotion
+    //   requires a fresh evidence review and a successful live test; a flag
+    //   edit alone is not a safety argument.
     let profile = match profile_for_current_platform().await {
         Some(p) => p,
         None => {
@@ -1773,20 +1763,20 @@ async fn restore_to_stock_impl(
     if !profile.verified_revertable {
         tracing::warn!(
             platform = %profile.signature,
-            "Restore-to-Stock: refusing confirm:true — platform code-supports \
-             but is NOT live-tested (W12-B layer 2 — verified_revertable=false)"
+            "Restore-to-Stock: refusing confirm:true — platform is not admitted \
+             for destructive restore (verified_revertable=false)"
         );
         let resp = RestoreToStockResponse {
             status: "rejected_unsupported_platform_pending_live_test".to_string(),
             reason: Some(format!(
                 "Restore-to-Stock code path supports `{sig}` (PROFILE_TABLE \
                  has an entry: mtd list, revert script, slot env keys), but \
-                 the platform has not been live-tested end-to-end \
-                 (preflight + NAND backup + flash + reboot + revert) on \
-                 real hardware. Flip `verified_revertable: true` in \
-                 source (PROFILE_TABLE in restore_to_stock.rs) after a \
-                 successful practical-test on this hardware before \
-                 re-attempting confirm:true. The DCENT_OS team uses \
+                 destructive restore is not currently admitted on that \
+                 platform. This may indicate missing validation or an \
+                 invalidated safety assumption. Re-review the implementation \
+                 and evidence, then complete an end-to-end practical test \
+                 before changing PROFILE_TABLE in restore_to_stock.rs. \
+                 The DCENT_OS team uses \
                  `verified_revertable: false` as a hard safety gate to \
                  avoid bricking unverified miners on the destructive \
                  path.",
@@ -1926,36 +1916,18 @@ async fn restore_to_stock_impl(
     // dashboard would remain stuck on `status:"scheduled"` forever
     // (R1-C1).
     //
-    // The proven on-target stock-revert sequence is in
-    // `DCENT_OS_Antminer/scripts/revert_to_stock.sh:97-115` and uses three
-    // primitives that have been live-tested for years:
-    //
-    //   flash_erase /dev/mtd<inactive> 0 0
-    //   nandwrite -p /dev/mtd<inactive> <extracted UBI image>
-    //   fw_setenv bootslot <inactive_slot>
-    //   fw_setenv upgrade_stage ""
-    //
-    // We invoke the shell script directly (Option A in the W9-A brief)
-    // rather than re-implementing the primitives in Rust. Reasons:
-    //   - The script is already on-image (rootfs-overlay/scripts/), so
-    //     no Buildroot package change is needed.
-    //   - The script auto-detects active vs inactive slot via fw_printenv
-    //     and picks the safe target.
-    //   - The script extracts the tarball into /tmp/stock_extract and
-    //     locates the `*.ubi` payload via `find` — handles both stock
-    //     Bitmain layouts (root-level UBI) and re-packed variants.
+    // The per-platform shell helper owns the actual restore transaction; Rust
+    // does not duplicate its storage operations. The old S9 helper's claimed
+    // active/inactive selection was disproved by local U-Boot/live evidence and
+    // has been replaced with an unconditional containment response. Its profile
+    // is `verified_revertable: false`, so S9 cannot reach this scheduling block.
     //
     // The script's interactive `read -p 'Type REVERT'` is bypassed by
     // piping `REVERT\n` on stdin — the typed-confirm gate is already
     // enforced by run_preflight() above.
     //
-    // NAND-write semantics: the spawned task does NOT trigger a reboot
-    // itself; instead it leaves the miner with stock Bitmain in the
-    // inactive slot, `bootslot` flipped, and `upgrade_stage` cleared.
-    // The 30-second REBOOT_DELAY_SECS sleep then issues `reboot` so the
-    // dashboard has time to render the response. The W9-C concurrency
-    // wave will replace this fire-and-forget with a state-machine driven
-    // sequence that updates STATUS as each primitive completes.
+    // A successfully admitted helper does not reboot itself. The delayed
+    // lifecycle action below gives the dashboard time to render the response.
     transition_state(RestoreState::Staging {
         backup_path: backup_path.clone(),
     });
@@ -2514,9 +2486,10 @@ async fn run_preflight(
     // ---- 7b. Append the manifest finding so the Critical gate
     //         (below) picks up `WrongModel` (Critical no_override)
     //         without bespoke routing. `VerifiedSafe` / `Unknown` /
-    //         `NonRevertable` / `ManifestUnavailable` surface as
-    //         informational/High findings the operator can review
-    //         (and ack via `acknowledge_high_findings:true` for High).
+    //         `NonRevertable` / `Unknown` / `ManifestUnavailable` surface as
+    //         diagnostic findings with `no_override:true`. Dry-run can report
+    //         them; the destructive handler refuses them before the ordinary
+    //         HIGH acknowledgement gate.
     findings.push(manifest_finding);
 
     // Critical no_override findings → hard reject. Operator cannot
@@ -2794,14 +2767,12 @@ async fn platform_supports_restore_to_stock() -> bool {
 /// matching against the stock-Bitmain manifest. Reads `/proc/cpuinfo`
 /// to distinguish Xilinx Zynq (S9 am1 / S17 am2 / S19 Pro am2 / S19j
 /// Pro Zynq am2) from Amlogic (S19j Pro Amlogic / S21 / S19k Pro).
-/// Returns `None` if cpuinfo is unreadable so the manifest lookup
-/// falls through to `Unknown`/`VerifiedSafe` without erroneously
-/// asserting `WrongModel`.
+/// Returns `None` if cpuinfo is unreadable. A matched manifest hash cannot
+/// become `VerifiedSafe` without this independent composition identity.
 ///
-/// Today the only ENFORCED signature is `zynq-am1-bm1387` (the S9 —
-/// the only platform that today passes `platform_supports_restore_to_stock`).
-/// Other entries are informational; wave-11 will expand the platform
-/// gate to use this fingerprint directly.
+/// Platform signatures are exact composition inputs to image admission. The
+/// independent PROFILE_TABLE gate currently keeps every platform destructive-
+/// disabled even when an image fixture would otherwise match.
 pub(crate) async fn detect_platform_signature() -> Option<String> {
     detect_platform_signature_with_root(None).await
 }
@@ -2964,22 +2935,20 @@ pub enum ManifestVerdict {
         detected_platform: String,
     },
     /// Tarball SHA matches a manifest entry, but the entry is marked
-    /// `dcentos_revertable: false` — operator must explicitly ack.
+    /// `dcentos_revertable: false`. This is a destructive blocker;
+    /// acknowledgement does not promote the image to verified-safe.
     NonRevertable {
         model: String,
         version: String,
         revert_notes: String,
     },
-    /// Tarball SHA is not in the manifest. Informational — operator
-    /// gets a Medium warning but can proceed.
+    /// Tarball SHA is not in the manifest. Diagnostic preflight reports a
+    /// Medium finding, but destructive restore remains blocked.
     Unknown,
     /// Manifest file is missing, malformed, or otherwise unavailable.
-    /// -prep A4''-HIGH-1: surfaces as `DCENT-2026-020` HIGH
-    /// require-ack — was previously Medium informational, which let
-    /// a manifest deletion silently fall open as "unknown image,
-    /// proceed with operator ack". Operator now MUST set
-    /// `acknowledge_high_findings: true` to flash when manifest
-    /// verification can't run.
+    /// -prep A4''-HIGH-1: surfaces as `DCENT-2026-020` HIGH.
+    /// Missing, malformed, schema-invalid, or signature-invalid manifest
+    /// evidence is non-overrideable for destructive restore.
     ManifestUnavailable { reason: String },
 }
 
@@ -3033,10 +3002,10 @@ impl ManifestVerdict {
                     "Tarball SHA matched the {model} {version} entry, but the \
                      manifest marks this image as dcentos_revertable:false. \
                      Reason: {revert_notes} \
-                     Set acknowledge_high_findings:true after reading the \
-                     reason if you accept the revert risk."
+                     Destructive restore is blocked; acknowledgement cannot \
+                     promote a non-revertable image to verified-safe."
                 ),
-                no_override: false,
+                no_override: true,
             },
             ManifestVerdict::Unknown => SafetyFinding {
                 id: "DCENT-2026-019".to_string(),
@@ -3046,19 +3015,20 @@ impl ManifestVerdict {
                 remediation: format!(
                     "Tarball SHA is not present in the stock-Bitmain manifest \
                      (detected platform: {}). The daemon cannot vouch that \
-                     this is a known-safe stock image for your model. Verify \
-                     the source out-of-band before proceeding.",
+                     this is a known-safe stock image for your model. \
+                     Destructive restore is blocked until an exact, reviewed \
+                     manifest entry is shipped.",
                     detected_platform.unwrap_or("unknown")
                 ),
-                no_override: false,
+                no_override: true,
             },
             ManifestVerdict::ManifestUnavailable { reason } => SafetyFinding {
                 // -prep A4''-HIGH-1: was DCENT-2026-019 Medium
                 // (collapsed with Unknown), which let a manifest deletion
                 // silently fall open as "unknown image, ack and proceed".
-                // Promoted to its own ID + High severity. Operator must
-                // explicitly `acknowledge_high_findings: true` to flash
-                // when the manifest can't be loaded — defense against an
+                // Promoted to its own ID + High severity. Destructive restore
+                // is non-overrideable when the manifest cannot be trusted —
+                // defense against an
                 // attacker who deletes /etc/dcentos/stock-bitmain-manifest.json
                 // (now baked-in, but kept defensible if a future wave
                 // re-introduces a disk path) or who corrupts the parser.
@@ -3068,16 +3038,31 @@ impl ManifestVerdict {
                 matched_path: None,
                 remediation: format!(
                     "Manifest lookup failed ({reason}); cannot verify the \
-                     staged image against the known-safe SHA list. Operator \
-                     MUST verify out-of-band that the staged tarball is \
-                     genuinely a Bitmain stock image for THIS model AND a \
-                     version DCENT_OS can revert FROM, then acknowledge the \
-                     HIGH-severity findings. If unsure, abort."
+                     staged image against the known-safe SHA list. Destructive \
+                     restore is blocked until valid manifest evidence is \
+                     available; acknowledgement cannot bypass this condition."
                 ),
-                no_override: false,
+                no_override: true,
             },
         }
     }
+}
+
+/// Return the first finding that cannot authorize destructive restore.
+///
+/// This deliberately does not accept an acknowledgement argument: operator
+/// acknowledgement is relevant only to overrideable HIGH findings and cannot
+/// change an evidence verdict into a verified-safe image admission.
+fn destructive_admission_blocker(findings: &[SafetyFinding]) -> Option<&SafetyFinding> {
+    findings.iter().find(|finding| finding.no_override)
+}
+
+/// Focused integration-test access to the destructive admission boundary.
+#[doc(hidden)]
+pub fn destructive_admission_blocker_for_test(
+    findings: &[SafetyFinding],
+) -> Option<&SafetyFinding> {
+    destructive_admission_blocker(findings)
 }
 
 /// -prep A4''-CRITICAL-1: stock-Bitmain manifest BAKED into the
@@ -3147,9 +3132,8 @@ const STOCK_MANIFEST_SIG_BAKED: &[u8] =
     include_bytes!("../../assets/stock-bitmain-manifest.json.sig");
 
 ///  W10-G: look up the staged tarball SHA in the stock-Bitmain
-/// manifest. The lookup is best-effort — manifest unavailability
-/// degrades to `ManifestUnavailable` (high require-ack post-A4'',
-/// previously medium informational), never silently passes.
+/// manifest. Manifest unavailability produces `ManifestUnavailable`, whose
+/// finding is a destructive no-override blocker; it never silently passes.
 ///
 /// `manifest_path` allows tests to point the helper at a fixture; in
 /// production callers pass `None` and the helper uses the
@@ -3381,10 +3365,17 @@ pub async fn lookup_in_stock_manifest_with_sig(
     // HashMap once instead of linearly scanning the array on every
     // call. Keys are lowercase-normalized so a manifest entry shipped
     // with mixed-case SHA still matches the always-lowercase
-    // `sha256_of_file` output. Skips `UNKNOWN`/empty placeholder rows.
+    // `sha256_of_file` output. Skips `UNKNOWN`/empty placeholder rows;
+    // those can never admit a destructive restore.
     let needle = staged_sha256.trim().to_ascii_lowercase();
+    if needle.len() != 64 || !needle.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return ManifestVerdict::ManifestUnavailable {
+            reason: "staged SHA-256 is not exactly 64 hexadecimal characters".to_string(),
+        };
+    }
     let mut by_sha: std::collections::HashMap<String, &serde_json::Value> =
         std::collections::HashMap::with_capacity(entries.len());
+    let mut duplicate_shas = std::collections::HashSet::new();
     for entry in entries {
         let entry_sha = entry
             .get("sha256")
@@ -3395,56 +3386,106 @@ pub async fn lookup_in_stock_manifest_with_sig(
         if entry_sha.is_empty() || entry_sha == "unknown" {
             continue;
         }
-        // First-write wins for duplicate SHAs (operator-supplied
-        // manifest oddity); a future wave can promote this to an
-        // explicit ManifestUnavailable if duplicates are observed in
-        // the wild.
-        by_sha.entry(entry_sha).or_insert(entry);
+        if by_sha.insert(entry_sha.clone(), entry).is_some() {
+            duplicate_shas.insert(entry_sha);
+        }
+    }
+
+    if duplicate_shas.contains(&needle) {
+        return ManifestVerdict::ManifestUnavailable {
+            reason: format!(
+                "{}: duplicate entries for staged SHA-256 make image identity ambiguous",
+                chosen.display()
+            ),
+        };
     }
 
     if let Some(entry) = by_sha.get(&needle) {
-        let model = entry
+        let model = match entry
             .get("model")
             .and_then(|v| v.as_str())
-            .unwrap_or("unknown-model")
-            .to_string();
-        let version = entry
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) => value.to_string(),
+            None => {
+                return ManifestVerdict::ManifestUnavailable {
+                    reason: format!(
+                        "{}: matched entry has missing or invalid `model`",
+                        chosen.display()
+                    ),
+                };
+            }
+        };
+        let version = match entry
             .get("stock_version")
             .and_then(|v| v.as_str())
-            .unwrap_or("unknown-version")
-            .to_string();
-        let manifest_platform = entry
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) => value.to_string(),
+            None => {
+                return ManifestVerdict::ManifestUnavailable {
+                    reason: format!(
+                        "{}: matched entry has missing or invalid `stock_version`",
+                        chosen.display()
+                    ),
+                };
+            }
+        };
+        let manifest_platform = match entry
             .get("platform_signature")
             .and_then(|v| v.as_str())
-            .unwrap_or("unknown-platform")
-            .to_string();
-        let revertable = entry
-            .get("dcentos_revertable")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != "unknown-platform")
+        {
+            Some(value) => value.to_string(),
+            None => {
+                return ManifestVerdict::ManifestUnavailable {
+                    reason: format!(
+                        "{}: matched entry has missing or invalid `platform_signature`",
+                        chosen.display()
+                    ),
+                };
+            }
+        };
+        let revertable = match entry.get("dcentos_revertable").and_then(|v| v.as_bool()) {
+            Some(value) => value,
+            None => {
+                return ManifestVerdict::ManifestUnavailable {
+                    reason: format!(
+                        "{}: matched entry has non-boolean or missing `dcentos_revertable`",
+                        chosen.display()
+                    ),
+                };
+            }
+        };
         let revert_notes = entry
             .get("revert_notes")
             .and_then(|v| v.as_str())
             .unwrap_or("(no notes)")
             .to_string();
 
-        // Platform check — only assert WrongModel if BOTH sides have
-        // a known platform signature and they differ. Unknown
-        // detected_platform falls through to the revertability check
-        // (the operator at least gets the matched-image confirmation
-        // even if the daemon couldn't read /proc/cpuinfo).
-        if let Some(detected) = detected_platform {
-            if !detected.is_empty()
-                && !manifest_platform.is_empty()
-                && manifest_platform != "unknown-platform"
-                && manifest_platform != detected
-            {
-                return ManifestVerdict::WrongModel {
-                    manifest_model: model,
-                    manifest_platform,
-                    detected_platform: detected.to_string(),
+        // Exact composition proof is mandatory. A known image hash without a
+        // known running-platform identity is still not a verified-safe match.
+        let detected = match detected_platform
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) => value,
+            None => {
+                return ManifestVerdict::ManifestUnavailable {
+                    reason: "running platform identity unavailable; cannot prove image composition compatibility"
+                        .to_string(),
                 };
             }
+        };
+        if manifest_platform != detected {
+            return ManifestVerdict::WrongModel {
+                manifest_model: model,
+                manifest_platform,
+                detected_platform: detected.to_string(),
+            };
         }
 
         if !revertable {
@@ -5236,10 +5277,10 @@ pub fn get_free_space_bytes_for_test(path: &str) -> Result<u64, String> {
 ///  W10-A (A1-HIGH-7): best-effort copy of `fw_setenv` from
 /// `src` into `backup_dir/fw_setenv`. Logs `info` on success, `warn`
 /// on missing source or copy failure — never returns an error or
-/// fails the backup pipeline. Operators on stock firmware that lacks
-/// libubootenv-tools use this copied binary for Option-A recovery
-/// (`./fw_setenv bootslot <slot>` to roll back). Option B (serial
-/// console U-Boot env edit) is the fallback when this copy is absent.
+/// fails the backup pipeline. The copied tool is only a recovery capability;
+/// the environment key/value transaction remains platform-specific and must
+/// come from separately validated evidence. Serial-console recovery remains
+/// the fallback when the copy is absent.
 ///
 /// Exposed as `pub` so the integration tests can drive it directly
 /// without invoking the rest of `nand_backup` (which requires real
@@ -5593,9 +5634,9 @@ pub struct PreflightChecks {
     pub platform_supported: bool,
 
     /// `true` when `platform_supported` AND the matching profile has
-    /// `verified_revertable: true`. Layer 2 of the W12-B gate. Today
-    /// only S9 am1 satisfies this; the operator can still dry-run on
-    /// supported-but-unverified platforms (W12-B closure).
+    /// `verified_revertable: true`. Layer 2 of the W12-B gate. No current
+    /// profile satisfies this; the operator can still dry-run on supported
+    /// but non-admitted platforms.
     pub platform_verified_revertable: bool,
 
     /// `true` when ALL of the following hold:

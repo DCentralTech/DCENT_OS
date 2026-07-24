@@ -42,7 +42,7 @@
       "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
       "size_bytes": 300,
       "dcentos_revertable": false,
-      "revert_notes": "Fixture entry — matched but NOT revertable; operator must ack High.",
+      "revert_notes": "Fixture entry — matched but NOT revertable; destructive restore must remain blocked.",
       "added_by_wave": 10
     },
     {

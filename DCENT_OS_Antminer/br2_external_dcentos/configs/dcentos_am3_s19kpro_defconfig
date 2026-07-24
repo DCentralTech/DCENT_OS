@@ -30,6 +30,6 @@ BR2_TARGET_GENERIC_ISSUE="DCENTos for S19K Pro (am3-aml NoPic) — D-Central Tec
 # product-specific files (etc/dcentos-version, dcentrald.toml, board ID files)
 # overwrite anything in the shared amlogic overlay.
 # =============================================================================
-BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/am3-s19kpro/rootfs-overlay"
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/common/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/am3-s19kpro/rootfs-overlay"
 BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/am3-s19kpro/post-build.sh $(BR2_EXTERNAL_DCENTOS_PATH)/board/common/prune-runtime-research-tools.sh"
 BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/am3-s19kpro/post-image.sh"

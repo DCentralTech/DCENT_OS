@@ -1526,6 +1526,47 @@ impl AutoTuner {
         clamped
     }
 
+    /// Clamp the runtime PowerTarget/Heater setpoint to the configured total
+    /// power budget (`total_power_limit_w`). Unlike `clamp_target_to_circuit_limit`
+    /// this runs even when no `circuit_capacity_watts` is declared — which is the
+    /// common default and the exact scenario the runtime path must cover.
+    ///
+    /// The runtime `ApplyMode(PowerTarget/Heater)` path validates only against
+    /// `ABSOLUTE_MAX_WATTS` and clamps only to the circuit ceiling, so without
+    /// this a direct operator command could drive the chain above the configured
+    /// residential/operator power cap until the next full re-tune. Preset power
+    /// targets already run through `clamp_preset_power_target`, which caps at
+    /// `total_power_limit_w` — this closes that asymmetry for the runtime command
+    /// path. `apply_to_config` sets `config.target_watts` from `target_watts()`
+    /// for BOTH PowerTarget and Heater (btu→watts), and `apply_target_mode`
+    /// allocates the budget from `config.target_watts`, so clamping it here bounds
+    /// the applied budget for either mode.
+    fn clamp_target_to_total_power_limit(&mut self) -> Option<u32> {
+        let limit = self.config.total_power_limit_w;
+        if limit == 0 {
+            return None;
+        }
+        if self.config.target_watts > 0 && self.config.target_watts > limit {
+            tracing::warn!(
+                requested = self.config.target_watts,
+                power_limit = limit,
+                "Clamping autotuner target_watts to configured total_power_limit_w"
+            );
+            self.config.target_watts = limit;
+            self.requested_config.target_watts = limit;
+            if let Some(TunerMode::PowerTarget { watts }) = self.config.tuner_mode.as_mut() {
+                *watts = limit;
+            }
+            if let Some(TunerMode::PowerTarget { watts }) =
+                self.requested_config.tuner_mode.as_mut()
+            {
+                *watts = limit;
+            }
+            return Some(limit);
+        }
+        None
+    }
+
     async fn apply_runtime_mode(
         &mut self,
         mode: TunerMode,
@@ -1547,6 +1588,13 @@ impl AutoTuner {
         // config so a PowerTarget command can never raise the requested
         // wattage above the declared circuit ceiling.
         let _ = self.clamp_target_to_circuit_limit();
+        // F3: also clamp the runtime setpoint to the configured total power
+        // budget. The circuit clamp above early-returns when no
+        // `circuit_capacity_watts` is declared (the default), so on its own it
+        // leaves `total_power_limit_w` unenforced for direct operator
+        // PowerTarget/Heater commands — matching the preset path, not leaving a
+        // residential-cap escape open until the next full re-tune.
+        let _ = self.clamp_target_to_total_power_limit();
         self.active_runtime_objective =
             Self::target_mode_objective(self.config.target_mode).to_string();
 
@@ -5424,6 +5472,15 @@ impl AutoTuner {
         // Track whether backoffs were error-based (safe to redistribute)
         // vs thermal-based (redistribution would cascade). CE WARNING-8.
         let mut had_error_based_backoff = false;
+        // F4: per-event backoff deltas from THIS snapshot only, as
+        // (chip_idx, old_freq, new_freq). Weak-chip compensation must redistribute
+        // the power freed by the backoffs that happened THIS snapshot using each
+        // event's own old->new pair (redistribute_freed_power's documented
+        // contract), NOT the cumulative all-time (profile_freq -> desired_freq)
+        // delta of every historically-backed-off chip — which re-donated the same
+        // freed watts again on every snapshot and crept the chain above its tuned
+        // power envelope.
+        let mut error_backoff_events: Vec<(u8, u16, u16)> = Vec::new();
 
         // Board-level fault detection: if ALL chips on this chain produced
         // 0 nonces in this window, this is a board-level fault (voltage loss,
@@ -5623,6 +5680,10 @@ impl AutoTuner {
                             );
                             needs_work_time_update = true;
                             had_error_based_backoff = true;
+                            // F4: record THIS event's per-chip old->new delta so
+                            // weak-chip compensation redistributes only the power
+                            // this backoff freed, not every past backoff's again.
+                            error_backoff_events.push((chip_idx, old_freq, new_freq));
                         }
                     }
 
@@ -5749,17 +5810,23 @@ impl AutoTuner {
                     .map(|(&(_, cidx), m)| (cidx, m.current_freq_mhz))
                     .collect();
 
-                // Find chips that were just backed off this snapshot
-                for i in 0..snapshot.chip_nonces.len() {
-                    let chip_idx = i as u8;
+                // F4: redistribute for the backoffs that happened THIS snapshot
+                // only, each with its own per-event old->new delta (passed to
+                // redistribute_freed_power below). The prior `for i in
+                // 0..chip_nonces` loop fired for EVERY chip still below profile and
+                // passed the cumulative profile->desired delta, so it re-donated
+                // every past backoff's full freed power again on every snapshot —
+                // creeping the chain above its tuned power envelope.
+                for &(backed_off_idx, old_freq, new_freq) in &error_backoff_events {
+                    let chip_idx = backed_off_idx;
                     let key = (snapshot.chain_id, chip_idx);
                     if let Some(monitor) = monitors.get(&key) {
                         // Detect a recent backoff: profile_freq > current_freq
                         if monitor.desired_freq_mhz < monitor.profile_freq_mhz {
                             let boosts = power_model.redistribute_freed_power(
                                 chip_idx,
-                                monitor.profile_freq_mhz,
-                                monitor.desired_freq_mhz,
+                                old_freq,
+                                new_freq,
                                 voltage_v,
                                 &profile.chips,
                                 &current_freqs,
@@ -6567,8 +6634,13 @@ impl AutoTuner {
                         if let Some(profile) = self.profiles.get_mut(&chain_id) {
                             for (i, &new_freq) in chain_freqs.iter().enumerate() {
                                 if i < profile.chips.len() {
-                                    profile.chips[i].operating_mhz = new_freq;
-                                    if let Err(e) = Self::set_chip_freq_checked(
+                                    // Record operating_mhz ONLY from the applied result
+                                    // (mirror the Power branch). Assigning new_freq before
+                                    // the apply meant a failed set_chip_freq left the power
+                                    // model trusting a frequency the hardware never took —
+                                    // and total-power enforcement then passed on phantom
+                                    // numbers while the chip ran at its prior (higher) freq.
+                                    match Self::set_chip_freq_checked(
                                         freq_cmd_tx,
                                         chain_id,
                                         profile.chips[i].chip_index,
@@ -6576,7 +6648,12 @@ impl AutoTuner {
                                     )
                                     .await
                                     {
-                                        warn!(chain_id, chip = profile.chips[i].chip_index, error = %e, "Hashrate target mode: failed to apply chip frequency");
+                                        Ok(applied_freq) => {
+                                            profile.chips[i].operating_mhz = applied_freq;
+                                        }
+                                        Err(e) => {
+                                            warn!(chain_id, chip = profile.chips[i].chip_index, error = %e, "Hashrate target mode: failed to apply chip frequency");
+                                        }
                                     }
                                 }
                             }
@@ -6634,11 +6711,22 @@ impl AutoTuner {
                         let runtime_voltage_supported = self.config.voltage_optimization
                             && self.capabilities.voltage_optimization_supported
                             && self.capabilities.profile_key == "bm1387-home-pic16";
-                        // Look up reference voltage for this chip type
-                        let reference_voltage_mv =
+                        // The optimizer derates max_stable toward a LOWER operating
+                        // voltage relative to this reference (efficiency.rs
+                        // contract: "voltage at which chip profiles were
+                        // characterized"), so it must be the profile's own
+                        // characterization voltage — NOT the chip's catalog default
+                        // (BM1387's is 8600 mV, below the ~9100 mV S9 operating
+                        // voltage, which under-derates every downward voltage step).
+                        // The >1.0-ratio overclock this previously also caused is
+                        // independently capped in EfficiencyOptimizer::optimize.
+                        let reference_voltage_mv = if profile.voltage_mv > 0 {
+                            profile.voltage_mv
+                        } else {
                             dcentrald_asic::drivers::MinerProfile::for_chip(chain_chip_id)
                                 .map(|p| p.default_voltage_mv)
-                                .unwrap_or(9100);
+                                .unwrap_or(9100)
+                        };
                         let optimizer_min_voltage_mv = if runtime_voltage_supported {
                             self.config.min_voltage_mv
                         } else {
@@ -8559,6 +8647,44 @@ mod tests {
             "pic16".to_string(),
             default_power_calibration(),
         )
+    }
+
+    #[test]
+    fn runtime_target_clamped_to_total_power_limit_without_circuit_cap() {
+        // F3: the runtime PowerTarget/Heater apply path must clamp target_watts to
+        // total_power_limit_w even when NO circuit_capacity_watts is declared (the
+        // default). clamp_target_to_circuit_limit early-returns on a None circuit
+        // capacity, so on its own it leaves the configured residential power cap
+        // unenforced — a direct operator command could exceed it until the next
+        // full re-tune. apply_to_config sets target_watts for PowerTarget AND
+        // Heater, and apply_target_mode allocates from target_watts, so clamping it
+        // here bounds the applied budget for both modes.
+        let mut tuner = make_test_tuner_for_gate();
+        tuner.config.circuit_capacity_watts = None;
+        tuner.config.total_power_limit_w = 1400;
+        tuner.config.target_watts = 1750;
+        tuner.config.tuner_mode = Some(crate::config::TunerMode::PowerTarget { watts: 1750 });
+        tuner.requested_config.target_watts = 1750;
+
+        // The circuit clamp alone does nothing without a declared circuit cap...
+        assert_eq!(tuner.clamp_target_to_circuit_limit(), None);
+        assert_eq!(
+            tuner.config.target_watts, 1750,
+            "circuit clamp leaves target unbounded when circuit_capacity is None"
+        );
+        // ...the total-power-limit clamp brings it down to the configured budget.
+        assert_eq!(tuner.clamp_target_to_total_power_limit(), Some(1400));
+        assert_eq!(tuner.config.target_watts, 1400);
+        assert_eq!(tuner.requested_config.target_watts, 1400);
+        assert!(matches!(
+            tuner.config.tuner_mode,
+            Some(crate::config::TunerMode::PowerTarget { watts: 1400 })
+        ));
+
+        // A target already within budget is left unchanged (no false clamp).
+        tuner.config.target_watts = 900;
+        assert_eq!(tuner.clamp_target_to_total_power_limit(), None);
+        assert_eq!(tuner.config.target_watts, 900);
     }
 
     #[test]

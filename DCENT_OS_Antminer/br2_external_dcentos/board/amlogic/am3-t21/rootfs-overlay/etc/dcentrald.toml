@@ -50,7 +50,7 @@ die_dangerous_c = 105.0
 cooldown_temp_c = 45.0
 min_fan_rpm = 2000
 fan_max_pwm = 30
-fan_min_pwm = 0
+fan_min_pwm = 10
 
 [psu]
 # APW12-class (PMBus) plus GPIO 437 rail gate. Same APW12 SMBus driver

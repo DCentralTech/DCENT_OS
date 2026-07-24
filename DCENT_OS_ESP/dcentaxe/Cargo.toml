@@ -10,6 +10,7 @@ description = "DCENT_axe — Clean-room BitAxe mining firmware"
 esp-idf-sys = "0.37"
 esp-idf-hal = "0.46"
 esp-idf-svc = "0.52"
+embedded-svc = "0.29"
 
 # Shared cross-firmware schemas
 # (path is relative to this manifest: ../../ reaches projects/ -> projects/dcent-schema.)
@@ -96,6 +97,21 @@ stratum-v2 = ["dcentaxe-stratum-v2"]
 # "LoRa" surface would be a lying UI (project  "no lying UI"). Verify
 # against the `updateFitsSlot` OTA gate before shipping on a public board.
 lora = ["dep:dcentaxe-lora", "dcentaxe-hal/pins-lora"]
+
+# ── W5500 SPI-Ethernet "DCENT LAN Mod" (orthogonal — combine with any board;
+# DEFAULT-OFF) ── PLAN-E Phase 1. Compiles the esp_eth W5500 bring-up seam
+# (`eth_w5500.rs`), the pure Wi-Fi⇄Ethernet failover FSM (`net.rs`), and the
+# HAL pin map (`dcentaxe-hal/eth`). OFF by default so the `dcentaxe` binary is
+# byte-identical to today unless a board explicitly opts in — a non-functional
+# "LAN" surface would be a lying UI (same radio-dark rule as `lora`). Runtime
+# is FURTHER gated by `config.network.eth_enabled` (default false) and
+# fail-closed by the `AccessoryMode::W5500Lan` guard (LAN xor BAP-Touch —
+# W5500 SPI rides the BAP-UART pins GPIO39/40; LoRa is unaffected on its own
+# SPI3 bus). BUILD REQUIREMENT: the ESP-IDF W5500 driver must be compiled in —
+# build with ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.eth-w5500"
+# (a compile_error! in eth_w5500.rs makes a missing overlay loud). Verify
+# against the `updateFitsSlot` OTA gate before shipping on a public board.
+eth-w5500 = ["dcentaxe-hal/eth-w5500"]
 
 # ── Meshtastic interop (opt-in ON TOP of `lora`; DEFAULT-OFF) ──
 # Lets a board run its SX1262 as a genuine Meshtastic Router (config-selected

@@ -590,6 +590,7 @@ version = "0.9.0"
 name = "dcentrald-common"
 version = "0.9.0"
 dependencies = [
+ "dcent-schema",
  "proptest",
 ]
 
@@ -614,11 +615,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcentrald-fabric-lease"
+version = "0.9.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "dcentrald-hal"
 version = "0.9.0"
 dependencies = [
  "dcentrald-api-types",
  "dcentrald-common",
+ "dcentrald-fabric-lease",
  "dcentrald-silicon-profiles",
  "flate2",
  "libc",
@@ -682,6 +691,7 @@ version = "0.9.0"
 dependencies = [
  "dcentrald-api-types",
  "dcentrald-hal",
+ "proptest",
  "serde",
  "thiserror 2.0.18",
  "tokio",
@@ -1656,6 +1666,7 @@ dependencies = [
 name = "pic-recovery"
 version = "0.9.0"
 dependencies = [
+ "dcentrald-fabric-lease",
  "libc",
 ]
 

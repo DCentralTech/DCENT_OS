@@ -1,7 +1,7 @@
 //!  HIGH-8 (2026-05-24) — recipe-broken runtime guard.
 //!
 //! Fail-closed startup gate that refuses to launch `dcentrald` on
-//! `a lab unit`-class AM2-XIL-Loki hardware when any of the 4 LIVE-FALSIFIED
+//! `a lab unit`-class AM2-XIL-Loki hardware when any forbidden
 //! "must-not-set" `DCENT_AM2_*` env vars from the  PROVEN MINING
 //! RECIPE are present in the environment.
 //!
@@ -10,10 +10,10 @@
 //! First DCENT_OS mining on `a lab unit` was achieved 2026-05-24 ():
 //! 12 shares accepted by public-pool.io in 165 s via bosminer-handoff.
 //! The proven path requires EXACTLY 13 specific env vars set (see
-//! `tests/wave54_proven_mining_recipe.rs`), and 4 specific env vars
-//! that MUST NOT be set — any of them re-breaks the mining path. The
-//! 4 forbidden gates were each independently FALSIFIED on the live
-//! `a lab unit` unit:
+//! `tests/wave54_proven_mining_recipe.rs`). Four forbidden gates were
+//! independently falsified on the live `a lab unit` unit. A fifth was later
+//! forbidden after fw71 firmware disassembly proved its purported
+//! calibration read was a voltage mutation:
 //!
 //! | Env var                                    | Why forbidden            |
 //! |--------------------------------------------|--------------------------|
@@ -21,6 +21,7 @@
 //! | `DCENT_AM2_PIC_RESET_STRACE_DERIVED`       | FRAMED warmup, same fw transition problem |
 //! | `DCENT_AM2_PSU_LOKI_REGISTER_POINTER`      | Loki Enable bytes corrupt spoof state for next bosminer |
 //! | `DCENT_AM2_PSU_CALIBRATION_PROBE_WAKE`     | Calibration probe corrupts Loki spoof state |
+//! | `DCENT_AM2_APW12_STANDARD_COLD_ENGAGE`      | Retired path included a mislabeled fw71 voltage mutation |
 //!
 //! ## Decision contract
 //!
@@ -35,7 +36,7 @@
 //!   it still requires the same AM2/Loki-compatible platform fingerprint.
 //! - If fingerprint does NOT match (S9, `a lab unit`, `a lab unit`, `a lab unit`, `a lab unit`,
 //!   any non-`a lab unit`-class), the guard is a no-op pass.
-//! - If fingerprint matches AND any of the 4 forbidden gates is set
+//! - If fingerprint matches AND any forbidden gate is set
 //!   (via the canonical env-helper convention — `1`/`true`/`yes`/`on`
 //!   case-insensitive), the guard REFUSES to start (returns
 //!   `GuardDecision::Refuse` with the offending names).
@@ -74,10 +75,8 @@
 
 use tracing::{error, warn};
 
-/// The 4 env vars that re-break the  PROVEN MINING RECIPE
-/// on `a lab unit`-class XIL S19j Pro hardware. Setting ANY of these
-/// regresses the proven path (each was independently live-falsified
-/// before the recipe was locked in).
+/// Environment gates forbidden by the  recipe and subsequent fw71
+/// protocol-safety findings on `a lab unit`-class XIL S19j Pro hardware.
 ///
 /// Keep this list in sync with:
 /// - `tests/wave54_proven_mining_recipe.rs::FORBIDDEN_ENV_VARS`
@@ -96,8 +95,8 @@ use tracing::{error, warn};
 ///
 /// When `DCENT_AM2_STANDALONE_RE_FIX=1` is present, the guard
 /// removes `DCENT_AM2_PIC_RESET_AND_START_APP` from the offender
-/// scan (the other 3 stay forbidden — they corrupt Loki spoof state
-/// regardless of standalone vs handoff mode). See
+/// scan (the remaining gates stay forbidden regardless of standalone vs
+/// handoff mode). See
 /// `evaluate_guard()` for the filter logic.
 ///
 /// ##  standalone-mode FRAMED warmup carve-out (2026-05-25)
@@ -121,8 +120,8 @@ use tracing::{error, warn};
 ///  extends the existing  carve-out to drop BOTH
 /// `DCENT_AM2_PIC_RESET_AND_START_APP` and
 /// `DCENT_AM2_PIC_RESET_STRACE_DERIVED` from the offender scan when
-/// `DCENT_AM2_STANDALONE_RE_FIX=1`. The other 2 gates
-/// (`PSU_LOKI_REGISTER_POINTER`, `PSU_CALIBRATION_PROBE_WAKE`) stay
+/// `DCENT_AM2_STANDALONE_RE_FIX=1`. The other 2  gates
+/// (`PSU_LOKI_REGISTER_POINTER` and `PSU_CALIBRATION_PROBE_WAKE`) stay
 /// forbidden — they corrupt Loki spoof state regardless of mode.
 pub const WAVE54_FORBIDDEN_ENV_VARS: &[&str] = &[
     "DCENT_AM2_PIC_RESET_AND_START_APP",
@@ -130,6 +129,16 @@ pub const WAVE54_FORBIDDEN_ENV_VARS: &[&str] = &[
     "DCENT_AM2_PSU_LOKI_REGISTER_POINTER",
     "DCENT_AM2_PSU_CALIBRATION_PROBE_WAKE",
 ];
+
+/// APW121215a fw71 gates forbidden by the later command-effect audit.
+///
+/// Kept separate from [`WAVE54_FORBIDDEN_ENV_VARS`] because this finding was
+/// not one of the four live-falsified  recipe breakers. Firmware
+/// disassembly proves the retired standard-engage path contained opcode 0x06,
+/// a voltage mutation formerly mislabeled as a calibration read. The current
+/// path no longer emits that byte, but `a lab unit` admission remains fail-closed
+/// because the overall energization recipe is obsolete and unverified.
+pub const APW121215A_FW71_FORBIDDEN_ENV_VARS: &[&str] = &["DCENT_AM2_APW12_STANDARD_COLD_ENGAGE"];
 
 /// VOLT-PIC-1 (2026-06-21) — lab-only SAFETY overrides that must NEVER be set on
 /// the `a lab unit` home unit, in **every** mode (no standalone carve-out).
@@ -239,9 +248,8 @@ pub enum GuardDecision {
     /// Caller MUST log an `error!` listing `offenders`, mention the
     /// runbook + memory rule, and exit with `EX_CONFIG_EXIT_CODE`.
     Refuse {
-        /// The env var names that are set (in `WAVE54_FORBIDDEN_ENV_VARS`
-        /// order, deduplicated). Always non-empty when `Refuse` is
-        /// returned.
+        /// The env var names that are set, in guard-list order and
+        /// deduplicated. Always non-empty when `Refuse` is returned.
         offenders: Vec<String>,
         /// Detected fingerprint values for the log line.
         platform: String,
@@ -426,8 +434,8 @@ where
         .map(|v| env_value_is_truthy(&v))
         .unwrap_or(false);
 
-    // Fingerprint matches — scan the forbidden env vars (the  recipe
-    // breakers below, then the VOLT-PIC-1 safety overrides).
+    // Fingerprint matches — scan the  recipe breakers, the later fw71
+    // command-effect finding, then the VOLT-PIC-1 safety overrides.
     let mut offenders: Vec<String> = Vec::new();
     for name in WAVE54_FORBIDDEN_ENV_VARS {
         //  +  standalone-mode carve-out: skip BOTH
@@ -444,6 +452,17 @@ where
         {
             continue;
         }
+        if let Some(value) = env_lookup(name) {
+            if env_value_is_truthy(&value) {
+                offenders.push((*name).to_string());
+            }
+        }
+    }
+
+    // The fw71 standard-engage gate is not a  finding and receives no
+    // standalone carve-out. It is an obsolete energization path whose former
+    // sequence contained a mislabeled voltage mutation.
+    for name in APW121215A_FW71_FORBIDDEN_ENV_VARS {
         if let Some(value) = env_lookup(name) {
             if env_value_is_truthy(&value) {
                 offenders.push((*name).to_string());
@@ -704,7 +723,10 @@ mod inline_tests {
 
     #[test]
     fn refuses_for_each_forbidden_env_var_individually() {
-        for forbidden in WAVE54_FORBIDDEN_ENV_VARS {
+        for forbidden in WAVE54_FORBIDDEN_ENV_VARS
+            .iter()
+            .chain(APW121215A_FW71_FORBIDDEN_ENV_VARS)
+        {
             let env = env_from(&[(*forbidden, "1")]);
             let decision = evaluate_guard("zynq-bm3-am2", "am2-xil", Some("loki"), env);
             match decision {
@@ -826,6 +848,7 @@ mod inline_tests {
             ("DCENT_AM2_PIC_RESET_STRACE_DERIVED", "1"),
             ("DCENT_AM2_PSU_LOKI_REGISTER_POINTER", "1"),
             ("DCENT_AM2_PSU_CALIBRATION_PROBE_WAKE", "1"),
+            ("DCENT_AM2_APW12_STANDARD_COLD_ENGAGE", "1"),
         ]);
         // `a lab unit` (XIL but not `a lab unit`)
         let decision = evaluate_guard("zynq-bm3-am2", "am2-s19jpro", Some("loki"), env);

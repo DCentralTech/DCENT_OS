@@ -43,6 +43,7 @@ mod model;
 mod persistent_log_ring;
 mod restart;
 mod runtime;
+mod s19j_hybrid_admission;
 mod s19j_hybrid_mining;
 mod s19j_tap_mining;
 mod serial_mining;
@@ -54,6 +55,7 @@ mod stratum_proxy;
 mod voltage_mailbox;
 mod wave55a_recipe_guard;
 mod work_dispatcher;
+mod work_ledger;
 
 use anyhow::{Context, Result};
 use tokio::signal;
@@ -131,14 +133,6 @@ fn classify_s19j_hybrid_auto(platform: &str, board_target: &str) -> (bool, Strin
 fn is_s19j_am2_board_target(board_target: &str) -> bool {
     let board_target = board_target.trim();
     board_target == "am2-s19j" || board_target.starts_with("am2-s19jpro")
-}
-
-fn auto_detect_s19j_hybrid() -> (bool, String) {
-    let platform = std::fs::read_to_string("/etc/bos_platform")
-        .or_else(|_| std::fs::read_to_string("/etc/dcentos/platform"))
-        .unwrap_or_default();
-    let board_target = std::fs::read_to_string("/etc/dcentos/board_target").unwrap_or_default();
-    classify_s19j_hybrid_auto(&platform, &board_target)
 }
 
 /// R1 (2026-05-17): compute the am2 low-idle fan command tuple for the
@@ -1062,6 +1056,32 @@ fn config_selects_bm1362(config: &DcentraldConfig) -> bool {
         || config.mining.model_chip_id() == Some(0x1362)
 }
 
+fn configured_asic_protocol_identity(
+    config: &DcentraldConfig,
+) -> std::result::Result<Option<dcentrald_common::AsicProtocolIdentity>, String> {
+    use dcentrald_common::AsicProtocolIdentity;
+
+    let serial_identity = config
+        .mining
+        .serial_chip_type
+        .as_deref()
+        .and_then(AsicProtocolIdentity::from_chip_label);
+    let model_identity = config
+        .mining
+        .model_chip_id()
+        .and_then(AsicProtocolIdentity::from_chip_id);
+
+    if let (Some(serial), Some(model)) = (serial_identity, model_identity) {
+        if serial != model {
+            return Err(format!(
+                "configured ASIC identity contradicts itself: serial_chip_type={serial:?}, model={model:?}"
+            ));
+        }
+    }
+
+    Ok(serial_identity.or(model_identity))
+}
+
 /// Existing top-level mining arm selected by CLI/auto-detection precedence.
 ///
 /// This is deliberately not a miner model. It describes only the runtime's
@@ -1130,8 +1150,22 @@ impl RuntimeDispatchKind {
             // Proxy owns no miner hardware. Tap/stock/default have ownership or
             // transport distinctions BoardDesc cannot generally express
             // faithfully. Exact am1-s9 standard-daemon resolution is applied
-            // later with the descriptor in hand; all other rows stay unresolved.
+            // later with the descriptor in hand; all other rows fail closed
+            // until they gain an explicit ownership contract.
             Self::StratumProxy | Self::Tap | Self::StockFpga | Self::StandardDaemon => (None, None),
+        }
+    }
+
+    /// Exact ASIC protocol required by engines whose register plan and work
+    /// codec are not yet family-generic. A matching carrier is insufficient:
+    /// these arms must receive a typed protocol-admission proof.
+    const fn required_asic_protocol(self) -> Option<dcentrald_common::AsicProtocolIdentity> {
+        use dcentrald_common::AsicProtocolIdentity;
+        match self {
+            Self::Am3BeagleBone | Self::Tap | Self::S19jHybrid => {
+                Some(AsicProtocolIdentity::Bm1362)
+            }
+            Self::StratumProxy | Self::Serial | Self::StockFpga | Self::StandardDaemon => None,
         }
     }
 }
@@ -1140,9 +1174,25 @@ impl RuntimeDispatchKind {
 enum RuntimeDispatchAdmission {
     MiningInactive,
     ExternalHardwareOwner,
-    UnknownBoardDesc,
-    Compatible,
-    Unresolved,
+    Compatible {
+        asic_protocol: Option<dcentrald_common::AsicProtocolAdmission>,
+    },
+}
+
+impl RuntimeDispatchAdmission {
+    fn require_asic_protocol(
+        self,
+        expected: dcentrald_common::AsicProtocolIdentity,
+    ) -> std::result::Result<dcentrald_common::AsicProtocolAdmission, String> {
+        match self {
+            Self::Compatible {
+                asic_protocol: Some(admission),
+            } if admission.identity() == expected => Ok(admission),
+            _ => Err(format!(
+                "runtime dispatch lacks exact {expected:?} ASIC protocol admission"
+            )),
+        }
+    }
 }
 
 fn selected_runtime_dispatch(
@@ -1174,6 +1224,7 @@ fn admit_board_desc_runtime_dispatch(
     board_desc: Option<&dcentrald_common::BoardDesc>,
     dispatch: RuntimeDispatchKind,
     mining_start_enabled: bool,
+    configured_asic_protocol: Option<dcentrald_common::AsicProtocolIdentity>,
 ) -> std::result::Result<RuntimeDispatchAdmission, String> {
     use dcentrald_common::WorkEngineKind;
 
@@ -1183,8 +1234,18 @@ fn admit_board_desc_runtime_dispatch(
     if !dispatch.owns_chain_or_work() {
         return Ok(RuntimeDispatchAdmission::ExternalHardwareOwner);
     }
+    let required_asic_protocol = dispatch.required_asic_protocol();
     let Some(board_desc) = board_desc else {
-        return Ok(RuntimeDispatchAdmission::UnknownBoardDesc);
+        if let Some(required) = required_asic_protocol {
+            return Err(format!(
+                "runtime dispatch {} requires exact {required:?} ASIC protocol admission, but no BoardDesc is registered",
+                dispatch.label()
+            ));
+        }
+        return Err(format!(
+            "runtime dispatch {} owns mining hardware but no BoardDesc is registered",
+            dispatch.label()
+        ));
     };
     if board_desc.work_engine == WorkEngineKind::ManagementOnly {
         return Err(format!(
@@ -1193,6 +1254,30 @@ fn admit_board_desc_runtime_dispatch(
             dispatch.label()
         ));
     }
+
+    // The direct serial route selects an ASIC implementation before opening
+    // its hardware-owning constructor. Bind that configured identity to the
+    // complete BoardDesc here; a RuntimeDiscovered descriptor is not enough to
+    // authorize pre-discovery mutations.
+    if dispatch == RuntimeDispatchKind::Serial {
+        let configured = configured_asic_protocol.ok_or_else(|| {
+            format!(
+                "runtime dispatch {} requires an explicit ASIC identity before hardware construction",
+                dispatch.label()
+            )
+        })?;
+        if board_desc.asic_protocol == dcentrald_common::AsicProtocolIdentity::RuntimeDiscovered {
+            return Err(format!(
+                "BoardDesc {} leaves ASIC protocol runtime-discovered; serial hardware construction requires passive identity refinement first",
+                board_desc.board_target
+            ));
+        }
+        board_desc.admit_asic_protocol(Some(configured), board_desc.asic_protocol)?;
+    }
+
+    let asic_protocol_admission = required_asic_protocol
+        .map(|required| board_desc.admit_asic_protocol(configured_asic_protocol, required))
+        .transpose()?;
 
     let (required_transport, required_work_engine) =
         if dispatch == RuntimeDispatchKind::StandardDaemon && board_desc.board_target == "am1-s9" {
@@ -1231,9 +1316,15 @@ fn admit_board_desc_runtime_dispatch(
     }
 
     if required_transport.is_none() && required_work_engine.is_none() {
-        Ok(RuntimeDispatchAdmission::Unresolved)
+        Err(format!(
+            "runtime dispatch {} has no exact transport/work ownership contract for BoardDesc {}; refusing hardware construction",
+            dispatch.label(),
+            board_desc.board_target
+        ))
     } else {
-        Ok(RuntimeDispatchAdmission::Compatible)
+        Ok(RuntimeDispatchAdmission::Compatible {
+            asic_protocol: asic_protocol_admission,
+        })
     }
 }
 
@@ -1246,6 +1337,12 @@ mod board_desc_runtime_dispatch_tests {
     const TAP_SOURCE: &str = include_str!("s19j_tap_mining.rs");
     const STOCK_SOURCE: &str = include_str!("stock_mining.rs");
     const SERIAL_SOURCE: &str = include_str!("serial_mining.rs");
+    const S17_INIT_SOURCE: &str = include_str!(
+        "../../../br2_external_dcentos/board/zynq/am2-s17pro/rootfs-overlay/etc/init.d/S82dcentrald"
+    );
+    const S19PRO_INIT_SOURCE: &str = include_str!(
+        "../../../br2_external_dcentos/board/zynq/am2-s19pro/rootfs-overlay/etc/init.d/S82dcentrald"
+    );
 
     fn future_desc(
         board_target: &'static str,
@@ -1257,8 +1354,18 @@ mod board_desc_runtime_dispatch_tests {
             family: dcentrald_common::BoardFamily::Zynq,
             chain_transport,
             work_engine,
+            asic_protocol: dcentrald_common::AsicProtocolIdentity::RuntimeDiscovered,
             voltage_controller: dcentrald_common::VoltageControllerClass::RuntimeDiscovered,
             slot_policy: dcentrald_common::SlotPolicy::LabGated,
+            enablement: dcentrald_common::HardwareEnablementPolicy {
+                storage_topology: dcentrald_common::StorageTopology::Unknown,
+                update_mechanism: dcentrald_common::UpdateMechanism::None,
+                update_maturity: dcentrald_common::ImplementationMaturity::NotImplemented,
+                install_authorization: dcentrald_common::InstallAuthorization::Denied,
+                recovery_maturity: dcentrald_common::RecoveryMaturity::NotImplemented,
+                artifact_kind: dcentrald_common::ArtifactKind::RuntimeBundle,
+                artifact_maturity: dcentrald_common::ArtifactMaturity::Experimental,
+            },
             public_beta_install: false,
             mining_default_enabled: false,
         }
@@ -1297,30 +1404,65 @@ mod board_desc_runtime_dispatch_tests {
     }
 
     #[test]
-    fn board_desc_dispatch_unknown_or_inactive_evidence_preserves_existing_routing() {
+    fn board_desc_dispatch_unknown_hardware_ownership_fails_closed() {
         for dispatch in RuntimeDispatchKind::ALL {
             assert_eq!(
-                admit_board_desc_runtime_dispatch(None, dispatch, false).unwrap(),
+                admit_board_desc_runtime_dispatch(None, dispatch, false, None).unwrap(),
                 RuntimeDispatchAdmission::MiningInactive
             );
-            assert_eq!(
-                admit_board_desc_runtime_dispatch(None, dispatch, true).unwrap(),
-                if dispatch == RuntimeDispatchKind::StratumProxy {
+            let admitted = admit_board_desc_runtime_dispatch(None, dispatch, true, None);
+            if dispatch == RuntimeDispatchKind::StratumProxy {
+                assert_eq!(
+                    admitted.unwrap(),
                     RuntimeDispatchAdmission::ExternalHardwareOwner
-                } else {
-                    RuntimeDispatchAdmission::UnknownBoardDesc
-                }
-            );
+                );
+            } else {
+                assert!(
+                    admitted.is_err(),
+                    "{dispatch:?} must require BoardDesc identity"
+                );
+            }
         }
     }
 
     #[test]
-    fn board_desc_dispatch_matrix_is_exhaustive_and_only_rejects_proven_contradictions() {
+    fn board_desc_admission_failure_preserves_cooling_and_closes_api_mutation() {
+        let marker =
+            "BoardDesc runtime dispatch contradiction; parking management-only before mining hardware construction";
+        let start = MAIN_SOURCE
+            .rfind(marker)
+            .expect("runtime admission-failure branch must remain present");
+        let end = MAIN_SOURCE[start..]
+            .find("if am3_bb_mode")
+            .map(|offset| start + offset)
+            .expect("runtime dispatch must follow admission handling");
+        let branch = &MAIN_SOURCE[start..end];
+
+        assert!(branch.contains("enter_management_only_idle("));
+        assert!(
+            branch.contains("spawn_proxy_mode_api_with_hardware_mutation_gate(")
+                && branch.contains("HardwareMutationGate::new_closed()"),
+            "an unadmitted composition must expose a read-only API plane"
+        );
+        assert!(
+            !branch.contains("am2_quiet_idle_tuple(")
+                && !branch.contains("force_am2_fans_to_quiet_idle"),
+            "admission failure has no rail-off proof and must not lower cooling"
+        );
+    }
+
+    #[test]
+    fn board_desc_dispatch_matrix_is_exhaustive_and_requires_exact_contracts() {
         use dcentrald_common::{ChainTransportKind, WorkEngineKind};
 
         for board_desc in dcentrald_common::BoardDesc::all_registered() {
             for dispatch in RuntimeDispatchKind::ALL {
-                let result = admit_board_desc_runtime_dispatch(Some(board_desc), dispatch, true);
+                let result = admit_board_desc_runtime_dispatch(
+                    Some(board_desc),
+                    dispatch,
+                    true,
+                    Some(board_desc.asic_protocol),
+                );
                 if dispatch == RuntimeDispatchKind::StratumProxy {
                     assert_eq!(
                         result.unwrap(),
@@ -1344,7 +1486,9 @@ mod board_desc_runtime_dispatch_tests {
                         assert_eq!(
                             result.is_ok(),
                             board_desc.chain_transport == ChainTransportKind::Serial
-                                && board_desc.work_engine == WorkEngineKind::SerialWork,
+                                && board_desc.work_engine == WorkEngineKind::SerialWork
+                                && board_desc.asic_protocol
+                                    == dcentrald_common::AsicProtocolIdentity::Bm1362,
                             "{}",
                             board_desc.board_target
                         );
@@ -1353,7 +1497,9 @@ mod board_desc_runtime_dispatch_tests {
                         assert_eq!(
                             result.is_ok(),
                             board_desc.chain_transport == ChainTransportKind::ZynqHybrid
-                                && board_desc.work_engine == WorkEngineKind::SerialWork,
+                                && board_desc.work_engine == WorkEngineKind::SerialWork
+                                && board_desc.asic_protocol
+                                    == dcentrald_common::AsicProtocolIdentity::Bm1362,
                             "{}",
                             board_desc.board_target
                         );
@@ -1361,24 +1507,29 @@ mod board_desc_runtime_dispatch_tests {
                     RuntimeDispatchKind::Serial => {
                         assert_eq!(
                             result.is_ok(),
-                            board_desc.work_engine == WorkEngineKind::SerialWork,
+                            board_desc.work_engine == WorkEngineKind::SerialWork
+                                && board_desc.asic_protocol
+                                    != dcentrald_common::AsicProtocolIdentity::RuntimeDiscovered,
                             "{}",
                             board_desc.board_target
                         );
                     }
                     RuntimeDispatchKind::StandardDaemon if board_desc.board_target == "am1-s9" => {
-                        assert_eq!(result.unwrap(), RuntimeDispatchAdmission::Compatible)
+                        assert_eq!(
+                            result.unwrap(),
+                            RuntimeDispatchAdmission::Compatible {
+                                asic_protocol: None
+                            }
+                        )
                     }
-                    RuntimeDispatchKind::Tap | RuntimeDispatchKind::StockFpga => assert_eq!(
-                        result.unwrap(),
-                        RuntimeDispatchAdmission::Unresolved,
-                        "{} / {dispatch:?}",
+                    RuntimeDispatchKind::Tap | RuntimeDispatchKind::StockFpga => assert!(
+                        result.is_err(),
+                        "{} / {dispatch:?} must not construct hardware without an exact ownership contract",
                         board_desc.board_target
                     ),
-                    RuntimeDispatchKind::StandardDaemon => assert_eq!(
-                        result.unwrap(),
-                        RuntimeDispatchAdmission::Unresolved,
-                        "{}",
+                    RuntimeDispatchKind::StandardDaemon => assert!(
+                        result.is_err(),
+                        "{} must not enter the standard hardware route",
                         board_desc.board_target
                     ),
                     RuntimeDispatchKind::StratumProxy => unreachable!(),
@@ -1396,9 +1547,16 @@ mod board_desc_runtime_dispatch_tests {
 
         let s9 = BoardDesc::lookup("am1-s9").unwrap();
         assert_eq!(
-            admit_board_desc_runtime_dispatch(Some(s9), RuntimeDispatchKind::StandardDaemon, true)
-                .unwrap(),
-            RuntimeDispatchAdmission::Compatible
+            admit_board_desc_runtime_dispatch(
+                Some(s9),
+                RuntimeDispatchKind::StandardDaemon,
+                true,
+                Some(dcentrald_common::AsicProtocolIdentity::Bm1387),
+            )
+            .unwrap(),
+            RuntimeDispatchAdmission::Compatible {
+                asic_protocol: None
+            }
         );
 
         // Matching facets on a future target do not mint exact S9 authority.
@@ -1407,20 +1565,28 @@ mod board_desc_runtime_dispatch_tests {
             family: BoardFamily::Zynq,
             chain_transport: ChainTransportKind::FpgaUio,
             work_engine: WorkEngineKind::FpgaWorkFifo,
+            asic_protocol: dcentrald_common::AsicProtocolIdentity::RuntimeDiscovered,
             voltage_controller: VoltageControllerClass::RuntimeDiscovered,
             slot_policy: SlotPolicy::LabGated,
+            enablement: dcentrald_common::HardwareEnablementPolicy {
+                storage_topology: dcentrald_common::StorageTopology::Unknown,
+                update_mechanism: dcentrald_common::UpdateMechanism::None,
+                update_maturity: dcentrald_common::ImplementationMaturity::NotImplemented,
+                install_authorization: dcentrald_common::InstallAuthorization::Denied,
+                recovery_maturity: dcentrald_common::RecoveryMaturity::NotImplemented,
+                artifact_kind: dcentrald_common::ArtifactKind::RuntimeBundle,
+                artifact_maturity: dcentrald_common::ArtifactMaturity::Experimental,
+            },
             public_beta_install: false,
             mining_default_enabled: false,
         };
-        assert_eq!(
-            admit_board_desc_runtime_dispatch(
-                Some(&future_fpga),
-                RuntimeDispatchKind::StandardDaemon,
-                true
-            )
-            .unwrap(),
-            RuntimeDispatchAdmission::Unresolved
-        );
+        assert!(admit_board_desc_runtime_dispatch(
+            Some(&future_fpga),
+            RuntimeDispatchKind::StandardDaemon,
+            true,
+            None,
+        )
+        .is_err());
 
         // Conversely, a contradictory exact row is rejected rather than
         // accepted from the target string alone.
@@ -1435,15 +1601,18 @@ mod board_desc_runtime_dispatch_tests {
         assert!(admit_board_desc_runtime_dispatch(
             Some(&contradictory_s9),
             RuntimeDispatchKind::StandardDaemon,
-            true
+            true,
+            None,
         )
         .is_err());
 
-        assert_eq!(
-            admit_board_desc_runtime_dispatch(None, RuntimeDispatchKind::StandardDaemon, true)
-                .unwrap(),
-            RuntimeDispatchAdmission::UnknownBoardDesc
-        );
+        assert!(admit_board_desc_runtime_dispatch(
+            None,
+            RuntimeDispatchKind::StandardDaemon,
+            true,
+            None,
+        )
+        .is_err());
     }
 
     #[test]
@@ -1460,26 +1629,20 @@ mod board_desc_runtime_dispatch_tests {
     }
 
     #[test]
-    fn board_desc_dispatch_tap_and_stock_remain_unresolved_for_every_mining_capable_row() {
-        use dcentrald_common::WorkEngineKind;
-
+    fn board_desc_dispatch_tap_and_stock_fail_closed_without_ownership_contracts() {
         for board_desc in dcentrald_common::BoardDesc::all_registered() {
             for dispatch in [RuntimeDispatchKind::Tap, RuntimeDispatchKind::StockFpga] {
-                let result = admit_board_desc_runtime_dispatch(Some(board_desc), dispatch, true);
-                if board_desc.work_engine == WorkEngineKind::ManagementOnly {
-                    assert!(
-                        result.is_err(),
-                        "management-only {} must still refuse {dispatch:?}",
-                        board_desc.board_target
-                    );
-                } else {
-                    assert_eq!(
-                        result.unwrap(),
-                        RuntimeDispatchAdmission::Unresolved,
-                        "{} must not gain {dispatch:?} authority from BoardDesc",
-                        board_desc.board_target
-                    );
-                }
+                let result = admit_board_desc_runtime_dispatch(
+                    Some(board_desc),
+                    dispatch,
+                    true,
+                    Some(board_desc.asic_protocol),
+                );
+                assert!(
+                    result.is_err(),
+                    "{} must not gain {dispatch:?} authority without a sealed ownership contract",
+                    board_desc.board_target
+                );
             }
         }
     }
@@ -1497,9 +1660,16 @@ mod board_desc_runtime_dispatch_tests {
         );
         assert_eq!(required_work, Some(WorkEngineKind::SerialWork));
         assert_eq!(
-            admit_board_desc_runtime_dispatch(Some(am2), RuntimeDispatchKind::Serial, true)
-                .unwrap(),
-            RuntimeDispatchAdmission::Compatible
+            admit_board_desc_runtime_dispatch(
+                Some(am2),
+                RuntimeDispatchKind::Serial,
+                true,
+                Some(dcentrald_common::AsicProtocolIdentity::Bm1362),
+            )
+            .unwrap(),
+            RuntimeDispatchAdmission::Compatible {
+                asic_protocol: None
+            }
         );
 
         assert!(MAIN_SOURCE.contains("DCENT_ALLOW_AM2_BM1362_SERIAL_WORK"));
@@ -1525,17 +1695,74 @@ mod board_desc_runtime_dispatch_tests {
             WorkEngineKind::FpgaWorkFifo,
         );
 
+        assert!(admit_board_desc_runtime_dispatch(
+            Some(&tap_lookalike),
+            RuntimeDispatchKind::Tap,
+            true,
+            Some(tap_lookalike.asic_protocol),
+        )
+        .is_err());
+
         for (board_desc, dispatch) in [
-            (&tap_lookalike, RuntimeDispatchKind::Tap),
             (&stock_lookalike, RuntimeDispatchKind::StockFpga),
             (&s9_facet_copy, RuntimeDispatchKind::StockFpga),
         ] {
-            assert_eq!(
-                admit_board_desc_runtime_dispatch(Some(board_desc), dispatch, true).unwrap(),
-                RuntimeDispatchAdmission::Unresolved,
-                "{} must remain unresolved for {dispatch:?}",
+            assert!(
+                admit_board_desc_runtime_dispatch(
+                    Some(board_desc),
+                    dispatch,
+                    true,
+                    Some(board_desc.asic_protocol),
+                )
+                .is_err(),
+                "{} must fail closed for {dispatch:?}",
                 board_desc.board_target
             );
+        }
+    }
+
+    #[test]
+    fn s19pro_bm1398_can_never_enter_the_bm1362_hybrid_engine() {
+        use dcentrald_common::{AsicProtocolIdentity, BoardDesc, WorkEngineKind};
+
+        let s19pro = BoardDesc::lookup("am2-s19pro").expect("registered S19 Pro target");
+        assert_eq!(s19pro.asic_protocol, AsicProtocolIdentity::Bm1398);
+        assert_eq!(s19pro.work_engine, WorkEngineKind::ManagementOnly);
+        assert!(admit_board_desc_runtime_dispatch(
+            Some(s19pro),
+            RuntimeDispatchKind::S19jHybrid,
+            true,
+            Some(AsicProtocolIdentity::Bm1398),
+        )
+        .is_err());
+        assert!(s19pro
+            .admit_asic_protocol(
+                Some(AsicProtocolIdentity::Bm1398),
+                AsicProtocolIdentity::Bm1362,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn non_bm1362_am2_launchers_never_inject_the_bm1362_hybrid_recipe() {
+        for (name, source) in [
+            ("am2-s17pro", S17_INIT_SOURCE),
+            ("am2-s19pro", S19PRO_INIT_SOURCE),
+        ] {
+            let selector_start = source
+                .find("IS_BM1362_HYBRID_TARGET=0")
+                .unwrap_or_else(|| panic!("{name}: missing exact protocol selector"));
+            let selector_end = source[selector_start..]
+                .find("# Operator escape hatch")
+                .map(|offset| selector_start + offset)
+                .unwrap_or(source.len());
+            let selector = &source[selector_start..selector_end];
+
+            assert!(selector
+                .contains("am2-s19j|am2-s19jpro|am2-s19jpro-zynq) IS_BM1362_HYBRID_TARGET=1"));
+            assert!(selector.contains("if [ \"$IS_BM1362_HYBRID_TARGET\" = \"1\" ]; then"));
+            assert!(!selector.contains("if [ \"$IS_AM2\" = \"1\" ]; then"));
+            assert!(selector.contains("unset DCENT_AM2_SERIAL_WORK_DISPATCH"));
         }
     }
 
@@ -1592,6 +1819,44 @@ mod board_desc_runtime_dispatch_tests {
             assert!(
                 admission < constructor,
                 "admission must precede {constructor}"
+            );
+        }
+
+        let identity_capture = run_body
+            .find("capture_system_platform_identity()")
+            .expect("immutable platform identity capture");
+        assert_eq!(
+            run_body
+                .matches("capture_system_platform_identity()")
+                .count(),
+            1
+        );
+        assert!(identity_capture < admission);
+        assert!(!run_body.contains("auto_detect_s19j_hybrid()"));
+        assert!(!run_body.contains("am3_bb_mining::auto_detect_am3_bb()"));
+        assert!(run_body.contains(
+            "Daemon::new(\n            config,\n            resolved_config_path,\n            platform_identity,"
+        ));
+        assert!(DAEMON_SOURCE.contains("let platform_identity = self.platform_identity.clone();"));
+        let daemon_lifecycle = DAEMON_SOURCE
+            .split("async fn run_lifecycle(&mut self)")
+            .nth(1)
+            .expect("daemon lifecycle body");
+        assert!(
+            !daemon_lifecycle.contains("capture_identity(&SystemPlatformIdentitySource)"),
+            "standard daemon must consume the admitted snapshot, never reread identity"
+        );
+
+        for stale_reread in [
+            "let legacy_psu_board_target = read_first_trimmed(",
+            "let thermal_has_xadc = !detect_control_board()",
+            "let mixed_chip_platform = read_first_trimmed(",
+            "let control_board = detect_control_board();",
+            "std::fs::read_to_string(\"/etc/dcentos/platform\")",
+        ] {
+            assert!(
+                !daemon_lifecycle.contains(stale_reread),
+                "post-admission policy must not reread mutable identity: {stale_reread}"
             );
         }
     }
@@ -1849,14 +2114,18 @@ async fn run_main() -> Result<()> {
     // `am3-bb-s19jpro` or the device-tree model is an `S19J_IO_BOARD`.
     // See DCENT_OS_Antminer/dcentrald/dcentrald/src/am3_bb_mining.rs.
     let am3_bb_cli = args.iter().any(|a| a == "--am3-bb-mining");
-    let am3_bb_auto = am3_bb_mining::auto_detect_am3_bb();
+    let platform_identity = crate::daemon::capture_system_platform_identity()?;
+    let am3_bb_auto = platform_identity.board_target() == "am3-bb-s19jpro";
     let am3_bb_mode = am3_bb_cli || am3_bb_auto;
 
     // Auto-route am2 platforms into s19j-hybrid mode only when the operator did
     // not explicitly request another bring-up path. This keeps the am2 safety
     // guard for the default case while still letting us intentionally run the
     // serial/tap/proxy experiments on .139.
-    let (auto_hybrid, detected_platform) = auto_detect_s19j_hybrid();
+    let (auto_hybrid, detected_platform) = classify_s19j_hybrid_auto(
+        platform_identity.platform_marker(),
+        platform_identity.board_target(),
+    );
     let explicit_non_hybrid_mode =
         stock_fpga_mode || serial_mining_mode || tap_mode || stratum_proxy_mode || am3_bb_mode;
     let s19j_hybrid_mode = s19j_hybrid_cli || (auto_hybrid && !explicit_non_hybrid_mode);
@@ -2119,11 +2388,8 @@ async fn run_main() -> Result<()> {
                             .map(str::to_string)
                     })
                     .or_else(|| {
-                        std::fs::read_to_string("/etc/dcentos/board_target")
-                            .ok()
-                            .and_then(|t| {
-                                model::board_target_chip_label(t.trim()).map(str::to_string)
-                            })
+                        model::board_target_chip_label(platform_identity.board_target())
+                            .map(str::to_string)
                     })
                     .unwrap_or_default();
                 tokio::spawn(async move {
@@ -2154,8 +2420,7 @@ async fn run_main() -> Result<()> {
     // runtime signal. If an in-development platform image carries a stale or
     // missing model field and mining would otherwise start, park management-only
     // before any voltage, PIC/PMBus, ASIC init, or hash-dispatch path.
-    let td003_board_target =
-        std::fs::read_to_string("/etc/dcentos/board_target").unwrap_or_default();
+    let td003_board_target = platform_identity.board_target().to_string();
     if config.mining_start_enabled() {
         if let Some(model_name) = model::td003_management_only_board_target(&td003_board_target) {
             tracing::warn!(
@@ -2168,19 +2433,24 @@ async fn run_main() -> Result<()> {
                 tokio::sync::watch::channel(dcentrald_api::RuntimeHealthSnapshot::for_mode(
                     dcentrald_api::RuntimeHealthMode::Native,
                 ));
-            let _api_handles = crate::runtime::api::spawn_proxy_mode_api(
-                config.clone(),
-                dcentrald_api::RuntimeHealthMode::Native,
-                Some(runtime_health_rx),
-                shutdown_token.clone(),
-            )
-            .await?;
+            let _api_handles =
+                crate::runtime::api::spawn_proxy_mode_api_with_hardware_mutation_gate(
+                    config.clone(),
+                    dcentrald_api::RuntimeHealthMode::Native,
+                    Some(runtime_health_rx),
+                    dcentrald_hal::platform::HardwareMutationGate::new_closed(),
+                    shutdown_token.clone(),
+                )
+                .await?;
             return enter_management_only_idle(
                 "td003-board-target",
                 config.mining.enabled,
                 config.has_configured_pool(),
                 shutdown_token.clone(),
-                am2_quiet_idle_tuple(&detected_platform, &config),
+                // Admission failure proves neither rail-off nor an idle thermal
+                // state. Preserve the existing cooling command; lowering PWM
+                // here could leave a hot donor/passthrough board under-cooled.
+                None,
             )
             .await;
         }
@@ -2193,9 +2463,10 @@ async fn run_main() -> Result<()> {
 
     // Typed composition admission over the existing dispatch order. BoardDesc
     // does not choose a mining arm; CLI/auto-detection above still does. It can
-    // only reject a proven transport/work-engine contradiction before an arm
-    // constructs hardware. Unknown descriptors and intentionally unresolved
-    // stock/tap/default ownership preserve the historical route.
+    // only reject a proven transport/work-engine/ASIC contradiction before an
+    // arm constructs hardware. Unknown and unresolved hardware ownership now
+    // parks management-only; safe-direction cleanup remains independently
+    // available and does not require mining admission.
     let runtime_dispatch = selected_runtime_dispatch(
         am3_bb_mode,
         stratum_proxy_mode,
@@ -2204,19 +2475,40 @@ async fn run_main() -> Result<()> {
         serial_mining_mode,
         stock_fpga_mode,
     );
-    let runtime_board_desc = dcentrald_common::BoardDesc::lookup(td003_board_target.trim());
-    match admit_board_desc_runtime_dispatch(
-        runtime_board_desc,
-        runtime_dispatch,
-        config.mining_start_enabled(),
+    let runtime_board_desc = platform_identity.board_desc;
+    let mut s19j_hybrid_route_admission = match configured_asic_protocol_identity(&config).and_then(
+        |configured_asic_protocol| {
+            let runtime_admission = admit_board_desc_runtime_dispatch(
+                runtime_board_desc,
+                runtime_dispatch,
+                config.mining_start_enabled(),
+                configured_asic_protocol,
+            )?;
+            let hybrid_route_admission = if runtime_dispatch == RuntimeDispatchKind::S19jHybrid
+                && config.mining_start_enabled()
+            {
+                Some(s19j_hybrid_admission::admit_s19j_hybrid_route(
+                    &platform_identity,
+                    runtime_dispatch,
+                    configured_asic_protocol,
+                )?)
+            } else {
+                None
+            };
+            Ok((runtime_admission, hybrid_route_admission))
+        },
     ) {
-        Ok(admission) => info!(
-            board_target = %td003_board_target.trim(),
-            board_desc_registered = runtime_board_desc.is_some(),
-            dispatch = runtime_dispatch.label(),
-            admission = ?admission,
-            "BoardDesc runtime transport/work admission evaluated"
-        ),
+        Ok((admission, hybrid_route_admission)) => {
+            info!(
+                board_target = %td003_board_target.trim(),
+                board_desc_registered = runtime_board_desc.is_some(),
+                dispatch = runtime_dispatch.label(),
+                admission = ?admission,
+                hybrid_route_admitted = hybrid_route_admission.is_some(),
+                "BoardDesc runtime transport/work/ASIC-protocol admission evaluated"
+            );
+            hybrid_route_admission
+        }
         Err(reason) => {
             tracing::warn!(
                 board_target = %td003_board_target.trim(),
@@ -2228,23 +2520,27 @@ async fn run_main() -> Result<()> {
                 tokio::sync::watch::channel(dcentrald_api::RuntimeHealthSnapshot::for_mode(
                     dcentrald_api::RuntimeHealthMode::Native,
                 ));
-            let _api_handles = crate::runtime::api::spawn_proxy_mode_api(
-                config.clone(),
-                dcentrald_api::RuntimeHealthMode::Native,
-                Some(runtime_health_rx),
-                shutdown_token.clone(),
-            )
-            .await?;
+            let _api_handles =
+                crate::runtime::api::spawn_proxy_mode_api_with_hardware_mutation_gate(
+                    config.clone(),
+                    dcentrald_api::RuntimeHealthMode::Native,
+                    Some(runtime_health_rx),
+                    dcentrald_hal::platform::HardwareMutationGate::new_closed(),
+                    shutdown_token.clone(),
+                )
+                .await?;
             return enter_management_only_idle(
                 "board-desc-dispatch",
                 config.mining.enabled,
                 config.has_configured_pool(),
                 shutdown_token.clone(),
-                am2_quiet_idle_tuple(&detected_platform, &config),
+                // Rejection proves neither rail-off nor an idle thermal state.
+                // Preserve cooling on a possibly hot inherited composition.
+                None,
             )
             .await;
         }
-    }
+    };
 
     if am3_bb_mode {
         // Phase C: AM335x BeagleBone S19j Pro (S19J_IO_BOARD_V2_0) mining.
@@ -2526,8 +2822,13 @@ async fn run_main() -> Result<()> {
         let mining_shutdown = shutdown_token.child_token();
         // AT-DASH: attach the live MinerState publisher so the hybrid mining
         // loop feeds /api/status + the dashboard.
-        let mut miner =
-            S19jHybridMiner::new(config, mining_shutdown.clone()).with_state_tx(miner_state_tx);
+        let route_admission = s19j_hybrid_route_admission.take().ok_or_else(|| {
+            anyhow::anyhow!(
+                "s19j-hybrid reached hardware construction without one-shot route admission"
+            )
+        })?;
+        let mut miner = S19jHybridMiner::new(config, mining_shutdown.clone(), route_admission)?
+            .with_state_tx(miner_state_tx);
 
         match miner.run().await {
             Ok(()) => {
@@ -2657,8 +2958,8 @@ async fn run_main() -> Result<()> {
         // (S9/am1 + am2-s17 Zynq). F1 no-brick parity (gap-swarm daemon-startup
         // #6): on a mining error this arm previously did `error!; Err(e)` →
         // process exit → the in-process :8080 API task dies, the dashboard proxy
-        // loses its target, and S82dcentrald crash-loops to a PERMANENT give-up
-        // (the F1 unmanageable-brick class). Every OTHER mining arm
+        // loses its target, and persistent session admission refuses an
+        // unverified replacement (the F1 unmanageable-brick class). Every OTHER mining arm
         // (serial / s19j-hybrid / stock-fpga / am3-bb) already routes its `Err`
         // through `enter_management_only`; the standard daemon arm was the lone
         // exception. Two-part fix:
@@ -2669,12 +2970,17 @@ async fn run_main() -> Result<()> {
         //       (enter_management_only's hardware-already-off contract is met);
         //   (2) park in management-only instead of exiting, so the (detached,
         //       still-running) API/dashboard/wizard/re-flash plane stays reachable
-        //       and the unit never crash-loops to an unmanageable brick.
+        //       and the unit never loses its management plane to a refused replacement.
         // am2_qi (Some only on am2; None on S9/am1) keeps the parked am2 fans at
         // the idle setpoint via the periodic fan-hold refresh; computed BEFORE
         // `config` is moved into Daemon::new.
         let am2_qi = am2_quiet_idle_tuple(&detected_platform, &config);
-        let mut daemon = Daemon::new(config, resolved_config_path, shutdown_token.clone());
+        let mut daemon = Daemon::new(
+            config,
+            resolved_config_path,
+            platform_identity,
+            shutdown_token.clone(),
+        );
 
         match daemon.run().await {
             Ok(()) => {
@@ -2858,8 +3164,8 @@ async fn enter_management_only_idle(
 /// With the API dead, the dashboard's `:80`→`:8080` proxy has no target,
 /// the onboarding wizard (complete OR W1-A skip) is unreachable, and the
 /// toolbox detector returns `board_target=unknown` so the unit can't even
-/// be re-flashed. `S82dcentrald` then crash-loops 5× and permanently gives
-/// up. The management plane must NOT die with mining.
+/// be re-flashed. `S82dcentrald` must then refuse an unverified replacement.
+/// The management plane must NOT die with mining.
 ///
 /// This is the EXACT pattern the codebase already endorses for the
 /// serial-mining *gated-off* case at `main.rs` (the
@@ -3427,11 +3733,20 @@ mod tests {
     /// / FPGA work dispatch at all ("does LESS, never MORE").
     #[test]
     fn f5_fresh_unit_gate_precedes_miner_run() {
+        let run_start = MAIN_RS
+            .find("async fn run_main() -> Result<()> {")
+            .expect("run_main entry missing");
+        let tests_start = MAIN_RS[run_start..]
+            .find("#[cfg(test)]")
+            .map(|offset| run_start + offset)
+            .expect("runtime test module boundary missing");
+        let runtime_main = &MAIN_RS[run_start..tests_start];
+
         // s19j-hybrid: the gate must precede `S19jHybridMiner::new`.
-        let s19j_new = MAIN_RS
-            .find("S19jHybridMiner::new(config, mining_shutdown.clone())")
+        let s19j_new = runtime_main
+            .find("S19jHybridMiner::new(")
             .expect("s19j-hybrid miner construction missing");
-        let s19j_gate = MAIN_RS[..s19j_new]
+        let s19j_gate = runtime_main[..s19j_new]
             .rfind("if !config.mining_start_enabled() {")
             .expect(
                 "F5: s19j-hybrid arm has no mining_start_enabled() gate before miner construction",
@@ -3443,10 +3758,10 @@ mod tests {
              miner (no PIC preflight, no cold boot, no crash)"
         );
         // am3-bb: the gate must precede `run_am3_bb_mining(`.
-        let am3_run = MAIN_RS
+        let am3_run = runtime_main
             .find("am3_bb_mining::run_am3_bb_mining(")
             .expect("am3-bb mining entry missing");
-        let am3_gate = MAIN_RS[..am3_run]
+        let am3_gate = runtime_main[..am3_run]
             .rfind("if !config.mining_start_enabled() {")
             .expect("F5: am3-bb arm has no mining_start_enabled() gate before run_am3_bb_mining");
         assert!(
@@ -3456,17 +3771,17 @@ mod tests {
 
         // tap: the gate must precede `S19jTapMiner::new`, because the tap
         // miner dispatches FPGA work even though bosminer owns PIC/PSU/serial.
-        let tap_arm = MAIN_RS
+        let tap_arm = runtime_main
             .find("} else if tap_mode {")
             .expect("tap-mode arm missing");
-        let tap_new = MAIN_RS
+        let tap_new = runtime_main
             .find("S19jTapMiner::new(config, mining_shutdown.clone())")
             .expect("tap miner construction missing");
-        let tap_gate = MAIN_RS[tap_arm..tap_new]
+        let tap_gate = runtime_main[tap_arm..tap_new]
             .find("if !config.mining_start_enabled() {")
             .map(|idx| tap_arm + idx)
             .expect("F5: tap arm has no mining_start_enabled() gate before S19jTapMiner::new");
-        let tap_idle_body = &MAIN_RS[tap_arm..tap_new];
+        let tap_idle_body = &runtime_main[tap_arm..tap_new];
         assert!(
             tap_gate < tap_new,
             "F5 SAFETY: tap fresh-unit gate must precede S19jTapMiner::new"
@@ -3482,7 +3797,7 @@ mod tests {
         // by these arms (the fn definition uses `async fn`, prose/this test
         // do not use that prefix), so this count is exactly the call sites.
         assert!(
-            MAIN_RS
+            runtime_main
                 .matches("return enter_management_only_idle(")
                 .count()
                 >= 3,
@@ -3514,8 +3829,9 @@ mod tests {
             "TD-003 board-target gate should only intercept starts that would otherwise mine"
         );
         assert!(
-            guard_body.contains("spawn_proxy_mode_api("),
-            "TD-003 board-target gate must keep the management/API surface reachable"
+            guard_body.contains("spawn_proxy_mode_api_with_hardware_mutation_gate(")
+                && guard_body.contains("HardwareMutationGate::new_closed()"),
+            "TD-003 board-target gate must keep a read-only management/API surface reachable"
         );
         assert!(
             guard_body.contains("\"td003-board-target\""),
@@ -3560,7 +3876,6 @@ mod tests {
         for marker in [
             "stratum_proxy::run(config, mining_shutdown.clone(), Some(stats))",
             "S19jTapMiner::new(config, mining_shutdown.clone())",
-            "S19jHybridMiner::new(config, mining_shutdown.clone())",
             "SerialMiner::new(config, mining_shutdown.clone())",
         ] {
             assert!(
@@ -3570,6 +3885,11 @@ mod tests {
                  used by management-only parking."
             );
         }
+        assert!(
+            MAIN_RS
+                .contains("S19jHybridMiner::new(config, mining_shutdown.clone(), route_admission)"),
+            "F1-B: S19jHybridMiner must receive its mining child token and one-shot route proof"
+        );
         let am3_call = MAIN_RS
             .find("am3_bb_mining::run_am3_bb_mining(")
             .expect("AM3-BB mining call missing");

@@ -123,19 +123,137 @@ impl ColdBootStep {
     }
 }
 
-/// Address-stride formula for SetChipAddress per chip family.
+/// Validation failure while constructing a linear ASIC address plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum LinearAddressPlanError {
+    ZeroChipCount,
+    ZeroStride,
+    TooManyChips {
+        chip_count: u16,
+    },
+    LastAddressExceedsByteSpace {
+        first_address: u8,
+        chip_count: u16,
+        address_interval: u8,
+    },
+}
+
+/// Dense chip-index to strided one-byte hardware-address mapping.
+///
+/// Geometry owns this value; chip identity alone does not. The inverse helper
+/// rejects odd/unassigned and out-of-range addresses instead of silently
+/// treating a raw hardware address as a dense chip index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct LinearAddressPlan {
+    first_address: u8,
+    chip_count: u16,
+    address_interval: u8,
+}
+
+impl LinearAddressPlan {
+    pub const fn try_new(
+        first_address: u8,
+        chip_count: u16,
+        address_interval: u8,
+    ) -> Result<Self, LinearAddressPlanError> {
+        if chip_count == 0 {
+            return Err(LinearAddressPlanError::ZeroChipCount);
+        }
+        if chip_count > 256 {
+            return Err(LinearAddressPlanError::TooManyChips { chip_count });
+        }
+        if address_interval == 0 {
+            return Err(LinearAddressPlanError::ZeroStride);
+        }
+        let last_address = first_address as u32 + (chip_count as u32 - 1) * address_interval as u32;
+        if last_address > u8::MAX as u32 {
+            return Err(LinearAddressPlanError::LastAddressExceedsByteSpace {
+                first_address,
+                chip_count,
+                address_interval,
+            });
+        }
+        Ok(Self {
+            first_address,
+            chip_count,
+            address_interval,
+        })
+    }
+
+    /// Construct the historical BM1397+ `floor(256 / chip_count)` plan with
+    /// explicit validation. Callers should persist the returned plan rather
+    /// than recomputing its stride from mutable geometry.
+    pub const fn from_truncated_byte_space(
+        chip_count: u16,
+    ) -> Result<Self, LinearAddressPlanError> {
+        if chip_count == 0 {
+            return Err(LinearAddressPlanError::ZeroChipCount);
+        }
+        if chip_count > 256 {
+            return Err(LinearAddressPlanError::TooManyChips { chip_count });
+        }
+        // A one-chip repair fixture has only address 0; the mathematical
+        // interval 256 is not representable on an 8-bit bus and must not wrap
+        // to zero. Use the smallest canonical non-zero interval instead.
+        let interval = if chip_count == 1 {
+            1
+        } else {
+            (256 / chip_count) as u8
+        };
+        Self::try_new(0, chip_count, interval)
+    }
+
+    pub const fn first_address(self) -> u8 {
+        self.first_address
+    }
+
+    pub const fn chip_count(self) -> u16 {
+        self.chip_count
+    }
+
+    pub const fn address_interval(self) -> u8 {
+        self.address_interval
+    }
+
+    pub const fn last_address(self) -> u8 {
+        (self.first_address as u16 + (self.chip_count - 1) * self.address_interval as u16) as u8
+    }
+
+    pub const fn hardware_address(self, dense_index: u16) -> Option<u8> {
+        if dense_index >= self.chip_count {
+            return None;
+        }
+        Some((self.first_address as u16 + dense_index * self.address_interval as u16) as u8)
+    }
+
+    pub const fn dense_index(self, hardware_address: u8) -> Option<u16> {
+        if hardware_address < self.first_address {
+            return None;
+        }
+        let offset = hardware_address - self.first_address;
+        if !offset.is_multiple_of(self.address_interval) {
+            return None;
+        }
+        let index = offset as u16 / self.address_interval as u16;
+        if index >= self.chip_count {
+            return None;
+        }
+        Some(index)
+    }
+}
+
+/// Compatibility wrapper for the historical address-stride formula.
 /// BM1387: hw_addr = chip_idx × 4 (max 63 chips).
-/// BM1397+: hw_addr = chip_idx × (256 / N) where N is the chain chip count.
+/// BM1397+: hw_addr = chip_idx × floor(256 / N).
+///
+/// New code should retain a validated [`LinearAddressPlan`] so invalid
+/// geometry cannot be confused with a legitimate zero stride.
 pub fn address_stride(family: ChipFamily, chip_count: u32) -> u32 {
     match family {
         ChipFamily::Bm1387 => 4,
-        _ => {
-            if chip_count == 0 {
-                0
-            } else {
-                256 / chip_count
-            }
-        }
+        _ if chip_count == 0 => 0,
+        _ => 256 / chip_count,
     }
 }
 
@@ -273,6 +391,56 @@ mod tests {
         assert_eq!(address_stride(ChipFamily::Bm1366, 77), 3);
         // 0 chip count → 0 (avoid div-by-zero).
         assert_eq!(address_stride(ChipFamily::Bm1397, 0), 0);
+    }
+
+    #[test]
+    fn linear_address_plan_round_trips_exact_assigned_addresses() {
+        let plan = LinearAddressPlan::try_new(0, 114, 2).unwrap();
+        assert_eq!(plan.hardware_address(0), Some(0));
+        assert_eq!(plan.hardware_address(113), Some(226));
+        assert_eq!(plan.dense_index(0), Some(0));
+        assert_eq!(plan.dense_index(226), Some(113));
+        assert_eq!(plan.hardware_address(114), None);
+        assert_eq!(plan.dense_index(227), None, "odd addresses are unassigned");
+        assert_eq!(plan.dense_index(228), None, "index 114 is out of range");
+    }
+
+    #[test]
+    fn linear_address_plan_rejects_invalid_geometry() {
+        assert_eq!(
+            LinearAddressPlan::try_new(0, 0, 2),
+            Err(LinearAddressPlanError::ZeroChipCount)
+        );
+        assert_eq!(
+            LinearAddressPlan::try_new(0, 114, 0),
+            Err(LinearAddressPlanError::ZeroStride)
+        );
+        assert_eq!(
+            LinearAddressPlan::try_new(0, 257, 1),
+            Err(LinearAddressPlanError::TooManyChips { chip_count: 257 })
+        );
+        assert_eq!(
+            LinearAddressPlan::try_new(0, 129, 2),
+            Err(LinearAddressPlanError::LastAddressExceedsByteSpace {
+                first_address: 0,
+                chip_count: 129,
+                address_interval: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn one_chip_repair_plan_uses_address_zero_without_stride_wrap() {
+        let plan = LinearAddressPlan::from_truncated_byte_space(1).unwrap();
+        assert_eq!(plan.address_interval(), 1);
+        assert_eq!(plan.hardware_address(0), Some(0));
+        assert_eq!(plan.dense_index(0), Some(0));
+        assert_eq!(plan.dense_index(1), None);
+    }
+
+    #[test]
+    fn historical_stride_wrapper_preserves_one_chip_u32_result() {
+        assert_eq!(address_stride(ChipFamily::Bm1398, 1), 256);
     }
 
     #[test]

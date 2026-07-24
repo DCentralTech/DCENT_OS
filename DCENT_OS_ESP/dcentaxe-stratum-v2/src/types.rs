@@ -199,19 +199,24 @@ impl NewMiningJob {
 
 impl SetNewPrevHash {
     pub fn from_bytes(data: &[u8]) -> Result<Self, &'static str> {
-        if data.len() < 44 {
-            return Err("SetNewPrevHash too short");
+        // SetNewPrevHash is a FIXED 48-byte payload:
+        //   channel_id(4) + job_id(4) + prev_hash(32) + min_ntime(4) + nbits(4).
+        // nbits is REQUIRED: it is the network target that goes into the block
+        // header's `bits` field (dispatcher header[72..76]). The earlier
+        // `< 48 => nbits = 0` fallback accepted a truncated message and
+        // fabricated nbits=0, which produced a header that differs from the
+        // pool's for that tip → EVERY share silently rejected (and bogus local
+        // block-found detection). A short SetNewPrevHash is unmineable, so fail
+        // closed and let the caller log + drop it instead of mining garbage.
+        if data.len() < 48 {
+            return Err("SetNewPrevHash too short (need 48 bytes incl. nbits)");
         }
         let channel_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         let job_id = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         let mut prev_hash = [0u8; 32];
         prev_hash.copy_from_slice(&data[8..40]);
         let min_ntime = u32::from_le_bytes([data[40], data[41], data[42], data[43]]);
-        let nbits = if data.len() >= 48 {
-            u32::from_le_bytes([data[44], data[45], data[46], data[47]])
-        } else {
-            0
-        };
+        let nbits = u32::from_le_bytes([data[44], data[45], data[46], data[47]]);
         Ok(Self {
             channel_id,
             job_id,
@@ -369,21 +374,27 @@ mod tests {
     // --- SetNewPrevHash::from_bytes ----------------------------------------
 
     #[test]
-    fn test_set_new_prev_hash_44_bytes_nbits_fallback() {
-        // Exactly 44 bytes: channel_id(4) + job_id(4) + prev_hash(32) +
-        // min_ntime(4). No nbits field present => nbits falls back to 0.
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&3u32.to_le_bytes()); // channel_id
-        buf.extend_from_slice(&4u32.to_le_bytes()); // job_id
-        buf.extend_from_slice(&[0xCDu8; 32]); // prev_hash
-        buf.extend_from_slice(&0x6543_2100u32.to_le_bytes()); // min_ntime
-        assert_eq!(buf.len(), 44);
-        let m = SetNewPrevHash::from_bytes(&buf).expect("44 bytes parses");
-        assert_eq!(m.channel_id, 3);
-        assert_eq!(m.job_id, 4);
-        assert_eq!(m.prev_hash, [0xCDu8; 32]);
-        assert_eq!(m.min_ntime, 0x6543_2100);
-        assert_eq!(m.nbits, 0, "missing nbits must fall back to 0");
+    fn test_set_new_prev_hash_44_to_47_bytes_rejected_no_nbits() {
+        // A SetNewPrevHash missing (part of) its required nbits field must be
+        // REJECTED, not parsed with a fabricated nbits=0 — nbits=0 lands in the
+        // hashed header and silently rejects every share for the tip.
+        let mut base = Vec::new();
+        base.extend_from_slice(&3u32.to_le_bytes()); // channel_id
+        base.extend_from_slice(&4u32.to_le_bytes()); // job_id
+        base.extend_from_slice(&[0xCDu8; 32]); // prev_hash
+        base.extend_from_slice(&0x6543_2100u32.to_le_bytes()); // min_ntime
+        assert_eq!(base.len(), 44);
+        // 44 (no nbits) through 47 (nbits truncated by 1 byte) all fail closed.
+        for extra in 0..4usize {
+            let mut buf = base.clone();
+            buf.extend(std::iter::repeat(0u8).take(extra));
+            assert_eq!(buf.len(), 44 + extra);
+            assert!(
+                SetNewPrevHash::from_bytes(&buf).is_err(),
+                "{}-byte SetNewPrevHash (nbits incomplete) must be rejected",
+                44 + extra
+            );
+        }
     }
 
     #[test]

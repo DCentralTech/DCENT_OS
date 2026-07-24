@@ -43,7 +43,21 @@ fn segwit_address_to_script_hex(addr: &str) -> Option<String> {
     if ver > 16 {
         return None;
     }
+    // BIP-173: a witness program is 2..=40 bytes for EVERY witness version.
+    // Without this, a checksum-valid future-version address with an out-of-range
+    // program (e.g. empty) would be accepted as a coinbase payout script.
+    if prog.len() < 2 || prog.len() > 40 {
+        return None;
+    }
+    // BIP-141: a v0 program must be exactly 20 (P2WPKH) or 32 (P2WSH) bytes.
     if ver == 0 && prog.len() != 20 && prog.len() != 32 {
+        return None;
+    }
+    // BIP-341: a v1 (P2TR) program must be exactly 32 bytes. A checksum-valid
+    // v1 program of any other length is an UNENCUMBERED / anyone-can-spend
+    // output — paying a solo block reward to such a script makes the reward
+    // trivially stealable. Fail closed rather than emit a plausible script.
+    if ver == 1 && prog.len() != 32 {
         return None;
     }
     // OP_0 = 0x00; OP_1..OP_16 = 0x51..0x60
@@ -130,6 +144,10 @@ fn bech32_hrp_expand(hrp: &str) -> Vec<u8> {
 }
 
 fn bech32_decode(addr: &str) -> Option<Bech32Decoded> {
+    // BIP-173: the overall bech32/bech32m string is capped at 90 characters.
+    if addr.len() > 90 {
+        return None;
+    }
     let lower = addr.to_ascii_lowercase();
     // Reject mixed case.
     if addr.to_ascii_uppercase() != addr && addr.to_ascii_lowercase() != addr {
@@ -300,5 +318,68 @@ mod tests {
         let script = address_to_script_hex("BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4")
             .expect("upper bech32");
         assert_eq!(script, "0014751e76e8199196d454941c45d1b3a323f1433bd6");
+    }
+
+    /// Test-only bech32/bech32m encoder built from the module's own private
+    /// helpers, so we can construct CHECKSUM-VALID addresses with arbitrary
+    /// witness version + program length to exercise the validation that real
+    /// wallets would never emit but a malicious/garbage input could.
+    fn encode_segwit(hrp: &str, ver: u8, prog: &[u8]) -> String {
+        let mut data = vec![ver];
+        data.extend(convert_bits(prog, 8, 5, true).expect("convert_bits pad"));
+        // Checksum constant: v0 = bech32 (1), v1..16 = bech32m (0x2bc830a3).
+        let konst: u32 = if ver == 0 { 1 } else { 0x2bc8_30a3 };
+        let mut values = bech32_hrp_expand(hrp);
+        values.extend_from_slice(&data);
+        values.extend_from_slice(&[0u8; 6]);
+        let polymod = bech32_polymod(&values) ^ konst;
+        let mut checksum = [0u8; 6];
+        for (i, c) in checksum.iter_mut().enumerate() {
+            *c = ((polymod >> (5 * (5 - i))) & 31) as u8;
+        }
+        let mut s = String::from(hrp);
+        s.push('1');
+        for &d in data.iter().chain(checksum.iter()) {
+            s.push(BECH32_ALPHA[d as usize] as char);
+        }
+        s
+    }
+
+    #[test]
+    fn p2tr_valid_program_builds_correct_script() {
+        // A v1 / 32-byte program is P2TR: OP_1 (0x51) PUSH32 (0x20) <32 bytes>.
+        // Round-trips through the module's production bech32m decode (the
+        // 0x2bc830a3 constant), so this validates both the checksum path and the
+        // byte-exact script construction for the witness-v1 branch.
+        let prog = [0xABu8; 32];
+        let addr = encode_segwit("bc", 1, &prog);
+        let script = address_to_script_hex(&addr).expect("valid p2tr must parse");
+        let expected = format!("5120{}", hex_encode(&prog));
+        assert_eq!(script, expected);
+    }
+
+    #[test]
+    fn encoder_roundtrips_valid_programs() {
+        // Sanity that the test encoder produces addresses the parser accepts for
+        // IN-RANGE programs (so the negative cases below fail on length, not on a
+        // broken encoder): v1/32 (P2TR), and future v2 at the 2- and 40-byte bounds.
+        assert!(address_to_script_hex(&encode_segwit("bc", 1, &[0x22; 32])).is_some());
+        assert!(address_to_script_hex(&encode_segwit("bc", 2, &[0x33; 2])).is_some());
+        assert!(address_to_script_hex(&encode_segwit("bc", 2, &[0x44; 40])).is_some());
+    }
+
+    #[test]
+    fn rejects_invalid_witness_programs_fail_closed() {
+        // v1 (P2TR) with a 20-byte program: NOT 32 bytes → anyone-can-spend → reject.
+        assert!(
+            address_to_script_hex(&encode_segwit("bc", 1, &[0x11; 20])).is_none(),
+            "v1/20-byte program must be rejected (anyone-can-spend)"
+        );
+        // v1 with an empty program → below the BIP-173 minimum → reject.
+        assert!(address_to_script_hex(&encode_segwit("bc", 1, &[])).is_none());
+        // v2 with a 1-byte program → below BIP-173 min (2) → reject.
+        assert!(address_to_script_hex(&encode_segwit("bc", 2, &[0x11])).is_none());
+        // v16 with a 41-byte program → above BIP-173 max (40) → reject.
+        assert!(address_to_script_hex(&encode_segwit("bc", 16, &[0x11; 41])).is_none());
     }
 }

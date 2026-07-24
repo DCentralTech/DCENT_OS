@@ -52,7 +52,7 @@ check_name am3-s21 rc "DCENTOS_AML3_S21_rc$DATE_STAMP"
 check_name am3-s21pro beta "DCENTOS_AML3_S21Pro_beta$DATE_STAMP"
 check_name am3-s21xp beta "DCENTOS_AML3_S21XP_beta$DATE_STAMP"
 check_name am3-bb-s19jpro-vnish beta "DCENTOS_BB3_S19jPro_beta$DATE_STAMP"
-check_name cv1835-s19jpro beta "DCENTOS_CV3_S19jPro_beta$DATE_STAMP"
+check_rejects 2 cv1835-s19jpro beta "$DATE_STAMP"
 
 check_name bitaxe-gamma dev "DCENTOS_ESP3_BitaxeGamma_dev$DATE_STAMP"
 check_name bitaxe-hex-ultra beta "DCENTOS_ESP3_BitaxeHexUltra_beta$DATE_STAMP"

@@ -468,10 +468,9 @@ copy_in "$ROOT_PART_TMP" "$README_TMP" "README.txt"
 dd if="$BOOT_PART_TMP" of="$IMG_FILE" bs=1M seek="$P1_OFFSET_MB" conv=notrunc status=none
 dd if="$ROOT_PART_TMP" of="$IMG_FILE" bs=1M seek="$P2_OFFSET_MB" conv=notrunc status=none
 
-# CE-204: emit a provenance sidecar and, when a release key is configured, an
-# Ed25519 signature over the whole image (mirrors the PROVEN vnish builder's
-# sign-after-build block). This builder is refuse-by-default (W24-SD-1); the
-# image is a bootloop diagnostic, NOT a product artifact, and the sidecar says so.
+# CE-204: emit a provenance sidecar. This builder is refuse-by-default
+# (W24-SD-1): the image is a bootloop diagnostic, NOT a product artifact, and
+# must never receive a release-authority signature.
 IMG_SHA256="$(sha256sum "$IMG_FILE" | awk '{print $1}')"
 cat > "$IMG_FILE.manifest.json" <<MANIFEST_EOF
 {
@@ -482,18 +481,14 @@ cat > "$IMG_FILE.manifest.json" <<MANIFEST_EOF
   "not_a_product_artifact": true
 }
 MANIFEST_EOF
-if [ -n "${DCENT_RELEASE_SIGNING_KEY:-}" ]; then
-    if [ -x "$SCRIPT_DIR/sign_sd_image.sh" ]; then
-        "$SCRIPT_DIR/sign_sd_image.sh" "$IMG_FILE" || {
-            echo "ERROR: sign_sd_image.sh failed for $IMG_FILE" >&2
-            exit 1
-        }
-    else
-        echo "[WARN] $SCRIPT_DIR/sign_sd_image.sh not found or not executable; skipping signing." >&2
-    fi
+if [ -e "$IMG_FILE.sig" ] || [ -L "$IMG_FILE.sig" ]; then
+    echo "ERROR: diagnostic image has a stale release-signature path: $IMG_FILE.sig" >&2
+    echo "       Remove it explicitly before rebuilding." >&2
+    exit 1
 fi
-if [ -n "${DCENT_RELEASE_PUBKEY_FILE:-}" ]; then
-    cp "${DCENT_RELEASE_PUBKEY_FILE}" "$SD_OUTPUT_DIR/release_ed25519.pub"
+if [ -n "${DCENT_RELEASE_SIGNING_KEY:-}" ] || \
+   [ -n "${DCENT_RELEASE_PUBKEY_FILE:-}" ]; then
+    echo "[INFO] release signing material ignored: bootloop diagnostic remains unsigned" >&2
 fi
 
 IMG_BYTES=$(total_bytes "$IMG_FILE")

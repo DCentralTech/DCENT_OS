@@ -121,6 +121,16 @@ pub fn frequency_transition_steps(current: f32, target: f32) -> Vec<f32> {
     const STEP_SIZE: f32 = FREQ_STEP_SIZE_MHZ;
     let mut steps = Vec::new();
 
+    // Fail closed on a non-finite endpoint. NaN would silently ramp toward 0
+    // (NaN saturates the step index to 0); ±inf saturates `target_step` to
+    // i32::MAX/MIN, generating up to ~2.1 BILLION Vec entries → an instant OOM
+    // abort/reboot on the ESP32-S3 (~300 KB RAM, panic=abort). A non-finite
+    // target is never a legal transition — return an empty (no-op) ramp so the
+    // caller writes nothing and the chip holds its current frequency.
+    if !current.is_finite() || !target.is_finite() {
+        return steps;
+    }
+
     if (current - target).abs() < EPSILON {
         return steps;
     }
@@ -144,6 +154,16 @@ pub fn frequency_transition_steps(current: f32, target: f32) -> Vec<f32> {
     } else {
         (target / STEP_SIZE).ceil() as i32
     };
+
+    // Fail closed on an implausibly large transition. The largest LEGAL ramp is
+    // ~104 steps (the 650 MHz chip max / 6.25 MHz). A delta beyond this cap can
+    // only come from an out-of-range / over-clock target (e.g. a mis-clamped
+    // 2900 MHz), which would both bloat the step Vec and, step by step, command a
+    // massive overclock — return a no-op ramp (write nothing) instead.
+    const MAX_TRANSITION_STEPS: i32 = 256;
+    if (target_step - current_step).abs() > MAX_TRANSITION_STEPS {
+        return Vec::new();
+    }
 
     if current_step != target_step {
         let signum: i32 = if target > current { 1 } else { -1 };
@@ -349,6 +369,28 @@ mod tests {
         assert!(frequency_transition_steps(200.0, 200.0).is_empty());
         // Within EPSILON of each other is also a no-op (no spurious step).
         assert!(frequency_transition_steps(200.0, 200.00005).is_empty());
+    }
+
+    #[test]
+    fn ramp_fails_closed_on_non_finite_and_overclock() {
+        // Non-finite endpoints must yield a no-op ramp — never a NaN->0 ramp, and
+        // never an inf-saturated multi-billion-entry Vec that OOM-reboots the ESP32.
+        assert!(frequency_transition_steps(525.0, f32::INFINITY).is_empty());
+        assert!(frequency_transition_steps(525.0, f32::NEG_INFINITY).is_empty());
+        assert!(frequency_transition_steps(525.0, f32::NAN).is_empty());
+        assert!(frequency_transition_steps(f32::NAN, 525.0).is_empty());
+        // A wildly out-of-range (over-clock) FINITE target exceeds the max legal
+        // transition and is refused as a no-op (no huge Vec, no over-clock ramp).
+        assert!(frequency_transition_steps(525.0, 2900.0).is_empty());
+        assert!(frequency_transition_steps(525.0, 1.0e9).is_empty());
+        // A legitimate large in-range transition still ramps normally and lands.
+        let steps = frequency_transition_steps(100.0, 650.0);
+        assert!(!steps.is_empty());
+        assert_eq!(*steps.last().unwrap(), 650.0);
+        assert!(
+            steps.len() < 256,
+            "legal transition must stay well under the cap"
+        );
     }
 
     #[test]

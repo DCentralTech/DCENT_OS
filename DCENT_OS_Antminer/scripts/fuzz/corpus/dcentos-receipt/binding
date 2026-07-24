@@ -1,0 +1,15 @@
+schema=dcentos-sysupgrade-resource-ledger-abi1
+transaction_id=Tx-1
+boot_id=abcdef12-3456-7890-abcd-ef1234567890
+owner_pid=123
+owner_starttime=456
+owner_mount_namespace=1:22
+acquisition_guard_device_inode=9:10
+transaction_lock_path=/run/dcentos-sysupgrade.lock
+transaction_lock_device_inode=2:33
+transaction_lock_owner_device_inode=2:34
+transaction_lock_owner_sha256=0000000000000000000000000000000000000000000000000000000000000000
+storage_mount_id=7
+ledger_path=/run/dcentos-sysupgrade.lock/ledger
+ledger_device_inode=5:99
+owner=zynq-sysupgrade

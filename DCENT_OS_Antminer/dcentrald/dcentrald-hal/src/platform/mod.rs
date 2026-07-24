@@ -17,8 +17,8 @@ pub mod beaglebone;
 pub mod beaglebone_cold_boot;
 pub mod config;
 pub mod cvitek;
-pub mod cvitek_cold_boot;
-pub mod cvitek_pinmux;
+pub(crate) mod cvitek_cold_boot;
+pub(crate) mod cvitek_pinmux;
 #[cfg(feature = "sim-hal")]
 pub mod sim;
 pub mod stm32mp15;
@@ -38,7 +38,7 @@ pub use am2_controller::{
 };
 pub use config::VoltageControllerKind;
 pub use subtype::{
-    discover_system_pic16_endpoint_with_heartbeat, discover_system_voltage_controller_endpoint,
+    discover_system_pic16_endpoint, discover_system_voltage_controller_endpoint,
     VoltageControllerEndpoint, VoltageControllerEndpointError,
 };
 
@@ -601,12 +601,14 @@ pub fn detect_platform() -> Result<Box<dyn Platform>> {
 
     // 4. CVitek uart_trans kernel module (CV1835 SoC, NOT BeagleBone).
     //
-    // W2B / B1 (2026-05-09): CV1835 platform fully implemented. The
-    // signature check inside `cvitek::CViTekPlatform::new()` is the
-    // load-bearing safety gate (refuses to construct on non-Sophgo
-    // hardware unless `DCENT_CVITEK_ACCEPT_UNVERIFIED=1` is set).
+    // The reverse-engineered HAL remains available to host tests, but it is
+    // not a runtime admission surface. The constructor is itself a typed,
+    // non-mutating refusal; detection repeats that refusal before construction.
     if std::path::Path::new("/sys/module/uart_trans").exists() {
-        return Ok(Box::new(cvitek::CViTekPlatform::new()?));
+        return Err(HalError::Platform(
+            "CV1835 runtime NOT IMPLEMENTED: automatic CVitek HAL construction and pinmux mutation are disabled"
+                .to_string(),
+        ));
     }
 
     // 4. Amlogic UART (must come after CVitek — both may have /dev/ttyS).

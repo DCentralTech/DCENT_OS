@@ -25,16 +25,23 @@ mkdir -p \
     "$FAKE_STATE/volumes" "$FAKE_STATE/containers"
 
 for helper in \
+    atomic_publish_file.py durable_file_io.py \
     build-dcentrald.sh build_input_snapshot.py binary_build_receipt.py \
     release_capsule_lineage.py release_invocation.py release_result_stage.py \
     release_docker_resources.py source_closure.py source_snapshot.py; do
     cp "$SCRIPT_DIR/$helper" "$SOURCE_REPO/DCENT_OS_Antminer/scripts/$helper"
 done
+grep -Fq 'from atomic_publish_file import' \
+    "$SOURCE_REPO/DCENT_OS_Antminer/scripts/binary_build_receipt.py"
+grep -Fq 'from durable_file_io import' \
+    "$SOURCE_REPO/DCENT_OS_Antminer/scripts/atomic_publish_file.py"
 chmod +x "$SOURCE_REPO/DCENT_OS_Antminer/scripts/build-dcentrald.sh"
 printf '%s\n' '[workspace]' > "$SOURCE_REPO/DCENT_OS_Antminer/dcentrald/Cargo.toml"
 printf '%s\n' 'snapshot-only dcentrald source' > "$SOURCE_REPO/DCENT_OS_Antminer/dcentrald/source.txt"
 printf '%s\n' 'test-sku' > "$SOURCE_REPO/DCENT_OS_Antminer/scripts/hw-acceptance/skus.conf"
 printf '%s\n' 'test-matrix' > "$SOURCE_REPO/DCENT_OS_Antminer/docs/architecture/install_matrix.tsv"
+printf '%s\n' '{"schema":1,"targets":[]}' \
+    > "$SOURCE_REPO/DCENT_OS_Antminer/docs/architecture/hardware_enablement_matrix.json"
 printf '%s\n' '[test]' > "$SOURCE_REPO/DCENT_OS_Antminer/dcentrald/dcentrald_s21xp.toml"
 printf '%s\n' 'snapshot-only schema source' > "$SOURCE_REPO/projects/dcent-schema/schema.txt"
 printf '%s\n' '{}' > "$SOURCE_REPO/knowledge-base/firmware-archive/stock-bitmain-manifest.json"
@@ -283,7 +290,8 @@ new_capsule() {
     CARGO_VOLUME="$(printf '%s\n' "$invocation_result" | python3 "$SCRIPT_DIR/release_invocation.py" query-result --field cargo_volume)"
     local result
     result="$(python3 "$SCRIPT_DIR/release_result_stage.py" create \
-        --stage-parent "$CONTROL_PARENT" --invocation-stage "$INVOCATION_STAGE")"
+        --stage-parent "$CONTROL_PARENT" --invocation-stage "$INVOCATION_STAGE" \
+        --result-output "$TMPDIR_TEST/result-stage-$suffix.json")"
     RESULT_STAGE="$(printf '%s\n' "$result" | python3 "$SCRIPT_DIR/release_result_stage.py" query-result --field stage)"
     RESULT_ROOT="$(printf '%s\n' "$result" | python3 "$SCRIPT_DIR/release_result_stage.py" query-result --field result_root)"
     RESULT_CAPABILITY="$(printf '%s\n' "$result" | python3 "$SCRIPT_DIR/release_result_stage.py" query-result --field capability)"
@@ -292,6 +300,7 @@ new_capsule() {
 run_driver() {
     env \
         PATH="$FAKE_BIN:$PATH" \
+        DCENT_DOCKER_BIN=docker \
         FAKE_DOCKER_STATE="$FAKE_STATE" FAKE_DOCKER_LOG="$DOCKER_LOG" \
         DCENT_CAPSULE_GIT_OBJECT_REPO="$SOURCE_REPO" \
         DCENT_CAPSULE_SOURCE_SNAPSHOT="$SNAPSHOT_DESCRIPTOR" \
@@ -422,7 +431,8 @@ if env PATH="$FAKE_BIN:$PATH" DCENT_RELEASE_IMAGE=1 \
     exit 1
 fi
 grep -q 'without an authenticated release capsule' "$TMPDIR_TEST/no-capsule.out"
-if ! env PATH="$FAKE_BIN:$PATH" FAKE_DOCKER_STATE="$FAKE_STATE" FAKE_DOCKER_LOG="$DOCKER_LOG" \
+if ! env PATH="$FAKE_BIN:$PATH" DCENT_DOCKER_BIN=docker \
+    FAKE_DOCKER_STATE="$FAKE_STATE" FAKE_DOCKER_LOG="$DOCKER_LOG" \
     DCENT_RUST_BUILDER_BASE=rust:1.90-bookworm \
     "$SOURCE_REPO/DCENT_OS_Antminer/scripts/build-dcentrald.sh" zynq \
     >"$TMPDIR_TEST/development.out" 2>&1; then

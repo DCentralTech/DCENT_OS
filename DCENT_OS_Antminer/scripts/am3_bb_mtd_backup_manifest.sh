@@ -1,175 +1,173 @@
 #!/usr/bin/env bash
-#
-# Generate a local AM3-BB MTD backup manifest from checked-in read-only evidence.
-#
-# This script does not contact a miner and does not read or write MTD devices.
-# It converts recon evidence into a reviewed backup checklist for the later
-# console/recovery proof ladder.
+# Convert retained LuxOS recon evidence into an exact, planning-only AM3 manifest.
 
 set -euo pipefail
+umask 077
 
-usage() {
-    local code="${1:-2}"
-    cat >&2 <<'USAGE'
-Usage:
-  am3_bb_mtd_backup_manifest.sh --evidence <luxos_bbb_recon.txt> [--output <manifest.md>]
-
-Options:
-  --evidence <file>  Required read-only recon evidence file.
-  --output <file>    Output markdown manifest. Default: <evidence>_mtd_backup_manifest.md
-  -h, --help         Show this help.
-
-Safety contract:
-  - Local evidence parser only.
-  - No SSH, no miner access, no flash/env reads, and no generated go decision.
-USAGE
-    exit "$code"
-}
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+ATOMIC_PUBLISHER="$SCRIPT_DIR/atomic_publish_file.py"
+DURABLE_IO="$SCRIPT_DIR/durable_file_io.py"
 
 EVIDENCE=""
 OUTPUT=""
 
+usage() {
+    local code="${1:-2}"
+    cat >&2 <<'USAGE'
+Usage: am3_bb_mtd_backup_manifest.sh --evidence <recon.txt> [--output <manifest.md>]
+
+Local parser only. It performs no network or MTD operation and grants no read
+or write authority. The exact 12-row geometry and LuxOS root marker are required.
+USAGE
+    exit "$code"
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
-        --evidence)
-            EVIDENCE="${2:?--evidence requires a file}"
-            shift 2
-            ;;
-        --evidence=*)
-            EVIDENCE="${1#--evidence=}"
-            shift
-            ;;
-        --output)
-            OUTPUT="${2:?--output requires a file}"
-            shift 2
-            ;;
-        --output=*)
-            OUTPUT="${1#--output=}"
-            shift
-            ;;
-        -h|--help)
-            usage 0
-            ;;
-        *)
-            echo "ERROR: unknown argument: $1" >&2
-            usage
-            ;;
+        --evidence) EVIDENCE="${2:?missing evidence}"; shift 2 ;;
+        --evidence=*) EVIDENCE="${1#*=}"; shift ;;
+        --output) OUTPUT="${2:?missing output}"; shift 2 ;;
+        --output=*) OUTPUT="${1#*=}"; shift ;;
+        -h|--help) usage 0 ;;
+        *) echo "ERROR: unknown argument: $1" >&2; usage ;;
     esac
 done
-
-[ -n "$EVIDENCE" ] || usage
-[ -f "$EVIDENCE" ] || {
-    echo "ERROR: evidence file not found: $EVIDENCE" >&2
-    exit 1
+[ -n "$EVIDENCE" ] && [ -f "$EVIDENCE" ] && [ ! -L "$EVIDENCE" ] || {
+    echo "ERROR: --evidence must be a regular non-symlink file" >&2; exit 1;
 }
-
-if [ -z "$OUTPUT" ]; then
-    case "$EVIDENCE" in
-        *.txt)
-            OUTPUT="${EVIDENCE%.txt}_mtd_backup_manifest.md"
-            ;;
-        *)
-            OUTPUT="$EVIDENCE.mtd-backup-manifest.md"
-            ;;
-    esac
+PYTHON_BIN="${PYTHON:-}"
+if [ -z "$PYTHON_BIN" ]; then
+    PYTHON_BIN="$(command -v python3 || command -v python || true)"
 fi
-
-mkdir -p "$(dirname "$OUTPUT")"
+[ -n "$PYTHON_BIN" ] || { echo "ERROR: Python is required for durable manifest publication" >&2; exit 1; }
+for helper in "$ATOMIC_PUBLISHER" "$DURABLE_IO"; do
+    [ -f "$helper" ] || { echo "ERROR: required publication helper is missing: $helper" >&2; exit 1; }
+done
+if [ -z "$OUTPUT" ]; then
+    case "$EVIDENCE" in *.txt) OUTPUT="${EVIDENCE%.txt}_mtd_backup_manifest.md" ;; *) OUTPUT="$EVIDENCE.mtd-backup-manifest.md" ;; esac
+fi
+[ ! -e "$OUTPUT" ] && [ ! -L "$OUTPUT" ] || {
+    echo "ERROR: refusing to replace existing manifest: $OUTPUT" >&2; exit 1;
+}
+"$PYTHON_BIN" "$DURABLE_IO" mkdir "$(dirname "$OUTPUT")" \
+    --mode 700 --parents --exist-ok >/dev/null || {
+    echo "ERROR: cannot durably create manifest parent directory" >&2; exit 1;
+}
 
 MTD_LINES="$(awk '
-    /^=== mtd layout ===/ { in_mtd = 1; next }
-    /^=== / && in_mtd { in_mtd = 0 }
-    in_mtd && /^mtd[0-9]+:/ { print }
+    /^=== mtd layout ===/ {inside=1; next}
+    /^=== / && inside {inside=0}
+    inside && /^mtd[0-9]+:/ {print}
 ' "$EVIDENCE")"
-
-[ -n "$MTD_LINES" ] || {
-    echo "ERROR: no mtd layout block found in $EVIDENCE" >&2
-    exit 1
-}
-
-EXPECTED_NAMES='spl spl_backup1 spl_backup2 spl_backup3 u-boot bootenv fdt kernel root config sig nvdata'
-LAYOUT_OK=1
-MISSING_NAMES=""
-for name in $EXPECTED_NAMES; do
-    if ! printf '%s\n' "$MTD_LINES" | grep -q "\"$name\""; then
-        LAYOUT_OK=0
-        MISSING_NAMES="$MISSING_NAMES $name"
-    fi
-done
-
-ROOT_HINT="$(grep -m1 'root=/dev/mtdblock' "$EVIDENCE" 2>/dev/null || true)"
+NORMALIZED="$(printf '%s\n' "$MTD_LINES" | awk '
+    /^mtd[0-9]+:/ {
+        node=$1; sub(/:$/, "", node); name=$4; gsub(/"/, "", name); sub(/\r$/, "", name)
+        printf "%s:%s:%s:%s\n", tolower(node), tolower($2), tolower($3), name
+    }
+')"
+EXPECTED='mtd0:00020000:00020000:spl
+mtd1:00020000:00020000:spl_backup1
+mtd2:00020000:00020000:spl_backup2
+mtd3:00020000:00020000:spl_backup3
+mtd4:001c0000:00020000:u-boot
+mtd5:00020000:00020000:bootenv
+mtd6:00020000:00020000:fdt
+mtd7:00500000:00020000:kernel
+mtd8:01400000:00020000:root
+mtd9:00200000:00020000:config
+mtd10:00200000:00020000:sig
+mtd11:06000000:00020000:nvdata'
+LAYOUT_OK=0
+[ "$NORMALIZED" = "$EXPECTED" ] && LAYOUT_OK=1
 ROOT_OK=0
-case "$ROOT_HINT" in
-    *root=/dev/mtdblock11*)
-        ROOT_OK=1
-        ;;
-esac
+CMDLINE_SECTION_COUNT="$(grep -Fxc '=== proc cmdline ===' "$EVIDENCE" || true)"
+CMDLINE="$(awk '
+    $0 == "=== proc cmdline ===" {inside=1; next}
+    /^=== / && inside {inside=0}
+    inside && length($0) {print}
+' "$EVIDENCE")"
+CMDLINE_LINE_COUNT="$(printf '%s\n' "$CMDLINE" | sed '/^$/d' | wc -l | awk '{print $1}')"
+ROOT_TOKENS="$(printf '%s\n' "$CMDLINE" | awk '{for (i=1; i<=NF; i++) if ($i ~ /^root=/) print $i}')"
+ROOT_TOKEN_COUNT="$(printf '%s\n' "$ROOT_TOKENS" | sed '/^$/d' | wc -l | awk '{print $1}')"
+if [ "$CMDLINE_SECTION_COUNT" = 1 ] && [ "$CMDLINE_LINE_COUNT" = 1 ] && \
+    [ "$ROOT_TOKEN_COUNT" = 1 ] && [ "$ROOT_TOKENS" = 'root=/dev/mtdblock11' ]; then
+    ROOT_OK=1
+fi
 
-STAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-SOURCE_BASENAME="$(basename "$EVIDENCE")"
-
+TMP=""
+ALLOCATION_SIGNAL=0
+cleanup_tmp() {
+    [ -z "${TMP:-}" ] || rm -f -- "$TMP"
+}
+allocate_pending_file() {
+    local prefix="$1" attempt candidate
+    ALLOCATION_SIGNAL=0
+    trap 'ALLOCATION_SIGNAL=1' HUP INT TERM
+    for ((attempt = 0; attempt < 32; attempt++)); do
+        if [ "$ALLOCATION_SIGNAL" -ne 0 ]; then
+            trap 'exit 1' HUP INT TERM
+            return 2
+        fi
+        candidate="${prefix}.$$.$RANDOM$RANDOM"
+        if (trap '' HUP INT TERM; set -o noclobber; : >"$candidate") 2>/dev/null; then
+            TMP="$candidate"
+            trap 'exit 1' HUP INT TERM
+            [ "$ALLOCATION_SIGNAL" -eq 0 ] || return 2
+            return 0
+        fi
+    done
+    trap 'exit 1' HUP INT TERM
+    return 1
+}
+trap cleanup_tmp EXIT
+trap 'exit 1' HUP INT TERM
+allocate_pending_file "${OUTPUT}.publication-pending." || {
+    echo "ERROR: cannot allocate private manifest staging file" >&2; exit 1;
+}
 {
-    echo "# AM3-BB MTD Backup Manifest"
+    echo '# AM3-BB MTD Backup Manifest'
     echo
-    echo "- Created: \`$STAMP\`"
-    echo "- Source evidence: \`$SOURCE_BASENAME\`"
-    echo "- Scope: Antminer S19j Pro BeagleBone/AM335x LuxOS"
-    echo "- Status: planning-only manifest"
+    echo "- Created: \`$(date -u +'%Y-%m-%dT%H:%M:%SZ')\`"
+    echo "- Source evidence: \`$(basename "$EVIDENCE")\`"
+    echo '- Scope: Antminer S19j Pro BeagleBone/AM335x LuxOS'
+    echo '- Status: planning-only; no NAND read/write authority'
     echo "- \`layout_profile_candidate=$LAYOUT_OK\`"
     echo "- \`root_mtdblock11_candidate=$ROOT_OK\`"
-    echo "- \`nand_backup_execute_go=0\`"
-    echo "- \`persistent_install_go=0\`"
+    echo '- `backup_scope=data-only-no-oob`'
+    echo '- `restore_authority=none-until-physical-rehearsal`'
+    echo '- `nand_backup_execute_go=0`'
+    echo '- `nand_write_go=0`'
+    echo '- `persistent_install_go=0`'
     echo
-    if [ "$LAYOUT_OK" != "1" ]; then
-        echo "Missing expected MTD names:$MISSING_NAMES"
-        echo
-    fi
-    echo "## Partition Table"
+    echo '## Partition Table'
     echo
-    echo "| Node | Size Hex | Erase Hex | Name | Required Future Artifact |"
-    echo "| --- | --- | --- | --- | --- |"
-    printf '%s\n' "$MTD_LINES" | awk '
-        /^mtd[0-9]+:/ {
-            node = $1
-            sub(/:$/, "", node)
-            size = $2
-            erase = $3
-            name = $4
-            gsub(/"/, "", name)
-            printf "| /dev/%s | 0x%s | 0x%s | %s | %s_%s.nanddump |\n", node, size, erase, name, node, name
-        }
-    '
+    echo '| Node | Size Hex | Erase Hex | Name | Required Artifact |'
+    echo '| --- | --- | --- | --- | --- |'
+    printf '%s\n' "$NORMALIZED" | awk -F: 'NF == 4 {
+        node=$1; size=$2; erase=$3; name=$4
+        printf "| /dev/%s | 0x%s | 0x%s | %s | %s_%s.nanddump |\n", node, size, erase, name, node, name
+    }'
     echo
-    echo "## Execution Gate"
+    echo '## Contract'
     echo
-    echo "Do not run NAND backup commands yet. The backup ladder first needs:"
+    echo 'Only a fresh exact-unit SD proof, restore-verified stock artifact, strict'
+    echo 'JSON plan, explicit operator approval, and two identical bounded host-side'
+    echo 'reads may admit a data-plane backup. OOB is omitted, so this manifest is'
+    echo 'not restore authority. Physical restoration remains a separate NO-GO gate.'
     echo
-    echo "- Serial console or equivalent boot recovery proof."
-    echo "- Restore-to-stock package/source artifact for this exact BeagleBone LuxOS lane."
-    echo "- Operator-approved maintenance window and pool credential redaction plan."
-    echo "- Hashes for every backup artifact captured on the host, not only on the miner."
-    echo "- A dry-run parser that verifies every expected partition artifact exists and is non-empty."
-    echo
-    echo "## Future Command Template"
-    echo
-    echo "These are templates for a later authorized session, not commands approved by this manifest:"
-    echo
-    echo '```sh'
-    printf '%s\n' "$MTD_LINES" | awk '
-        /^mtd[0-9]+:/ {
-            node = $1
-            sub(/:$/, "", node)
-            name = $4
-            gsub(/"/, "", name)
-            printf "# nanddump --bb=skipbad --omitoob -f /tmp/%s_%s.nanddump /dev/%s\n", node, name, node
-        }
-    '
-    echo '```'
-    echo
-    echo "## Decision"
-    echo
-    echo "This manifest is evidence preparation only. It does not authorize NAND reads,"
-    echo "NAND writes, bootenv changes, persistent install, native mining, or tap mining."
-} > "$OUTPUT"
-
-echo "wrote=$OUTPUT"
+    echo 'Future reads use `nanddump --bb=padbad --omitoob`; `skipbad`, short dumps,'
+    echo 'stale output directories, target-local staging, and optional readback fail.'
+} >"$TMP"
+"$PYTHON_BIN" "$ATOMIC_PUBLISHER" --require-directory-sync \
+    "$TMP" "$OUTPUT" >/dev/null || {
+    echo "ERROR: durable manifest publication failed" >&2
+    exit 1
+}
+TMP=""
+trap - EXIT HUP INT TERM
+{
+    echo "wrote=$OUTPUT"
+    echo "layout_profile_candidate=$LAYOUT_OK"
+    echo "root_mtdblock11_candidate=$ROOT_OK"
+} || true
+exit 0

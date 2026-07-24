@@ -4,10 +4,11 @@
 #
 ################################################################################
 
-SEED_ENTROPY_VERSION = 1.0.0
+SEED_ENTROPY_VERSION = 2.0.0
 SEED_ENTROPY_SITE = $(BR2_EXTERNAL_DCENTOS_PATH)/packages/seed-entropy/src
 SEED_ENTROPY_SITE_METHOD = local
 SEED_ENTROPY_LICENSE = GPL-3.0+
+SEED_ENTROPY_LICENSE_FILES = seed-entropy.c
 
 define SEED_ENTROPY_BUILD_CMDS
 	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) \

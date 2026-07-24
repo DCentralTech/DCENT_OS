@@ -754,7 +754,12 @@ impl ThermalSupervisor {
         }
 
         // 4. Per-board classification.
-        let mut max_board_was_cool = true;
+        // F-thermal-2: an empty board_sensors vec (total input blackout) must NOT
+        // read as "all cool" and emit RequestFansMin/RequestProfileStepUp on zero
+        // thermal evidence (the C35 fail-open class). A present-but-empty/NaN board
+        // already fails closed via the SensorFailure power-off path; seed the flag
+        // false for the empty-vec shape so it produces NoOp instead of a cool verdict.
+        let mut max_board_was_cool = !sample.board_sensors.is_empty();
         let mut any_above_target = false;
         for board in &sample.board_sensors {
             let chain_id = board.chain_id;
@@ -829,7 +834,12 @@ impl ThermalSupervisor {
                 .collect();
 
             // Sensor failure: too few valid PCB sensors → power off this board.
-            if (valid_pcb.len() as u8) < self.config.min_per_board {
+            // F-thermal-3: clamp min_per_board to >=1 at the point of use.
+            // ThermalSupervisor::new stores the TOML config unvalidated (unlike the
+            // controller constructor), so a config min_per_board=0 would make this
+            // guard (len < 0) never fire → board_max folds over an empty valid_pcb to
+            // f32::MIN → ice-cold fail-open. At least one valid sensor is required.
+            if (valid_pcb.len() as u8) < self.config.min_per_board.max(1) {
                 if board.powered_on {
                     bs.ever_thermal_off = true;
                     actions.push(SupervisorAction::RequestBoardPowerOff {
@@ -838,6 +848,10 @@ impl ThermalSupervisor {
                         recoverable: false,
                     });
                 }
+                // A board whose sensors failed is NOT "cool": clear the cool verdict
+                // so the aggregate never emits a fans-min / step-power-UP advisory on
+                // a blind board (the same C35 fail-open class as F-thermal-2/3).
+                max_board_was_cool = false;
                 continue;
             }
 
@@ -847,6 +861,30 @@ impl ThermalSupervisor {
             } else {
                 valid_chip.iter().cloned().fold(f32::MIN, f32::max)
             };
+
+            // F-thermal-1: the reliability filter (dropped "liar" sensors) must NOT
+            // blind the PANIC tier. A sensor dropped because it strays past the
+            // ±bad_average_threshold band (which normal per-chip die spreads do —
+            // chip_imbalance_threshold_c defaults to 15 C) is excluded from
+            // board_max/chip_max above, so a later panic-level reading FROM that
+            // sensor would be invisible, skipping the only chip-die shutdown in the
+            // system. Take a raw max over ALL finite readings (dropped or not) for
+            // the panic checks ONLY; hot/curve/ATM classification keeps the filtered
+            // maxes so a liar can't drag the fan curve. If every reading is
+            // non-finite the raw max stays f32::MIN and the earlier SensorFailure
+            // power-off has already fired (fail-closed).
+            let raw_finite_pcb_max = board
+                .pcb_temps_c
+                .iter()
+                .copied()
+                .filter(|t| t.is_finite())
+                .fold(f32::MIN, f32::max);
+            let raw_finite_chip_max = board
+                .chip_temps_c
+                .iter()
+                .copied()
+                .filter(|t| t.is_finite())
+                .fold(f32::MIN, f32::max);
 
             // Inter-chip temperature imbalance — DIAGNOSTIC / TELEMETRY ONLY.
             //
@@ -885,8 +923,9 @@ impl ThermalSupervisor {
                 bs.chip_imbalance_flagged = false;
             }
 
-            // Panic thresholds — power off this board.
-            if board_max >= self.config.board_panic_c {
+            // Panic thresholds — power off this board. Uses the raw finite max
+            // (F-thermal-1) so a dropped-as-"liar" sensor at panic level still fires.
+            if raw_finite_pcb_max >= self.config.board_panic_c {
                 if board.powered_on {
                     bs.ever_thermal_off = true;
                     actions.push(SupervisorAction::RequestBoardPowerOff {
@@ -899,7 +938,7 @@ impl ThermalSupervisor {
                 any_above_target = true;
                 continue;
             }
-            if chip_max >= self.config.chip_panic_c {
+            if raw_finite_chip_max >= self.config.chip_panic_c {
                 if board.powered_on {
                     bs.ever_thermal_off = true;
                     actions.push(SupervisorAction::RequestBoardPowerOff {
@@ -1201,6 +1240,104 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, SupervisorAction::RequestFansMin)));
+    }
+
+    // -- F-thermal-1: a dropped "liar" sensor's panic reading still fires --
+    #[test]
+    fn dropped_liar_chip_sensor_still_fires_panic() {
+        let mut s = ThermalSupervisor::new(cfg_enabled());
+        // Warm up: chip 3 sits ~15 C above the median every tick (a normal spread,
+        // below chip_hot_c) so the reliability filter drops it as a "liar" after
+        // max_bad_readings. No shutdown should occur during warm-up.
+        for _ in 0..12 {
+            let a = s.tick(&tick(
+                vec![board(0, vec![55.0, 55.0], vec![70.0, 72.0, 74.0, 88.0])],
+                vec![1000],
+                30,
+                5,
+            ));
+            assert!(
+                !a.iter()
+                    .any(|x| matches!(x, SupervisorAction::RequestBoardPowerOff { .. })),
+                "no shutdown expected during sub-hot warm-up: {a:?}"
+            );
+        }
+        // The dropped chip 3 now spikes past chip_panic_c; the filtered chip_max
+        // (over the survivors) misses it, but the raw finite max must still fire.
+        let actions = s.tick(&tick(
+            vec![board(0, vec![55.0, 55.0], vec![70.0, 72.0, 74.0, 101.0])],
+            vec![1000],
+            30,
+            5,
+        ));
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                SupervisorAction::RequestBoardPowerOff {
+                    reason: ThermalReason::ChipPanic,
+                    ..
+                }
+            )),
+            "a dropped 'liar' chip sensor at panic level must still fire ChipPanic: {actions:?}"
+        );
+    }
+
+    // -- F-thermal-2: empty board_sensors blackout must not read as cool --
+    #[test]
+    fn empty_board_sensors_blackout_does_not_read_cool() {
+        let cfg = ThermalSupervisorConfig {
+            atm_startup_grace_secs: 0,
+            atm_post_ramp_grace_secs: 0,
+            ..cfg_enabled()
+        };
+        let mut s = ThermalSupervisor::new(cfg);
+        let actions = s.tick(&tick(vec![], vec![1000], 30, 5));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, SupervisorAction::RequestProfileStepUp)),
+            "empty blackout must not step power UP: {actions:?}"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, SupervisorAction::RequestFansMin)),
+            "empty blackout must not emit a cool-verdict fans-min: {actions:?}"
+        );
+    }
+
+    // -- F-thermal-3: min_per_board=0 must still fail closed on all-NaN --
+    #[test]
+    fn min_per_board_zero_still_fails_closed_on_all_nan() {
+        let cfg = ThermalSupervisorConfig {
+            min_per_board: 0,
+            atm_startup_grace_secs: 0,
+            atm_post_ramp_grace_secs: 0,
+            ..cfg_enabled()
+        };
+        let mut s = ThermalSupervisor::new(cfg);
+        let actions = s.tick(&tick(
+            vec![board(0, vec![f32::NAN, f32::NAN], vec![f32::NAN])],
+            vec![1000],
+            30,
+            5,
+        ));
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                SupervisorAction::RequestBoardPowerOff {
+                    reason: ThermalReason::SensorFailure,
+                    ..
+                }
+            )),
+            "all-NaN board with min_per_board=0 must fail closed (SensorFailure): {actions:?}"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, SupervisorAction::RequestProfileStepUp)),
+            "must not step power UP on an all-NaN board: {actions:?}"
+        );
     }
 
     // -- 3. Target band → fans curve --

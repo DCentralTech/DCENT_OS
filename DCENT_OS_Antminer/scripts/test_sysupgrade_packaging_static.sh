@@ -33,6 +33,35 @@ require_pattern() {
     fi
 }
 
+require_exact_line() {
+    file=$1
+    line=$2
+    label=$3
+
+    if grep -Fqx -- "$line" "$file" >/dev/null 2>&1; then
+        pass "$label"
+    else
+        fail "$label: missing exact line '$line' in $file"
+    fi
+}
+
+require_ordered_patterns() {
+    file=$1
+    first=$2
+    second=$3
+    label=$4
+
+    if awk -v first="$first" -v second="$second" '
+        first_line == 0 && index($0, first) { first_line = NR }
+        first_line > 0 && index($0, second) { second_line = NR; exit }
+        END { exit (first_line > 0 && second_line > first_line) ? 0 : 1 }
+    ' "$file"; then
+        pass "$label"
+    else
+        fail "$label: '$first' must precede '$second' in $file"
+    fi
+}
+
 reject_pattern() {
     file=$1
     pattern=$2
@@ -68,6 +97,11 @@ reject_executable_pattern() {
 make_test_sysupgrade_package() {
     pkgdir=$1
     status=$2
+    if [ "$status" = "lab_unsigned" ]; then
+        manifest_profile=dcentos.sysupgrade-unsigned-lab/v1
+    else
+        manifest_profile=dcentos.sysupgrade-authority/v1
+    fi
 
     mkdir -p "$pkgdir"
     printf '\047\005\031\126kernel\n' > "$pkgdir/kernel"
@@ -83,8 +117,12 @@ make_test_sysupgrade_package() {
 
     cat > "$pkgdir/MANIFEST.json" <<EOF
 {
+  "schema": 1,
+  "manifest_profile": "$manifest_profile",
   "product": "DCENT_OS",
   "package_type": "sysupgrade",
+  "installable": true,
+  "artifact_maturity": "experimental",
   "board": "am3-s19k",
   "board_target": "am3-s19k",
   "version": "test",
@@ -123,8 +161,12 @@ make_test_oversized_zynq_package() {
 
     cat > "$pkgdir/MANIFEST.json" <<EOF
 {
+  "schema": 1,
+  "manifest_profile": "dcentos.sysupgrade-unsigned-lab/v1",
   "product": "DCENT_OS",
   "package_type": "sysupgrade",
+  "installable": true,
+  "artifact_maturity": "experimental",
   "board": "$board",
   "board_target": "$board",
   "version": "test",
@@ -188,11 +230,6 @@ signing_policy_selftest() {
             return 1
         fi
         if SUP_DIR="$tmpdir/stage-generated" DCENT_RELEASE_SIGNING_KEY="$tmpdir/generated.key" DCENT_PACKAGE_STATUS=lab_generated_key DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 sh -c '. scripts/lib/sysupgrade_package_common.sh; dcent_stage_release_key' >/dev/null 2>&1; then
-            [ -f "$tmpdir/stage-generated/release_ed25519.pub" ] || {
-                rm -rf "$tmpdir"
-                return 1
-            }
-        else
             rm -rf "$tmpdir"
             return 1
         fi
@@ -214,6 +251,124 @@ zynq_payload_window_selftest() {
         rm -rf "$tmpdir"
         return 1
     fi
+
+    rm -rf "$tmpdir"
+    return 0
+}
+
+run_zynq_target_payload_authority() {
+    authority_target_script=$1
+    authority_fixture_root=$2
+    {
+        sed -n '/^verify_sha256() {/,/^validate_sysupgrade_tar_members() {/p' "$authority_target_script" | sed '$d'
+        cat <<'SELFTEST'
+validate_extracted_package_leaves &&
+validate_manifest_payload_binding kernel kernel "$PACKAGE_KERNEL" &&
+validate_manifest_payload_binding rootfs root "$ROOTFS" &&
+validate_manifest_payload_binding metadata METADATA "$PACKAGE_SUBDIR/METADATA" &&
+validate_manifest_payload_binding verification_key release_ed25519.pub "$PACKAGE_RELEASE_KEY"
+SELFTEST
+    } | PACKAGE_SUBDIR="$authority_fixture_root/sysupgrade-test" \
+        PACKAGE_SUBDIR_NAME=sysupgrade-test \
+        PACKAGE_MANIFEST="$authority_fixture_root/sysupgrade-test/MANIFEST.json" \
+        PACKAGE_KERNEL="$authority_fixture_root/sysupgrade-test/kernel" \
+        ROOTFS="$authority_fixture_root/sysupgrade-test/root" \
+        PACKAGE_RELEASE_KEY="$authority_fixture_root/sysupgrade-test/release_ed25519.pub" \
+        sh
+}
+
+write_zynq_target_authority_manifest() {
+    authority_manifest_dir=$1
+    authority_kernel_path=$2
+    authority_kernel_size_value=$3
+    authority_kernel_sha_value=$4
+    authority_root_size=$(wc -c < "$authority_manifest_dir/root" | tr -d '[:space:]')
+    authority_metadata_size=$(wc -c < "$authority_manifest_dir/METADATA" | tr -d '[:space:]')
+    authority_key_size=$(wc -c < "$authority_manifest_dir/release_ed25519.pub" | tr -d '[:space:]')
+    authority_root_sha=$(sha256sum "$authority_manifest_dir/root" | awk '{print $1}')
+    authority_metadata_sha=$(sha256sum "$authority_manifest_dir/METADATA" | awk '{print $1}')
+    authority_key_sha=$(sha256sum "$authority_manifest_dir/release_ed25519.pub" | awk '{print $1}')
+    cat > "$authority_manifest_dir/MANIFEST.json" <<EOF
+{
+  "payloads": {
+    "kernel": { "path": "$authority_kernel_path", "size": $authority_kernel_size_value, "sha256": "$authority_kernel_sha_value" },
+    "rootfs": { "path": "sysupgrade-test/root", "size": $authority_root_size, "sha256": "$authority_root_sha" },
+    "metadata": { "path": "sysupgrade-test/METADATA", "size": $authority_metadata_size, "sha256": "$authority_metadata_sha" },
+    "verification_key": { "path": "sysupgrade-test/release_ed25519.pub", "size": $authority_key_size, "sha256": "$authority_key_sha" }
+  }
+}
+EOF
+}
+
+zynq_target_payload_authority_selftest() {
+    tmpdir=$(mktemp -d 2>/dev/null || echo "/tmp/dcentos-zynq-authority-selftest.$$")
+    rm -rf "$tmpdir"
+    fixture_dir="$tmpdir/sysupgrade-test"
+    mkdir -p "$fixture_dir"
+    printf 'kernel-bytes' > "$fixture_dir/kernel"
+    printf 'rootfs-bytes' > "$fixture_dir/root"
+    printf 'board=test\n' > "$fixture_dir/METADATA"
+    printf 'test-release-key' > "$fixture_dir/release_ed25519.pub"
+    kernel_size=$(wc -c < "$fixture_dir/kernel" | tr -d '[:space:]')
+    kernel_sha=$(sha256sum "$fixture_dir/kernel" | awk '{print $1}')
+    write_zynq_target_authority_manifest "$fixture_dir" sysupgrade-test/kernel "$kernel_size" "$kernel_sha"
+
+    for target_script in \
+        br2_external_dcentos/board/zynq/rootfs-overlay/usr/sbin/sysupgrade \
+        br2_external_dcentos/board/zynq/am2-s19jpro/rootfs-overlay/usr/sbin/sysupgrade \
+        br2_external_dcentos/board/zynq/am2-s19pro/rootfs-overlay/usr/sbin/sysupgrade \
+        br2_external_dcentos/board/zynq/am2-s17pro/rootfs-overlay/usr/sbin/sysupgrade; do
+        run_zynq_target_payload_authority "$target_script" "$tmpdir" >/dev/null 2>&1 || {
+            rm -rf "$tmpdir"
+            return 1
+        }
+    done
+
+    printf 'unknown' > "$fixture_dir/unknown.bin"
+    if run_zynq_target_payload_authority \
+        br2_external_dcentos/board/zynq/rootfs-overlay/usr/sbin/sysupgrade \
+        "$tmpdir" >/dev/null 2>&1; then
+        rm -rf "$tmpdir"
+        return 1
+    fi
+    rm -f "$fixture_dir/unknown.bin"
+
+    mkdir -p "$fixture_dir/nested"
+    printf 'nested' > "$fixture_dir/nested/payload"
+    if run_zynq_target_payload_authority \
+        br2_external_dcentos/board/zynq/rootfs-overlay/usr/sbin/sysupgrade \
+        "$tmpdir" >/dev/null 2>&1; then
+        rm -rf "$tmpdir"
+        return 1
+    fi
+    rm -rf "$fixture_dir/nested"
+
+    for invalid_case in path string-size zero-size uppercase-sha wrong-sha; do
+        case "$invalid_case" in
+            path)
+                write_zynq_target_authority_manifest "$fixture_dir" sysupgrade-test/root "$kernel_size" "$kernel_sha"
+                ;;
+            string-size)
+                write_zynq_target_authority_manifest "$fixture_dir" sysupgrade-test/kernel '"'"$kernel_size"'"' "$kernel_sha"
+                ;;
+            zero-size)
+                write_zynq_target_authority_manifest "$fixture_dir" sysupgrade-test/kernel 0 "$kernel_sha"
+                ;;
+            uppercase-sha)
+                uppercase_sha=$(printf '%s' "$kernel_sha" | tr 'a-f' 'A-F')
+                write_zynq_target_authority_manifest "$fixture_dir" sysupgrade-test/kernel "$kernel_size" "$uppercase_sha"
+                ;;
+            wrong-sha)
+                write_zynq_target_authority_manifest "$fixture_dir" sysupgrade-test/kernel "$kernel_size" '0000000000000000000000000000000000000000000000000000000000000000'
+                ;;
+        esac
+        if run_zynq_target_payload_authority \
+            br2_external_dcentos/board/zynq/rootfs-overlay/usr/sbin/sysupgrade \
+            "$tmpdir" >/dev/null 2>&1; then
+            rm -rf "$tmpdir"
+            return 1
+        fi
+    done
 
     rm -rf "$tmpdir"
     return 0
@@ -266,57 +421,65 @@ release_image_hardening_coupling_selftest() {
     return 0
 }
 
-# CE-374: functional proof that BOTH NAND backup planners bind the restore
-# proof to the exact unit — a marker-only proof (or a MAC/HWID mismatch, or no
-# --expect-* supplied) must NOT reach plan_ready=1, and only a matched identity
-# emits restore_matched_mac in the JSON. The planners need bash (`local`,
-# pipefail); skip gracefully if bash is unavailable.
-nand_backup_identity_selftest() {
-    command -v bash >/dev/null 2>&1 || return 0
-    nbtmp=$(mktemp -d 2>/dev/null || echo "/tmp/dcentos-nandid-selftest.$$")
-    rm -rf "$nbtmp"
-    mkdir -p "$nbtmp"
-    {
-        echo 'layout_profile_candidate=1'
-        echo '| Node | Size | Erase | Name | Artifact |'
-        echo '| --- | --- | --- | --- | --- |'
-        echo '| /dev/mtd7 | 0x100000 | 0x20000 | firmware1 | mtd7_firmware1.nanddump |'
-    } > "$nbtmp/manifest.md"
-    printf 'restore_verified=1\n' > "$nbtmp/marker.txt"
-    printf 'restore_verified=1\nrestore_mac=aa:bb:cc:dd:ee:ff\nrestore_hwid=HWID123\n' > "$nbtmp/id.txt"
+toolbox_install_contract_selftest() {
+    helper='scripts/lib/sysupgrade_package_common.sh'
 
-    nb_rc=0
-    for plan in scripts/am1_nand_backup_plan.sh scripts/am2_nand_backup_plan.sh; do
-        # (a) marker-only proof -> plan_ready=0 + no "for this exact unit".
-        out=$(bash "$plan" --manifest "$nbtmp/manifest.md" \
-            --restore-artifact-proof "$nbtmp/marker.txt" \
-            --output "$nbtmp/a.md" --json-template "$nbtmp/a.json" 2>/dev/null) || nb_rc=1
-        printf '%s\n' "$out" | grep -q 'plan_ready=0' || nb_rc=1
-        if grep -q 'verified for this exact unit' "$nbtmp/a.md"; then nb_rc=1; fi
+    if ! BOARD_NAME=am1-s9 sh -c \
+        '. "$1"; dcent_require_toolbox_install_contract "$2" "$3"' \
+        sh "$helper" \
+        'dcent install <ip> -f dcentos-sysupgrade-118.tar' \
+        target_sysupgrade >/dev/null 2>&1; then
+        return 1
+    fi
+    if ! BOARD_NAME=am2-s19j sh -c \
+        '. "$1"; dcent_require_toolbox_install_contract "$2" "$3"' \
+        sh "$helper" \
+        'dcent install <ip> -f dcentos-sysupgrade-am2-s19jpro.tar --artifact-dir <restore_verified_dir> --accept-am2-persistent-lab --i-have-recovery' \
+        target_sysupgrade >/dev/null 2>&1; then
+        return 1
+    fi
+    if ! BOARD_NAME=am3-s21 sh -c \
+        '. "$1"; dcent_require_toolbox_install_contract "$2" "$3"' \
+        sh "$helper" \
+        'dcent install <ip> -f dcentos-sysupgrade-am3-s21.tar --artifact-dir <restore_verified_dir>' \
+        host_driven_rootfs_window_lab >/dev/null 2>&1; then
+        return 1
+    fi
 
-        # (b) matching identity + --expect-* -> plan_ready=1 + matched MAC in JSON.
-        out=$(bash "$plan" --manifest "$nbtmp/manifest.md" \
-            --restore-artifact-proof "$nbtmp/id.txt" \
-            --expect-mac 32:30:41:27:F6:AB --expect-hwid HWID123 \
-            --output "$nbtmp/b.md" --json-template "$nbtmp/b.json" 2>/dev/null) || nb_rc=1
-        printf '%s\n' "$out" | grep -q 'plan_ready=1' || nb_rc=1
-        grep -q '"restore_matched_mac": "aa:bb:cc:dd:ee:ff"' "$nbtmp/b.json" || nb_rc=1
-
-        # (c) wrong MAC -> plan_ready=0.
-        out=$(bash "$plan" --manifest "$nbtmp/manifest.md" \
-            --restore-artifact-proof "$nbtmp/id.txt" \
-            --expect-mac de:ad:be:ef:00:00 --expect-hwid HWID123 \
-            --output "$nbtmp/c.md" --json-template "$nbtmp/c.json" 2>/dev/null) || nb_rc=1
-        printf '%s\n' "$out" | grep -q 'plan_ready=0' || nb_rc=1
-
-        # (d) identity in proof but no --expect-* supplied -> plan_ready=0.
-        out=$(bash "$plan" --manifest "$nbtmp/manifest.md" \
-            --restore-artifact-proof "$nbtmp/id.txt" \
-            --output "$nbtmp/d.md" --json-template "$nbtmp/d.json" 2>/dev/null) || nb_rc=1
-        printf '%s\n' "$out" | grep -q 'plan_ready=0' || nb_rc=1
+    for bad_command in \
+        'dcent install <ip> -f dcentos-sysupgrade-am3-s21.tar' \
+        'dcent install <ip> -f dcentos-sysupgrade-am3-s21.tar --artifact-dir <restore_verified_dir> --yes' \
+        'dcent install <ip> -f dcentos-sysupgrade-am3-s21.tar --artifact-dir <restore_verified_dir> --accept-vnish-aml-rootfs-window'
+    do
+        if BOARD_NAME=am3-s21 sh -c \
+            '. "$1"; dcent_require_toolbox_install_contract "$2" "$3"' \
+            sh "$helper" "$bad_command" \
+            host_driven_rootfs_window_lab >/dev/null 2>&1; then
+            return 1
+        fi
     done
-    rm -rf "$nbtmp"
-    return $nb_rc
+
+    for bad_command in \
+        'dcent install <ip> -f dcentos-sysupgrade-am2-s19jpro.tar --accept-am2-persistent-lab --i-have-recovery' \
+        'dcent install <ip> -f dcentos-sysupgrade-am2-s19jpro.tar --artifact-dir <restore_verified_dir> --i-have-recovery' \
+        'dcent install <ip> -f dcentos-sysupgrade-am2-s19jpro.tar --artifact-dir <restore_verified_dir> --accept-am2-persistent-lab'
+    do
+        if BOARD_NAME=am2-s19j sh -c \
+            '. "$1"; dcent_require_toolbox_install_contract "$2" "$3"' \
+            sh "$helper" "$bad_command" target_sysupgrade >/dev/null 2>&1; then
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+# CE-374: exercise AM2's strict plan validator here. AM1's stricter Python
+# evidence suite is wired into the Python safety gate and Zynq integration gate.
+nand_backup_identity_selftest() {
+    python_bin=$(command -v python3 || command -v python || true)
+    [ -n "$python_bin" ] || return 0
+    "$python_bin" scripts/validate_am2_nand_backup_plan.py --self-test >/dev/null
 }
 
 require_no_active_fw_env_lines() {
@@ -358,6 +521,9 @@ VERIFY='scripts/verify_sysupgrade_signature.sh'
 PACKAGE='scripts/package_sysupgrade.sh'
 PRE_FLASH='scripts/pre_flash_validate.sh'
 VERSION_GATE='scripts/lib/dcentrald_version_gate.sh'
+ARCHIVE_ADMISSION='scripts/lib/sysupgrade_archive_admission.sh'
+ZYNQ_GEOMETRY_HELPER='scripts/lib/sysupgrade_zynq_geometry.sh'
+MANIFEST_JSON='scripts/lib/sysupgrade_manifest_json.py'
 AM2_POST_IMAGE='br2_external_dcentos/board/zynq/am2-s19jpro/post-image.sh'
 AM3_S19K_POST_IMAGE='br2_external_dcentos/board/amlogic/am3-s19kpro/post-image.sh'
 AM3_S21_POST_IMAGE='br2_external_dcentos/board/amlogic/am3-s21/post-image.sh'
@@ -377,6 +543,10 @@ S9_SYSUPGRADE='br2_external_dcentos/board/zynq/rootfs-overlay/usr/sbin/sysupgrad
 AM2_SYSUPGRADE='br2_external_dcentos/board/zynq/am2-s19jpro/rootfs-overlay/usr/sbin/sysupgrade'
 AM2_S19PRO_SYSUPGRADE='br2_external_dcentos/board/zynq/am2-s19pro/rootfs-overlay/usr/sbin/sysupgrade'
 AM2_S17PRO_SYSUPGRADE='br2_external_dcentos/board/zynq/am2-s17pro/rootfs-overlay/usr/sbin/sysupgrade'
+S9_POST_BUILD='br2_external_dcentos/board/zynq/post-build.sh'
+AM2_POST_BUILD='br2_external_dcentos/board/zynq/am2-s19jpro/post-build.sh'
+AM2_S19PRO_POST_BUILD='br2_external_dcentos/board/zynq/am2-s19pro/post-build.sh'
+AM2_S17PRO_POST_BUILD='br2_external_dcentos/board/zynq/am2-s17pro/post-build.sh'
 RESTORE_ROUTE='dcentrald/dcentrald-api/src/routes/restore_to_stock.rs'
 CI_BETA_XIL_RELEASE_GATES='scripts/ci_beta_xil_release_gates.sh'
 BETA_XIL_RELEASE_NAMES='scripts/verify_beta_xil_release_names.sh'
@@ -400,6 +570,19 @@ require_pattern "$VERIFY" 'Public key is not a valid PEM public key' 'verifier r
 require_pattern "$VERIFY" 'Package manifest and signature validated' 'verifier uses manifest/signature validated wording'
 reject_pattern "$VERIFY" 'Signature verified:' 'verifier no longer reports signature-only proof'
 
+require_pattern "$ARCHIVE_ADMISSION" 'DCENT_SYSUPGRADE_ARCHIVE_MAX_MEMBERS=32' 'archive admission caps sysupgrade envelopes at 32 members'
+require_pattern "$ARCHIVE_ADMISSION" 'duplicate archive member' 'archive admission rejects duplicate exact members'
+require_pattern "$ARCHIVE_ADMISSION" 'duplicate logical archive member' 'archive admission rejects duplicate logical members'
+require_pattern "$ARCHIVE_ADMISSION" 'expected exactly one canonical %s/ directory member' 'archive admission requires one exact target prefix directory'
+require_pattern "$ARCHIVE_ADMISSION" 'nested or empty member path' 'archive admission rejects nested member paths'
+require_pattern "$ARCHIVE_ADMISSION" 'unsafe type %s for member %s' 'archive admission rejects symlink, hardlink, and special members'
+require_pattern "$ARCHIVE_ADMISSION" 'unknown member leaf' 'archive admission uses an explicit leaf allowlist'
+require_pattern "$ARCHIVE_ADMISSION" 'archive payload is not declared exactly once in MANIFEST.json' 'archive admission rejects unmanifested optional payload leaves'
+require_pattern "$ARCHIVE_ADMISSION" 'fpga_bitstream.bit' 'archive admission preserves the manifest-bound optional FPGA bitstream'
+require_pattern "$ARCHIVE_ADMISSION" "grep -F '\\'" 'archive admission rejects all JSON escape aliases before byte-oriented authority readers'
+require_pattern "$MANIFEST_JSON" 'object_pairs_hook=_unique_object' 'semantic manifest admission rejects decoded duplicate keys at every object depth'
+require_pattern "$MANIFEST_JSON" 'compare-version' 'semantic manifest authority exposes the deterministic version comparator'
+
 require_pattern "$PACKAGE" 'infer_package_version' 'packager infers package version'
 require_pattern "$PACKAGE" 'Package version is required for fail-closed release manifests' 'packager fails closed if version cannot be set'
 require_pattern "$PACKAGE" '"version": "$PACKAGE_VERSION"' 'packager writes a non-null manifest version'
@@ -408,13 +591,20 @@ require_pattern "$PRE_FLASH" 'AM3 kernel/root uImage magic valid' 'package-only 
 require_pattern "$PRE_FLASH" 'AM3 root payload fits am3 rootfs window' 'package-only validator keeps AM3 rootfs window gate'
 require_pattern "$PRE_FLASH" 'squashfs-style root payload magic valid' 'package-only validator has squashfs-style board profile'
 require_pattern "$PRE_FLASH" 'AM3 uImage/rootfs-window checks skipped for squashfs-style' 'package-only validator does not label S9/am2 packages as AM3 uImage'
-require_pattern "$PRE_FLASH" 'AM1_S9_ROOTFS_MAX_BYTES=$((134 * ZYNQ_UBI_LEB_SIZE_BYTES))' 'package-only validator pins S9 rootfs byte window'
-require_pattern "$PRE_FLASH" 'AM2_ZYNQ_KERNEL_MAX_BYTES=$(((23 + 4) * ZYNQ_UBI_LEB_SIZE_BYTES))' 'package-only validator pins AM2 kernel byte window with runtime tolerance'
+require_pattern "$PRE_FLASH" 'sysupgrade_zynq_geometry.sh' 'package-only validator sources canonical real-target Zynq geometry'
+require_pattern "$ZYNQ_GEOMETRY_HELPER" 'ZYNQ_UBI_LEB_SIZE_BYTES=126976' 'canonical geometry pins captured Xilinx UBI LEB bytes'
+require_pattern "$ZYNQ_GEOMETRY_HELPER" 'AM2_ZYNQ_KERNEL_PACKAGE_LEBS=23' 'canonical geometry separates package fit from runtime layout tolerance'
+require_pattern "$ZYNQ_GEOMETRY_HELPER" 'AM2_ZYNQ_ROOTFS_PACKAGE_LEBS=179' 'canonical geometry pins the live AM2 rootfs window'
+require_pattern "$ZYNQ_GEOMETRY_HELPER" 'AM2_ZYNQ_KERNEL_TAR_BOUND_BYTES=' 'canonical geometry exposes a separate pre-extraction bound'
 require_pattern "$PRE_FLASH" 'assert_payload_fits_window "$board kernel" "$kernel_size" "$ZYNQ_KERNEL_MAX_BYTES" "zynq kernel window"' 'package-only validator rejects oversized Zynq kernels'
 require_pattern "$PRE_FLASH" 'assert_payload_fits_window "$board root" "$root_size" "$ZYNQ_ROOTFS_MAX_BYTES" "zynq rootfs window"' 'package-only validator rejects oversized Zynq rootfs payloads'
-require_pattern "$PRE_FLASH" 'am1-s9|am2-s19j|am2-s19jpro|am2-s17p)' 'package-only validator covers am2-s17p runtime-only tarballs'
+require_pattern "$PRE_FLASH" 'am1-s9|am2-s19j|am2-s19jpro|am2-s19pro|am2-s17p)' 'package-only validator covers all admitted Zynq board identities'
 require_pattern "$PRE_FLASH" 'validate_package_only "$TARBALL" "am1-s9"' 'am1-s9 live pre-flash validates the package before declaring backup-floor success (CE-352)'
-require_pattern "$BUILD_DOCKER" 'am3-s19kpro|am3-s21|am3-s19jpro-aml|am3-t21|am2-s19jpro|am2-s17pro)' 'build_in_docker package-validates am2-s17pro tarballs when present'
+require_pattern "$BUILD_DOCKER" 'am3-s19kpro|am3-s21|am3-s21pro|am3-s21xp|am3-s19jpro-aml|am3-t21|am2-s19jpro|am2-s19pro|am2-s17pro)' 'build_in_docker package-validates every Amlogic and AM2 tarball lane when present'
+require_pattern "$SYSUPGRADE_COMMON" 'dcent_require_toolbox_install_contract "$install_command" "$install_mode"' 'manifest writer validates its operator install command'
+require_pattern "$SYSUPGRADE_COMMON" 'must preserve interactive confirmation' 'package metadata never pre-acknowledges --yes'
+require_pattern "$SYSUPGRADE_COMMON" 'must not pre-acknowledge the VNish-source safety gate' 'generic Amlogic package metadata does not pre-acknowledge a source-specific route'
+require_pattern "$BUILD_DOCKER" '--artifact-dir <restore_verified_dir> --plan' 'Amlogic build handoff supplies the restore-verified artifact directory'
 require_pattern "$S9_SYSUPGRADE" 'payload_fits_ubi_volume' 'S9 sysupgrade validates payload byte fit before UBI writes'
 require_pattern "$AM2_SYSUPGRADE" 'payload_fits_ubi_volume' 'am2-s19j sysupgrade validates payload byte fit before UBI writes'
 require_pattern "$AM2_S19PRO_SYSUPGRADE" 'payload_fits_ubi_volume' 'am2-s19pro sysupgrade validates payload byte fit before UBI writes'
@@ -432,6 +622,38 @@ require_pattern "$AM2_SYSUPGRADE" 'Refusing before ubiupdatevol' 'am2-s19j sysup
 require_pattern "$AM2_S19PRO_SYSUPGRADE" 'Refusing before ubiupdatevol' 'am2-s19pro sysupgrade names the pre-write oversized-payload refusal'
 require_pattern "$AM2_S17PRO_SYSUPGRADE" 'Refusing before ubiupdatevol' 'am2-s17p sysupgrade names the pre-write oversized-payload refusal'
 for zynq_sysupgrade in "$S9_SYSUPGRADE" "$AM2_SYSUPGRADE" "$AM2_S19PRO_SYSUPGRADE" "$AM2_S17PRO_SYSUPGRADE"; do
+    require_exact_line "$zynq_sysupgrade" 'manifest_key_count() {' "Zynq sysupgrade $(basename "$zynq_sysupgrade") defines the manifest cardinality helper under its callable name"
+    require_pattern "$zynq_sysupgrade" 'dcentos.sysupgrade-authority/v1' "Zynq sysupgrade $(basename "$zynq_sysupgrade") requires the versioned mutation-authority profile"
+    require_pattern "$zynq_sysupgrade" 'dcentos.sysupgrade-unsigned-lab/v1)' "Zynq sysupgrade $(basename "$zynq_sysupgrade") recognizes the explicit unsigned lab profile"
+    require_pattern "$zynq_sysupgrade" 'Package authority-v1 forbids status=lab_unsigned' "Zynq sysupgrade $(basename "$zynq_sysupgrade") rejects the signed/unsigned status contradiction"
+    require_pattern "$zynq_sysupgrade" "exactly one 'status' authority field" "Zynq sysupgrade $(basename "$zynq_sysupgrade") requires one unambiguous status claim"
+    require_pattern "$zynq_sysupgrade" 'status must not contain surrounding whitespace' "Zynq sysupgrade $(basename "$zynq_sysupgrade") rejects whitespace-padded status"
+    require_pattern "$zynq_sysupgrade" 'version must not contain surrounding whitespace' "Zynq sysupgrade $(basename "$zynq_sysupgrade") rejects whitespace-padded version"
+    require_pattern "$zynq_sysupgrade" 'Package unsigned-lab/v1 requires exactly one status=lab_unsigned field' "Zynq sysupgrade $(basename "$zynq_sysupgrade") pins exact unsigned lab status"
+    require_pattern "$zynq_sysupgrade" 'Package unsigned-lab/v1 forbids MANIFEST.sig' "Zynq sysupgrade $(basename "$zynq_sysupgrade") rejects signatures in the unsigned lab profile"
+    require_pattern "$zynq_sysupgrade" 'Package unsigned-lab/v1 forbids release_ed25519.pub' "Zynq sysupgrade $(basename "$zynq_sysupgrade") rejects release keys in the unsigned lab profile"
+    require_pattern "$zynq_sysupgrade" 'Package unsigned-lab/v1 forbids a verification_key payload' "Zynq sysupgrade $(basename "$zynq_sysupgrade") rejects verification authority in the unsigned lab profile"
+    require_pattern "$zynq_sysupgrade" 'for payload_key in kernel rootfs metadata' "Zynq sysupgrade $(basename "$zynq_sysupgrade") bounds named payload duplicates"
+    require_pattern "$zynq_sysupgrade" 'validate_extracted_package_leaves || exit 1' "Zynq sysupgrade $(basename "$zynq_sysupgrade") revalidates the extracted flat leaf envelope"
+    require_pattern "$zynq_sysupgrade" 'Extracted package contains nested payload entry' "Zynq sysupgrade $(basename "$zynq_sysupgrade") rejects post-extraction nested entries"
+    require_pattern "$zynq_sysupgrade" 'Extracted package contains unknown payload leaf' "Zynq sysupgrade $(basename "$zynq_sysupgrade") rejects post-extraction unknown leaves"
+    require_pattern "$zynq_sysupgrade" "for _payload_field in path size sha256" "Zynq sysupgrade $(basename "$zynq_sysupgrade") requires one complete payload declaration tuple"
+    require_pattern "$zynq_sysupgrade" "payload path must be exactly" "Zynq sysupgrade $(basename "$zynq_sysupgrade") binds payload kinds to canonical paths"
+    require_pattern "$zynq_sysupgrade" 'payload size must be a positive JSON integer' "Zynq sysupgrade $(basename "$zynq_sysupgrade") requires typed positive payload sizes"
+    require_pattern "$zynq_sysupgrade" 'payload size does not match signed manifest' "Zynq sysupgrade $(basename "$zynq_sysupgrade") binds signed payload sizes to regular files"
+    require_pattern "$zynq_sysupgrade" 'sha256 must be exactly 64 lowercase hexadecimal characters' "Zynq sysupgrade $(basename "$zynq_sysupgrade") requires canonical signed payload digests"
+    require_pattern "$zynq_sysupgrade" 'payload bytes do not match signed sha256' "Zynq sysupgrade $(basename "$zynq_sysupgrade") hashes the actual extracted payload bytes"
+    require_pattern "$zynq_sysupgrade" 'contains fpga_bitstream.bit without exactly one signed bitstream declaration' "Zynq sysupgrade $(basename "$zynq_sysupgrade") rejects an undeclared optional FPGA payload"
+    require_pattern "$zynq_sysupgrade" 'manifest declares bitstream but fpga_bitstream.bit is absent' "Zynq sysupgrade $(basename "$zynq_sysupgrade") rejects an absent declared FPGA payload"
+    require_pattern "$zynq_sysupgrade" 'validate_manifest_payload_binding verification_key release_ed25519.pub' "Zynq sysupgrade $(basename "$zynq_sysupgrade") binds the signed verification key payload"
+    require_pattern "$zynq_sysupgrade" 'validate_manifest_payload_binding bitstream fpga_bitstream.bit' "Zynq sysupgrade $(basename "$zynq_sysupgrade") binds the optional FPGA payload when declared"
+    require_pattern "$zynq_sysupgrade" 'manifest_boolean_field "$PACKAGE_MANIFEST" installable' "Zynq sysupgrade $(basename "$zynq_sysupgrade") distinguishes JSON boolean installability from strings"
+    require_pattern "$zynq_sysupgrade" 'Package manifest must explicitly declare installable=true' "Zynq sysupgrade $(basename "$zynq_sysupgrade") requires signed install authorization"
+    require_pattern "$zynq_sysupgrade" 'Package manifest artifact_maturity must match this target' "Zynq sysupgrade $(basename "$zynq_sysupgrade") requires policy-aligned artifact maturity"
+    require_pattern "$zynq_sysupgrade" 'Package manifest board and board_target must be present and identical' "Zynq sysupgrade $(basename "$zynq_sysupgrade") binds signed target aliases"
+    require_pattern "$zynq_sysupgrade" 'does not match signed target' "Zynq sysupgrade $(basename "$zynq_sysupgrade") binds package directory to signed target"
+    require_pattern "$zynq_sysupgrade" 'for unsupported_chain_key in ota_intermediate_cert ota_revoked_intermediates' "Zynq sysupgrade $(basename "$zynq_sysupgrade") restricts authority-v1 to direct release-root signatures"
+    require_pattern "$zynq_sysupgrade" 'certificate validity has no trusted-time authority on Zynq' "Zynq sysupgrade $(basename "$zynq_sysupgrade") does not trust an unauthenticated recovery clock"
     require_pattern "$zynq_sysupgrade" 'enforce_sysupgrade_version_floor || exit 1' "Zynq sysupgrade $(basename "$zynq_sysupgrade") enforces downgrade floor before payload writes"
     require_pattern "$zynq_sysupgrade" 'DCENT_SYSUPGRADE_VERSION_PATH' "Zynq sysupgrade $(basename "$zynq_sysupgrade") exposes offline version-file seam"
     require_pattern "$zynq_sysupgrade" 'DCENT_ALLOW_DOWNGRADE' "Zynq sysupgrade $(basename "$zynq_sysupgrade") requires explicit downgrade override"
@@ -440,6 +662,22 @@ for zynq_sysupgrade in "$S9_SYSUPGRADE" "$AM2_SYSUPGRADE" "$AM2_S19PRO_SYSUPGRAD
     require_pattern "$zynq_sysupgrade" 'command -v jsonfilter' "Zynq sysupgrade $(basename "$zynq_sysupgrade") prefers jsonfilter for manifest parsing"
     require_pattern "$zynq_sysupgrade" 'command -v python3' "Zynq sysupgrade $(basename "$zynq_sysupgrade") checks python3 before manifest parsing"
     require_pattern "$zynq_sysupgrade" 'Error: manifest_field needs jsonfilter or python3' "Zynq sysupgrade $(basename "$zynq_sysupgrade") fails clearly when manifest parser is unavailable"
+    require_pattern "$zynq_sysupgrade" 'ARCHIVE_ADMISSION_HELPER="/usr/libexec/dcentos/sysupgrade-archive-admission.sh"' "Zynq sysupgrade $(basename "$zynq_sysupgrade") binds the installed archive-admission helper"
+    require_pattern "$zynq_sysupgrade" 'MANIFEST_JSON_HELPER="/usr/libexec/dcentos/sysupgrade-manifest-json.py"' "Zynq sysupgrade $(basename "$zynq_sysupgrade") binds semantic manifest/version admission"
+    require_pattern "$zynq_sysupgrade" '. "$ARCHIVE_ADMISSION_HELPER"' "Zynq sysupgrade $(basename "$zynq_sysupgrade") sources canonical archive admission"
+    require_pattern "$zynq_sysupgrade" 'python3 "$MANIFEST_JSON_HELPER" validate "$PACKAGE_MANIFEST"' "Zynq sysupgrade $(basename "$zynq_sysupgrade") semantically admits JSON before authority reads"
+    require_pattern "$zynq_sysupgrade" 'python3 "$MANIFEST_JSON_HELPER" compare-version "$1" "$2"' "Zynq sysupgrade $(basename "$zynq_sysupgrade") compares versions without awk numeric coercion"
+    require_pattern "$zynq_sysupgrade" 'python3 "$MANIFEST_JSON_HELPER" read-version-file "$VERSION_PATH"' "Zynq sysupgrade $(basename "$zynq_sysupgrade") requires one canonical current-version line"
+    require_pattern "$zynq_sysupgrade" '"${DCENT_SYSUPGRADE_WORKSPACE:-${TMPDIR:-/tmp}}"' "Zynq sysupgrade $(basename "$zynq_sysupgrade") admits the exact board archive with transaction-private scratch when available and a standalone target fallback"
+    require_ordered_patterns "$zynq_sysupgrade" \
+        'validate_sysupgrade_tar_preextract "$ROOTFS"' \
+        'validate_sysupgrade_tar_members "$ROOTFS"' \
+        "Zynq sysupgrade $(basename "$zynq_sysupgrade") bounds then admits the archive before extraction"
+done
+for zynq_post_build in "$S9_POST_BUILD" "$AM2_POST_BUILD" "$AM2_S19PRO_POST_BUILD" "$AM2_S17PRO_POST_BUILD"; do
+    require_pattern "$zynq_post_build" 'scripts/lib/sysupgrade_archive_admission.sh' "Zynq post-build $(basename "$(dirname "$zynq_post_build")") installs the canonical archive-admission source"
+    require_pattern "$zynq_post_build" 'sysupgrade-archive-admission.sh' "Zynq post-build $(basename "$(dirname "$zynq_post_build")") stages the target helper path"
+    require_pattern "$zynq_post_build" 'sysupgrade-manifest-json.py' "Zynq post-build $(basename "$(dirname "$zynq_post_build")") installs semantic manifest/version admission"
 done
 require_pattern "$BUILD_DOCKER" 'release/verified builds fail closed on missing or mismatched toolchain' 'docker release builds document mandatory toolchain SHA gate'
 require_pattern "$BUILD_DOCKER" 'ERROR (DEVOPS-002): no expected SHA256 pinned' 'docker release build fails closed when no toolchain SHA is pinned'
@@ -495,8 +733,10 @@ reject_pattern "$BUILD_DOCKER" 'DCENT_ALLOW_UNSIGNED_SYSUPGRADE="${DCENT_ALLOW_U
 reject_pattern "$BUILD_DOCKER" '-e DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1' 'docker build does not hardcode unsigned lab override into container'
 require_pattern "$BUILD_WSL" 'release sysupgrade packaging requires DCENT_RELEASE_SIGNING_KEY' 'WSL build fails closed for unsigned release sysupgrade builds'
 reject_pattern "$BUILD_WSL" 'export DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1' 'WSL build does not auto-enable unsigned lab override'
-require_pattern "$BUILD_AMLOGIC_NATIVE" '--lab-unsigned' 'amlogic native build accepts explicit lab unsigned flag'
-reject_pattern "$BUILD_AMLOGIC_NATIVE" 'DCENT_ALLOW_UNSIGNED_SYSUPGRADE="${DCENT_ALLOW_UNSIGNED_SYSUPGRADE:-1}"' 'amlogic native build does not default to unsigned lab override'
+require_pattern "$BUILD_AMLOGIC_NATIVE" '--lab-unsigned' 'amlogic native extractor accepts explicit lab unsigned validation'
+require_pattern "$BUILD_AMLOGIC_NATIVE" 'expected existing tarball missing' 'amlogic native extractor requires an existing package'
+require_pattern "$BUILD_AMLOGIC_NATIVE" 'does not invoke the disabled non-S9 packaging lane' 'amlogic native extractor does not claim build authority'
+reject_pattern "$BUILD_AMLOGIC_NATIVE" 'DCENT_ALLOW_UNSIGNED_SYSUPGRADE="${DCENT_ALLOW_UNSIGNED_SYSUPGRADE:-1}"' 'amlogic native extractor does not default to unsigned lab override'
 require_pattern 'br2_external_dcentos/board/zynq/post-build.sh' 'dcent_require_dcentrald_version_match' 'S9 post-build gates staged dcentrald version'
 require_pattern 'br2_external_dcentos/board/zynq/am2-s19jpro/post-build.sh' 'dcent_require_dcentrald_version_match' 'am2 post-build gates staged dcentrald version'
 require_pattern 'br2_external_dcentos/board/zynq/am2-s19jpro/post-build.sh' 'revert_to_stock_s19_am2.sh' 'am2 post-build ships profile revert helper'
@@ -515,8 +755,8 @@ require_pattern "$AM3_S21_POST_IMAGE" 'dcent_write_sysupgrade_manifest' 'am3-s21
 require_pattern "$SYSUPGRADE_COMMON" 'dcent_stage_release_key' 'shared manifest helper stages release key'
 require_pattern "$SYSUPGRADE_COMMON" 'dcent_sign_sysupgrade_manifest' 'shared manifest helper signs and verifies manifest'
 require_pattern "$SYSUPGRADE_COMMON" 'production release package requires trusted release keys/signatures' 'shared signing helper fails closed for production release mode'
-require_pattern "$SYSUPGRADE_COMMON" 'self-derived generated-key package' 'shared signing helper labels generated-key flow lab-only'
-require_pattern "$PACKAGE" 'Production release signing requires --verify-pubkey or DCENT_RELEASE_PUBKEY_FILE' 'standalone packager requires trusted public key for production signing'
+require_pattern "$SYSUPGRADE_COMMON" 'package must never derive its trust root from the signing key' 'shared signing helper forbids self-derived generated-key trust'
+require_pattern "$PACKAGE" 'Release-root signing requires --verify-pubkey or DCENT_RELEASE_PUBKEY_FILE' 'standalone packager requires trusted public key for release-root signing'
 require_pattern "$PACKAGE" 'unsigned package generation' 'standalone packager gates unsigned package generation'
 require_pattern "$AM3_S19K_POST_IMAGE" 'DCENT_TARGET_SIDE_SYSUPGRADE=false' 'am3-s19k metadata disables target-side sysupgrade'
 require_pattern "$AM3_S21_POST_IMAGE" 'DCENT_TARGET_SIDE_SYSUPGRADE=false' 'am3-s21 metadata disables target-side sysupgrade'
@@ -526,7 +766,9 @@ require_pattern "$AM3_GEOMETRY" 'DCENT_AM3_ROOTFS_OFFSET_HEX="${DCENT_AM3_ROOTFS
 require_pattern "$AM3_GEOMETRY" 'DCENT_AM3_ROOTFS_WINDOW_HEX="${DCENT_AM3_ROOTFS_WINDOW_HEX:-0x02800000}"' 'am3 geometry centralizes rootfs window'
 require_pattern "$AM3_S21_REVERT" 'ROOTFS_OFFSET="$DCENT_AM3_ROOTFS_OFFSET_HEX"' 'am3-s21 revert uses shared rootfs offset'
 require_pattern "$RESTORE_ROUTE" '.arg(&post_dwell_fp.sha256)' 'restore route passes post-dwell SHA into revert helper'
-for revert_script in "$S9_REVERT" "$S17_REVERT" "$S19_AM2_REVERT" "$AM3_S19K_REVERT" "$AM3_S21_REVERT"; do
+require_pattern "$S9_REVERT" 'S9 stock restore is disabled' 'S9 stock restore is an explicit containment boundary'
+reject_executable_pattern "$S9_REVERT" 'EXPECTED_SHA256=' 'contained S9 helper does not inspect an image'
+for revert_script in "$S17_REVERT" "$AM3_S19K_REVERT" "$AM3_S21_REVERT"; do
     require_pattern "$revert_script" 'EXPECTED_SHA256=' "stock revert helper $(basename "$revert_script") accepts expected SHA"
     require_pattern "$revert_script" 'Firmware SHA-256 verified at extraction time.' "stock revert helper $(basename "$revert_script") verifies SHA before extract"
     require_pattern "$revert_script" 'MAX_EXTRACTED_KB' "stock revert helper $(basename "$revert_script") caps extracted size"
@@ -594,14 +836,17 @@ BB_MGMT_CFG='br2_external_dcentos/board/beaglebone/am3-bb-s19jpro/rootfs-overlay
 BB_S19JPRO_POSTBUILD='br2_external_dcentos/board/beaglebone/am3-bb-s19jpro/post-build.sh'
 
 require_pattern "$BB_S82" 'AM3_BB_COLDBOOT_PROOF_MARKER="/data/dcentos/am3-bb-coldboot-proven"' 'am3-bb-s19jpro S82dcentrald defines the cold-boot proof marker'
-require_pattern "$BB_S82" 'if [ -f "$AM3_BB_COLDBOOT_PROOF_MARKER" ]; then' 'am3-bb-s19jpro S82dcentrald gates mining start on the proof marker'
+require_pattern "$BB_S82" '[ -e "$AM3_BB_COLDBOOT_PROOF_MARKER" ] && AM3_BB_MINING_REQUESTED=1' 'am3-bb-s19jpro S82dcentrald snapshots the proof marker before safety admission'
+require_pattern "$BB_S82" 'if [ "$AM3_BB_MINING_REQUESTED" -eq 1 ]; then' 'am3-bb-s19jpro S82dcentrald gates mining start on the immutable posture snapshot'
 require_pattern "$BB_S82" 'MANAGEMENT-ONLY until cold-boot proof' 'am3-bb-s19jpro S82dcentrald logs management-only posture when unproven'
 require_pattern "$BB_S82" 'AM3_BB_MGMT_ONLY_CONFIG="/etc/dcentrald.management-only.toml"' 'am3-bb-s19jpro S82dcentrald points at the management-only config'
-# The ONLY --am3-bb-mining invocation must be inside the marker-present branch.
+# The ONLY --am3-bb-mining invocation must be inside the snapshotted
+# marker-present branch; a marker appearing during safe-off cannot upgrade the
+# current invocation from management-only into mining.
 # There must be exactly one --am3-bb-mining ARGS assignment and it must follow
 # the marker test. Assert the marker test precedes the --am3-bb-mining ARGS.
 if awk '
-    /if \[ -f "\$AM3_BB_COLDBOOT_PROOF_MARKER" \]; then/ { seen_marker = 1 }
+    /if \[ "\$AM3_BB_MINING_REQUESTED" -eq 1 \]; then/ { seen_marker = 1 }
     /ARGS="--am3-bb-mining \$ARGS"/ { if (!seen_marker) { bad = 1 } }
     END { exit (bad ? 1 : 0) }
 ' "$BB_S82"; then
@@ -620,11 +865,11 @@ require_pattern "$BB_S19JPRO_POSTBUILD" '/etc/dcentrald.management-only.toml mis
 reject_pattern "$AM3_BB_REVERT" 'flash_erase' 'am3-bb NAND revert script contains no erase path'
 reject_pattern "$AM3_BB_REVERT" 'nandwrite' 'am3-bb NAND revert script contains no write path'
 reject_pattern "$AM3_BB_REVERT" 'fw_setenv' 'am3-bb NAND revert script contains no env write path'
-require_pattern "$S9_SYSUPGRADE" 'PACKAGE_STATUS=$(manifest_field "$PACKAGE_MANIFEST" status' 'S9 target sysupgrade reads manifest package status'
-require_pattern "$S9_SYSUPGRADE" 'unsigned release package is not allowed' 'S9 target sysupgrade rejects unsigned release packages even with lab override'
+require_pattern "$S9_SYSUPGRADE" 'PACKAGE_STATUS=$(manifest_string_field "$PACKAGE_MANIFEST" status' 'S9 target sysupgrade reads typed manifest package status'
+require_pattern "$S9_SYSUPGRADE" 'Package authority-v1 is missing MANIFEST.sig' 'S9 target sysupgrade rejects unsigned authority packages even with lab override'
 require_pattern "$S9_SYSUPGRADE" 'DCENT_PACKAGE_STATUS to be a non-release lab value' 'S9 target raw lab sysupgrade requires non-release status'
-require_pattern "$AM2_SYSUPGRADE" 'PACKAGE_STATUS=$(manifest_field "$PACKAGE_MANIFEST" status' 'am2 target sysupgrade reads manifest package status'
-require_pattern "$AM2_SYSUPGRADE" 'unsigned release package is not allowed' 'am2 target sysupgrade rejects unsigned release packages even with lab override'
+require_pattern "$AM2_SYSUPGRADE" 'PACKAGE_STATUS=$(manifest_string_field "$PACKAGE_MANIFEST" status' 'am2 target sysupgrade reads typed manifest package status'
+require_pattern "$AM2_SYSUPGRADE" 'Package authority-v1 is missing MANIFEST.sig' 'am2 target sysupgrade rejects unsigned authority packages even with lab override'
 require_pattern "$AM2_SYSUPGRADE" 'DCENT_PACKAGE_STATUS to be a non-release lab value' 'am2 target raw lab sysupgrade requires non-release status'
 require_pattern "$AM2_SYSUPGRADE" 'DCENT_ALLOW_AM2_S19J_AMBIGUOUS_BOS_PLATFORM' 'am2-s19j sysupgrade requires guided override for ambiguous generic AM2 platform'
 require_pattern "$AM2_SYSUPGRADE" 'ambiguous AM2 platform marker' 'am2-s19j sysupgrade explains zynq-bm3-am2 ambiguity'
@@ -656,8 +901,8 @@ for am2_sup in "$AM2_SYSUPGRADE" "$AM2_S19PRO_SYSUPGRADE" "$AM2_S17PRO_SYSUPGRAD
     reject_executable_pattern "$am2_sup" 'switch_firmware.py' "am2 sysupgrade [$am2_name] does not invoke the raw-env switch_firmware.py helper"
 done
 
-require_pattern "$AM2_S19PRO_SYSUPGRADE" 'PACKAGE_STATUS=$(manifest_field "$PACKAGE_MANIFEST" status' 'am2-s19pro sysupgrade reads manifest package status'
-require_pattern "$AM2_S17PRO_SYSUPGRADE" 'PACKAGE_STATUS=$(manifest_field "$PACKAGE_MANIFEST" status' 'am2-s17pro sysupgrade reads manifest package status'
+require_pattern "$AM2_S19PRO_SYSUPGRADE" 'PACKAGE_STATUS=$(manifest_string_field "$PACKAGE_MANIFEST" status' 'am2-s19pro sysupgrade reads typed manifest package status'
+require_pattern "$AM2_S17PRO_SYSUPGRADE" 'PACKAGE_STATUS=$(manifest_string_field "$PACKAGE_MANIFEST" status' 'am2-s17pro sysupgrade reads typed manifest package status'
 require_pattern "$AM2_S19PRO_SYSUPGRADE" 'DCENT_ALLOW_AM2_S19PRO_AMBIGUOUS_BOS_PLATFORM' 'am2-s19pro sysupgrade requires explicit lab override for ambiguous generic AM2 platform'
 require_pattern "$AM2_S19PRO_SYSUPGRADE" 'ambiguous AM2 platform marker' 'am2-s19pro sysupgrade explains zynq-bm3-am2 ambiguity'
 require_pattern "$AM2_S19PRO_SYSUPGRADE" 'Wrong AM2 image = brick' 'am2-s19pro sysupgrade treats ambiguous first-flash as a brick guard'
@@ -724,18 +969,14 @@ case "$s9_ovl_line" in
 esac
 # --- end base-sysupgrade am1-only overlay-precedence coverage ----------------
 
-# --- Legacy sd_nand_install.sh: raw mtd4 fallback is am1/S9-ONLY (am2-fenced) -
-# RE WARNING (2026-05-21): scripts/sd_nand_install.sh retains a raw
-# nanddump/flash_erase/nandwrite /dev/mtd4 fallback when fw_setenv is absent.
-# It is am1/S9-ONLY: the script HARD-REFUSES (die) any aarch64 / s17 / s19 /
-# s21 / am2 board family at its top before any NAND detection, so the raw
-# fallback can never execute on an AM2 weak-ECC pl35x-nand env partition. Pin
-# both the early refusal AND that the helper prefers fw_setenv first.
+# --- Legacy SD-to-NAND compatibility path has no mutation authority ---------
 SD_NAND_INSTALL='scripts/sd_nand_install.sh'
-require_pattern "$SD_NAND_INSTALL" 'validated only for S9/AM1. Refusing this board family' 'sd_nand_install refuses non-S9/AM1 (am2/aarch64/s17/s19/s21) board families'
-require_pattern "$SD_NAND_INSTALL" 'am2*' 'sd_nand_install board-family refusal case matches am2'
-require_pattern "$SD_NAND_INSTALL" 'fw_setenv firmware' 'sd_nand_install prefers fw_setenv for the env flip'
-# --- end sd_nand_install am1-only coverage -----------------------------------
+require_pattern "$SD_NAND_INSTALL" 'NOT IMPLEMENTED (mutation denied)' 'sd_nand_install declares its zero-mutation compatibility boundary'
+require_pattern "$SD_NAND_INSTALL" 'exit 78' 'sd_nand_install refuses legacy mutation-shaped calls with EX_CONFIG'
+for forbidden_writer in fw_setenv fw_printenv flash_erase nandwrite nanddump ubiattach ubiformat ubiupdatevol; do
+    reject_executable_pattern "$SD_NAND_INSTALL" "$forbidden_writer" "sd_nand_install excludes writer: $forbidden_writer"
+done
+# --- end legacy SD-to-NAND containment --------------------------------------
 require_pattern "$AM3_S19K_POST_IMAGE" 'rootfs uImage exceeds Amlogic rootfs window' 'am3-s19k post-image fails if rootfs exceeds rootfs window'
 require_pattern "$AM3_S21_POST_IMAGE" 'rootfs uImage exceeds Amlogic rootfs window' 'am3-s21 post-image fails if rootfs exceeds rootfs window'
 reject_pattern "$AM2_POST_IMAGE" '"version": null' 'am2 post-image does not emit null manifest version'
@@ -827,53 +1068,31 @@ require_pattern "$ZYNQ_FW_ENV" '/dev/mtd4   0x00000   0x20000   0x20000   1' 'zy
 require_pattern "$ZYNQ_FW_ENV" '/dev/mtd4   0x20000   0x20000   0x20000   1' 'zynq fw_env.config copy B geometry (CRC-verified)'
 # --- end zynq upgrade_stage-clear reliability coverage -----------------------
 
-# --- CV1835 eMMC signed-sysupgrade + pre-extraction validation (CE-091/287) --
-# The CV1835 eMMC safe-sysupgrade consumer was the outlier: it extracted the
-# untrusted tar with ZERO pre-extraction validation, accepted any inner dir, and
-# did no signature verify (only SHA sidecars inside the same attacker-controlled
-# tar). These static pins mirror how this file already regression-pins the
-# zynq/am2 consumers. NOTE: a full functional dry-run of safe_sysupgrade_cv_emmc.sh
-# is not reachable host-side — it hard-gates on /etc/dcentos/board_target (and
-# DCENT_CV1835_EMMC_PROVEN) with no offline seam, so the member-traversal-reject
-# and unsigned-release-reject paths are pinned statically here + by the
-# line-number ORDERING check in scripts/ci_offline_gates.sh's
-# cv1835_emmc_signed_sysupgrade_check.
+# --- CV1835 brick-vector retirement -----------------------------------------
+# Held FIP/U-Boot evidence disproves the old persistent-environment premise.
+# No artifact producer is admitted until exact-toolchain and final-rootfs
+# containment closure are proven. Every historical build/update entry point
+# must therefore remain an unconditional refusal.
 CV1835_SAFE_SU='scripts/safe_sysupgrade_cv_emmc.sh'
+CV1835_REVERT='scripts/revert_to_stock_cv1835.sh'
+CV1835_BUILD='scripts/build_cv1835_s19jpro.sh'
 CV1835_POST_IMAGE='br2_external_dcentos/board/cvitek/cv1835-s19jpro/post-image.sh'
 CV1835_POST_BUILD='br2_external_dcentos/board/cvitek/cv1835-s19jpro/post-build.sh'
-OTA_SIGNATURE_RS='dcentrald/dcentrald-api/src/ota_signature.rs'
+CV1835_FW_ENV='br2_external_dcentos/board/cvitek/cv1835-s19jpro/rootfs-overlay/etc/fw_env.config'
 
-# Pre-extraction validation (member traversal/type + package-size ceiling).
-require_pattern "$CV1835_SAFE_SU" 'validate_sysupgrade_tar_members "$UPGRADE_TAR"' 'cv1835 safe-sysupgrade validates tar members before extraction'
-require_pattern "$CV1835_SAFE_SU" 'validate_sysupgrade_tar_preextract "$UPGRADE_TAR"' 'cv1835 safe-sysupgrade bounds package size/free-space before extraction'
-require_pattern "$CV1835_SAFE_SU" 'Refusing before tar extraction' 'cv1835 safe-sysupgrade reports pre-extraction package refusal'
-require_pattern "$CV1835_SAFE_SU" 'unsafe tar member path' 'cv1835 safe-sysupgrade rejects absolute/.. traversal tar member paths'
-require_pattern "$CV1835_SAFE_SU" 'unsafe tar member type' 'cv1835 safe-sysupgrade rejects symlink/hardlink/device tar members'
-require_pattern "$CV1835_SAFE_SU" 'dcentos-cv1835-s19jpro-sysupgrade' 'cv1835 safe-sysupgrade pins the produced top-level dir name'
-# The old any-directory find|head-1 acceptance must be gone.
-reject_pattern "$CV1835_SAFE_SU" 'find "$STAGE_DIR" -mindepth 1 -maxdepth 1 -type d | head -1' 'cv1835 safe-sysupgrade no longer accepts any first inner directory'
-
-# Mandatory Ed25519 signature verification against the pinned release key.
-require_pattern "$CV1835_SAFE_SU" 'openssl pkeyutl -verify -rawin -pubin' 'cv1835 safe-sysupgrade verifies MANIFEST.sig with openssl pkeyutl'
-require_pattern "$CV1835_SAFE_SU" '/etc/dcentos/release_ed25519.pub' 'cv1835 safe-sysupgrade verifies against the pinned release key'
-require_pattern "$CV1835_SAFE_SU" 'refusing unsigned CV1835 eMMC sysupgrade' 'cv1835 safe-sysupgrade refuses an unsigned package fail-closed'
-require_pattern "$CV1835_SAFE_SU" '&& ! is_release_status "$MANIFEST_STATUS"' 'cv1835 safe-sysupgrade only accepts the unsigned lab override for a non-release status'
-require_pattern "$CV1835_SAFE_SU" 'verify_manifest_payload_sha "$NEW_KERNEL" "uImage"' 'cv1835 consumer binds uImage to the signed manifest digest'
-require_pattern "$CV1835_SAFE_SU" 'verify_manifest_payload_sha "$NEW_ROOTFS" "rootfs.gz"' 'cv1835 consumer binds rootfs.gz to the signed manifest digest'
-
-# Producer: signed package emission + rootfs pubkey staging.
-require_pattern "$CV1835_POST_IMAGE" 'dcent_stage_release_key' 'cv1835 post-image stages release_ed25519.pub via the shared signing helper'
-require_pattern "$CV1835_POST_IMAGE" 'dcent_sign_sysupgrade_manifest' 'cv1835 post-image signs MANIFEST.json (emits MANIFEST.sig)'
-require_pattern "$CV1835_POST_IMAGE" 'required deployable rootfs missing' 'cv1835 producer fails when consumer-required rootfs.gz is unavailable'
-require_pattern "$CV1835_POST_IMAGE" 'required deployable kernel missing' 'cv1835 producer fails when consumer-required uImage is unavailable'
-require_pattern "$CV1835_POST_IMAGE" '"path": "dcentos-${BOARD_NAME}-sysupgrade/uImage"' 'cv1835 producer declares the consumer-required uImage in the canonical payload registry'
-require_pattern "$CV1835_POST_IMAGE" '"path": "dcentos-${BOARD_NAME}-sysupgrade/rootfs.gz"' 'cv1835 producer declares the consumer-required rootfs.gz in the canonical payload registry'
-require_pattern "$OTA_SIGNATURE_RS" 'accepted_leaves: &["kernel", "uImage"]' 'public OTA registry maps the canonical kernel kind to CV uImage'
-require_pattern "$OTA_SIGNATURE_RS" 'accepted_leaves: &["root", "rootfs.gz"]' 'public OTA registry maps the canonical rootfs kind to CV rootfs.gz'
-reject_pattern "$CV1835_POST_IMAGE" 'rootfs.ext2' 'cv1835 producer does not advertise the unsupported ext2 fallback'
-reject_pattern "$CV1835_POST_IMAGE" 'sysupgrade will be rootfs-only' 'cv1835 producer does not emit an unusable rootfs-only package'
-require_pattern "$CV1835_POST_BUILD" 'etc/dcentos/release_ed25519.pub' 'cv1835 post-build stages the pinned release_ed25519.pub into the rootfs'
-# --- end CV1835 eMMC signed-sysupgrade coverage ------------------------------
+require_pattern "$CV1835_SAFE_SU" 'exit 78' 'cv1835 updater exits with unconditional unavailable status'
+require_pattern "$CV1835_REVERT" 'exit 78' 'cv1835 stock-revert exits with unconditional unavailable status'
+require_pattern "$CV1835_BUILD" 'exit 78' 'cv1835 standalone build entry point refuses every artifact lane'
+require_pattern "$CV1835_POST_BUILD" 'exit 78' 'cv1835 post-build hook refuses direct Buildroot invocation'
+require_pattern "$CV1835_POST_IMAGE" 'exit 78' 'cv1835 post-image hook refuses direct Buildroot invocation'
+require_pattern "$CV1835_SAFE_SU" 'BuiltInVolatile/mutation-denied' 'cv1835 updater records the evidenced volatile environment backend'
+reject_pattern "$CV1835_SAFE_SU" 'DCENT_ALLOW_UNSIGNED_SYSUPGRADE' 'cv1835 updater has no proof or unsigned-package override'
+if [ ! -e "$CV1835_FW_ENV" ] && [ ! -L "$CV1835_FW_ENV" ]; then
+    pass 'cv1835 guessed fw_env.config remains absent'
+else
+    fail 'cv1835 guessed fw_env.config was reintroduced'
+fi
+# --- end CV1835 brick-vector retirement -------------------------------------
 
 # =============================================================================
 # Bucket-A P0 blocker coverage (CE-105 / CE-056 / CE-153 / CE-408 / CE-341 /
@@ -881,28 +1100,61 @@ require_pattern "$CV1835_POST_BUILD" 'etc/dcentos/release_ed25519.pub' 'cv1835 p
 # cannot silently rot. All files are already offline/static-checkable here.
 # =============================================================================
 
-# --- CE-105: sd_nand_install ubi_replace proves inactive-slot targeting -------
-require_pattern "$SD_NAND_INSTALL" 'IS the active firmware slot' 'sd_nand_install ubi_replace refuses to overwrite the active firmware slot'
-require_pattern "$SD_NAND_INSTALL" 'prove inactive-slot targeting' 'sd_nand_install ubi_replace proves inactive-slot targeting before writing'
-require_pattern "$SD_NAND_INSTALL" 'fw_printenv -n firmware' 'sd_nand_install reads the active firmware slot via fw_printenv'
-require_pattern "$SD_NAND_INSTALL" 'refusing NAND write' 'sd_nand_install refuses a NAND write when the boot source is unknown'
+# --- CE-105 successor: inactive-slot work is denied until the shared engine --
+require_pattern "$SD_NAND_INSTALL" 'no exact admitted hardware/update descriptor' 'sd_nand_install requires typed hardware/update admission before implementation'
+require_pattern "$SD_NAND_INSTALL" 'legacy install-shaped arguments cannot authorize' 'sd_nand_install rejects legacy argument-based write authority'
 
-# --- CE-056: package_sysupgrade fail-closes am2-s19j S9 placeholder -----------
-require_pattern "$PACKAGE" 'DCENT_ALLOW_AM2_S9_PLACEHOLDER' 'package_sysupgrade fail-closes am2-s19j S9-placeholder unless explicit lab override'
-require_pattern "$PACKAGE" 'Refusing to package am2-s19j with an S9 placeholder' 'package_sysupgrade names the am2-s19j S9-placeholder brick refusal'
-require_pattern "$PACKAGE" 'PLACEHOLDER-DO-NOT-FLASH' 'package_sysupgrade forces non-flashable naming for am2-s19j placeholder builds'
+# The standalone packager owns only the S9 lane. AM2 artifacts come from their
+# dedicated target post-image scripts, so an S9 DTB can never be relabelled AM2.
+reject_pattern "$PACKAGE" 'DCENT_ALLOW_AM2_S9_PLACEHOLDER' 'S9 packager has no AM2 placeholder override'
+reject_pattern "$PACKAGE" 'DCENT_FORCE_AM2_UPLOAD' 'S9 packager has no AM2 live-upload override'
+reject_pattern "$PACKAGE" 'am2-s19j)' 'S9 packager cannot dispatch an AM2 package lane'
+require_pattern "$PACKAGE" 'accepted: am1-s9' 'S9 packager declares its single accepted board'
+if retired_output=$(bash "$PACKAGE" \
+    --board am2-s19j \
+    --version 0.9.0 \
+    --images-dir /dcentos-am2-retired-lane-must-not-be-read \
+    --output /dcentos-am2-retired-lane-must-not-be-written.tar 2>&1); then
+    fail "S9 packager accepted the retired AM2 package lane"
+else
+    case "$retired_output" in
+        *"Unsupported board: am2-s19j (accepted: am1-s9)"*)
+            pass "S9 packager refuses AM2 before reading build inputs"
+            ;;
+        *)
+            fail "S9 packager AM2 refusal was not the canonical early board gate"
+            ;;
+    esac
+fi
 
-# --- CE-153: host switch_firmware.py aligned to the guarded overlay copy ------
+# --- CE-153: raw environment transformers are guarded host-only tools --------
 HOST_SWITCH_FW='scripts/switch_firmware.py'
+HOST_SWITCH_FW_SH='scripts/switch_firmware.sh'
+TARGET_SWITCH_FW='br2_external_dcentos/board/zynq/rootfs-overlay/usr/sbin/switch_firmware.py'
+TARGET_SWITCH_FW_SH='br2_external_dcentos/board/zynq/rootfs-overlay/usr/sbin/switch_firmware.sh'
+RUNTIME_PRUNE='br2_external_dcentos/board/common/prune-runtime-research-tools.sh'
 require_pattern "$HOST_SWITCH_FW" '--i-understand-this-is-not-fw-setenv' 'host switch_firmware.py requires the not-fw-setenv acknowledgement'
 require_pattern "$HOST_SWITCH_FW" 'REFUSING: switch_firmware.py is DEPRECATED' 'host switch_firmware.py refuses to run without the ack'
 require_pattern "$HOST_SWITCH_FW" 'DEPRECATED FOR THE OTA/SYSUPGRADE WRITE PATH' 'host switch_firmware.py carries the deprecation banner'
 require_pattern "$HOST_SWITCH_FW" 'distinct flags' 'host switch_firmware.py writes redundant env copies with distinct flags'
+require_pattern "$HOST_SWITCH_FW_SH" '--i-understand-this-is-not-fw-setenv' 'host switch_firmware.sh requires the not-fw-setenv acknowledgement'
+require_pattern "$HOST_SWITCH_FW_SH" 'REFUSING: switch_firmware.sh is DEPRECATED' 'host switch_firmware.sh refuses to run without the ack'
+for target_switch_fw in "$TARGET_SWITCH_FW" "$TARGET_SWITCH_FW_SH"; do
+    if [ ! -e "$target_switch_fw" ] && [ ! -L "$target_switch_fw" ]; then
+        pass "target overlay excludes host-only transformer: $target_switch_fw"
+    else
+        fail "target overlay contains forbidden raw environment transformer: $target_switch_fw"
+    fi
+done
+require_pattern "$RUNTIME_PRUNE" 'usr/sbin/switch_firmware.py' 'final rootfs prune removes stale switch_firmware.py'
+require_pattern "$RUNTIME_PRUNE" 'usr/sbin/switch_firmware.sh' 'final rootfs prune removes stale switch_firmware.sh'
 
-# --- CE-408: revert_to_stock_s19_am2 requires hash-bound stock provenance -----
-require_pattern "$S19_AM2_REVERT" 'DCENT_STOCK_REVERT_ALLOW_UNVERIFIED' 'revert_to_stock_s19_am2 gates the unverified path behind an explicit lab override'
-require_pattern "$S19_AM2_REVERT" 'refusing stock revert with an unauthenticated runtime download' 'revert_to_stock_s19_am2 refuses a no-image unauthenticated download by default'
-require_pattern "$S19_AM2_REVERT" 'refusing stock revert without expected SHA-256' 'revert_to_stock_s19_am2 refuses a supplied image with no expected SHA by default'
+# --- CE-408 successor: unverified S19 AM2 restore is fully contained ---------
+require_pattern "$S19_AM2_REVERT" 'NOT IMPLEMENTED (mutation denied)' 'revert_to_stock_s19_am2 declares its zero-mutation compatibility boundary'
+require_pattern "$S19_AM2_REVERT" 'exit 78' 'revert_to_stock_s19_am2 refuses legacy mutation-shaped calls with EX_CONFIG'
+for forbidden_writer in fw_setenv fw_printenv flash_erase nandwrite nanddump wget curl; do
+    reject_executable_pattern "$S19_AM2_REVERT" "$forbidden_writer" "revert_to_stock_s19_am2 excludes writer: $forbidden_writer"
+done
 
 # --- CE-341: build_in_docker labels/gates the canonical release alias ---------
 require_pattern "$BUILD_DOCKER" 'LAB-UNSIGNED-NOT-FOR-RELEASE' 'build_in_docker labels a non-release-grade canonical alias as lab-unsigned'
@@ -928,7 +1180,18 @@ for web_inst in "$WEB_INSTALLER"; do
 done
 
 # --- CE-374: NAND backup planners bind restore-proof to the exact unit --------
-for nand_plan in scripts/am1_nand_backup_plan.sh scripts/am2_nand_backup_plan.sh; do
+AM1_NAND_PLAN=scripts/am1_nand_backup_plan.py
+AM1_NAND_PLAN_WRAPPER=scripts/am1_nand_backup_plan.sh
+require_pattern "$AM1_NAND_PLAN_WRAPPER" 'am1_nand_backup_plan.py' 'AM1 planner wrapper delegates to the strict Python implementation'
+require_pattern "$AM1_NAND_PLAN" '"--restore-artifact"' 'AM1 planner requires the physical restore artifact bytes'
+require_pattern "$AM1_NAND_PLAN" '"--expect-host-key-sha256"' 'AM1 planner binds the pinned SSH host key'
+require_pattern "$AM1_NAND_PLAN" 'args.expect_target != AUTHORIZED_BOARD_TARGET' 'AM1 planner rejects an operator-selected board class'
+require_ordered_patterns "$AM1_NAND_PLAN" \
+    'atomic_publish(args.output, markdown)' \
+    'atomic_publish(args.json_template, encoded)' \
+    'AM1 planner publishes its executable validated JSON last'
+
+for nand_plan in scripts/am2_nand_backup_plan.sh; do
     require_pattern "$nand_plan" '--expect-mac' "$(basename "$nand_plan") accepts an --expect-mac identity arg"
     require_pattern "$nand_plan" '--expect-hwid' "$(basename "$nand_plan") accepts an --expect-hwid identity arg"
     require_pattern "$nand_plan" 'restore_verified_identity_matched' "$(basename "$nand_plan") sets restore-proof OK only on identity match"
@@ -969,10 +1232,25 @@ if zynq_payload_window_selftest; then
 else
     fail "zynq package-only selftest failed"
 fi
+if zynq_target_payload_authority_selftest; then
+    pass "Zynq target payload authority validates canonical bindings and rejects malformed paths, sizes, hashes, and extracted leaves"
+else
+    fail "Zynq target payload authority behavioral selftest failed"
+fi
+if python3 scripts/test_sysupgrade_manifest_json.py >/dev/null; then
+    pass "semantic manifest JSON and deterministic version contracts pass"
+else
+    fail "semantic manifest JSON/version contract test failed"
+fi
 if release_image_hardening_coupling_selftest; then
     pass "CE-183 release-status packaging fails closed without release-image hardening and no-ops for lab status"
 else
     fail "CE-183 release-status hardening coupling selftest failed"
+fi
+if toolbox_install_contract_selftest; then
+    pass "toolbox install metadata accepts complete contracts and rejects missing or pre-acknowledged gates"
+else
+    fail "toolbox install metadata contract selftest failed"
 fi
 
 for phrase in \

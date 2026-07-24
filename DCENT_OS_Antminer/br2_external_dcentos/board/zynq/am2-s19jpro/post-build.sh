@@ -40,6 +40,37 @@ mkdir -p "${TARGET_DIR}/var/log"
 mkdir -p "${TARGET_DIR}/data"
 mkdir -p "${TARGET_DIR}/etc/dcentos"
 
+ARCHIVE_ADMISSION_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../scripts/lib/sysupgrade_archive_admission.sh"
+ARCHIVE_ADMISSION_DST="${TARGET_DIR}/usr/libexec/dcentos/sysupgrade-archive-admission.sh"
+[ -r "$ARCHIVE_ADMISSION_SRC" ] || {
+    echo "DCENTos post-build (am2-s19jpro): ERROR: archive-admission helper not found at $ARCHIVE_ADMISSION_SRC" >&2
+    exit 1
+}
+mkdir -p "$(dirname "$ARCHIVE_ADMISSION_DST")"
+cp "$ARCHIVE_ADMISSION_SRC" "$ARCHIVE_ADMISSION_DST"
+chmod 0644 "$ARCHIVE_ADMISSION_DST"
+
+# Install the semantic JSON/version authority used by every Zynq consumer.
+# Python 3 is a required package in dcentos-common.fragment; missing either
+# side is a build-time error rather than a runtime downgrade in policy.
+MANIFEST_JSON_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../scripts/lib/sysupgrade_manifest_json.py"
+MANIFEST_JSON_DST="${TARGET_DIR}/usr/libexec/dcentos/sysupgrade-manifest-json.py"
+[ -r "$MANIFEST_JSON_SRC" ] || {
+    echo "DCENTos post-build: ERROR: manifest JSON helper not found at $MANIFEST_JSON_SRC" >&2
+    exit 1
+}
+cp "$MANIFEST_JSON_SRC" "$MANIFEST_JSON_DST"
+chmod 0755 "$MANIFEST_JSON_DST"
+
+ZYNQ_GEOMETRY_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../scripts/lib/sysupgrade_zynq_geometry.sh"
+ZYNQ_GEOMETRY_DST="${TARGET_DIR}/usr/libexec/dcentos/sysupgrade-zynq-geometry.sh"
+[ -r "$ZYNQ_GEOMETRY_SRC" ] || {
+    echo "DCENTos post-build (am2-s19jpro): ERROR: Zynq geometry helper not found at $ZYNQ_GEOMETRY_SRC" >&2
+    exit 1
+}
+cp "$ZYNQ_GEOMETRY_SRC" "$ZYNQ_GEOMETRY_DST"
+chmod 0644 "$ZYNQ_GEOMETRY_DST"
+
 # W1.5 (2026-05-07): pre-create /data/dcent/ with tight perms (auth.json holder).
 mkdir -p "${TARGET_DIR}/data/dcent"
 chmod 0700 "${TARGET_DIR}/data/dcent"
@@ -58,7 +89,6 @@ chmod +x "${TARGET_DIR}"/root/tools/*.py 2>/dev/null || true
 chmod +x "${TARGET_DIR}"/root/tools/*.sh 2>/dev/null || true
 chmod +x "${TARGET_DIR}"/usr/bin/dcent-shell 2>/dev/null || true
 chmod +x "${TARGET_DIR}"/usr/sbin/sysupgrade 2>/dev/null || true
-chmod +x "${TARGET_DIR}"/usr/sbin/switch_firmware.py 2>/dev/null || true
 
 #  restore-to-stock closure: this am2 defconfig runs its own
 # post-build script, not board/zynq/post-build.sh, so install the

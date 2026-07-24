@@ -1,46 +1,39 @@
-//! BM1398 ASIC driver (Antminer S19/S19j).
+//! Experimental BM1398 ASIC driver (NBP1901/S19 Pro lineage).
 //!
-//! The BM1398 is the 7nm SHA-256 mining ASIC used in the standard Antminer S19
-//! (non-Pro, non-XP). It is a close sibling of the BM1397 (S17/T17), sharing
-//! the same register layout, command protocol, and PLL structure.
+//! This implementation is admitted from two independent local vendor binaries,
+//! not from an assumption that BM1398 is a renamed BM1397. Shared BM139x
+//! framing is reused only where captured command bytes agree; BM1398 PLL,
+//! core-enable, address-assignment, FIFO, and relay contracts live in
+//! `dcentrald_api_types::bm1398_protocol`.
 //!
-//! Key differences from BM1397:
-//!   - 76 chips per chain (vs 48 on S17)
+//! Evidence-scoped NBP1901/S19 Pro composition:
+//!   - 114 chips per chain, fixed addresses 0x00..0xE2 at interval 2
 //!   - ChipID: 0x1398 (vs 0x1397)
 //!   - Default operating frequency: 675 MHz (vs ~500 MHz on S17)
 //!   - Higher default voltage: 13.8V per board (vs ~12V on S17)
 //!   - S19 control board uses am2-s17 platform (same as S17)
 //!   - 4 FPGA chain slots (vs 3 on S9), only 3 used
 //!
-//! Shared with BM1397:
-//!   - 7nm process, 672 cores per chip (0x18 * 28)
+//! Shared with the admitted BM139x transport:
+//!   - an experimental 672-slot legacy nonce-attribution/work-time model,
+//!     kept separate from the 624 physical small cores recovered from stock
 //!   - 9-byte nonce response
 //!   - 4-midstate version rolling support (AsicBoost)
 //!   - BM139X unified command format (0x51/0x52/0x53 headers)
 //!   - PLL0 at register 0x08, MiscCtrl at 0x18, TicketMask at 0x14
 //!   - PLL3 at 0x68 for baud rate clock
-//!   - Job ID increment: +4 mod 128
-//!   - open-core: ⚠️ PRE-LIVE FLAG (2026-06-10). DCENT assumes "no open-core
-//!     needed" (ESP-Miner heritage). The Bitmain S17 factory jig runs an
-//!     explicit per-core open-core (`enable_core_clock` ×84 + dummy work +
-//!     OpenCoreGap) for the BM1397 die — BM1398 is the same die. S19 Pro DID
-//!     produce 146K nonces standalone WITHOUT it (so it is not a hard
-//!     zero-nonce here), but DCENT may be activating only the broadcast-clocked
-//!     cores, leaving hashrate on the table vs the factory's per-core sweep.
-//!     Verify S19/S19 Pro standalone hashrate-at-spec, or A/B the gated
-//!     open-core. See STANDALONE_MINING_PRELIVE_FINDINGS.md.
-//!   - FB_DIV range: 60-200
+//!   - 8-bit logical job IDs; the FPGA carrier appends midstate-slot bits
+//!   - open-core remains an experimental hardware-validation question. Do not
+//!     infer BM1398 requirements from BM1397 die-similarity claims.
+//!   - Vendor PLL search: REFDIV 2 then 1, POSTDIV1/2 1..=7,
+//!     nearest FBDIV 16..=250, VCO 2000..=3200 MHz
 //!   - Maximum baud: 3.125 MHz on CLKI
-//!
-//! The BM1398 is essentially a BM1397 binned for higher frequency operation
-//! and placed on a hash board with more chips per chain. All register addresses,
-//! bit fields, PLL calculations, and command encoding are identical.
 //!
 //! Hardware reference:
 //!   - S19 probe:
 //!   - S19 deep probe:
-//!   - ASIC Register Bible: BM1397 section (shared register map)
-//!   - BraiinsOS source: bosminer-am2-s17/src/hashchain/bm1398.rs (separate driver file)
+//!   - Stock `bmminer` NBP1901 function `FUN_000502c0` (VA `0x502c0`)
+//!   - AMTC repair jig `single_board_test_bm1398` function at VA `0x29b48`
 //!
 //! Register values (reset defaults, same as BM1397):
 //!   0x00 ChipAddress:    0x13981800 (ID=0x1398, CORE_NUM=0x18, ADDR=0x00)
@@ -52,7 +45,9 @@
 //!   0x68 PLL3:           0x00700111
 //!   0x70 PLL0 Divider:   0x03040607
 
-use crate::drivers::{ChipDriver, MinerProfile, MiningWork, NonceResult, PllConfig};
+use crate::drivers::{
+    ChipDriver, FpgaNonceDecodeContext, MinerProfile, MiningWork, NonceResult, PllConfig,
+};
 use crate::pic::PicController;
 use crate::Result;
 use dcentrald_hal::fpga_chain::{self, FpgaChain};
@@ -84,9 +79,13 @@ const NUM_MIDSTATES: usize = 4;
 /// Log2 of NUM_MIDSTATES -- used to shift work_id for FPGA encoding.
 const MIDSTATE_CNT_LOG2: u32 = 2;
 
-/// Number of SHA-256 cores per BM1398 chip.
-/// Same as BM1397: CORE_NUM=0x18 (24), multiply by 28 = 672 actual cores.
-const NUM_CORES_ON_CHIP: u32 = 672;
+/// Number of addressable SHA-256 small cores per BM1398 chip.
+///
+/// Stock NBP1901 reports 156 hash-engine groups, four small cores per group,
+/// and a maximum small-core index of 623. The older 672-slot work-time model
+/// is not evidence of physical die geometry and remains separate in
+/// `MinerProfile::nonce_attribution_cores`.
+const NUM_CORES_ON_CHIP: u32 = 624;
 
 /// BM1398 register addresses (identical to BM1397).
 pub mod regs {
@@ -128,127 +127,7 @@ pub mod regs {
     pub const CLOCK_ORDER_CTRL0: u8 = 0x80;
     /// Clock Order Control 1 -- maps PLL clocks to core domains (high).
     pub const CLOCK_ORDER_CTRL1: u8 = 0x84;
-    /// UART Relay register — controls the FPGA↔hashboard UART MUX.
-    ///
-    /// After ASIC init via ttyS, this register must be written to switch
-    /// the hash board UART path from ttyS (command mode) to FPGA WORK_TX/RX
-    /// (mining mode). Without this, FPGA work dispatch gets no nonces.
-    ///
-    /// Bit fields (from bosminer binary RE):
-    ///   - gap_cnt: gap count between nonce transmissions
-    ///   - nonce_gap_en: enable nonce gap feature
-    ///   - ro_relay_en: enable read-out relay (nonces from ASIC → FPGA WORK_RX)
-    ///   - co_relay_en: enable command-out relay (work from FPGA WORK_TX → ASIC)
-    ///
-    /// Confirmed at offset 0x34 (not 0x2C) from bosminer register scanner.
-    pub const UART_RELAY: u8 = 0x34;
 }
-
-/// BM1398 UART relay enable value.
-///
-/// Written to chip 0 only (register 0x34) to route the hash board UART
-/// between ttyS (command mode) and FPGA WORK_TX/RX (mining mode).
-///
-/// Reference values from other chips:
-///   BM1397 at 0x2C: 0x000F_0000
-///   BM1366 at 0x2C: 0x007C_0003 (ro_relay_en=1, co_relay_en=1, gap_cnt=0x1F)
-///
-/// BM1398 is BM1397+, so try BM1397 value first. If it fails, try BM1366 value.
-pub const UART_RELAY_ENABLE: u32 = 0x000F_0000;
-
-/// Alternative relay value (BM1366 style) if BM1397 value doesn't work.
-pub const UART_RELAY_ENABLE_ALT: u32 = 0x007C_0003;
-
-impl Bm1398Driver {
-    /// Write UART relay register to enable FPGA↔hashboard path for mining.
-    ///
-    /// Must be called after ASIC init (cold boot) or during passthrough handoff.
-    /// Written to chip 0 only (first chip in the daisy chain controls the relay).
-    ///
-    /// On am2-s17, this switches the hash board UART from ttyS to FPGA WORK_TX/RX.
-    /// Without this write, FPGA work dispatch produces zero nonces because the
-    /// nonce return path (ASIC→FPGA WORK_RX) is not connected.
-    /// Write UART relay via ttyS serial (FPGA CMD is dead on am2-s17).
-    ///
-    /// `serial_path`: "/dev/ttyS1" for chain 1, "/dev/ttyS3" for chain 3
-    pub fn enable_uart_relay_via_serial(serial_path: &str, chain_id: u8) {
-        use crate::protocol::crc5;
-        use dcentrald_hal::serial::DevmemUart;
-
-        let reg = regs::UART_RELAY;
-        let val = UART_RELAY_ENABLE;
-        let val_bytes = val.to_be_bytes();
-
-        // BM1397+ broadcast write: [55 AA 51 09 00 REG VAL_BE CRC5]
-        let payload = [
-            0x51,
-            0x09,
-            0x00,
-            reg,
-            val_bytes[0],
-            val_bytes[1],
-            val_bytes[2],
-            val_bytes[3],
-        ];
-        let crc = crc5(&payload);
-
-        let mut frame = Vec::with_capacity(11);
-        frame.extend_from_slice(&[0x55, 0xAA]);
-        frame.extend_from_slice(&payload);
-        frame.push(crc);
-
-        // Try 115200 first, then 3.125 MHz fallback
-        for &baud in &[115_200u32, 3_125_000] {
-            match DevmemUart::open_no_unbind(serial_path, baud) {
-                Ok(uart) => {
-                    if let Ok(()) = uart.write_bytes(&frame) {
-                        tracing::info!(
-                            chain_id,
-                            serial_path,
-                            baud,
-                            reg = format_args!("0x{:02X}", reg),
-                            value = format_args!("0x{:08X}", val),
-                            "BM1398: UART relay written via ttyS (FPGA↔hashboard active)",
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                        return;
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(chain_id, baud, error = %e, "ttyS open failed, trying next baud");
-                }
-            }
-        }
-        tracing::error!(
-            chain_id,
-            serial_path,
-            "BM1398: UART relay write FAILED at all baud rates"
-        );
-    }
-
-    /// Legacy FPGA CMD path (does NOT work on am2-s17, kept for S9 compatibility).
-    pub fn enable_uart_relay(chain: &mut FpgaChain) {
-        let reg = regs::UART_RELAY;
-        let val = UART_RELAY_ENABLE;
-        let cmd_word = 0x41u32 | (0x09u32 << 8) | ((reg as u32) << 24);
-        chain.write_cmd(cmd_word);
-        chain.write_cmd(val);
-        tracing::info!(
-            chain_id = chain.chain_id,
-            reg = format_args!("0x{:02X}", reg),
-            value = format_args!("0x{:08X}", val),
-            "BM1398: UART relay via FPGA CMD (S9 path)",
-        );
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-}
-
-/// BM1398 PLL calculation constants.
-/// Formula: f_PLL = 25 MHz * FBDIV / (REFDIV * POSTDIV1 * POSTDIV2)
-/// Same formula, same constraints as BM1397.
-const CLKI_MHZ: f64 = 25.0;
-const FB_DIV_MIN: u16 = 60;
-const FB_DIV_MAX: u16 = 200;
 
 /// Calculate BM1398 PLL0 register value for a target frequency.
 ///
@@ -262,59 +141,20 @@ const FB_DIV_MAX: u16 = 200;
 ///
 /// Returns (reg_value, actual_freq_mhz, fb_div, ref_div, postdiv1, postdiv2).
 fn bm1398_pll_calc(target_mhz: u16) -> (u32, u16, u16, u8, u8, u8) {
-    let target = target_mhz.clamp(50, 900) as f64;
-
-    let mut best_freq = 0.0f64;
-    let mut best_fb: u16 = 96;
-    let mut best_ref: u8 = 1;
-    let mut best_pd1: u8 = 1;
-    let mut best_pd2: u8 = 1;
-    let mut best_diff = f64::MAX;
-
-    for refdiv in [1u8, 2] {
-        for postdiv1 in 1..=7u8 {
-            for postdiv2 in 1..=7u8 {
-                if postdiv1 < postdiv2 {
-                    continue;
-                }
-                let divider = (refdiv as f64) * (postdiv1 as f64) * (postdiv2 as f64);
-                let fbdiv_f = target * divider / CLKI_MHZ;
-                let fbdiv = fbdiv_f.round() as u16;
-                if !(FB_DIV_MIN..=FB_DIV_MAX).contains(&fbdiv) {
-                    continue;
-                }
-                let actual = CLKI_MHZ * (fbdiv as f64) / divider;
-                let diff = (actual - target).abs();
-                if diff < best_diff
-                    || (diff == best_diff
-                        && (postdiv1 as u16 * postdiv2 as u16)
-                            < (best_pd1 as u16 * best_pd2 as u16))
-                {
-                    best_diff = diff;
-                    best_freq = actual;
-                    best_fb = fbdiv;
-                    best_ref = refdiv;
-                    best_pd1 = postdiv1;
-                    best_pd2 = postdiv2;
-                }
-            }
-        }
-    }
-
-    // BM1398 PLL register encoding (same as BM1397 -- raw postdiv, no -1):
-    let reg_value: u32 = (1u32 << 30)                        // PLLEN = 1
-        | ((best_fb as u32 & 0x7FF) << 16)                   // FBDIV [26:16]
-        | ((best_ref as u32 & 0x3F) << 8)                    // REFDIV [13:8]
-        | ((best_pd1 as u32 & 0x7) << 4)                     // POSTDIV1 [6:4]
-        | (best_pd2 as u32 & 0x7); // POSTDIV2 [2:0]
-
+    let target_mhz = target_mhz.clamp(50, 900);
+    let solution = dcentrald_api_types::bm1398_protocol::resolve_bm1398_pll(target_mhz)
+        .expect("built-in BM1398 PLL search envelope must resolve mining frequencies");
+    let dividers = solution.dividers;
+    let actual_millimhz = dividers
+        .output_millimhz(dcentrald_api_types::bm1398_protocol::BM1398_PLL_SEARCH_SPEC.reference_mhz)
+        .expect("resolved BM1398 dividers are non-zero");
     (
-        reg_value,
-        best_freq.round() as u16,
-        best_fb,
-        best_ref,
-        best_pd1,
-        best_pd2,
+        solution.register_value,
+        ((actual_millimhz + 500) / 1_000) as u16,
+        dividers.fbdiv,
+        dividers.refdiv,
+        dividers.postdiv1,
+        dividers.postdiv2,
     )
 }
 
@@ -366,11 +206,7 @@ fn fifo_bm1398_read_reg_single(chip_addr: u8, reg: u8) -> u32 {
 }
 
 /// BM1398 driver implementation.
-pub struct Bm1398Driver {
-    /// Runtime MIDSTATE_CNT log2, read from FPGA CTRL_REG on first send_work().
-    /// Default 2 (4 midstates, 36 words). Passthrough from bosminer may be 3 (8 midstates, 68 words).
-    runtime_midstate_cnt: std::sync::atomic::AtomicU32,
-}
+pub struct Bm1398Driver;
 
 impl Default for Bm1398Driver {
     fn default() -> Self {
@@ -380,32 +216,32 @@ impl Default for Bm1398Driver {
 
 impl Bm1398Driver {
     pub fn new() -> Self {
-        Self {
-            runtime_midstate_cnt: std::sync::atomic::AtomicU32::new(MIDSTATE_CNT_LOG2),
+        Self
+    }
+
+    fn fpga_midstate_mode(
+        midstate_count_log2: u8,
+    ) -> Result<dcentrald_api_types::bm1398_protocol::Bm1398FpgaMidstateMode> {
+        match midstate_count_log2 {
+            2 => Ok(dcentrald_api_types::bm1398_protocol::Bm1398FpgaMidstateMode::Four),
+            3 => Ok(dcentrald_api_types::bm1398_protocol::Bm1398FpgaMidstateMode::Eight),
+            other => Err(crate::AsicError::InvalidParameter(format!(
+                "BM1398 FPGA midstate_count_log2 must be 2 or 3, got {other}"
+            ))),
         }
     }
 
-    /// Read the current MIDSTATE_CNT from the FPGA CTRL register and cache it.
-    /// Returns the log2 value (2=4 midstates, 3=8 midstates).
-    fn read_fpga_midstate_cnt(&self, chain: &fpga_chain::FpgaChain) -> u32 {
-        let ctrl = chain.common.read_reg(fpga_chain::REG_CTRL);
-        let cnt = (ctrl >> fpga_chain::CTRL_MIDSTATE_SHIFT) & 0x03;
-        let prev = self
-            .runtime_midstate_cnt
-            .swap(cnt, std::sync::atomic::Ordering::Relaxed);
-        if prev != cnt {
-            tracing::info!(
-                chain_id = chain.chain_id,
-                ctrl = format_args!("0x{:02X}", ctrl),
-                midstate_cnt = cnt,
-                num_midstates = 1u32 << cnt,
-                "BM1398: FPGA MIDSTATE_CNT changed {} → {} (work format: {} words)",
-                prev,
-                cnt,
-                4 + (1u32 << cnt) * 8,
-            );
-        }
-        cnt
+    fn base_carrier_work_id(
+        mode: dcentrald_api_types::bm1398_protocol::Bm1398FpgaMidstateMode,
+        logical_work_id: u16,
+    ) -> Result<u16> {
+        dcentrald_api_types::bm1398_protocol::BM1398_FPGA_FIFO_SPEC
+            .encode_work_id(mode, logical_work_id, 0)
+            .ok_or_else(|| {
+                crate::AsicError::InvalidParameter(format!(
+                    "BM1398 logical work id {logical_work_id} exceeds the 8-bit FPGA ring"
+                ))
+            })
     }
 
     /// Calculate WORK_TIME register value for a given frequency and midstate count.
@@ -430,9 +266,12 @@ impl Bm1398Driver {
     }
 }
 
-/// BM1397/BM1398 per-core `enable_core_clock` register value, jig-verified from
-/// the S17 factory jig (`BM1397_enable_core_clock`): `CoreRegCtrl (0x3C) =
-/// (core << 16) | 0x84AA`. The same BM1397 die underlies BM1398.
+/// BM139x per-core `enable_core_clock` register value, jig-verified from the
+/// retained factory-jig implementation: `CoreRegCtrl (0x3C) =
+/// (core << 16) | 0x84AA`.
+///
+/// The byte-level agreement is the authority. This helper does not assert that
+/// BM1397 and BM1398 are the same die.
 pub fn open_core_enable_value(core: u32) -> u32 {
     (core << 16) | 0x84AA
 }
@@ -456,8 +295,7 @@ impl ChipDriver for Bm1398Driver {
     }
 
     fn cores_per_chip(&self) -> u32 {
-        // Same as BM1397: CORE_NUM=0x18 (24 domains), 28 small cores each = 672.
-        672
+        NUM_CORES_ON_CHIP
     }
 
     fn response_length(&self) -> usize {
@@ -563,12 +401,21 @@ impl ChipDriver for Bm1398Driver {
         chain.write_cmd(w1);
         tracing::debug!("Ordered Clock Enable = 0x00000001");
 
-        // --- Step 4: Core Register Control = 0x80008074 ---
-        // Enables AsicBoost and sets tuning parameters.
-        let (w0, w1) = fifo_bm1398_write_reg_bcast(regs::CORE_REG_CTRL, 0x8000_8074);
-        chain.write_cmd(w0);
-        chain.write_cmd(w1);
-        tracing::debug!("Core Register Control = 0x80008074 (AsicBoost enable)");
+        // --- Step 4: staged core-register control ---
+        // Both the stock NBP1901 miner and repair jig apply these two writes
+        // in order. They are chip-scope evidence and do not imply that the
+        // surrounding board initialization snapshot is vendor-exact.
+        for write in dcentrald_api_types::bm1398_protocol::BM1398_PROVEN_CORE_WRITES {
+            debug_assert_eq!(write.register, regs::CORE_REG_CTRL);
+            let (w0, w1) = fifo_bm1398_write_reg_bcast(write.register, write.value);
+            chain.write_cmd(w0);
+            chain.write_cmd(w1);
+            tracing::debug!(
+                register = format_args!("0x{:02X}", write.register),
+                value = format_args!("0x{:08X}", write.value),
+                "BM1398: applied evidence-backed staged core-control write"
+            );
+        }
 
         // --- Steps 5-6: PLL3 + FastUART — SKIP when staying at 115200 ---
         // PLL3 changes the ASIC's internal UART clock from 25 MHz to 400 MHz.
@@ -816,23 +663,19 @@ impl ChipDriver for Bm1398Driver {
         // 0 nonces from own dispatch (Perf expert hypothesis #1, highest
         // probability root cause for the .129 cold-boot 0-nonce blocker).
         //
-        // The companion `runtime_midstate_cnt.store(2, Release)` keeps the
-        // send_work() path in lockstep with the FPGA we just programmed, so
-        // the first work item out the door already uses shift=2 even before
-        // `read_fpga_midstate_cnt()` re-reads CTRL on its first call.
+        // Work encoding and nonce decoding consume explicit per-chain state;
+        // no shared driver-global MIDSTATE_CNT cache is permitted.
         //
         // XXX: see ~/ and
         //       (W13.A2 NEW rule)
         let cold_ctrl = self.ctrl_reg_value(); // 0x1C — BM139X|ENABLE|MIDSTATE_CNT=2
         chain.write_ctrl(cold_ctrl);
-        self.runtime_midstate_cnt
-            .store(MIDSTATE_CNT_LOG2, std::sync::atomic::Ordering::Release);
         std::thread::sleep(std::time::Duration::from_millis(2));
         tracing::info!(
             chain_id = chain.chain_id,
             ctrl = format_args!("0x{:08X}", cold_ctrl),
             midstate_cnt = MIDSTATE_CNT_LOG2,
-            "Step 11b (W13.B3): EXPLICIT CTRL write 0x{:08X} + runtime_midstate_cnt={} \
+            "Step 11b (W13.B3): EXPLICIT CTRL write 0x{:08X} with per-chain midstate_cnt={} \
              — overrides any bosminer 0x1E remnant",
             cold_ctrl,
             MIDSTATE_CNT_LOG2,
@@ -993,21 +836,20 @@ impl ChipDriver for Bm1398Driver {
             ));
         }
 
-        // Use per-work-item fpga_midstate_cnt (set by work_dispatcher from chain state).
-        // This is the source of truth — matches what FPGA CTRL_REG was configured to.
-        // Clamp to valid BM1398 values: 2 (4 midstates) or 3 (8 midstates).
-        let ms_cnt = (work.fpga_midstate_cnt as u32).clamp(2, 3);
-        // Update the cached atomic for decode_nonce() to use
-        self.runtime_midstate_cnt
-            .store(ms_cnt, std::sync::atomic::Ordering::Relaxed);
-        let num_slots = 1usize << ms_cnt; // 2^cnt: 4 or 8 midstate slots
-        let work_words = 4 + num_slots * 8; // 36 or 68 words
+        // Use the per-work-item FPGA mode set by the dispatcher from immutable
+        // chain state. Invalid modes are a composition error, not something to
+        // clamp into a different on-wire packet shape.
+        let mode = Self::fpga_midstate_mode(work.fpga_midstate_cnt)?;
+        let ms_cnt = mode.log2_count() as u32;
+        let num_slots = mode.midstate_count() as usize;
+        let work_words = mode.payload_words() as usize;
 
         // Allocate work buffer (max 68 words for 8 midstates)
         let mut words = [0u32; 68]; // Max size for MIDSTATE_CNT=3
 
-        // Word 0: Extended Work ID, shifted left by runtime midstate_cnt.
-        words[0] = (work.work_id as u32) << ms_cnt;
+        // Word 0: extended carrier ID. Slot zero is the base dispatch entry;
+        // ASIC-returned low bits select the actual midstate slot.
+        words[0] = Self::base_carrier_work_id(mode, work.work_id)? as u32;
 
         // Word 1: nbits.
         words[1] = work.nbits;
@@ -1059,26 +901,54 @@ impl ChipDriver for Bm1398Driver {
     }
 
     fn decode_nonce(&self, raw: &[u32; 2]) -> Result<NonceResult> {
+        let _ = raw;
+        Err(crate::AsicError::InvalidParameter(
+            "BM1398 nonce decoding requires per-chain FPGA midstate context".into(),
+        ))
+    }
+
+    fn decode_nonce_with_context(
+        &self,
+        raw: &[u32; 2],
+        context: FpgaNonceDecodeContext,
+    ) -> Result<NonceResult> {
         // BM1398 nonce response (from WORK_RX_FIFO):
         //   Word 0: nonce value (32-bit)
         //   Word 1: [CRC:8 | extended_work_id:16 | solution_index:8]
         //
         // Same FIFO word layout as BM1397 (shared FPGA format).
         //
-        // Uses runtime MIDSTATE_CNT for work_id/midstate_idx extraction.
+        // Uses caller-supplied per-chain MIDSTATE_CNT for work_id/midstate_idx extraction.
         // Passthrough from bosminer: MIDSTATE_CNT=3 (shift=3, 8 slots).
         // Our cold boot: MIDSTATE_CNT=2 (shift=2, 4 slots).
 
-        let ms_cnt = self
-            .runtime_midstate_cnt
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let ms_cnt = context.midstate_count_log2();
+        if !matches!(ms_cnt, 2 | 3) {
+            return Err(crate::AsicError::InvalidParameter(format!(
+                "BM1398 FPGA midstate_count_log2 must be 2 or 3, got {ms_cnt}"
+            )));
+        }
 
         let nonce = raw[0];
         let w1 = raw[1];
         let solution_id = (w1 & 0xFF) as u8;
         let hw_work_id = ((w1 >> 8) & 0xFFFF) as u16;
-        let work_id = hw_work_id >> ms_cnt;
-        let midstate_idx = (hw_work_id & ((1u16 << ms_cnt) - 1)) as u8;
+        let mode = match ms_cnt {
+            2 => dcentrald_api_types::bm1398_protocol::Bm1398FpgaMidstateMode::Four,
+            3 => dcentrald_api_types::bm1398_protocol::Bm1398FpgaMidstateMode::Eight,
+            _ => {
+                return Err(crate::AsicError::InvalidParameter(format!(
+                    "BM1398 FPGA midstate_count_log2 must be 2 or 3, got {ms_cnt}"
+                )))
+            }
+        };
+        let (work_id, midstate_idx) = dcentrald_api_types::bm1398_protocol::BM1398_FPGA_FIFO_SPEC
+            .decode_work_id(mode, hw_work_id)
+            .ok_or_else(|| {
+                crate::AsicError::InvalidParameter(format!(
+                    "BM1398 echoed work id 0x{hw_work_id:04X} exceeds the 8-bit logical FPGA ring"
+                ))
+            })?;
 
         // BM1398 chip address in nonce bits [24:17] (8 bits).
         let chip_addr = ((nonce >> 17) & 0xFF) as u8;
@@ -1099,7 +969,7 @@ impl ChipDriver for Bm1398Driver {
     fn ctrl_reg_value(&self) -> u32 {
         // BM1398 CTRL for cold boot: 0x1C (BM139X=1, ENABLE=1, MIDSTATE_CNT=2 → 4 midstates).
         // In passthrough mode, daemon.rs preserves bosminer's CTRL=0x1E (8 midstates).
-        // The runtime_midstate_cnt field + read_fpga_midstate_cnt() handle both cases.
+        // Work and decode paths receive the corresponding per-chain value.
         //
         // Bosminer working state: CTRL=0x1E (8 midstates, 68-word work items, BAUD=0x00)
         // Our cold boot: CTRL=0x1C (4 midstates, 36-word work items)
@@ -1157,8 +1027,6 @@ impl ChipDriver for Bm1398Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::Ordering;
-
     /// Pins the jig-verified BM1397/BM1398 per-core enable_core_clock value
     /// (`CoreRegCtrl 0x3C = (core << 16) | 0x84AA`, from the S17 factory jig).
     #[test]
@@ -1199,36 +1067,45 @@ mod tests {
         );
     }
 
-    /// W13.B3 fix #1 (companion) — the runtime midstate counter must lock to
-    /// MIDSTATE_CNT_LOG2 = 2 at driver construction, so the first send_work()
-    /// after cold-boot uses shift=2 even before read_fpga_midstate_cnt() runs.
+    /// Nonce decode must use immutable per-chain carrier state. A shared
+    /// driver serves every chain, so storing the last writer's MIDSTATE_CNT in
+    /// the driver would make 4-slot and 8-slot chains race semantically.
     #[test]
-    fn bm1398_runtime_midstate_cnt_explicit_after_cold_boot() {
+    fn bm1398_nonce_decode_is_explicitly_contextual() {
         let driver = Bm1398Driver::new();
+        let raw = [0x01c2_0000, (0x0157u32 << 8) | 0x5a];
+        assert!(driver.decode_nonce(&raw).is_err());
+
+        let four = driver
+            .decode_nonce_with_context(&raw, FpgaNonceDecodeContext::try_new(2).unwrap())
+            .unwrap();
+        assert_eq!(four.work_id, 0x55);
+        assert_eq!(four.midstate_idx, 3);
+
+        let eight = driver
+            .decode_nonce_with_context(&raw, FpgaNonceDecodeContext::try_new(3).unwrap())
+            .unwrap();
+        assert_eq!(eight.work_id, 0x2a);
+        assert_eq!(eight.midstate_idx, 7);
+
+        assert!(driver
+            .decode_nonce_with_context(&raw, FpgaNonceDecodeContext::try_new(1).unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn bm1398_work_carrier_rejects_aliases_and_invalid_modes() {
+        let four = Bm1398Driver::fpga_midstate_mode(2).unwrap();
+        let eight = Bm1398Driver::fpga_midstate_mode(3).unwrap();
+        assert_eq!(Bm1398Driver::base_carrier_work_id(four, 255).unwrap(), 1020);
         assert_eq!(
-            MIDSTATE_CNT_LOG2, 2,
-            "MIDSTATE_CNT_LOG2 must be 2 (4 midstates / 36-word work format)"
+            Bm1398Driver::base_carrier_work_id(eight, 255).unwrap(),
+            2040
         );
-        let cnt = driver.runtime_midstate_cnt.load(Ordering::Acquire);
-        assert_eq!(
-            cnt, MIDSTATE_CNT_LOG2,
-            "runtime_midstate_cnt must initialize to MIDSTATE_CNT_LOG2; got {}",
-            cnt
-        );
-        // Simulate the explicit Step 11b store (W13.B3 fix #1).
-        driver
-            .runtime_midstate_cnt
-            .store(MIDSTATE_CNT_LOG2, Ordering::Release);
-        let post = driver.runtime_midstate_cnt.load(Ordering::Acquire);
-        assert_eq!(post, 2, "post-cold-boot runtime_midstate_cnt must be 2");
-        // Pin that send_work() encoding (work_id << ms_cnt) uses shift=2.
-        let work_id: u32 = 0x55;
-        let encoded = work_id << post;
-        assert_eq!(
-            encoded,
-            0x55 << 2,
-            "work_id encoding must use shift=2 after cold boot"
-        );
+        assert!(Bm1398Driver::base_carrier_work_id(four, 256).is_err());
+        assert!(Bm1398Driver::base_carrier_work_id(eight, u16::MAX).is_err());
+        assert!(Bm1398Driver::fpga_midstate_mode(1).is_err());
+        assert!(Bm1398Driver::fpga_midstate_mode(4).is_err());
     }
 
     /// W13.B3 fix #3 — PLL lock poll loop must budget at least 100 ms total,
@@ -1268,9 +1145,8 @@ mod tests {
     /// is 0x46E46 (290,374 cycles), proven byte-for-byte against bosminer.
     #[test]
     fn bm1398_work_time_register_set_to_canonical_value() {
-        // Pin NUM_MIDSTATES is what the cold-boot path uses — not the value
-        // returned by read_fpga_midstate_cnt(chain), which can be wrong if
-        // bosminer left CTRL=0x1E.
+        // Pin NUM_MIDSTATES is what the cold-boot path programs; passthrough
+        // chain state is supplied explicitly by the dispatcher.
         assert_eq!(
             NUM_MIDSTATES, 4,
             "BM1398 cold-boot canonical NUM_MIDSTATES must be 4"

@@ -11,6 +11,7 @@ members = [
     "dcentrald-api",
     "dcentrald-autotuner",
     "dcentrald-common",
+    "dcentrald-fabric-lease",
     "dcentrald-silicon-profiles",
     # A44 (Knowledge Goldmine 2026-06-10): pure no-HAL chip-health math
     # (Laplacian gradient / cross-slot z-score / nonce-deficit). Precursor
@@ -41,6 +42,7 @@ default-members = [
     "dcentrald-api",
     "dcentrald-autotuner",
     "dcentrald-common",
+    "dcentrald-fabric-lease",
     "dcentrald-silicon-profiles",
     "dcentrald-chip-analysis",
     "dcentrald-re-catalog",
@@ -93,6 +95,17 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # the binary. Binary-size sweep 2026-07-09.
 rumqttc = { version = "0.24", default-features = false }
 proptest = "1"
+
+# Workspace test/link profile sized for bounded CI and Docker workers. Full
+# source-level debug data is unnecessary for the compile gate and made a
+# single dcentrald test link exceed Docker Desktop's memory allocation.
+# Preserve unwinding: tests exercise panic containment contracts that the
+# production `panic = "abort"` profile intentionally does not provide.
+[profile.ci-test]
+inherits = "test"
+debug = "line-tables-only"
+incremental = false
+codegen-units = 16
 
 [profile.release]
 strip = true

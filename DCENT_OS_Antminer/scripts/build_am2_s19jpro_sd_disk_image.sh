@@ -223,6 +223,8 @@ write_am2_sd_manifest() {
     manifest_rootfs=$(json_bool_file "$ROOTFS_SQUASHFS")
     manifest_uenv=$(json_bool_int "$UENV_STAGED")
     manifest_allow_incomplete=$(json_bool_int "$ALLOW_INCOMPLETE")
+    manifest_image_size=$(total_bytes "$IMG_FILE")
+    manifest_image_sha256=$(sha256sum "$IMG_FILE" | awk '{print $1}')
 
     manifest_complete=false
     if [ "$manifest_boot_bin" = true ] && \
@@ -236,9 +238,11 @@ write_am2_sd_manifest() {
 
     manifest_body=$(cat <<EOF
 {
-  "schema": "dcentos.am2_s19jpro_sd_image_manifest.v1",
+  "schema": "dcentos.am2_s19jpro_sd_image_manifest.v2",
   "target": "am2-s19jpro-sd",
   "image": "$(basename "$IMG_FILE")",
+  "image_size_bytes": $manifest_image_size,
+  "image_sha256": "$manifest_image_sha256",
   "created_utc": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
   "allow_incomplete": $manifest_allow_incomplete,
   "boot_artifacts_complete": $manifest_complete,
@@ -410,8 +414,14 @@ sd_common::need_tool mkfs.vfat  "sudo apt install dosfstools"
 sd_common::need_tool mcopy      "sudo apt install mtools"
 sd_common::need_tool mkfs.ext2  "sudo apt install e2fsprogs"
 sd_common::need_tool dd         "(coreutils)"
+sd_common::need_tool sha256sum  "(coreutils)"
 
 IMG_FILE="$SD_OUTPUT_DIR/dcentos-am2-s19jpro.img"
+if [ -e "$IMG_FILE.sig" ] || [ -L "$IMG_FILE.sig" ]; then
+    echo "ERROR: refusing to rewrite an AM2 image beside stale signature: $IMG_FILE.sig" >&2
+    echo "       Remove the signature explicitly before rebuilding." >&2
+    exit 1
+fi
 UENV_STAGED=0
 P1_OFFSET_MB=1
 P1_SIZE_MB=64

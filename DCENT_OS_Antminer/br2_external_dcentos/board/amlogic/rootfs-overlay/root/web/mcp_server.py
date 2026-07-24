@@ -976,13 +976,36 @@ def tool_service_control(params):
     if service == "dcentrald":
         for init_script in ("/etc/init.d/S82dcentrald", "/etc/init.d/dcentrald"):
             if os.path.exists(init_script):
-                output = run_cmd(f"{init_script} {action} 2>&1", timeout=15)
-                return {
+                try:
+                    result = subprocess.run(
+                        [init_script, action],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        timeout=45,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    return {
+                        "error": "guarded dcentrald service action timed out",
+                        "service": service,
+                        "action": action,
+                        "init_script": init_script,
+                        "output": (exc.stdout or "")[-2000:],
+                    }
+                response = {
                     "service": service,
                     "action": action,
                     "init_script": init_script,
-                    "output": output or "ok",
+                    "returncode": result.returncode,
+                    "output": (result.stdout or "")[-2000:] or "ok",
                 }
+                if result.returncode != 0:
+                    response["error"] = (
+                        "service action refused; hardware-session admission may require "
+                        "operator disposition"
+                    )
+                return response
         return {
             "error": "dcentrald service wrapper not found; refusing unsafe direct process control",
             "expected": ["/etc/init.d/S82dcentrald", "/etc/init.d/dcentrald"],

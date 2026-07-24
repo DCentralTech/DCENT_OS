@@ -40,15 +40,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dcentrald_api::routes::restore_to_stock::{
     build_preflight_checks_for_test, copy_fw_setenv_and_record_status_for_test,
-    copy_fw_setenv_into_backup_dir, detect_platform_signature_with_root_for_test,
-    drive_partial_dir_cleanup_armed_for_test, drive_partial_dir_cleanup_disarmed_for_test,
-    extracted_size_violation, first_slip_violation, header_extracted_violation_for_test,
-    is_inside_staging_root, last_backup_fw_setenv_present_for_test, lookup_in_stock_manifest,
-    max_tar_entries_for_test, profile_for, push_log_line_for_test, recent_log_lines_len_for_test,
+    copy_fw_setenv_into_backup_dir, destructive_admission_blocker_for_test,
+    detect_platform_signature_with_root_for_test, drive_partial_dir_cleanup_armed_for_test,
+    drive_partial_dir_cleanup_disarmed_for_test, extracted_size_violation, first_slip_violation,
+    header_extracted_violation_for_test, is_inside_staging_root,
+    last_backup_fw_setenv_present_for_test, lookup_in_stock_manifest, max_tar_entries_for_test,
+    profile_for, push_log_line_for_test, recent_log_lines_len_for_test,
     recent_log_lines_max_for_test, recent_log_lines_snapshot_for_test, reset_status_for_test,
     restore_lock_in_use, sweep_orphan_partial_backups_for_test, try_lock_restore, ManifestVerdict,
-    PlatformProfile, PreflightChecks, PreflightProbes, RestoreError, RestoreLockGuard,
-    RestoreState, RestoreToStockBody, SafetyFinding, Severity, PROFILE_TABLE,
+    PreflightChecks, PreflightProbes, RestoreError, RestoreLockGuard, RestoreState,
+    RestoreToStockBody, SafetyFinding, Severity, PROFILE_TABLE,
 };
 
 // ---------------------------------------------------------------------------
@@ -1945,10 +1946,9 @@ fn test_w9d_source_no_8mib_cap() {
 
 /// W10-A A1-HIGH-7: when `/usr/sbin/fw_setenv` (or whatever path the
 /// daemon points at) exists at restore-to-stock time, the binary
-/// MUST be copied into the timestamped NAND-backup directory so the
-/// operator on stock has Option-A recovery (`./fw_setenv bootslot
-/// <prev>` to roll back) even if stock firmware lacks
-/// libubootenv-tools.
+/// MUST be copied into the timestamped NAND-backup directory as a recovery
+/// capability. The actual selector transaction is platform-specific and is
+/// intentionally not prescribed by this test.
 ///
 /// We don't drive the full `nand_backup` here (it requires real
 /// /dev/mtd devices); instead we test the helper directly with a
@@ -2116,7 +2116,7 @@ async fn test_manifest_size_cap_rejects_oversized_file() {
     )
     .await;
 
-    match verdict {
+    match &verdict {
         ManifestVerdict::ManifestUnavailable { reason } => {
             assert!(
                 reason.contains("exceeds") && reason.contains("byte cap"),
@@ -2129,6 +2129,13 @@ async fn test_manifest_size_cap_rejects_oversized_file() {
             );
         }
     }
+
+    let finding = verdict.into_finding(Some("zynq-am1-bm1387"));
+    assert!(
+        finding.no_override,
+        "unreadable/oversized manifest evidence must remain a destructive blocker"
+    );
+    assert!(destructive_admission_blocker_for_test(&[finding]).is_some());
 
     let _ = std::fs::remove_dir_all(&workdir);
 }
@@ -2583,6 +2590,10 @@ async fn test_known_safe_stock_image_passes_preflight() {
     assert_eq!(finding.id, "DCENT-2026-016");
     assert!(matches!(finding.severity, Severity::Info));
     assert!(!finding.no_override);
+    assert!(
+        destructive_admission_blocker_for_test(&[finding]).is_none(),
+        "an exact verified-safe match is the only image verdict that may pass this gate"
+    );
 }
 
 /// W10-G: matched SHA but platform mismatch produces `WrongModel`
@@ -2616,10 +2627,12 @@ async fn test_wrong_model_stock_image_blocked() {
         finding.no_override,
         "W10-G: WrongModel must be no_override:true so confirm:true is refused"
     );
+    assert!(destructive_admission_blocker_for_test(&[finding]).is_some());
 }
 
-/// W10-G: matched SHA but `dcentos_revertable:false` produces
-/// `NonRevertable` (High, override-via-acknowledge_high_findings).
+/// A matched SHA with `dcentos_revertable:false` remains diagnostic High,
+/// but is a destructive no-override blocker. Ordinary HIGH acknowledgement
+/// must never promote it to verified-safe.
 #[tokio::test]
 async fn test_non_revertable_stock_warns() {
     let manifest = fixture_manifest_path();
@@ -2646,13 +2659,14 @@ async fn test_non_revertable_stock_warns() {
     assert_eq!(finding.id, "DCENT-2026-018");
     assert!(matches!(finding.severity, Severity::High));
     assert!(
-        !finding.no_override,
-        "W10-G: NonRevertable can be acknowledged via acknowledge_high_findings"
+        finding.no_override,
+        "NonRevertable must remain blocked even when acknowledge_high_findings=true"
     );
+    assert!(destructive_admission_blocker_for_test(&[finding]).is_some());
 }
 
-/// W10-G: SHA absent from the manifest → `Unknown` (Medium,
-/// informational).
+/// SHA absent from the manifest remains a useful Medium diagnostic, but cannot
+/// authorize destructive restore even when HIGH findings are acknowledged.
 #[tokio::test]
 async fn test_unknown_stock_image_medium_warning() {
     let manifest = fixture_manifest_path();
@@ -2667,11 +2681,51 @@ async fn test_unknown_stock_image_medium_warning() {
     let finding = verdict.into_finding(Some("zynq-am1-bm1387"));
     assert_eq!(finding.id, "DCENT-2026-019");
     assert!(matches!(finding.severity, Severity::Medium));
-    assert!(!finding.no_override);
+    assert!(finding.no_override);
+    assert!(destructive_admission_blocker_for_test(&[finding]).is_some());
+}
+
+/// A placeholder manifest SHA is not evidence and cannot be made into a
+/// match by passing placeholder text as the staged digest.
+#[tokio::test]
+async fn test_placeholder_hash_is_non_overrideable() {
+    let manifest = fixture_manifest_path();
+    let verdict =
+        lookup_in_stock_manifest("UNKNOWN", Some("amlogic-a113d-bm1362"), Some(&manifest)).await;
+    let finding = verdict.into_finding(Some("amlogic-a113d-bm1362"));
+    assert!(
+        matches!(finding.severity, Severity::High),
+        "an invalid/placeholder staged digest must fail as unavailable evidence"
+    );
+    assert!(finding.no_override);
+    assert!(destructive_admission_blocker_for_test(&[finding]).is_some());
+}
+
+/// Even a known SHA and `dcentos_revertable:true` row is not verified-safe
+/// without an exact running composition identity.
+#[tokio::test]
+async fn test_known_hash_without_composition_identity_is_non_overrideable() {
+    let manifest = fixture_manifest_path();
+    let verdict = lookup_in_stock_manifest(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        None,
+        Some(&manifest),
+    )
+    .await;
+    match &verdict {
+        ManifestVerdict::ManifestUnavailable { reason } => assert!(
+            reason.contains("platform identity") || reason.contains("composition"),
+            "reason must identify missing composition proof: {reason}"
+        ),
+        other => panic!("known hash without composition must fail closed, got {other:?}"),
+    }
+    let finding = verdict.into_finding(None);
+    assert!(finding.no_override);
+    assert!(destructive_admission_blocker_for_test(&[finding]).is_some());
 }
 
 /// W10-G: missing manifest path produces `ManifestUnavailable`
-/// (degrades to Medium informational, never blocks).
+/// and a destructive no-override finding.
 #[tokio::test]
 async fn test_manifest_unavailable_degrades_gracefully() {
     let nonexistent = PathBuf::from("/tmp/dcentos-w10g-nonexistent-manifest.json");
@@ -2682,7 +2736,7 @@ async fn test_manifest_unavailable_degrades_gracefully() {
         Some(&nonexistent),
     )
     .await;
-    match verdict {
+    match &verdict {
         ManifestVerdict::ManifestUnavailable { reason } => {
             assert!(
                 !reason.is_empty(),
@@ -2691,6 +2745,66 @@ async fn test_manifest_unavailable_degrades_gracefully() {
         }
         other => panic!("W10-G: expected ManifestUnavailable, got {other:?}"),
     }
+    let finding = verdict.into_finding(Some("zynq-am1-bm1387"));
+    assert!(matches!(finding.severity, Severity::High));
+    assert!(finding.no_override);
+    assert!(destructive_admission_blocker_for_test(&[finding]).is_some());
+}
+
+/// The ordinary HIGH acknowledgement is intentionally absent from the
+/// destructive blocker helper's inputs. Prove all non-admitting manifest
+/// verdicts remain blockers while only VerifiedSafe passes.
+#[test]
+fn test_acknowledgement_cannot_bypass_manifest_image_admission() {
+    let body = body_for(Path::new("/tmp/not-used-by-pure-admission-test.tar"), true);
+    assert!(
+        body.acknowledge_high_findings,
+        "fixture explicitly represents an operator who acknowledged HIGH findings"
+    );
+
+    let blockers = [
+        ManifestVerdict::WrongModel {
+            manifest_model: "S19 Pro".to_string(),
+            manifest_platform: "zynq-am2-bm1398".to_string(),
+            detected_platform: "zynq-am1-bm1387".to_string(),
+        },
+        ManifestVerdict::NonRevertable {
+            model: "S9".to_string(),
+            version: "known-hash-but-disabled".to_string(),
+            revert_notes: "selector contract invalidated".to_string(),
+        },
+        ManifestVerdict::Unknown,
+        ManifestVerdict::ManifestUnavailable {
+            reason: "invalid signature or schema".to_string(),
+        },
+    ];
+    for verdict in blockers {
+        let finding = verdict.into_finding(Some("zynq-am1-bm1387"));
+        assert!(finding.no_override, "{} must be no-override", finding.id);
+        assert!(
+            destructive_admission_blocker_for_test(&[finding]).is_some(),
+            "acknowledgement must not bypass an incompatible, unknown, non-revertable, or unavailable image verdict"
+        );
+    }
+
+    let safe = ManifestVerdict::VerifiedSafe {
+        model: "S9".to_string(),
+        version: "synthetic-exact-safe-fixture".to_string(),
+    }
+    .into_finding(Some("zynq-am1-bm1387"));
+    assert!(destructive_admission_blocker_for_test(&[safe]).is_none());
+
+    let src = read_module_source();
+    let admission_gate = src
+        .find("destructive_admission_blocker(&preflight.safety_findings)")
+        .expect("destructive no-override gate must be wired into handler");
+    let high_ack_gate = src
+        .find("let has_high_findings = preflight")
+        .expect("ordinary HIGH acknowledgement gate must remain wired");
+    assert!(
+        admission_gate < high_ack_gate,
+        "non-overrideable admission must run before acknowledge_high_findings"
+    );
 }
 
 /// W10-G: source-pin the manifest-lookup integration into
@@ -3101,7 +3215,7 @@ async fn test_manifest_schema_version_drift_rejected() {
         Some(&manifest_path),
     )
     .await;
-    match verdict {
+    match &verdict {
         ManifestVerdict::ManifestUnavailable { reason } => {
             assert!(
                 reason.contains("999") || reason.contains("unsupported"),
@@ -3112,6 +3226,13 @@ async fn test_manifest_schema_version_drift_rejected() {
             "W11-A T7: schema_version=999 manifest must produce ManifestUnavailable; got {other:?}"
         ),
     }
+
+    let finding = verdict.into_finding(Some("zynq-am1-bm1387"));
+    assert!(
+        finding.no_override,
+        "invalid manifest schema must remain a destructive blocker"
+    );
+    assert!(destructive_admission_blocker_for_test(&[finding]).is_some());
 
     let _ = std::fs::remove_dir_all(&workdir);
 }
@@ -3280,10 +3401,10 @@ async fn test_sweep_orphan_partial_backups_removes_only_partials() {
 // 10 new tests pinning the W12-B contract:
 //   1. profile_for_known_platforms_returns_some_for_4_entries
 //   2. profile_for_unknown_signature_returns_none
-//   3. profile_for_zynq_am1_has_verified_revertable_true
+//   3. profile_for_zynq_am1_is_contained_by_evidence
 //   4. profile_for_amlogic_has_no_ubi_expected_lebs
 //   5. profile_for_am335x_bb_has_correct_revert_script_path
-//   6. handler_admits_zynq_am1_via_two_layer_gate
+//   6. handler_enforces_profile_two_layer_gate
 //   7. handler_rejects_amlogic_via_two_layer_gate_pending_live_test
 //   8. leb_check_skipped_when_profile_ubi_lebs_is_none
 //   9. nand_backup_uses_profile_mtds_not_global_const
@@ -3292,37 +3413,39 @@ async fn test_sweep_orphan_partial_backups_removes_only_partials() {
 // These are pure-data + source-pin tests — no live AppState required.
 // ---------------------------------------------------------------------------
 
-/// W12-B test 1 (W16/W19/W23/W2B/Phase-2B-extended): PROFILE_TABLE has
-/// the 10 expected platform entries and `profile_for` returns `Some`
+/// W12-B test 1 (W16/W19/W23/Phase-2B-extended): PROFILE_TABLE has
+/// the 9 evidence-backed platform entries and `profile_for` returns `Some`
 /// for each known signature. W16 added `zynq-am2-bm1397` (S17 am2-s17
 /// BM1397+); W19 added `zynq-am2-bm1398` (S19 Pro + S19j Pro Zynq am2
 /// XC7Z020); W23 renamed Amlogic keys to match the
 /// [`detect_platform_signature`] output (`amlogic-am3-*` →
 /// `amlogic-a113d-*`) and added the missing `amlogic-a113d-bm1362`
-/// entry for S19j Pro Amlogic. W2B (B1) added `cv1835-bm1362` for the
-/// Sophgo CV1835 S19j Pro variant. The v2 preparedness sweep
-/// (Phase 2B, 2026-05-15) added the two S21 Pro / S21 XP BM1370 entries
+/// entry for S19j Pro Amlogic. The v2 preparedness sweep (Phase 2B,
+/// 2026-05-15) added the two S21 Pro / S21 XP BM1370 entries
 /// (`amlogic-a113d-bm1370`, `amlogic-a113d-bm1370-xp`) to close the
 /// BM1370-silent-routing gap (S21 Pro / XP previously fell through the
 /// bare-"s21" match to the BM1368 profile + S21 revert script). All
-/// entries are `verified_revertable: false` except S9 am1 until their
-/// respective live-test waves.
+/// entries are `verified_revertable: false`. S9 am1 was demoted after local
+/// U-Boot/live evidence invalidated the former helper's selector assumptions.
 ///
 /// Stale-test note (fixed 2026-06-02): this test previously asserted
 /// `len() == 8` and listed only 8 signatures, so it broke when Phase 2B
 /// added the two BM1370 entries. The PROFILE_TABLE additions are
 /// correct (new, well-documented platform rows — see
 /// `restore_to_stock.rs` PROFILE_TABLE entries #9/#10); the test's
-/// count + signature list were outdated. The function name still reads
+/// count + signature list were outdated. CV1835 is intentionally absent:
+/// its typed policy marks recovery NOT_IMPLEMENTED and the old entry contained
+/// guessed device paths, environment keys, and a nonexistent helper. The
+/// function name still reads
 /// `..._for_4_entries` for historical/test-filter stability — the
 /// load-bearing assertion is the count + per-signature lookup, both
-/// updated to the real table size (10).
+/// updated to the real table size (9).
 #[test]
 fn test_profile_for_known_platforms_returns_some_for_4_entries() {
     assert_eq!(
         PROFILE_TABLE.len(),
-        10,
-        "W12-B + W16 + W19 + W23 + W2B + Phase-2B PROFILE_TABLE must have 10 entries"
+        9,
+        "W12-B + W16 + W19 + W23 + Phase-2B PROFILE_TABLE must have 9 entries"
     );
     for sig in [
         "zynq-am1-bm1387",
@@ -3332,13 +3455,32 @@ fn test_profile_for_known_platforms_returns_some_for_4_entries() {
         "amlogic-a113d-bm1362",    // W23: NEW — S19j Pro Amlogic
         "zynq-am2-bm1397",         // W16: S17 am2-s17 BM1397+ code-only entry
         "zynq-am2-bm1398",         // W19: S19 Pro + S19j Pro Zynq am2 (XC7Z020)
-        "cv1835-bm1362",           // W2B B1: CV1835 S19j Pro code-only port
         "amlogic-a113d-bm1370",    // Phase 2B (v2 sweep): S21 Pro BM1370
         "amlogic-a113d-bm1370-xp", // Phase 2B (v2 sweep): S21 XP BM1370
     ] {
         assert!(
             profile_for(sig).is_some(),
-            "PROFILE_TABLE missing W12-B/W16/W19/W23/W2B/Phase-2B entry for `{sig}`"
+            "PROFILE_TABLE missing W12-B/W16/W19/W23/Phase-2B entry for `{sig}`"
+        );
+    }
+    assert!(
+        profile_for("cv1835-bm1362").is_none(),
+        "CV1835 recovery must remain absent until an evidence-backed typed recovery implementation exists"
+    );
+}
+
+#[test]
+fn cv1835_speculative_restore_profile_cannot_reappear() {
+    let src = read_module_source();
+    for guessed_contract in [
+        "cv1835-bm1362",
+        "/dev/mmcblk0boot0",
+        "/dev/mmcblk0p2",
+        "revert_to_stock_cv1835_s19j.sh",
+    ] {
+        assert!(
+            !src.contains(guessed_contract),
+            "restore source must not contain speculative CV1835 contract {guessed_contract:?}"
         );
     }
 }
@@ -3373,37 +3515,62 @@ fn test_profile_for_unknown_signature_returns_none() {
     }
 }
 
-/// W12-B test 3 (W16/W19-extended): S9 am1 entry has `verified_revertable:
-/// true` (the only platform with live-test proof). Every other entry
-/// — including the W16 `zynq-am2-bm1397` S17 entry and the W19
-/// `zynq-am2-bm1398` S19 Pro / S19j Pro Zynq am2 entry — has
-/// `verified_revertable: false` until its respective live-test wave.
+/// S9 containment: local U-Boot/live evidence identifies `firmware=1|2` as
+/// the selector and disproves the former helper's selector assumptions. The
+/// profile must stay non-revertable and must expose only the evidenced key.
 #[test]
-fn test_profile_for_zynq_am1_has_verified_revertable_true() {
+fn test_profile_for_zynq_am1_is_contained_by_evidence() {
     let p = profile_for("zynq-am1-bm1387").expect("S9 am1 entry");
     assert!(
-        p.verified_revertable,
-        "S9 am1 PROFILE_TABLE entry must have verified_revertable: true \
-         (wave-8-11 home-S9 first practical test GO)"
+        !p.verified_revertable,
+        "S9 restore must remain blocked after its selector contract was invalidated"
     );
-    // The other 7 entries must have verified_revertable: false until
-    // their respective live tests pass.
-    for sig in [
-        "am335x-bb-bm1362",
-        "amlogic-a113d-bm1368", // W23 rename
-        "amlogic-a113d-bm1366", // W23 rename
-        "amlogic-a113d-bm1362", // W23 NEW — S19j Pro Amlogic
-        "zynq-am2-bm1397",      // W16: S17 code-only port
-        "zynq-am2-bm1398",      // W19: S19 Pro / S19j Pro Zynq am2 code-only port
-        "cv1835-bm1362",        // W2B B1: CV1835 S19j Pro code-only port
-    ] {
-        let p = profile_for(sig).expect(sig);
+    assert_eq!(
+        p.bootslot_env_keys,
+        &["firmware"],
+        "S9 slot discovery must use the locally evidenced firmware=1|2 key only"
+    );
+    // Iterate the table itself so a newly added profile cannot silently escape
+    // the current all-platform destructive-admission freeze.
+    for p in PROFILE_TABLE {
         assert!(
             !p.verified_revertable,
-            "{sig} PROFILE_TABLE entry must have verified_revertable: false \
-             until its respective live-test wave (W12-B / W16 / W19 closure)"
+            "{} PROFILE_TABLE entry must remain non-admitted until separately proven",
+            p.signature
         );
     }
+}
+
+/// The production manifest must not retain the invalidated S9 revertability
+/// claim. Keep the reason in the existing `revert_notes` field rather than
+/// inventing a schema extension that older daemons would not understand.
+#[test]
+fn test_baked_manifest_demotes_invalidated_s9_claim() {
+    let manifest_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/stock-bitmain-manifest.json");
+    let raw = std::fs::read_to_string(&manifest_path).expect("read baked stock manifest source");
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("parse baked stock manifest");
+    let entries = parsed["stock_images"]
+        .as_array()
+        .expect("stock_images array");
+    let s9 = entries
+        .iter()
+        .find(|entry| {
+            entry["sha256"].as_str()
+                == Some("21ff390e9b0f61f34853823db153475f6ab33b095a61c2fb7133e605dd2b7d81")
+        })
+        .expect("evidence-backed pre-2019 S9 image row");
+    assert_eq!(s9["dcentos_revertable"].as_bool(), Some(false));
+    let notes = s9["revert_notes"].as_str().expect("S9 invalidation notes");
+    assert!(notes.contains("INVALIDATED 2026-07-15"));
+    assert!(notes.contains("firmware=1|2"));
+    assert!(notes.contains("bootslot") && notes.contains("active_slot"));
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry["dcentos_revertable"].as_bool() != Some(true)),
+        "the production manifest currently has no destructively admitted image row"
+    );
 }
 
 /// W12-B test 4 (W23-extended): am3-aml entries have
@@ -3657,7 +3824,7 @@ fn test_s19_am2_revert_script_path_resolves() {
 /// `profile_for_current_platform()`. Source-pin so the W12-B 2-layer
 /// gate can't be silently regressed to the wave-≤11 single-Zynq gate.
 #[test]
-fn test_handler_admits_zynq_am1_via_two_layer_gate() {
+fn test_handler_enforces_profile_two_layer_gate() {
     let src = read_module_source();
     // Layer 1 wiring: profile_for_current_platform() in the handler.
     assert!(
@@ -3680,12 +3847,12 @@ fn test_handler_admits_zynq_am1_via_two_layer_gate() {
 }
 
 /// W12-B test 7: pending-live-test rejection text is operator-facing
-/// and cites the source-side flip required to admit confirm:true.
+/// and cites the evidence review required to admit confirm:true.
 #[test]
 fn test_handler_rejects_amlogic_via_two_layer_gate_pending_live_test() {
     let src = read_module_source();
     // The layer-2 reason text must mention the verified_revertable
-    // flag and the source-side flip — without that, the operator has
+    // flag and the source-side review — without that, the operator has
     // no clear path forward when their platform code-supports but
     // hasn't been live-tested.
     assert!(
@@ -3694,7 +3861,7 @@ fn test_handler_rejects_amlogic_via_two_layer_gate_pending_live_test() {
     );
     assert!(
         src.contains("PROFILE_TABLE in restore_to_stock.rs"),
-        "W12-B layer 2 reason must point operators at the source-side flip"
+        "W12-B layer 2 reason must point operators at the source-side review"
     );
     // The pending-live-test status string must NOT appear in the
     // wave-≤11 zynq-only rejection branch — the two cases are now
@@ -3901,9 +4068,8 @@ fn mock_all_present() -> MockPreflightProbes {
     }
 }
 
-/// W12-C test 1: complete environment on a verified-revertable
-/// platform (S9 am1) → `all_present: true` and every probe field
-/// resolves to a path/value.
+/// S9 containment: even a complete host environment cannot make the invalidated
+/// restore route destructive-ready.
 #[tokio::test]
 #[serial_test::serial(restore_to_stock)]
 async fn test_preflight_checks_all_present_when_setup_complete() {
@@ -3934,13 +4100,10 @@ async fn test_preflight_checks_all_present_when_setup_complete() {
         Some("zynq-am1-bm1387"),
     );
     assert!(checks.platform_supported, "S9 am1 is in PROFILE_TABLE");
+    assert!(!checks.platform_verified_revertable);
     assert!(
-        checks.platform_verified_revertable,
-        "S9 am1 is the only verified_revertable=true entry today",
-    );
-    assert!(
-        checks.all_present,
-        "all probes Some + free_mib >= 250 + verified_revertable → all_present: true"
+        !checks.all_present,
+        "verified_revertable=false must dominate otherwise complete probes"
     );
 }
 

@@ -1,93 +1,29 @@
 #!/bin/sh
 #
-# S99upgrade - cv1835-s19jpro safe no-op/readiness marker.
+# S99upgrade - cv1835-s19jpro persistent-update containment shadow.
 #
-# SHADOW SCRIPT (brick-vector removal). The cv1835-s19jpro overlay chains the
-# Amlogic rootfs-overlay via dcentos_cv1835_s19jpro_defconfig, so without this
-# file the inherited Amlogic S99upgrade
-# (board/amlogic/rootfs-overlay/etc/init.d/S99upgrade) would land in the CVitek
-# image. That Amlogic script commits a firmware slot by writing a recovery flag
-# to /dev/mtd5 (flash_erase + nandwrite) and clearing a U-Boot env var via
-# fw_setenv against an Amlogic /dev/nand_env. The CV1835 carrier is an eMMC
-# part with a different storage layout and no validated Amlogic recovery flag,
-# /dev/nand_env, or firstboot U-Boot env commit -- running the Amlogic NAND
-# commit logic here is a remote brick vector. This same-name overlay file
-# shadows the inherited Amlogic NAND-commit script so the Amlogic NAND logic can
-# never run on a CVitek (eMMC) carrier. It deliberately performs NO NAND/flash_erase/nandwrite
-# or fw_env writes; it only reports first-boot readiness. eMMC sysupgrade stays
-# gated by storage_status (emmc-sysupgrade-disabled-pending-3-roundtrip-bench-
-# proof) + safe_sysupgrade_cv_emmc.sh, never this init script.
+# NEGATIVE AUTHORITY (brick-vector removal). The unadmitted CV1835 scaffold
+# historically inherited the Amlogic rootfs overlay, whose S99upgrade writes a
+# recovery flag to /dev/mtd5 and clears an Amlogic U-Boot environment. Supported
+# build hooks now fail before rootfs assembly. This same-name refusal remains an
+# exact CV authority so a direct assembly, synthetic merge, legacy caller, or
+# warm-build residue still cannot acquire probing, waiting, storage,
+# environment, network, process-control, or reboot behavior.
+# Exact held bootloaders use a BuiltInVolatile environment and the p2 content
+# marker as their selector. Persistent eMMC update is NOT IMPLEMENTED, and the
+# installed safe_sysupgrade_cv_emmc.sh name is an unconditional refusal.
 #
-# Mirrors board/beaglebone/am3-bb/rootfs-overlay/etc/init.d/S99upgrade (the
-# BeagleBone overlay shadows the same inherited Amlogic script for the same
-# reason).
-
-BOARD_TARGET_FILE=/etc/dcentos/board_target
-EXPECTED_BOARD=cv1835-s19jpro
-
-wait_for_dcentrald_api() {
-    limit=${1:-20}
-
-    if ! command -v wget >/dev/null 2>&1; then
-        echo "  [INFO] wget unavailable; skipping local API readiness probe"
-        return 0
-    fi
-
-    echo "  Checking local dcentrald API readiness (up to ${limit}s)..."
-    i=1
-    while [ "$i" -le "$limit" ]; do
-        if wget -q -T 2 -O /dev/null http://127.0.0.1:8080/api/status 2>/dev/null; then
-            echo "  [OK] dcentrald API management endpoint is reachable"
-            return 0
-        fi
-        sleep 1
-        i=$((i + 1))
-    done
-
-    echo "  [WARN] dcentrald API management endpoint not reachable yet"
-    return 0
-}
-
-report_readiness() {
-    if [ -r "$BOARD_TARGET_FILE" ]; then
-        board_target=$(cat "$BOARD_TARGET_FILE" 2>/dev/null || echo unknown)
-    else
-        board_target=unknown
-    fi
-
-    if [ "$board_target" != "$EXPECTED_BOARD" ]; then
-        echo "S99upgrade cv1835-s19jpro: board_target=$board_target; no CV1835 upgrade commit action"
-        return 0
-    fi
-
-    echo "S99upgrade cv1835-s19jpro: eMMC carrier; no NAND recovery flag or fw_env commit (Amlogic NAND logic shadowed)"
-
-    if ip addr show eth0 2>/dev/null | grep -q 'inet '; then
-        echo "  [OK] eth0 has an IPv4 address"
-    else
-        echo "  [INFO] eth0 IPv4 address not present at S99"
-    fi
-
-    if netstat -tln 2>/dev/null | grep -q ':22 '; then
-        echo "  [OK] SSH management port is listening"
-    else
-        echo "  [INFO] SSH management port not listening at S99"
-    fi
-
-    wait_for_dcentrald_api 20
-}
+# This file is intentionally implemented only with shell builtins.
 
 case "$1" in
-    start)
-        report_readiness
+    start|restart)
+        printf '%s\n' 'S99upgrade cv1835-s19jpro: persistent update NOT IMPLEMENTED; BuiltInVolatile environment is mutation-denied and p2 marker writes are unsupported'
         ;;
     stop)
-        ;;
-    restart)
-        report_readiness
+        :
         ;;
     *)
-        echo "Usage: $0 {start|stop|restart}"
+        printf 'Usage: %s {start|stop|restart}\n' "$0" >&2
         exit 1
         ;;
 esac

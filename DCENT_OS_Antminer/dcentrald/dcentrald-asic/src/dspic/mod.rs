@@ -392,15 +392,18 @@ const REJUMP_BEFORE_ENABLE_MAX_ATTEMPTS: u8 = 3;
 pub const DSPIC_BOSMINER_PARSER_FLUSH_LEN: usize = 7;
 pub const DSPIC_BOSMINER_INTER_BYTE_GAP_MS: u64 = 6;
 
+fn dspic_bosminer_faithful_value_enabled(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
 /// : env-gate inspector.
 ///
 /// `true` when `DCENT_AM2_DSPIC_BOSMINER_FAITHFUL=1` is set. Used by
 /// `dspic_get_version_transaction_steps` to skip the parser flush and
 /// by `bosminer_warmup` to scale the sync-prelude length down to 7.
 pub fn dspic_bosminer_faithful_enabled() -> bool {
-    std::env::var("DCENT_AM2_DSPIC_BOSMINER_FAITHFUL")
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false)
+    let value = std::env::var("DCENT_AM2_DSPIC_BOSMINER_FAITHFUL").ok();
+    dspic_bosminer_faithful_value_enabled(value.as_deref())
 }
 
 // ---------------------------------------------------------------------------
@@ -673,13 +676,23 @@ fn dspic_get_version_probe_order(firmware: DspicFirmware) -> [GetVersionEncoding
 }
 
 fn dspic_get_version_transaction_steps(encoding: GetVersionEncoding) -> Vec<I2cTransactionStep> {
+    dspic_get_version_transaction_steps_with_bosminer_faithful(
+        encoding,
+        dspic_bosminer_faithful_enabled(),
+    )
+}
+
+fn dspic_get_version_transaction_steps_with_bosminer_faithful(
+    encoding: GetVersionEncoding,
+    bosminer_faithful: bool,
+) -> Vec<I2cTransactionStep> {
     // : when DCENT_AM2_DSPIC_BOSMINER_FAITHFUL=1, omit the
     // pre-GET_VERSION parser flush. Bosminer's i2c-0 strace shows it
     // does NOT prepend any zero bytes before sending the framed/short
     // GET_VERSION — it just sleeps ~500 ms after the prior reply, then
     // writes the GET_VERSION bytes one at a time. The 16-byte flush
     // DCENT_OS uses may be exactly what wedges 0x20 on `a lab unit`.
-    let mut steps = if dspic_bosminer_faithful_enabled() {
+    let mut steps = if bosminer_faithful {
         vec![
             I2cTransactionStep::WriteByteByByte(dspic_get_version_frame(encoding).to_vec()),
             I2cTransactionStep::SleepMs(DSPIC_GET_VERSION_REPLY_DELAY_MS),
@@ -755,6 +768,49 @@ pub enum DspicFirmware {
     Unknown,
 }
 
+const DSPIC_FORCE_FW89_ENCODING_ENV: &str = "DCENT_AM2_FORCE_FW89_ENCODING";
+
+fn force_fw89_encoding_value_enabled(value: Option<&str>) -> bool {
+    matches!(
+        value,
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
+fn force_fw89_encoding_enabled_from_env() -> bool {
+    let value = std::env::var(DSPIC_FORCE_FW89_ENCODING_ENV).ok();
+    force_fw89_encoding_value_enabled(value.as_deref())
+}
+
+fn decode_dspic_firmware(fw_byte: Option<u8>) -> DspicFirmware {
+    match fw_byte {
+        Some(0x82) => DspicFirmware::Fw82,
+        Some(0x86) => DspicFirmware::Fw86,
+        Some(0x89) => DspicFirmware::Fw89,
+        Some(0x8A) => DspicFirmware::Fw8A,
+        Some(0xB9) => DspicFirmware::FwB9,
+        Some(0xFE) => DspicFirmware::FwFE,
+        Some(0x00 | 0xFF) | None => DspicFirmware::Unknown,
+        Some(other) => DspicFirmware::Other(other),
+    }
+}
+
+/// Apply the lab-only encoding experiment to an already decoded identity.
+///
+/// Keeping this transformation pure makes the safety boundary testable under
+/// Cargo's parallel runner. Only the production adapter above reads process
+/// state, and only Fw82 can cross this boundary into Fw89 encoding.
+fn apply_fw89_encoding_override(
+    detected: DspicFirmware,
+    force_fw89_encoding: bool,
+) -> DspicFirmware {
+    if force_fw89_encoding && matches!(detected, DspicFirmware::Fw82) {
+        DspicFirmware::Fw89
+    } else {
+        detected
+    }
+}
+
 impl DspicFirmware {
     /// Determine the I2C protocol mode for this firmware version.
     pub fn protocol(&self) -> DspicProtocol {
@@ -809,38 +865,24 @@ impl DspicFirmware {
     /// lab-only [`DSPIC_FW86_TRUST_DEGRADED_ENV`]. `Fw82` (the legitimate cold-boot
     /// bootloader/bare-protocol case) is the only fw this flag may upgrade.
     pub fn from_version(version: u8) -> Self {
-        let detected = match version {
-            0x82 => DspicFirmware::Fw82,
-            0x86 => DspicFirmware::Fw86,
-            0x89 => DspicFirmware::Fw89,
-            0x8A => DspicFirmware::Fw8A,
-            0xB9 => DspicFirmware::FwB9,
-            0xFE => DspicFirmware::FwFE,
-            0x00 | 0xFF => DspicFirmware::Unknown,
-            v => DspicFirmware::Other(v),
-        };
+        Self::from_version_with_fw89_encoding(version, force_fw89_encoding_enabled_from_env())
+    }
+
+    fn from_version_with_fw89_encoding(version: u8, force_fw89_encoding: bool) -> Self {
+        let detected = decode_dspic_firmware(Some(version));
+        let effective = apply_fw89_encoding_override(detected, force_fw89_encoding);
 
         // SAFETY: Fw82 ONLY. Fw86 deliberately excluded so it stays caught by
         // the fw=0x86 voltage-refusal predicate (see the doc-comment above).
-        if matches!(detected, DspicFirmware::Fw82)
-            && std::env::var("DCENT_AM2_FORCE_FW89_ENCODING")
-                .map(|v| {
-                    matches!(
-                        v.as_str(),
-                        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-                    )
-                })
-                .unwrap_or(false)
-        {
+        if effective != detected {
             tracing::info!(
                 detected_fw = format_args!("0x{:02X}", version),
                 forced_to = "Fw89",
                 "Wave-27 DCENT_AM2_FORCE_FW89_ENCODING=1 — remapping detected fw=0x82 bare-protocol fw to Fw89 (framed-DAC) for SetVoltage / Enable / Disable encoding (fw=0x86 is NOT remapped — it stays voltage-refused)"
             );
-            return DspicFirmware::Fw89;
         }
 
-        detected
+        effective
     }
 }
 
@@ -895,17 +937,18 @@ pub fn at3_measure_voltage_firmware_allowed(fw: DspicFirmware) -> bool {
 /// non-auditable path. The ONLY sanctioned fw=0x86 override is the auditable,
 /// lab-only [`DSPIC_FW86_TRUST_DEGRADED_ENV`].
 pub fn pic0x89_firmware_from_observed_fw_byte(fw_byte: Option<u8>) -> DspicFirmware {
-    let detected = match fw_byte {
-        Some(0x82) => DspicFirmware::Fw82,
-        Some(0x86) => DspicFirmware::Fw86,
-        Some(0x89) => DspicFirmware::Fw89,
-        Some(0x8A) => DspicFirmware::Fw8A,
-        Some(0xB9) => DspicFirmware::FwB9,
-        Some(0xFE) => DspicFirmware::FwFE,
-        Some(0x00 | 0xFF) => DspicFirmware::Unknown,
-        Some(other) => DspicFirmware::Other(other),
-        None => DspicFirmware::Unknown,
-    };
+    pic0x89_firmware_from_observed_fw_byte_with_fw89_encoding(
+        fw_byte,
+        force_fw89_encoding_enabled_from_env(),
+    )
+}
+
+fn pic0x89_firmware_from_observed_fw_byte_with_fw89_encoding(
+    fw_byte: Option<u8>,
+    force_fw89_encoding: bool,
+) -> DspicFirmware {
+    let detected = decode_dspic_firmware(fw_byte);
+    let effective = apply_fw89_encoding_override(detected, force_fw89_encoding);
 
     //  (2026-05-23): mirror of `from_version`'s env override —
     // when `DCENT_AM2_FORCE_FW89_ENCODING=1`, treat the fw=0x82 bare-protocol
@@ -914,25 +957,15 @@ pub fn pic0x89_firmware_from_observed_fw_byte(fw_byte: Option<u8>) -> DspicFirmw
     //
     // SAFETY: Fw82 ONLY. Fw86 deliberately excluded so it stays caught by the
     // fw=0x86 voltage-refusal predicate (see the doc-comment above).
-    if matches!(detected, DspicFirmware::Fw82)
-        && std::env::var("DCENT_AM2_FORCE_FW89_ENCODING")
-            .map(|v| {
-                matches!(
-                    v.as_str(),
-                    "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-                )
-            })
-            .unwrap_or(false)
-    {
+    if effective != detected {
         tracing::info!(
             detected_fw = format_args!("0x{:?}", fw_byte),
             forced_to = "Fw89",
             "Wave-27b DCENT_AM2_FORCE_FW89_ENCODING=1 — pic0x89 path remapping fw=0x82 bare-protocol fw to Fw89 (framed-DAC) for SetVoltage encoding (fw=0x86 is NOT remapped — it stays voltage-refused)"
         );
-        return DspicFirmware::Fw89;
     }
 
-    detected
+    effective
 }
 
 /// Lab-only override for fw=0x86 voltage commands.
@@ -5813,18 +5846,13 @@ mod pic0x89_tests {
     /// prelude (bosminer's strace on `a lab unit` shows it doesn't send one
     /// before GET_VERSION). When unset, the legacy path stays.
     ///
-    /// Note: env vars are process-wide so this test temporarily sets
-    /// and unsets the gate to avoid affecting other tests.
     #[test]
-    fn wave41_get_version_skips_parser_flush_when_env_set() {
+    fn wave41_get_version_skips_parser_flush_when_policy_enabled() {
         // Default-off path: parser flush present.
-        // SAFETY: env mutation in tests — single-threaded test runner
-        // for this file by default; if cargo test is run with multiple
-        // threads, this could race. Use --test-threads=1 if flaky.
-        unsafe {
-            std::env::remove_var("DCENT_AM2_DSPIC_BOSMINER_FAITHFUL");
-        }
-        let steps_off = dspic_get_version_transaction_steps(GetVersionEncoding::Short);
+        let steps_off = dspic_get_version_transaction_steps_with_bosminer_faithful(
+            GetVersionEncoding::Short,
+            false,
+        );
         assert_eq!(steps_off.len(), 5, "default path includes parser flush");
         assert!(
             matches!(steps_off[0], I2cTransactionStep::WriteByteByByte(ref b) if b.len() == DSPIC_PARSER_FLUSH_LEN),
@@ -5832,10 +5860,10 @@ mod pic0x89_tests {
         );
 
         //  on: parser flush omitted.
-        unsafe {
-            std::env::set_var("DCENT_AM2_DSPIC_BOSMINER_FAITHFUL", "1");
-        }
-        let steps_on = dspic_get_version_transaction_steps(GetVersionEncoding::Short);
+        let steps_on = dspic_get_version_transaction_steps_with_bosminer_faithful(
+            GetVersionEncoding::Short,
+            true,
+        );
         let expected_len = 2 + DSPIC_GET_VERSION_SHORT_READ_LEN;
         assert_eq!(
             steps_on.len(),
@@ -5846,11 +5874,9 @@ mod pic0x89_tests {
             matches!(steps_on[0], I2cTransactionStep::WriteByteByByte(ref b) if b.as_slice() == dspic_get_version_frame(GetVersionEncoding::Short)),
             "bosminer-faithful first step must be GET_VERSION write (no preceding flush)"
         );
-
-        // Tidy up so other tests see default behavior.
-        unsafe {
-            std::env::remove_var("DCENT_AM2_DSPIC_BOSMINER_FAITHFUL");
-        }
+        assert!(!dspic_bosminer_faithful_value_enabled(None));
+        assert!(!dspic_bosminer_faithful_value_enabled(Some("0")));
+        assert!(dspic_bosminer_faithful_value_enabled(Some(" 1 ")));
     }
 
     /// : pin the bosminer-faithful constants. Drift in either
@@ -5869,7 +5895,10 @@ mod pic0x89_tests {
 
     #[test]
     fn get_version_transaction_flushes_waits_writes_then_reads() {
-        let steps = dspic_get_version_transaction_steps(GetVersionEncoding::Short);
+        let steps = dspic_get_version_transaction_steps_with_bosminer_faithful(
+            GetVersionEncoding::Short,
+            false,
+        );
         assert_eq!(steps.len(), 5);
 
         match &steps[0] {
@@ -5900,7 +5929,10 @@ mod pic0x89_tests {
             I2cTransactionStep::Read(DSPIC_GET_VERSION_SHORT_READ_LEN)
         ));
 
-        let framed_steps = dspic_get_version_transaction_steps(GetVersionEncoding::Framed);
+        let framed_steps = dspic_get_version_transaction_steps_with_bosminer_faithful(
+            GetVersionEncoding::Framed,
+            false,
+        );
         assert_eq!(framed_steps.len(), 4 + DSPIC_GET_VERSION_FRAMED_READ_LEN);
         assert!(
             framed_steps[4..]
@@ -5964,19 +5996,19 @@ mod pic0x89_tests {
     #[test]
     fn firmware_protocol_maps_fw86_to_bare_and_fw89_to_framed() {
         assert_eq!(
-            DspicFirmware::from_version(0x82).protocol(),
+            decode_dspic_firmware(Some(0x82)).protocol(),
             DspicProtocol::Bare
         );
         assert_eq!(
-            DspicFirmware::from_version(0x86).protocol(),
+            decode_dspic_firmware(Some(0x86)).protocol(),
             DspicProtocol::Bare
         );
         assert_eq!(
-            DspicFirmware::from_version(0x89).protocol(),
+            decode_dspic_firmware(Some(0x89)).protocol(),
             DspicProtocol::Framed
         );
         assert_eq!(
-            DspicFirmware::from_version(0x8A).protocol(),
+            decode_dspic_firmware(Some(0x8A)).protocol(),
             DspicProtocol::Framed
         );
     }
@@ -6117,32 +6149,15 @@ mod pic0x89_tests {
     /// Before the PIC-1 fix this test FAILS (both functions remapped Fw86 ->
     /// Fw89, which `dspic_voltage_command_allowed` then permits).
     ///
-    /// Env vars are process-wide; this test saves, mutates, and restores
-    /// `DCENT_AM2_FORCE_FW89_ENCODING`. Single-threaded runner assumed for this
-    /// file (see the  env test note); use --test-threads=1 if flaky.
     #[test]
     fn force_fw89_encoding_does_not_remap_fw86_so_it_stays_voltage_refused() {
-        const ENV: &str = "DCENT_AM2_FORCE_FW89_ENCODING";
-        let prior = std::env::var(ENV).ok();
-
-        unsafe {
-            std::env::set_var(ENV, "1");
-        }
-
         // version-byte path: fw=0x86 stays Fw86 (NOT Fw89).
-        let from_ver = DspicFirmware::from_version(0x86);
+        let from_ver = DspicFirmware::from_version_with_fw89_encoding(0x86, true);
         // observed-fw-byte (pic0x89) path: fw=0x86 stays Fw86 (NOT Fw89).
-        let from_observed = pic0x89_firmware_from_observed_fw_byte(Some(0x86));
+        let from_observed =
+            pic0x89_firmware_from_observed_fw_byte_with_fw89_encoding(Some(0x86), true);
         // Missing evidence must not be upgraded by an encoding experiment.
-        let from_missing = pic0x89_firmware_from_observed_fw_byte(None);
-
-        // Restore env before any assertion can unwind and leak the override.
-        unsafe {
-            match prior {
-                Some(v) => std::env::set_var(ENV, v),
-                None => std::env::remove_var(ENV),
-            }
-        }
+        let from_missing = pic0x89_firmware_from_observed_fw_byte_with_fw89_encoding(None, true);
 
         assert_eq!(
             from_ver,
@@ -6183,29 +6198,15 @@ mod pic0x89_tests {
     /// Restricting the guard to Fw82-only must not break the path it exists for.
     #[test]
     fn force_fw89_encoding_still_remaps_fw82_to_fw89() {
-        const ENV: &str = "DCENT_AM2_FORCE_FW89_ENCODING";
-        let prior = std::env::var(ENV).ok();
-
         // Baseline (override OFF): fw=0x82 stays Fw82 on both paths.
-        unsafe {
-            std::env::remove_var(ENV);
-        }
-        let off_ver = DspicFirmware::from_version(0x82);
-        let off_observed = pic0x89_firmware_from_observed_fw_byte(Some(0x82));
+        let off_ver = DspicFirmware::from_version_with_fw89_encoding(0x82, false);
+        let off_observed =
+            pic0x89_firmware_from_observed_fw_byte_with_fw89_encoding(Some(0x82), false);
 
         // Override ON: fw=0x82 upgrades to Fw89 on both paths.
-        unsafe {
-            std::env::set_var(ENV, "1");
-        }
-        let on_ver = DspicFirmware::from_version(0x82);
-        let on_observed = pic0x89_firmware_from_observed_fw_byte(Some(0x82));
-
-        unsafe {
-            match prior {
-                Some(v) => std::env::set_var(ENV, v),
-                None => std::env::remove_var(ENV),
-            }
-        }
+        let on_ver = DspicFirmware::from_version_with_fw89_encoding(0x82, true);
+        let on_observed =
+            pic0x89_firmware_from_observed_fw_byte_with_fw89_encoding(Some(0x82), true);
 
         assert_eq!(off_ver, DspicFirmware::Fw82, "fw=0x82 default must be Fw82");
         assert_eq!(
@@ -6222,6 +6223,65 @@ mod pic0x89_tests {
             on_observed,
             DspicFirmware::Fw89,
             "FORCE_FW89_ENCODING must still remap observed fw=0x82 -> Fw89 (the .25 cold-boot path)"
+        );
+    }
+
+    #[test]
+    fn force_fw89_encoding_env_values_preserve_the_existing_opt_in_contract() {
+        for enabled in ["1", "true", "TRUE", "yes", "YES", "on", "ON"] {
+            assert!(
+                force_fw89_encoding_value_enabled(Some(enabled)),
+                "documented opt-in value {enabled:?} must remain enabled"
+            );
+        }
+
+        for disabled in ["", "0", "false", "False", "no", "off", " true "] {
+            assert!(
+                !force_fw89_encoding_value_enabled(Some(disabled)),
+                "non-contract value {disabled:?} must remain disabled"
+            );
+        }
+        assert!(!force_fw89_encoding_value_enabled(None));
+    }
+
+    #[test]
+    fn force_fw89_encoding_changes_only_observed_fw82_across_the_byte_space() {
+        for fw_byte in u8::MIN..=u8::MAX {
+            let detected = decode_dspic_firmware(Some(fw_byte));
+            let default_version = DspicFirmware::from_version_with_fw89_encoding(fw_byte, false);
+            let forced_version = DspicFirmware::from_version_with_fw89_encoding(fw_byte, true);
+            let default_observed =
+                pic0x89_firmware_from_observed_fw_byte_with_fw89_encoding(Some(fw_byte), false);
+            let forced_observed =
+                pic0x89_firmware_from_observed_fw_byte_with_fw89_encoding(Some(fw_byte), true);
+
+            assert_eq!(
+                default_version, detected,
+                "default version byte 0x{fw_byte:02X}"
+            );
+            assert_eq!(
+                default_observed, detected,
+                "default observed byte 0x{fw_byte:02X}"
+            );
+            assert_eq!(
+                forced_version, forced_observed,
+                "both adapters must resolve byte 0x{fw_byte:02X} identically"
+            );
+
+            if fw_byte == 0x82 {
+                assert_eq!(forced_version, DspicFirmware::Fw89);
+            } else {
+                assert_eq!(
+                    forced_version, detected,
+                    "encoding experiment changed non-fw82 identity 0x{fw_byte:02X}"
+                );
+            }
+        }
+
+        assert_eq!(
+            pic0x89_firmware_from_observed_fw_byte_with_fw89_encoding(None, true),
+            DspicFirmware::Unknown,
+            "encoding experiment must not manufacture identity from missing evidence"
         );
     }
 

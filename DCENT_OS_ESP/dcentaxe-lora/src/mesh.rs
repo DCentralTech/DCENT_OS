@@ -162,6 +162,12 @@ pub struct MeshCommand {
     /// e.g. "frequency", "fan_speed", "restart_mining".
     pub param: String,
     pub value: String,
+    /// Sender-side wrap epoch, bumped whenever the `u8` frame `seq` rolls over.
+    /// Bound into the owner MAC and carried so the receiver's
+    /// [`ReplayGuard`](crate::auth::ReplayGuard) can reject a captured command
+    /// whose `seq` re-enters the forward window after a full 256-message wrap.
+    #[serde(default)]
+    pub epoch: u16,
     /// Owner-auth tag (shared-secret HMAC / pairing token). `None` ⇒ unauthed ⇒
     /// the frame MUST be refused before it reaches any hardware write.
     pub auth: Option<String>,
@@ -339,10 +345,11 @@ impl MeshFrame {
                 hex_lower(&f.bytes),
             ),
             MeshKind::Command(c) => format!(
-                "{},{},{},{}",
+                "{},{},{},{},{}",
                 escape(&c.verb),
                 escape(&c.param),
                 escape(&c.value),
+                c.epoch,
                 c.auth.as_deref().map(escape).unwrap_or_default(),
             ),
             MeshKind::Ack(p) => escape(p),
@@ -483,18 +490,20 @@ fn decode_kind(tok: &str, fields: &str) -> Result<MeshKind, LoraError> {
             }))
         }
         "CMD" => {
-            if parts.len() != 4 {
+            if parts.len() != 5 {
                 return Err(bad());
             }
-            let auth = if parts[3].is_empty() {
+            let epoch = parts[3].parse::<u16>().map_err(|_| bad())?;
+            let auth = if parts[4].is_empty() {
                 None
             } else {
-                Some(unescape(parts[3]))
+                Some(unescape(parts[4]))
             };
             Ok(MeshKind::Command(MeshCommand {
                 verb: unescape(parts[0]),
                 param: unescape(parts[1]),
                 value: unescape(parts[2]),
+                epoch,
                 auth,
             }))
         }
@@ -981,6 +990,7 @@ mod tests {
                 verb: "set".into(),
                 param: "pool".into(),
                 value: "stratum+tcp://a,b:3333".into(),
+                epoch: 4242,
                 auth: Some("owner-tok-123".into()),
             }),
         );
@@ -998,9 +1008,11 @@ mod tests {
             verb: "set".into(),
             param: "frequency".into(),
             value: "525".into(),
+            epoch: 0,
             auth: Some(tag_to_hex(&command_mac(
                 &key,
                 NODE,
+                0,
                 seq,
                 "set",
                 "frequency",
@@ -1028,6 +1040,7 @@ mod tests {
             verb: "set".into(),
             param: "asic_voltage".into(),
             value: "1300".into(),
+            epoch: 0,
             auth: None,
         };
         assert_eq!(

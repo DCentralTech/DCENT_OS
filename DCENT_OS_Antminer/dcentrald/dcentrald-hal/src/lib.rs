@@ -131,9 +131,40 @@ pub enum HalError {
     #[error("I2C error on bus {bus} addr 0x{addr:02X}: {detail}")]
     I2c { bus: u8, addr: u8, detail: String },
 
+    /// A read-only kernel-owned endpoint has not appeared or cannot yet
+    /// satisfy its fixed read. Callers may retry this readiness condition
+    /// within an explicit outer deadline. Ownership, safety-generation, and
+    /// queue/service failures use their existing terminal variants instead.
+    #[error("I2C endpoint not ready on bus {bus} addr 0x{addr:02X}: {detail}")]
+    I2cEndpointNotReady { bus: u8, addr: u8, detail: String },
+
+    /// A typed endpoint operation was refused by topology/policy or cannot be
+    /// supported by this transport. This is a control-plane/configuration
+    /// failure, not evidence of a sick controller, so workers must not reset
+    /// or reopen the I2C backend in response.
+    #[error("I2C endpoint operation refused on bus {bus} addr 0x{addr:02X}: {detail}")]
+    I2cEndpointRefused { bus: u8, addr: u8, detail: String },
+
+    /// Exclusive ownership of the complete physical I2C fabric could not be
+    /// established or was lost. This is a control-plane refusal, not a wire
+    /// fault: callers must not reset/reopen the controller or fall back to an
+    /// unleased GPIO/FPGA master.
+    #[error("I2C fabric {fabric} ownership unavailable: {detail}")]
+    I2cFabricUnavailable {
+        fabric: dcentrald_fabric_lease::PhysicalI2cFabricId,
+        detail: String,
+    },
+
+    /// A worker-owned protocol job has exclusive use of the serialized bus.
+    /// This is a control-flow refusal, not a transport fault.
+    #[error("I2C admission job busy on bus {bus} addr 0x{addr:02X}: {detail}")]
+    I2cAdmissionBusy { bus: u8, addr: u8, detail: String },
+
     /// A controller-stage authorization was intentionally revoked by a newer
-    /// safe-off generation. This is not a transport fault and must not trigger
-    /// bus reset/reopen recovery ahead of the pending SafeOff operation.
+    /// safe-off generation, or raw authority was permanently superseded by a
+    /// managed controller allocation. This is a non-retryable control-flow
+    /// refusal, not a transport fault, and must not trigger bus reset/reopen
+    /// recovery.
     #[error("I2C request superseded on bus {bus} addr 0x{addr:02X}: {detail}")]
     I2cSafetySuperseded { bus: u8, addr: u8, detail: String },
 
@@ -193,18 +224,17 @@ pub enum HalError {
 
     /// PSU telemetry is not yet characterized for this FW byte.
     ///
-    /// Returned by `Apw121215a::read_voltage()` / `read_power()` /
-    /// `read_calibration()` when the detected `PsuModel` has telemetry
-    /// capability marked as **unknown** (e.g. `Apw121215f` fw=0x76, live-
-    /// confirmed on `a lab unit` but not yet probed for ADC behavior). This is
+    /// Returned by protocol-specific PSU telemetry adapters when the detected
+    /// model has telemetry capability marked as **unknown** (for example
+    /// `Apw121215f` fw=0x76, live-confirmed on `a lab unit` but not yet probed for ADC
+    /// behavior). This is
     /// **distinct** from `Ok(None)` returned for known-no-feedback variants
     /// such as `Apw121215a` fw=0x71. Callers that ignore `Ok(None)` get
     /// silent zero-telemetry; callers that ignore this error get a hard
     /// fail — the explicit fail-closed semantics for "we don't know yet".
     ///
-    /// Recovery: an operator probe via `i2cget -y <bus> <addr> 0x8B w`
-    /// (READ_VOUT) etc. against a live unit. See `Apw121215a::probe()`
-    /// log lines and the `PsuModel::Apw121215f` doc comment.
+    /// Recovery requires a protocol-identified operator probe. Never infer a
+    /// telemetry read from a byte shared with another firmware dialect.
     #[error("PSU telemetry unavailable: {0}")]
     PsuTelemetryUnavailable(String),
 

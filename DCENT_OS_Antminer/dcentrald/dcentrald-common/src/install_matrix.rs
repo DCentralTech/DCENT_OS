@@ -5,7 +5,10 @@
 //! this so stringly-typed board lists stop diverging.
 
 use crate::board_desc::{
-    BoardDesc, BoardFamily, ChainTransportKind, SlotPolicy, VoltageControllerClass, WorkEngineKind,
+    BoardDesc, BoardFamily, ChainTransportKind, VoltageControllerClass, WorkEngineKind,
+};
+use dcent_schema::hardware::{
+    HardwareEnablementPolicy, UpdateMechanism, HARDWARE_ENABLEMENT_SCHEMA_VERSION,
 };
 
 /// One row of the install/product matrix.
@@ -16,17 +19,18 @@ pub struct InstallMatrixRow {
     pub chain_transport: ChainTransportKind,
     pub work_engine: WorkEngineKind,
     pub voltage_controller: VoltageControllerClass,
-    pub slot_policy: SlotPolicy,
-    /// Signed public-beta package is appropriate.
+    pub enablement: HardwareEnablementPolicy,
+    /// Signed public-beta package is appropriate for first install from a
+    /// non-DCENT_OS source.
     pub public_beta_install: bool,
     /// Fresh image may auto-enable mining (almost always false).
     pub mining_default_enabled: bool,
     /// Product install without lab override is allowed.
     pub product_install_allowed: bool,
-    /// A/B sysupgrade with fw_setenv is the supported update rail.
+    /// A/B sysupgrade with fw_setenv is the declared update mechanism.
     pub ab_sysupgrade: bool,
-    /// Lab-only / evidence-gated first-flash.
-    pub lab_gated_install: bool,
+    /// The complete typed policy admits a persistent update API.
+    pub persistent_update_allowed: bool,
 }
 
 impl From<&BoardDesc> for InstallMatrixRow {
@@ -37,13 +41,15 @@ impl From<&BoardDesc> for InstallMatrixRow {
             chain_transport: d.chain_transport,
             work_engine: d.work_engine,
             voltage_controller: d.voltage_controller,
-            slot_policy: d.slot_policy,
+            enablement: d.enablement,
             public_beta_install: d.public_beta_install,
             mining_default_enabled: d.mining_default_enabled,
             product_install_allowed: d.product_install_allowed(),
-            ab_sysupgrade: matches!(d.slot_policy, SlotPolicy::ZynqAbFwSetenv),
-            lab_gated_install: matches!(d.slot_policy, SlotPolicy::LabGated)
-                || !d.public_beta_install,
+            ab_sysupgrade: matches!(
+                d.enablement.update_mechanism,
+                UpdateMechanism::ZynqUbiFwSetenv
+            ),
+            persistent_update_allowed: d.enablement.allows_persistent_update(),
         }
     }
 }
@@ -76,33 +82,84 @@ pub fn ab_sysupgrade_board_targets() -> Vec<&'static str> {
 
 /// Stable TSV for docs/CI (no external deps).
 ///
-/// Columns: board_target, family, public_beta, ab_sysupgrade, lab_gated, slot_policy
+/// The TSV is a derived human-readable view. Machine consumers must use the
+/// versioned JSON export so schema drift fails closed.
 pub fn install_matrix_tsv() -> String {
     let mut out = String::from(
-        "board_target\tfamily\tpublic_beta\tab_sysupgrade\tlab_gated\tslot_policy\ttransport\n",
+        "board_target\tfamily\tstorage_topology\tupdate_mechanism\tupdate_maturity\tinstall_authorization\trecovery_maturity\tartifact_kind\tartifact_maturity\tpublic_beta_install\tpersistent_update_allowed\ttransport\n",
     );
     for row in install_matrix() {
         out.push_str(&format!(
-            "{}\t{:?}\t{}\t{}\t{}\t{:?}\t{:?}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             row.board_target,
-            row.family,
+            row.family.as_str(),
+            row.enablement.storage_topology.as_str(),
+            row.enablement.update_mechanism.as_str(),
+            row.enablement.update_maturity.as_str(),
+            row.enablement.install_authorization.as_str(),
+            row.enablement.recovery_maturity.as_str(),
+            row.enablement.artifact_kind.as_str(),
+            row.enablement.artifact_maturity.as_str(),
             row.public_beta_install as u8,
-            row.ab_sysupgrade as u8,
-            row.lab_gated_install as u8,
-            row.slot_policy,
-            row.chain_transport,
+            row.persistent_update_allowed as u8,
+            row.chain_transport.as_str(),
         ));
     }
+    out
+}
+
+/// Canonical versioned machine-readable export for non-Rust consumers.
+///
+/// Values come exclusively from typed enums; there are no inferred defaults.
+pub fn install_matrix_json() -> String {
+    let rows = install_matrix();
+    let mut out = format!(
+        "{{\n  \"schema\": {},\n  \"targets\": [\n",
+        HARDWARE_ENABLEMENT_SCHEMA_VERSION
+    );
+    for (index, row) in rows.iter().enumerate() {
+        if index != 0 {
+            out.push_str(",\n");
+        }
+        out.push_str(&format!(
+            concat!(
+                "    {{\"board_target\":\"{}\",\"family\":\"{}\",",
+                "\"storage_topology\":\"{}\",\"update_mechanism\":\"{}\",",
+                "\"update_maturity\":\"{}\",\"install_authorization\":\"{}\",",
+                "\"recovery_maturity\":\"{}\",\"artifact_kind\":\"{}\",",
+                "\"artifact_maturity\":\"{}\",\"public_beta_install\":{},",
+                "\"persistent_update_allowed\":{},\"transport\":\"{}\"}}"
+            ),
+            row.board_target,
+            row.family.as_str(),
+            row.enablement.storage_topology.as_str(),
+            row.enablement.update_mechanism.as_str(),
+            row.enablement.update_maturity.as_str(),
+            row.enablement.install_authorization.as_str(),
+            row.enablement.recovery_maturity.as_str(),
+            row.enablement.artifact_kind.as_str(),
+            row.enablement.artifact_maturity.as_str(),
+            row.public_beta_install,
+            row.persistent_update_allowed,
+            row.chain_transport.as_str(),
+        ));
+    }
+    out.push_str("\n  ]\n}\n");
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dcent_schema::hardware::{
+        ArtifactKind, ArtifactMaturity, ImplementationMaturity, InstallAuthorization,
+        RecoveryMaturity,
+        StorageTopology,
+    };
 
     #[test]
-    fn public_beta_is_exactly_xil_pair() {
-        assert_eq!(public_beta_board_targets(), vec!["am1-s9", "am2-s19j"]);
+    fn public_beta_first_install_is_s9_only() {
+        assert_eq!(public_beta_board_targets(), vec!["am1-s9"]);
     }
 
     #[test]
@@ -122,14 +179,100 @@ mod tests {
     }
 
     #[test]
-    fn amlogic_rows_are_lab_gated_not_public_beta() {
+    fn amlogic_rows_are_never_public_install_targets() {
         for row in install_matrix()
             .into_iter()
             .filter(|r| r.family == BoardFamily::Amlogic)
         {
             assert!(!row.public_beta_install, "{}", row.board_target);
-            assert!(row.lab_gated_install, "{}", row.board_target);
+            assert!(
+                matches!(
+                    row.enablement.install_authorization,
+                    InstallAuthorization::LabOnly | InstallAuthorization::Denied
+                ),
+                "{} must remain lab-only or denied",
+                row.board_target
+            );
+            assert_eq!(
+                row.enablement.storage_topology,
+                StorageTopology::SingleSlot,
+                "{}",
+                row.board_target
+            );
             assert_eq!(row.chain_transport, ChainTransportKind::Serial);
+        }
+    }
+
+    #[test]
+    fn am2_public_update_does_not_authorize_vendor_source_first_install() {
+        let row = install_matrix()
+            .into_iter()
+            .find(|row| row.board_target == "am2-s19j")
+            .expect("registered AM2 S19j row");
+        assert_eq!(
+            row.enablement.install_authorization,
+            InstallAuthorization::PublicBeta
+        );
+        assert!(row.persistent_update_allowed);
+        assert!(!row.public_beta_install);
+        assert!(!row.product_install_allowed);
+    }
+
+    #[test]
+    fn cv1835_has_no_artifact_or_install_lane() {
+        let row = install_matrix()
+            .into_iter()
+            .find(|row| row.board_target == "cv1835-s19jpro")
+            .expect("CV1835 row");
+        assert_eq!(row.enablement.storage_topology, StorageTopology::SingleSlot);
+        assert_eq!(
+            row.enablement.update_maturity,
+            ImplementationMaturity::NotImplemented
+        );
+        assert_eq!(
+            row.enablement.install_authorization,
+            InstallAuthorization::Denied
+        );
+        assert_eq!(
+            row.enablement.recovery_maturity,
+            RecoveryMaturity::NotImplemented
+        );
+        assert_eq!(row.enablement.artifact_kind, ArtifactKind::None);
+        assert!(!row.persistent_update_allowed);
+        assert!(!row.product_install_allowed);
+    }
+
+    #[test]
+    fn metadata_only_targets_have_no_artifact_or_install_lane() {
+        for target in [
+            "am2-s17plus",
+            "am2-t17",
+            "am2-t17plus",
+            "am2-t19",
+            "am3-s19xp",
+        ] {
+            let row = install_matrix()
+                .into_iter()
+                .find(|row| row.board_target == target)
+                .unwrap_or_else(|| panic!("missing metadata-only target {target}"));
+            assert_eq!(
+                row.enablement.update_maturity,
+                ImplementationMaturity::NotImplemented,
+                "{target}"
+            );
+            assert_eq!(
+                row.enablement.install_authorization,
+                InstallAuthorization::Denied,
+                "{target}"
+            );
+            assert_eq!(row.enablement.artifact_kind, ArtifactKind::None, "{target}");
+            assert_eq!(
+                row.enablement.artifact_maturity,
+                ArtifactMaturity::NotImplemented,
+                "{target}"
+            );
+            assert!(!row.persistent_update_allowed, "{target}");
+            assert!(!row.product_install_allowed, "{target}");
         }
     }
 
@@ -155,6 +298,17 @@ mod tests {
         assert!(tsv.contains('\t'), "TSV must use tab separators");
     }
 
+    #[test]
+    fn json_is_versioned_and_contains_typed_cv_policy() {
+        let json = install_matrix_json();
+        assert!(json.starts_with("{\n  \"schema\": 3,"));
+        assert!(json.contains("\"board_target\":\"cv1835-s19jpro\""));
+        assert!(json.contains("\"artifact_kind\":\"none\""));
+        assert!(json.contains("\"artifact_maturity\":\"not_implemented\""));
+        assert!(json.contains("\"update_maturity\":\"not_implemented\""));
+        assert!(json.contains("\"install_authorization\":\"denied\""));
+    }
+
     /// Drift pin: committed `docs/architecture/install_matrix.tsv` must match
     /// `install_matrix_tsv()`. Regenerate with
     /// `scripts/export_install_matrix.ps1` after BoardDesc changes.
@@ -176,6 +330,16 @@ mod tests {
             norm(committed),
             norm(&generated),
             "install_matrix.tsv drifted from BoardDesc registry — re-run scripts/export_install_matrix.ps1"
+        );
+    }
+
+    #[test]
+    fn committed_install_matrix_json_matches_generator() {
+        let committed = include_str!("../../../docs/architecture/hardware_enablement_matrix.json");
+        assert_eq!(
+            committed.replace("\r\n", "\n"),
+            install_matrix_json(),
+            "hardware_enablement_matrix.json drifted from BoardDesc registry"
         );
     }
 }

@@ -101,16 +101,33 @@ MTD_LINES="$(awk '
     exit 1
 }
 
-# AM2 BraiinsOS-style layout (10 partitions).
-EXPECTED_NAMES='boot boot-failover fpga1 fpga2 uboot_env miner_cfg recovery firmware1 firmware2 factory'
-LAYOUT_OK=1
-MISSING_NAMES=""
-for name in $EXPECTED_NAMES; do
-    if ! printf '%s\n' "$MTD_LINES" | grep -q "\"$name\""; then
-        LAYOUT_OK=0
-        MISSING_NAMES="$MISSING_NAMES $name"
-    fi
-done
+# AM2 BraiinsOS-style layout (10 partitions), pinned to the held .139 U-Boot
+# mtdparts evidence. Names alone are insufficient: wrong size/order/erase
+# geometry can turn a nominal backup into a non-restorable artifact set.
+EXPECTED_GEOMETRY='mtd0:00800000:00020000:boot
+mtd1:00c00000:00020000:boot-failover
+mtd2:00200000:00020000:fpga1
+mtd3:00200000:00020000:fpga2
+mtd4:00080000:00020000:uboot_env
+mtd5:00080000:00020000:miner_cfg
+mtd6:05700000:00020000:recovery
+mtd7:03900000:00020000:firmware1
+mtd8:03900000:00020000:firmware2
+mtd9:01e00000:00020000:factory'
+OBSERVED_GEOMETRY="$(printf '%s\n' "$MTD_LINES" | awk '
+    /^mtd[0-9]+:/ {
+        node = $1
+        sub(/:$/, "", node)
+        name = $4
+        gsub(/"/, "", name)
+        sub(/\r$/, "", name)
+        printf "%s:%s:%s:%s\n", tolower(node), tolower($2), tolower($3), name
+    }
+')"
+LAYOUT_OK=0
+if [ "$OBSERVED_GEOMETRY" = "$EXPECTED_GEOMETRY" ]; then
+    LAYOUT_OK=1
+fi
 
 # Detect active firmware slot from evidence (if recorded).
 ACTIVE_SLOT=""
@@ -128,7 +145,7 @@ SOURCE_BASENAME="$(basename "$EVIDENCE")"
     echo
     echo "- Created: \`$STAMP\`"
     echo "- Source evidence: \`$SOURCE_BASENAME\`"
-    echo "- Scope: Antminer S19 Pro / S19j Pro Zynq am2 (XC7Z020 BraiinsOS-class layout)"
+    echo "- Scope: Antminer S19 Pro / S19j Pro Zynq am2 (7007S BraiinsOS-class layout)"
     echo "- Status: planning-only manifest"
     echo "- \`layout_profile_candidate=$LAYOUT_OK\`"
     echo "- \`active_slot_candidate=${ACTIVE_SLOT:-unknown}\`"
@@ -136,7 +153,7 @@ SOURCE_BASENAME="$(basename "$EVIDENCE")"
     echo "- \`persistent_install_go=0\`"
     echo
     if [ "$LAYOUT_OK" != "1" ]; then
-        echo "Missing expected MTD names:$MISSING_NAMES"
+        echo "Observed MTD geometry does not exactly match the held AM2 dual-slot contract."
         echo
         echo "If this unit has the **stock XIL single-slot layout** (\`mtd1=ramfs\`,"
         echo "no \`firmware1\`/\`firmware2\`), it is NOT eligible for the BraiinsOS-class"
@@ -157,6 +174,7 @@ SOURCE_BASENAME="$(basename "$EVIDENCE")"
             erase = $3
             name = $4
             gsub(/"/, "", name)
+            sub(/\r$/, "", name)
             printf "| /dev/%s | 0x%s | 0x%s | %s | %s_%s.nanddump |\n", node, size, erase, name, node, name
         }
     '
@@ -188,7 +206,8 @@ SOURCE_BASENAME="$(basename "$EVIDENCE")"
             sub(/:$/, "", node)
             name = $4
             gsub(/"/, "", name)
-            printf "# nanddump --bb=skipbad --omitoob -f /tmp/%s_%s.nanddump /dev/%s\n", node, name, node
+            sub(/\r$/, "", name)
+            printf "# nanddump --bb=padbad --omitoob -f /tmp/%s_%s.nanddump /dev/%s\n", node, name, node
         }
     '
     echo '```'

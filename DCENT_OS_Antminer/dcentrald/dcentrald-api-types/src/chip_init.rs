@@ -201,7 +201,7 @@ pub fn init_spec(family: ChipFamily) -> ChipInitSpec {
             chip_id: [0x13, 0x98],
             cores_per_chip: 672,
             default_baud: 115200,
-            operational_baud: 6_250_000,
+            operational_baud: 3_125_000,
             response_bytes: 9,
             pll_register: 0x08,
             miscctrl_register: 0x18,
@@ -511,7 +511,7 @@ mod tests {
         let cases: &[(ChipFamily, u32)] = &[
             (ChipFamily::Bm1387, 1_562_500),
             (ChipFamily::Bm1397, 6_250_000),
-            (ChipFamily::Bm1398, 6_250_000),
+            (ChipFamily::Bm1398, 3_125_000),
             (ChipFamily::Bm1362, 3_125_000),
             (ChipFamily::Bm1366, 3_125_000),
             (ChipFamily::Bm1368, 3_125_000),

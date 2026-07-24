@@ -241,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn ttyO3_is_intentionally_absent() {
+    fn tty_o3_is_intentionally_absent() {
         // Defensive pin: ttyO3 is reserved (debug console on BB) and
         // MUST NOT appear in the chain list. Live RE confirmed only
         // {1,2,4,5}.

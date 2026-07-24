@@ -206,3 +206,242 @@ mod mock_chain_mini_soak {
         assert_eq!(failing.hw_errors, 3);
     }
 }
+
+#[cfg(test)]
+mod process_environment_source_contract {
+    use std::path::{Path, PathBuf};
+
+    const ENV_CONTRACT_CHILD: &str = "DCENT_ASIC_ENV_CONTRACT_CHILD";
+    const POLICY_ENV_NAMES: &[&str] = &[
+        "DCENT_AM2_DSPIC_READ_CONFIG_LATCH",
+        "DCENT_AM2_DSPIC_BOSMINER_LM75_PASSTHROUGH",
+        "DCENT_AM2_DSPIC_SENSOR_ONLY",
+        "DCENT_AM2_DSPIC_POSTJUMP_HEARTBEAT_KEEPALIVE",
+        "DCENT_AM2_DSPIC_KEEPALIVE_INTERVAL_MS",
+        "DCENT_AM2_DSPIC_REJUMP_BEFORE_ENABLE",
+        "DCENT_AM2_DSPIC_SKIP_SETVOLTAGE_KEEP_ENABLE",
+        "DCENT_AM2_DSPIC_BOSMINER_MINIMAL_ENABLE",
+        "DCENT_AM2_DSPIC_JUMP_REVERIFY_MAX",
+        "DCENT_AM2_DSPIC_RESET_DWELL_MS",
+        "DCENT_AM2_DSPIC_RESET_JUMP_REVERIFY_MAX",
+        "DCENT_AM2_DSPIC_BOSMINER_FAITHFUL",
+        "DCENT_CV1835_ACCEPT_INFERRED_SOC_REGS",
+        "DCENT_CV1835_ACCEPT_INFERRED_FPGA",
+        "DCENT_PIC_RECOVERY_LOG_DIR",
+    ];
+
+    fn collect_rust_sources(dir: &Path, sources: &mut Vec<PathBuf>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", dir.display()))
+            .map(|entry| entry.expect("source directory entry"))
+            .collect();
+        entries.sort_by_key(|entry| entry.path());
+
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rust_sources(&path, sources);
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+                sources.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn driver_tests_do_not_mutate_process_global_environment() {
+        let source_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut sources = Vec::new();
+        collect_rust_sources(&source_root, &mut sources);
+
+        // Build the needles at runtime so this source-contract test does not
+        // match itself. Environment integration belongs in child processes;
+        // in-process tests must inject parsed policy values explicitly.
+        let forbidden = [["set", "_var("].concat(), ["remove", "_var("].concat()];
+        let mut violations = Vec::new();
+        for path in sources {
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+            for (line_index, line) in source.lines().enumerate() {
+                if forbidden.iter().any(|needle| line.contains(needle)) {
+                    let relative = path
+                        .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                        .unwrap_or(&path);
+                    violations.push(format!("{}:{}", relative.display(), line_index + 1));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "dcentrald-asic source must not mutate process-global environment; \
+             inject explicit policy values or use a child process for environment \
+             integration tests. Violations: {}",
+            violations.join(", ")
+        );
+    }
+
+    fn assert_environment_adapters(active_env: Option<&str>) {
+        use crate::bm1362::uart_relay::{
+            cold_boot_enable_nonce_path, NoncePathOutcome, UartRelayReg,
+        };
+        use crate::dspic::bosminer_warmup;
+
+        assert_eq!(
+            bosminer_warmup::am2_dspic_read_config_latch_enabled(),
+            active_env == Some("DCENT_AM2_DSPIC_READ_CONFIG_LATCH")
+        );
+        assert_eq!(
+            bosminer_warmup::am2_dspic_lm75_passthrough_enabled(),
+            active_env == Some("DCENT_AM2_DSPIC_BOSMINER_LM75_PASSTHROUGH")
+        );
+        assert_eq!(
+            bosminer_warmup::am2_dspic_sensor_only_enabled(),
+            active_env == Some("DCENT_AM2_DSPIC_SENSOR_ONLY")
+        );
+        assert_eq!(
+            bosminer_warmup::am2_dspic_postjump_heartbeat_keepalive_enabled(),
+            active_env == Some("DCENT_AM2_DSPIC_POSTJUMP_HEARTBEAT_KEEPALIVE")
+        );
+        assert_eq!(
+            bosminer_warmup::am2_dspic_rejump_before_enable_enabled(),
+            active_env == Some("DCENT_AM2_DSPIC_REJUMP_BEFORE_ENABLE")
+        );
+        assert_eq!(
+            bosminer_warmup::am2_dspic_skip_setvoltage_keep_enable_enabled(),
+            active_env == Some("DCENT_AM2_DSPIC_SKIP_SETVOLTAGE_KEEP_ENABLE")
+        );
+        assert_eq!(
+            bosminer_warmup::am2_dspic_bosminer_minimal_enable_enabled(),
+            active_env == Some("DCENT_AM2_DSPIC_BOSMINER_MINIMAL_ENABLE")
+        );
+        assert_eq!(
+            bosminer_warmup::am2_dspic_keepalive_interval_ms(),
+            if active_env == Some("DCENT_AM2_DSPIC_KEEPALIVE_INTERVAL_MS") {
+                150
+            } else {
+                300
+            }
+        );
+        assert_eq!(
+            bosminer_warmup::am2_dspic_jump_reverify_max(),
+            if active_env == Some("DCENT_AM2_DSPIC_JUMP_REVERIFY_MAX") {
+                6
+            } else {
+                0
+            }
+        );
+        assert_eq!(
+            bosminer_warmup::am2_dspic_reset_dwell_ms(),
+            if active_env == Some("DCENT_AM2_DSPIC_RESET_DWELL_MS") {
+                1_500
+            } else {
+                1_000
+            }
+        );
+        assert_eq!(
+            bosminer_warmup::am2_dspic_reset_jump_reverify_max(),
+            if active_env == Some("DCENT_AM2_DSPIC_RESET_JUMP_REVERIFY_MAX") {
+                4
+            } else {
+                0
+            }
+        );
+        assert_eq!(
+            crate::dspic::dspic_bosminer_faithful_enabled(),
+            active_env == Some("DCENT_AM2_DSPIC_BOSMINER_FAITHFUL")
+        );
+
+        let relay = cold_boot_enable_nonce_path(UartRelayReg::zero());
+        let relay_expected = matches!(
+            active_env,
+            Some("DCENT_CV1835_ACCEPT_INFERRED_SOC_REGS" | "DCENT_CV1835_ACCEPT_INFERRED_FPGA")
+        );
+        assert_eq!(
+            matches!(relay, NoncePathOutcome::Frame { .. }),
+            relay_expected
+        );
+
+        #[cfg(feature = "recovery-tool")]
+        {
+            let path = crate::dspic::recovery_fw86::path_c_log_path();
+            if active_env == Some("DCENT_PIC_RECOVERY_LOG_DIR") {
+                let dir = std::env::var("DCENT_PIC_RECOVERY_LOG_DIR")
+                    .expect("explicit recovery log directory");
+                assert_eq!(
+                    path,
+                    PathBuf::from(dir).join(crate::dspic::recovery_fw86::PATH_C_LOG_FILENAME)
+                );
+            } else {
+                assert_eq!(
+                    path,
+                    PathBuf::from(crate::dspic::recovery_fw86::DEFAULT_PATH_C_LOG_DIR)
+                        .join(crate::dspic::recovery_fw86::PATH_C_LOG_FILENAME)
+                );
+            }
+        }
+    }
+
+    fn run_environment_contract_child(mode: &str) {
+        let current_exe = std::env::current_exe().expect("current ASIC test executable");
+        let mut child = std::process::Command::new(current_exe);
+        child
+            .arg("--exact")
+            .arg(
+                "process_environment_source_contract::environment_adapters_are_exercised_in_child_process",
+            )
+            .arg("--nocapture")
+            .env(ENV_CONTRACT_CHILD, mode);
+        for name in POLICY_ENV_NAMES {
+            child.env_remove(name);
+        }
+
+        match mode {
+            "defaults" => {}
+            "DCENT_AM2_DSPIC_KEEPALIVE_INTERVAL_MS" => {
+                child.env(mode, "150");
+            }
+            "DCENT_AM2_DSPIC_JUMP_REVERIFY_MAX" => {
+                child.env(mode, "6");
+            }
+            "DCENT_AM2_DSPIC_RESET_DWELL_MS" => {
+                child.env(mode, "1500");
+            }
+            "DCENT_AM2_DSPIC_RESET_JUMP_REVERIFY_MAX" => {
+                child.env(mode, "4");
+            }
+            "DCENT_PIC_RECOVERY_LOG_DIR" => {
+                child.env(
+                    mode,
+                    std::env::temp_dir().join("dcent-recovery-env-contract"),
+                );
+            }
+            name if POLICY_ENV_NAMES.contains(&name) => {
+                child.env(name, "1");
+            }
+            other => panic!("unknown environment contract mode: {other}"),
+        }
+
+        let status = child.status().expect("run isolated environment contract");
+        assert!(
+            status.success(),
+            "{mode} environment child failed: {status}"
+        );
+    }
+
+    #[test]
+    fn environment_adapters_are_exercised_in_child_process() {
+        match std::env::var(ENV_CONTRACT_CHILD) {
+            Ok(mode) if mode == "defaults" => assert_environment_adapters(None),
+            Ok(mode) if POLICY_ENV_NAMES.contains(&mode.as_str()) => {
+                assert_environment_adapters(Some(&mode));
+            }
+            Ok(other) => panic!("unknown environment contract mode: {other}"),
+            Err(_) => {
+                run_environment_contract_child("defaults");
+                for name in POLICY_ENV_NAMES {
+                    run_environment_contract_child(name);
+                }
+            }
+        }
+    }
+}

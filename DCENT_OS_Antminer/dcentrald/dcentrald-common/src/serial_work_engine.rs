@@ -74,10 +74,22 @@ impl WorkHistoryRing {
 }
 
 /// Bounded share-dedup set for serial paths.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SeenShareSet {
     inner: BTreeSet<(u8, u32, u16)>,
     cap: usize,
+}
+
+impl Default for SeenShareSet {
+    // Manual, NOT derived: a derived Default sets cap = 0, bypassing new()'s
+    // `cap.max(1)` invariant. With cap = 0 the clear-at-cap check
+    // (`should_clear_seen_shares(len, 0)` = `len > 0`) fires on every insert
+    // BEFORE the membership test, so every share — including an immediate
+    // duplicate — reads as new and the dedup is fully defeated (duplicate
+    // submits to the pool). Route through the real constructor instead.
+    fn default() -> Self {
+        Self::with_default_cap()
+    }
 }
 
 impl SeenShareSet {
@@ -185,6 +197,20 @@ impl SerialWorkBookkeeping {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seen_share_set_default_dedups_like_new() {
+        // D1: the derived Default gave cap=0, which defeated dedup entirely
+        // (the clear-at-cap check fired on every insert BEFORE the membership
+        // test, so every share read as new). The manual Default routes through
+        // the real constructor, so an immediate duplicate is caught.
+        let mut s = SeenShareSet::default();
+        assert!(s.insert(1, 42, 0), "first insert is new");
+        assert!(
+            !s.insert(1, 42, 0),
+            "an immediate duplicate must be caught, not reported as new"
+        );
+    }
 
     #[test]
     fn history_ring_evicts_oldest() {

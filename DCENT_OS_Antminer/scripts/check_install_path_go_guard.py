@@ -85,7 +85,7 @@ def main() -> int:
             )
         if len(axes_hit) < 3:
             failures.append(
-                "Aggregate YES requires ≥3 distinct proof markers across CAPSTONE "
+                "Aggregate YES requires >=3 distinct proof markers across CAPSTONE "
                 f"(found {sorted(axes_hit)})"
             )
 

@@ -1,101 +1,40 @@
-# U-Boot bootcmd / boot-count recovery for cv1835-s19jpro
-#
-# Status: runtime-only — no live CV1835 unit on the fleet. These recipes
-# are CODE-ONLY and must be live-validated on a bench unit before any
-# sysupgrade executes.
-#
-# Source: dev-kit DOCS/multi_platform_master.md §9 + bms19j_pro_porting_plan.md
-# §7, CORRECTED 2026-07-02 against held VNish unlock gpt.img + stock CVCtrl
-# updateporc.sh (
-# cv1835[0]/[2]/[3]). REAL eMMC GPT (512-byte LBA):
-# p1 = kernel (LBA 8192, 16 MiB) <- raw; stock: dd boot.emmc of=p1
-# p2 = marker (LBA 40960, 1 MiB, EMPTY)
-# p3 = minerfs/rootfs (LBA 43008, 32 MiB) <- raw; stock: dd minerfs.gz of=p3
-# p4 = sig (LBA 108032, 2 MiB, RSA pubkey/signature)
-# p5 = /config (ext4) p6 = /miner (ext4) p7 = /nvdata (1 GiB ext4)
-# The OLD "p1=u-boot, p2=kernel, p3=rootfs, p4=DTB+sig" line was a PHANTOM
-# (invented a user-area u-boot partition, shifting everything by one) — the
-# bootrom reads the FIP from the eMMC hw-boot partition, not a GPT slot.
-# p1/p3/p4 are RAW dd'd images (no ext4 fs) — load via `mmc read`, NOT ext4load.
-#
-# WHY THIS IS DIFFERENT FROM AM2 SWITCH_FIRMWARE
-# ----------------------------------------------
-# am2 (S19j Pro Zynq) uses a userspace recovery model: switch_firmware.py
-# clears upgrade_stage, then if the boot fails, U-Boot's auto_recovery
-# detects upgrade_stage=0 + bootcount>N and reverts. That model has a
-# documented foot-gun:
-# upgrade_stage=0 is the SUCCESS state, and clearing it BEFORE confirmed
-# success disarms recovery.
-#
-# CV1835 has no A/B partitions, so we can't model success vs upgrade-in-flight
-# with a single "stage" flag. Instead we use a kernel-side bootcount that
-# U-Boot reads BEFORE jumping into kernel:
-#
-# 1. Each cold boot: U-Boot reads `dcent_boot_count` from env, increments,
-# writes back. If count <= 3, normal boot.
-# 2. If count > 3: U-Boot ASSUMES the new image is broken, restores
-# /config/factory_kernel.bin into the kernel partition (p1, raw LBA 8192)
-# directly from U-Boot's eMMC driver, resets count to 0, and reboots.
-# 3. Userspace clears the count back to 0 after dcentrald reaches mining
-# steady-state (or after the operator confirms via dashboard).
-#
-# CRITICAL: userspace MUST clear the count via fw_setenv. NEVER manually
-# poke the eMMC env block — concurrent writes corrupt it.
-#
-# OPERATOR ACTION: cut/paste the relevant block at U-Boot prompt to install
-# the env, then `saveenv`. THIS IS NOT AUTO-APPLIED — DCENT_OS does not
-# re-flash the bootloader during sysupgrade.
+# REJECTED HISTORICAL PROPOSAL - DO NOT APPLY
 
-# === Recovery env block (paste at U-Boot prompt; saveenv after) ===
-setenv dcent_boot_count 0
-setenv dcent_boot_max 3
-setenv dcent_factory_kernel /config/factory_kernel.bin
-setenv dcent_kernel_part mmc 0:1
-setenv dcent_rootfs_part mmc 0:3
-setenv dcent_sig_part mmc 0:4
-# Raw kernel-partition start LBA (GPT p1 = 8192 = 0x2000) for mmc read/write.
-setenv dcent_kernel_lba 0x2000
+This filename is retained so existing references resolve to the correction.
+It is not a U-Boot command recipe. Do not paste any earlier version of this
+file at a console and do not persist its former variables or boot command.
 
-# Increment and check boot count BEFORE booting kernel.
-setenv dcent_bootcount_check '
-    if test ${dcent_boot_count} -ge ${dcent_boot_max}; then
-        echo "DCENTos: bootcount=${dcent_boot_count} >= ${dcent_boot_max}, restoring factory kernel...";
-        ext4load mmc 0:5 ${kernel_addr_r} factory_kernel.bin;
-        if test $? -eq 0; then
-            mmc dev 0;
-            mmc write ${kernel_addr_r} ${dcent_kernel_lba} 0x2800;
-            setenv dcent_boot_count 0;
-            saveenv;
-            reset;
-        else
-            echo "DCENTos: factory_kernel.bin missing, dropping to U-Boot prompt";
-            exit;
-        fi;
-    fi;
-    setexpr dcent_boot_count ${dcent_boot_count} + 1;
-    saveenv;
-'
+## Exact held anchor
 
-# Modified bootcmd that runs the recovery check first.
-# p1 (kernel) is a RAW partition (no ext4 fs) at LBA 0x2000 — use `mmc read`,
-# NOT ext4load. DTB source is unvalidated (a uImage may carry an appended FDT,
-# or the DTB lives in p4/sig) — MUST be confirmed on the bench unit.
-setenv bootcmd '
-    run dcent_bootcount_check;
-    mmc dev 0;
-    mmc read ${kernel_addr_r} ${dcent_kernel_lba} 0x2800;
-    booti ${kernel_addr_r} - ${fdt_addr_r}
-'
+FIP SHA256:
+  874efb83b18a5cfbf76f1a9b514438813ced1aa279a115678c3cd9c50a66fd2e
 
-# Sector layout note (CORRECTED 2026-07-02 — kernel is GPT p1, raw, LBA 8192):
-# `${dcent_kernel_lba}` = 0x2000 (=8192) is now the corpus-verified kernel
-# partition start (VNish gpt.img entry1 firstLBA + stock updateporc.sh
-# `dd of=/dev/mmcblk0p1`). The `0x2800` (5 MiB) count comfortably holds a
-# ~4.6 MB factory kernel within the 16 MiB partition. STILL bench-gated: the
-# raw-read vs FIT-image boot method + the DTB/fdt_addr_r source must be
-# confirmed against the real CV1835 FIP/U-Boot on a bench unit before use.
-#
-# Userspace clear (after dcentrald reaches steady-state mining):
-# fw_setenv dcent_boot_count 0
+Derived U-Boot/BL33 SHA256 (fiptool/analysis extraction from the primary FIP;
+no independently persisted BL33 artifact):
+  be3bb20a30a52d49315442454aedc542394d1c5571f83de531d09685a052f466
 
-# vim: ft=conf
+Version:
+  U-Boot 2017.07 (Feb 15 2023 - 16:04:02 +0800) cvitek_cv1835
+
+The binary relocates its built-in default environment from raw image offset
+0x4eae8. It contains no MMC environment-read or save backend. Its only saveenv
+reference is part of USB-programmer command filtering. Neither eMMC hardware
+boot partition is a persistent environment store. Four other held CV1835
+builds agree with this backend classification.
+
+## Why the former recipe is rejected
+
+The former proposal invented a persistent dcent_boot_count variable, a
+dcent_boot_max threshold, and an automatic /config/factory_kernel.bin restore.
+Those values are not present vendor behavior. With a BuiltInVolatile
+environment they cannot provide persistent boot counting or recovery. The
+guessed fw_env.config targeting mmcblk0boot1 was also unsupported and could
+overwrite boot material.
+
+The observed selector is instead the contents of GPT p2 at LBA 40960 (0xa000),
+length 2048 sectors: zero selects minerfs and nonzero selects upgrade-ramfs.
+That fact does not prove a safe write transaction or authorize marker writes.
+DCENT_OS has no persistent CV1835 update, recovery, or marker API.
+
+Policy for these fingerprints: BuiltInVolatile / mutation denied.
+Implementation maturity: NOT IMPLEMENTED.

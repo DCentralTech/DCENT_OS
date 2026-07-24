@@ -28,6 +28,13 @@ if os.fspath(SCRIPT_DIRECTORY) not in sys.path:
 
 import release_capsule_lineage  # noqa: E402
 import build_input_snapshot  # noqa: E402
+from atomic_publish_file import (  # noqa: E402
+    CommitSignalGuard,
+    PublishError,
+    atomic_publish as publish_staged_file,
+    report_after_commit,
+)
+from durable_file_io import fsync_directory as sync_directory  # noqa: E402
 
 
 SCHEMA_VERSION = 4
@@ -56,6 +63,7 @@ REQUIRED_SOURCE_INPUTS = (
     *BAKED_INPUTS,
     "DCENT_OS_Antminer/scripts/hw-acceptance/skus.conf",
     "DCENT_OS_Antminer/docs/architecture/install_matrix.tsv",
+    "DCENT_OS_Antminer/docs/architecture/hardware_enablement_matrix.json",
     "DCENT_OS_Antminer/dcentrald/dcentrald_s21xp.toml",
 )
 BUILD_ENV_KEYS = (
@@ -1326,40 +1334,77 @@ def query_export_snapshot_path(
     return safe_path
 
 
-def _atomic_raw_write_new(path: Path, raw: bytes) -> None:
+def _atomic_raw_write_new(
+    path: Path,
+    raw: bytes,
+    *,
+    before_commit: Callable[[], None] | None = None,
+) -> tuple[int, int]:
     path = lexical_absolute(path)
     assert_no_symlink_components(path.parent, "retained output directory")
     assert_no_symlink_components(path, "retained output", allow_missing_leaf=True)
     if path.exists() or path.is_symlink():
         raise ReceiptError(f"retained output already exists: {path}")
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.publication-pending.", dir=path.parent
+    )
     temporary_path = Path(temporary)
+    staged_stat = os.fstat(descriptor)
+    staged_identity = (staged_stat.st_dev, staged_stat.st_ino)
+    owned_descriptor: int | None = descriptor
+    committed = False
     try:
-        with os.fdopen(descriptor, "wb") as stream:
+        stream = os.fdopen(owned_descriptor, "wb")
+        owned_descriptor = None
+        with stream:
             stream.write(raw)
             stream.flush()
             os.fsync(stream.fileno())
         try:
-            # Publish with create-if-absent semantics. os.replace() would
-            # overwrite a destination raced into place after the checks above.
-            os.link(temporary_path, path, follow_symlinks=False)
-        except FileExistsError as error:
-            raise ReceiptError(
-                f"retained output appeared during copy: {path}"
-            ) from error
-        except OSError as error:
+            if before_commit is None:
+                publish_staged_file(
+                    temporary_path,
+                    path,
+                    require_directory_sync=True,
+                    require_staged_cleanup=True,
+                    expected_staged_identity=staged_identity,
+                )
+            else:
+                publish_staged_file(
+                    temporary_path,
+                    path,
+                    require_directory_sync=True,
+                    require_staged_cleanup=True,
+                    expected_staged_identity=staged_identity,
+                    _after_staged_open=before_commit,
+                )
+            committed = True
+        except PublishError as error:
             raise ReceiptError(
                 f"cannot atomically publish retained output {path}: {error}"
             ) from error
-        temporary_path.unlink()
-        _fsync_directory(path.parent)
     finally:
-        if temporary_path.exists():
-            temporary_path.unlink()
+        if owned_descriptor is not None:
+            try:
+                os.close(owned_descriptor)
+            except OSError:
+                pass
+        if not committed:
+            try:
+                current = temporary_path.lstat()
+                if (current.st_dev, current.st_ino) == staged_identity:
+                    temporary_path.unlink()
+            except OSError:
+                pass
+    return staged_identity
 
 
 def retain_export_snapshot_set(
-    stage_value: Path, output_dir_value: Path, artifact_prefix: str
+    stage_value: Path,
+    output_dir_value: Path,
+    artifact_prefix: str,
+    *,
+    before_commit: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     """Retain every verified export pair under release-scoped flat names."""
 
@@ -1374,9 +1419,11 @@ def retain_export_snapshot_set(
     prefix = _validated_binary_query_name(artifact_prefix)
     descriptor = verify_export_snapshot_set(stage)
     retained: list[dict[str, object]] = []
-    destinations: list[Path] = []
+    destinations: list[tuple[Path, tuple[int, int]]] = []
     seen_names: set[str] = set()
     try:
+        if before_commit is not None:
+            before_commit()
         for pair in descriptor["artifacts"]:
             name = PurePosixPath(pair["binary"]["source_path"]).name
             if name in seen_names:
@@ -1405,10 +1452,31 @@ def retain_export_snapshot_set(
             receipt_name = f"{prefix}.prebuilt-rust.{name}.build-receipt.json"
             binary_destination = output_dir / binary_name
             receipt_destination = output_dir / receipt_name
-            _atomic_raw_write_new(binary_destination, source_raw["binary"])
-            destinations.append(binary_destination)
-            _atomic_raw_write_new(receipt_destination, source_raw["receipt"])
-            destinations.append(receipt_destination)
+            if before_commit is None:
+                binary_identity = _atomic_raw_write_new(
+                    binary_destination, source_raw["binary"]
+                )
+            else:
+                binary_identity = _atomic_raw_write_new(
+                    binary_destination,
+                    source_raw["binary"],
+                    before_commit=before_commit,
+                )
+            destinations.append((binary_destination, binary_identity))
+            if before_commit is not None:
+                before_commit()
+                receipt_identity = _atomic_raw_write_new(
+                    receipt_destination,
+                    source_raw["receipt"],
+                    before_commit=before_commit,
+                )
+            else:
+                receipt_identity = _atomic_raw_write_new(
+                    receipt_destination, source_raw["receipt"]
+                )
+            destinations.append((receipt_destination, receipt_identity))
+            if before_commit is not None:
+                before_commit()
             retained.append(
                 {
                     "name": name,
@@ -1423,13 +1491,34 @@ def retain_export_snapshot_set(
                 }
             )
         retained.sort(key=lambda item: item["name"])
+        if before_commit is not None:
+            before_commit()
         return {"artifacts": retained}
-    except Exception:
-        for destination in reversed(destinations):
+    except Exception as error:
+        rollback_errors: list[str] = []
+        for destination, identity in reversed(destinations):
             try:
+                current = destination.lstat()
+                if (current.st_dev, current.st_ino) != identity:
+                    rollback_errors.append(
+                        f"{destination.name}: identity changed before rollback"
+                    )
+                    continue
                 destination.unlink()
             except FileNotFoundError:
                 pass
+            except OSError as rollback_error:
+                rollback_errors.append(f"{destination.name}: {rollback_error}")
+        if destinations:
+            try:
+                sync_directory(output_dir)
+            except OSError as rollback_error:
+                rollback_errors.append(f"output directory sync: {rollback_error}")
+        if rollback_errors:
+            raise ReceiptError(
+                "retained export-set publication failed and rollback was incomplete: "
+                + "; ".join(rollback_errors)
+            ) from error
         raise
 
 
@@ -1893,14 +1982,23 @@ def main() -> int:
                 )
             )
         elif args.command == "retain-export-snapshot-set":
-            print(
-                canonical_json_bytes(
-                    retain_export_snapshot_set(
-                        args.stage, args.output_dir, args.artifact_prefix
+            with CommitSignalGuard(
+                "durable retained export-set publication", ReceiptError
+            ) as termination:
+                retained = retain_export_snapshot_set(
+                    args.stage,
+                    args.output_dir,
+                    args.artifact_prefix,
+                    before_commit=termination.refuse_pending_before_commit,
+                )
+                termination.mark_committed()
+                report_after_commit(
+                    (
+                        canonical_json_bytes(retained)
+                        .decode("utf-8")
+                        .removesuffix("\n"),
                     )
-                ).decode("utf-8"),
-                end="",
-            )
+                )
         else:
             check_override_policy(args)
     except ReceiptError as error:

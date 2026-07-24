@@ -436,17 +436,16 @@ impl Sv2MiningChannel {
             }
 
             mining::SETUP_CONNECTION_ERROR => {
-                // Payload: error_code STR0_255 + error_msg STR0_255
-                let reason = if !frame.payload.is_empty() {
-                    // Skip error_code, take the human-readable message
-                    if let Ok((code, consumed)) = decode_str(&frame.payload, 0) {
-                        if let Ok((msg, _)) = decode_str(&frame.payload, consumed) {
-                            format!("{}: {}", code, msg)
-                        } else {
-                            code
-                        }
-                    } else {
-                        String::from_utf8_lossy(&frame.payload).to_string()
+                // Payload (SV2 spec): flags U32 + error_code STR0_255. The
+                // earlier decode read TWO STR0_255 from offset 0, so against a
+                // conformant pool the first flags byte was taken as a length
+                // (flags=0 => "": ""), the real error_code was never extracted,
+                // and the SV2-9 flags-mismatch decoration below went dead. Skip
+                // the 4 flags bytes and take the human-readable error_code.
+                let reason = if frame.payload.len() >= 4 {
+                    match decode_str(&frame.payload, 4) {
+                        Ok((code, _)) if !code.is_empty() => code,
+                        _ => "SetupConnection rejected (no reason given)".to_string(),
                     }
                 } else {
                     "SetupConnection rejected (no reason given)".to_string()
@@ -501,11 +500,44 @@ impl Sv2MiningChannel {
                     log::info!("SV2: mining channel {} opened", channel_id);
                     self.state = ChannelState::Mining { channel_id };
                 } else {
-                    log::warn!(
-                        "SV2: OpenStandardMiningChannelSuccess payload too short ({})",
+                    // Fail-closed: a truncated Success is unusable (no channel_id
+                    // / target). Warn-only left the state in OpeningChannel with
+                    // no event, wedging the miner exactly like a missing 0x12
+                    // handler did. Surface it so the caller can reconnect/retry.
+                    let reason = format!(
+                        "OpenStandardMiningChannelSuccess payload too short ({} < 40)",
                         frame.payload.len()
                     );
+                    log::error!("SV2: {}", reason);
+                    self.state = ChannelState::Error(reason.clone());
+                    self.events.push(Sv2Event::Disconnected(reason));
                 }
+            }
+
+            mining::OPEN_MINING_CHANNEL_ERROR => {
+                // Payload: request_id U32 + error_code STR0_255. Without this arm
+                // a pool rejection of OpenStandardMiningChannel (unknown user
+                // identity, hashrate=0, unsupported flags, …) fell through to the
+                // catch-all debug log: NO event was emitted, the state stayed in
+                // `OpeningChannel` forever, and the TCP-driving `poll` never
+                // retried — the miner idled indefinitely with the failure
+                // unsurfaced. Surface it like SetupConnection.Error so the caller
+                // can reconnect/retry.
+                let reason = if frame.payload.len() >= 4 {
+                    match decode_str(&frame.payload, 4) {
+                        Ok((code, _)) if !code.is_empty() => {
+                            format!("pool rejected OpenStandardMiningChannel: {}", code)
+                        }
+                        _ => {
+                            "pool rejected OpenStandardMiningChannel (no reason given)".to_string()
+                        }
+                    }
+                } else {
+                    "pool rejected OpenStandardMiningChannel (malformed error)".to_string()
+                };
+                log::error!("SV2: {}", reason);
+                self.state = ChannelState::Error(reason.clone());
+                self.events.push(Sv2Event::Disconnected(reason));
             }
 
             // ------------------------------------------------------------------
@@ -551,6 +583,32 @@ impl Sv2MiningChannel {
                                     ntime: min_ntime,
                                     target: self.current_target,
                                     clean_jobs,
+                                });
+                            }
+                        } else if let Some(ref ph) = self.current_prev_hash {
+                            // MED-1 (out-of-order recovery): a FUTURE job (min_ntime=None)
+                            // that arrives AFTER the SetNewPrevHash referencing it. The
+                            // SET_NEW_PREV_HASH no-match branch buffered this tip with
+                            // `prev_hash_unannounced=true` and promised "will match on next
+                            // NewMiningJob" — but the immediately-usable path above only fires
+                            // for min_ntime=Some, and a SetNewPrevHash-referenced job is by
+                            // definition a future job (min_ntime=None). Without this arm the
+                            // referenced job silently never activates: the dispatcher keeps
+                            // grinding the stale tip (every share stale-rejected) until some
+                            // later message trips recovery. Pair it NOW, exactly as the matched
+                            // SetNewPrevHash path would have — emit clean_jobs=true to flush the
+                            // stale tip, then clear the flag so a re-sent copy does not re-emit.
+                            if self.prev_hash_unannounced && ph.job_id == job.job_id {
+                                self.prev_hash_unannounced = false;
+                                self.events.push(Sv2Event::NewJob {
+                                    job_id: job.job_id,
+                                    version: job.version,
+                                    prev_hash: ph.prev_hash,
+                                    merkle_root: job.merkle_root,
+                                    nbits: ph.nbits,
+                                    ntime: ph.min_ntime,
+                                    target: self.current_target,
+                                    clean_jobs: true,
                                 });
                             }
                         }
@@ -1050,10 +1108,10 @@ mod tests {
         let mut channel = Sv2MiningChannel::new("worker", 500.0);
         channel.state = ChannelState::SettingUp;
 
-        // Build a minimal error payload: code + message (both STR0_255)
+        // SV2 spec payload: flags U32 + error_code STR0_255.
         let mut payload = Vec::new();
-        encode_str(&mut payload, "unsupported-feature");
-        encode_str(&mut payload, "Server does not support version rolling");
+        payload.extend_from_slice(&0u32.to_le_bytes()); // flags
+        encode_str(&mut payload, "unsupported-feature"); // error_code
         let data = make_raw_frame(mining::SETUP_CONNECTION_ERROR, payload);
         let events = channel.feed_data(&data);
 
@@ -1080,16 +1138,16 @@ mod tests {
         let mut channel = Sv2MiningChannel::new("worker", 500.0);
         channel.state = ChannelState::SettingUp;
 
+        // SV2 spec payload: flags U32 + error_code STR0_255.
         let mut payload = Vec::new();
-        encode_str(&mut payload, "protocol-version-mismatch");
-        encode_str(&mut payload, "Pool requires SV2 v3");
+        payload.extend_from_slice(&0u32.to_le_bytes()); // flags
+        encode_str(&mut payload, "protocol-version-mismatch"); // error_code
         let data = make_raw_frame(mining::SETUP_CONNECTION_ERROR, payload);
         let events = channel.feed_data(&data);
 
         assert_eq!(events.len(), 1);
         if let Sv2Event::Disconnected(reason) = &events[0] {
             assert!(reason.contains("protocol-version-mismatch"));
-            assert!(reason.contains("Pool requires SV2 v3"));
             // Generic path is not decorated with the version-rolling advisory.
             assert!(
                 !reason.to_ascii_lowercase().contains("advertised flags"),
@@ -1118,6 +1176,61 @@ mod tests {
         assert_eq!(channel.state, ChannelState::Mining { channel_id: 99 });
         assert!(channel.is_mining());
         assert_eq!(channel.channel_id(), Some(99));
+    }
+
+    #[test]
+    fn test_feed_data_open_channel_error_surfaces_and_exits_opening() {
+        let mut channel = Sv2MiningChannel::new("worker", 500.0);
+        channel.state = ChannelState::OpeningChannel;
+
+        // Payload: request_id U32 + error_code STR0_255.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&7u32.to_le_bytes()); // request_id
+        encode_str(&mut payload, "unknown-user-identity");
+        let data = make_raw_frame(mining::OPEN_MINING_CHANNEL_ERROR, payload);
+        let events = channel.feed_data(&data);
+
+        // Before the fix there was NO handler arm: the frame fell to the
+        // catch-all debug log, no event fired, and the channel stayed in
+        // OpeningChannel forever (miner idles with the failure unsurfaced).
+        assert_eq!(
+            events.len(),
+            1,
+            "channel-open rejection must surface an event"
+        );
+        match &events[0] {
+            Sv2Event::Disconnected(reason) => assert!(
+                reason.contains("unknown-user-identity"),
+                "reason must carry the pool's error code, got: {reason}"
+            ),
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+        assert!(
+            matches!(channel.state, ChannelState::Error(_)),
+            "state must leave OpeningChannel on rejection"
+        );
+    }
+
+    #[test]
+    fn test_feed_data_open_channel_success_truncated_does_not_wedge() {
+        let mut channel = Sv2MiningChannel::new("worker", 500.0);
+        channel.state = ChannelState::OpeningChannel;
+
+        // A Success frame too short to carry channel_id(4)+request_id(4)+
+        // target(32) = 40 bytes. Warn-only used to leave the channel stuck in
+        // OpeningChannel with no event (silent wedge); it must now fail closed.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes()); // request_id only (8 < 40)
+        payload.extend_from_slice(&99u32.to_le_bytes());
+        let data = make_raw_frame(mining::OPEN_STANDARD_MINING_CHANNEL_SUCCESS, payload);
+        let events = channel.feed_data(&data);
+
+        assert_eq!(events.len(), 1, "a truncated Success must surface an event");
+        assert!(matches!(events[0], Sv2Event::Disconnected(_)));
+        assert!(
+            matches!(channel.state, ChannelState::Error(_)),
+            "truncated Success must not leave the channel wedged in OpeningChannel"
+        );
     }
 
     #[test]
@@ -1766,6 +1879,78 @@ mod tests {
         assert!(
             channel.current_prev_hash.is_some(),
             "prev_hash must be buffered"
+        );
+    }
+
+    /// Out-of-order: a SetNewPrevHash arrives BEFORE the future job it references,
+    /// then that FUTURE job (min_ntime=None) arrives. It must activate the buffered
+    /// tip now — before the fix, the future-job path skipped the emit (gated on
+    /// min_ntime=Some) so the referenced job silently never activated and the
+    /// dispatcher kept grinding the stale tip.
+    #[test]
+    fn test_future_job_after_set_new_prev_hash_activates() {
+        let mut channel = Sv2MiningChannel::new("worker", 500.0);
+        channel.state = ChannelState::Mining { channel_id: 1 };
+
+        // SetNewPrevHash references job_id=7, which has NOT arrived yet → buffer the tip.
+        let mut ph_payload = Vec::new();
+        ph_payload.extend_from_slice(&1u32.to_le_bytes()); // channel_id
+        ph_payload.extend_from_slice(&7u32.to_le_bytes()); // job_id (future)
+        ph_payload.extend_from_slice(&[0xB7; 32]); // prev_hash
+        ph_payload.extend_from_slice(&1_700_000_000u32.to_le_bytes()); // min_ntime
+        ph_payload.extend_from_slice(&0x1903a30cu32.to_le_bytes()); // nbits
+        let ph_data = make_raw_frame(mining::SET_NEW_PREV_HASH, ph_payload);
+        assert_eq!(
+            channel.feed_data(&ph_data).len(),
+            0,
+            "no job yet → buffer, no event"
+        );
+
+        // The referenced FUTURE job (min_ntime=None, job_id=7) now arrives out of order.
+        let mut job_payload = Vec::new();
+        job_payload.extend_from_slice(&1u32.to_le_bytes()); // channel_id
+        job_payload.extend_from_slice(&7u32.to_le_bytes()); // job_id
+        job_payload.push(0x00); // future — min_ntime absent
+        job_payload.extend_from_slice(&0x2000_0000u32.to_le_bytes()); // version
+        job_payload.extend_from_slice(&[0x77; 32]); // merkle_root
+        let job_data = make_raw_frame(mining::NEW_MINING_JOB, job_payload);
+        let events = channel.feed_data(&job_data);
+
+        assert_eq!(
+            events.len(),
+            1,
+            "the referenced future job must activate the buffered tip"
+        );
+        if let Sv2Event::NewJob {
+            job_id,
+            prev_hash,
+            nbits,
+            ntime,
+            clean_jobs,
+            ..
+        } = &events[0]
+        {
+            assert_eq!(*job_id, 7);
+            assert_eq!(prev_hash, &[0xB7u8; 32], "paired with the buffered tip");
+            assert_eq!(*nbits, 0x1903a30c, "nbits from the buffered tip");
+            assert_eq!(*ntime, 1_700_000_000, "ntime from the buffered tip");
+            assert!(*clean_jobs, "a genuine tip change must flush stale work");
+        } else {
+            panic!("expected NewJob activating the out-of-order future job");
+        }
+
+        // The flag is cleared → a re-sent copy of the same future job does not re-emit.
+        let mut dup = Vec::new();
+        dup.extend_from_slice(&1u32.to_le_bytes());
+        dup.extend_from_slice(&7u32.to_le_bytes());
+        dup.push(0x00);
+        dup.extend_from_slice(&0x2000_0000u32.to_le_bytes());
+        dup.extend_from_slice(&[0x77; 32]);
+        let dup_data = make_raw_frame(mining::NEW_MINING_JOB, dup);
+        assert_eq!(
+            channel.feed_data(&dup_data).len(),
+            0,
+            "unannounced flag cleared → no duplicate activation"
         );
     }
 }

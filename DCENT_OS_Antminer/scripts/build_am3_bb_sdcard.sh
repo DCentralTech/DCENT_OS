@@ -61,21 +61,9 @@ BR2_EXTERNAL="$PROJECT_ROOT/br2_external_dcentos"
 if [ -d "$BUILDROOT_DIR" ] && [ -f "$BUILDROOT_DIR/Makefile" ] && command -v make >/dev/null 2>&1; then
     make -C "$BUILDROOT_DIR" BR2_EXTERNAL="$BR2_EXTERNAL" dcentos_am3_bb_defconfig
     make -C "$BUILDROOT_DIR"
-elif command -v docker >/dev/null 2>&1; then
-    OUTDIR=$(dirname "$OUTPUT")
-    "$SCRIPT_DIR/build_in_docker.sh" --target am3-bb --output-dir "$OUTDIR"
-    DOCKER_OUTPUT="$OUTDIR/dcentos-am3-bb-sdcard.tar"
-    if [ -f "$DOCKER_OUTPUT" ]; then
-        if [ "$DOCKER_OUTPUT" != "$OUTPUT" ]; then
-            cp "$DOCKER_OUTPUT" "$OUTPUT"
-        fi
-        echo "Wrote $OUTPUT"
-        exit 0
-    fi
-    echo "ERROR: Docker build did not produce $DOCKER_OUTPUT" >&2
-    exit 1
 else
-    echo "WARN: Buildroot tree or make not found; packaging existing output only." >&2
+    echo "WARN: local Buildroot tree or make not found; packaging existing output only." >&2
+    echo "      Docker fallback is disabled because am3-bb has no authenticated capsule." >&2
 fi
 
 BINARIES_DIR="${BINARIES_DIR:-$BUILDROOT_DIR/output/images}"

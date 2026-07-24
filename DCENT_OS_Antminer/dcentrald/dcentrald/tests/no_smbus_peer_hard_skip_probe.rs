@@ -7,8 +7,8 @@
 //!     when `no_smbus_peer == Some(true)` — i.e., a runtime `if` guard
 //!     references the field BEFORE the `bring_up_apw121215a_smart_lenient`
 //!     call site
-//!   - the skip branch sets `psu_arc = None; psu_hb_handle = None;`
-//!     (the canonical "Loki-removed / genuinely-silent" fall-through state)
+//!   - the skip branch keeps `psu_arc = None` and never reaches the helper whose
+//!     outcome can register a heartbeat with `RuntimeThreadGuard`
 //!
 //! ## Why this is a source-parse test
 //!
@@ -64,14 +64,11 @@ fn phase_0c_skip_branch_logs_canonical_message() {
 
 #[test]
 fn phase_0c_hard_skip_path_sets_psu_arc_none() {
-    // The hard-skip branch must set both `psu_arc = None` and
-    // `psu_hb_handle = None` — equivalent to the lenient-probe-deadline-
-    // expired fall-through state. A regression that left psu_arc as
-    // Some(...) would spawn a heartbeat thread targeting a bus the
-    // operator has declared empty.
+    // A regression that left psu_arc as Some(...) or called the helper here
+    // could register a heartbeat targeting a bus the operator declared empty.
     //
     // Find the hard-skip block (the `if ovr.no_smbus_peer == Some(true) {`
-    // branch) and assert its body contains both None assignments.
+    // branch) and assert it neither retains a PSU nor calls the helper.
     let body = HYBRID_RS;
     let if_start = body
         .find("if ovr.no_smbus_peer == Some(true) {")
@@ -87,10 +84,7 @@ fn phase_0c_hard_skip_path_sets_psu_arc_none() {
         skip_body.contains("psu_arc = None"),
         "hard-skip body must set psu_arc = None"
     );
-    assert!(
-        skip_body.contains("psu_hb_handle = None"),
-        "hard-skip body must set psu_hb_handle = None"
-    );
+    assert!(!skip_body.contains("bring_up_apw121215a_smart_lenient("));
 }
 
 #[test]
@@ -141,10 +135,7 @@ fn phase_0c_zero_psu_bytes_env_hard_skips_lenient_branch() {
         zero_gate_body.contains("psu_arc = None"),
         "zero-PSU-byte hard-skip must leave psu_arc = None"
     );
-    assert!(
-        zero_gate_body.contains("psu_hb_handle = None"),
-        "zero-PSU-byte hard-skip must not spawn a PSU heartbeat"
-    );
+    assert!(!zero_gate_body.contains("bring_up_apw121215a_smart_lenient("));
     assert!(
         zero_gate_body.contains("zero PSU bytes") && zero_gate_body.contains("PWR_CONTROL-only"),
         "zero-PSU-byte hard-skip log must be grep-friendly for live forensics"

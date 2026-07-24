@@ -412,8 +412,10 @@ pub static MINER_PROFILES: &[MinerProfile] = &[
         default_freq_mhz: 675,
         default_voltage_mv: 13800,
         max_freq_mhz: 850,
-        cores_per_chip: 672,
-        // BM1398: big engines == nonce-attribution slots == 672 (same die as BM1397).
+        // Stock NBP1901: 156 hash-engine groups × 4 small cores, indexed 0..=623.
+        cores_per_chip: 624,
+        // EXPERIMENTAL: the inherited 672-slot carrier/work-time assumption has
+        // not been proven by accepted shares. Keep it distinct from die geometry.
         nonce_attribution_cores: 672,
         hardware_difficulty: 256,
         // S19 Pro spec: ~29.5 J/TH, 110 TH/s, ~3245W, 342 chips (114*3)
@@ -715,6 +717,31 @@ pub struct NonceResult {
     pub midstate_idx: u8,
 }
 
+/// Per-chain FPGA state required to decode a nonce without chip-driver global
+/// mutable state. The value is the log2 midstate-slot count encoded by the
+/// admitted chain's FPGA control register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FpgaNonceDecodeContext {
+    midstate_count_log2: u8,
+}
+
+impl FpgaNonceDecodeContext {
+    /// A 16-bit echoed work-id cannot carry more than 15 slot bits.
+    pub const fn try_new(midstate_count_log2: u8) -> Option<Self> {
+        if midstate_count_log2 < u16::BITS as u8 {
+            Some(Self {
+                midstate_count_log2,
+            })
+        } else {
+            None
+        }
+    }
+
+    pub const fn midstate_count_log2(self) -> u8 {
+        self.midstate_count_log2
+    }
+}
+
 /// PLL configuration for a target frequency.
 pub struct PllConfig {
     /// PLL feedback divider.
@@ -812,6 +839,16 @@ pub trait ChipDriver: Send + Sync {
     /// Decode a nonce response from the WORK_RX_FIFO.
     fn decode_nonce(&self, raw: &[u32; 2]) -> Result<NonceResult>;
 
+    /// Decode using immutable per-chain FPGA state. Drivers whose response
+    /// shape is independent of carrier configuration retain the default.
+    fn decode_nonce_with_context(
+        &self,
+        raw: &[u32; 2],
+        _context: FpgaNonceDecodeContext,
+    ) -> Result<NonceResult> {
+        self.decode_nonce(raw)
+    }
+
     /// Compute the FPGA BAUD_REG value for a target baud rate.
     fn baud_reg_value(&self, target_baud: u32, fpga_clock_hz: u32) -> u32;
 
@@ -843,11 +880,119 @@ pub trait ChipDriver: Send + Sync {
     }
 }
 
-/// Registry of production-trusted chip drivers.
+/// Evidence maturity of one ASIC protocol implementation.
 ///
-/// Maps chip ID (u16) to a boxed ChipDriver implementation.
+/// Recognition and execution are deliberately separate.  A chip ID may be
+/// known well enough to parse and report without being admitted to issue
+/// voltage, reset, PLL, address, or work commands on production hardware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChipDriverMaturity {
+    Production,
+    Experimental,
+    Scaffold,
+}
+
+/// Inert chip identity returned by [`ChipRegistry::recognize`].
+///
+/// This value contains no driver reference and therefore cannot authorize a
+/// hardware write by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChipRecognition {
+    chip_id: u16,
+    chip_name: &'static str,
+    maturity: ChipDriverMaturity,
+}
+
+impl ChipRecognition {
+    pub const fn chip_id(self) -> u16 {
+        self.chip_id
+    }
+
+    pub const fn chip_name(self) -> &'static str {
+        self.chip_name
+    }
+
+    pub const fn maturity(self) -> ChipDriverMaturity {
+        self.maturity
+    }
+}
+
+/// Sealed proof that the active registry policy admits execution for one exact
+/// chip identity.  Callers can inspect the identity but cannot construct this
+/// value without crossing [`ChipRegistry::admit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChipDriverAdmission {
+    recognition: ChipRecognition,
+}
+
+impl ChipDriverAdmission {
+    pub const fn recognition(self) -> ChipRecognition {
+        self.recognition
+    }
+
+    pub const fn chip_id(self) -> u16 {
+        self.recognition.chip_id
+    }
+}
+
+/// Explicit executable-driver policy carried across hardware-owning runtime
+/// boundaries.
+///
+/// Production drivers are always eligible.  Experimental authority is scoped
+/// to one exact chip ID so enabling a beta for one hashboard generation cannot
+/// silently enable future experimental families.  Scaffold authority remains
+/// a separate simulator/lab decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChipDriverExecutionPolicy {
+    experimental_chip_id: Option<u16>,
+    allow_scaffold: bool,
+}
+
+impl ChipDriverExecutionPolicy {
+    pub const fn production_only() -> Self {
+        Self {
+            experimental_chip_id: None,
+            allow_scaffold: false,
+        }
+    }
+
+    pub const fn with_experimental_chip(chip_id: u16) -> Self {
+        Self {
+            experimental_chip_id: Some(chip_id),
+            allow_scaffold: false,
+        }
+    }
+
+    const fn with_scaffold(mut self) -> Self {
+        self.allow_scaffold = true;
+        self
+    }
+
+    pub const fn experimental_chip_id(self) -> Option<u16> {
+        self.experimental_chip_id
+    }
+
+    pub fn allows(self, recognition: ChipRecognition) -> bool {
+        match recognition.maturity {
+            ChipDriverMaturity::Production => true,
+            ChipDriverMaturity::Experimental => {
+                self.experimental_chip_id == Some(recognition.chip_id)
+            }
+            ChipDriverMaturity::Scaffold => self.allow_scaffold,
+        }
+    }
+}
+
+struct ChipDriverEntry {
+    recognition: ChipRecognition,
+    driver: Box<dyn ChipDriver>,
+}
+
+/// Registry of recognized ASIC identities plus policy-admitted executable
+/// drivers.
 pub struct ChipRegistry {
-    drivers: HashMap<u16, Box<dyn ChipDriver>>,
+    entries: HashMap<u16, ChipDriverEntry>,
+    execution_policy: ChipDriverExecutionPolicy,
 }
 
 impl ChipRegistry {
@@ -866,7 +1011,7 @@ impl ChipRegistry {
         let allow = scaffold_asic_driver_override_enabled();
         let ack = scaffold_stub_behavior_acknowledged();
         if should_register_scaffold_drivers(allow, ack) {
-            registry.register_scaffold_drivers();
+            registry.execution_policy = registry.execution_policy.with_scaffold();
         } else if allow && !ack {
             tracing::warn!(
                 "{ALLOW_SCAFFOLD_ASIC_DRIVERS_ENV} is set but the mandatory second \
@@ -882,49 +1027,103 @@ impl ChipRegistry {
 
     pub fn production() -> Self {
         let mut registry = Self {
-            drivers: HashMap::new(),
+            entries: HashMap::new(),
+            execution_policy: ChipDriverExecutionPolicy::production_only(),
         };
         registry.register(Box::new(bm1387::Bm1387Driver::new()));
-        registry.register(Box::new(bm1397::Bm1397Driver::new()));
-        registry.register(Box::new(bm1398::Bm1398Driver::new()));
+        registry.register_with_maturity(
+            Box::new(bm1397::Bm1397Driver::new()),
+            ChipDriverMaturity::Experimental,
+        );
+        registry.register_with_maturity(
+            Box::new(bm1398::Bm1398Driver::new()),
+            ChipDriverMaturity::Experimental,
+        );
         registry.register(Box::new(bm1362::Bm1362Driver::new()));
         registry.register(Box::new(bm1366::Bm1366Driver::new()));
         registry.register(Box::new(bm1368::Bm1368Driver::new()));
         registry.register(Box::new(bm1370::Bm1370Driver::new()));
-        registry
-    }
-
-    pub fn with_scaffold_drivers() -> Self {
-        let mut registry = Self::production();
         registry.register_scaffold_drivers();
         registry
     }
 
+    pub fn with_execution_policy(execution_policy: ChipDriverExecutionPolicy) -> Self {
+        let mut registry = Self::production();
+        registry.execution_policy = execution_policy;
+        registry
+    }
+
+    pub fn with_experimental_driver(chip_id: u16) -> Self {
+        Self::with_execution_policy(ChipDriverExecutionPolicy::with_experimental_chip(chip_id))
+    }
+
+    pub fn with_scaffold_drivers() -> Self {
+        let mut registry = Self::production();
+        registry.execution_policy = registry.execution_policy.with_scaffold();
+        registry
+    }
+
     fn register_scaffold_drivers(&mut self) {
-        self.register(Box::new(bm1373::Bm1373Driver::new()));
+        self.register_with_maturity(
+            Box::new(bm1373::Bm1373Driver::new()),
+            ChipDriverMaturity::Scaffold,
+        );
         // BM1373/S23 dual-key: real silicon reports 0x1372 on enumeration
         // (NerdQAxePlus `chip_id[6]`) but DCENT keys the scaffold on 0x1373.
         // Operator decision 2026-07-08: resolve BOTH ids to the same fail-closed
         // BM1373 scaffold until a live S23 confirms which is real. Scaffold-only
         // (never added to `production()`), so both ids still fail closed for a
         // real detect; `init_chain` remains fail-closed regardless of the key.
-        self.register_alias(bm1373::ENUM_CHIP_ID, Box::new(bm1373::Bm1373Driver::new()));
-        self.register(Box::new(bm1489::Bm1489Driver::new()));
+        self.register_alias_with_maturity(
+            bm1373::ENUM_CHIP_ID,
+            Box::new(bm1373::Bm1373Driver::new()),
+            ChipDriverMaturity::Scaffold,
+        );
+        self.register_with_maturity(
+            Box::new(bm1489::Bm1489Driver::new()),
+            ChipDriverMaturity::Scaffold,
+        );
         // BM1391 (S11) — jig-verified protocol but fail-closed (no live S11 on
         // the fleet to validate a bring-up against). Gated like the other
         // pre-live drivers; its init_chain refuses live bring-up regardless.
-        self.register(Box::new(bm1391::Bm1391Driver::new()));
+        self.register_with_maturity(
+            Box::new(bm1391::Bm1391Driver::new()),
+            ChipDriverMaturity::Scaffold,
+        );
         // ScryptL7 (W3-B): when the default-OFF `scrypt-l7` feature is compiled,
         // the W3-A-accurate driver SUPERSEDES the older `bm1489.rs` scaffold for
         // chip-id 0x1489 (registered LAST so it overrides the HashMap slot). It
         // is still a KICKOFF: its init_chain fails closed (L7 chain-FIFO deferred).
         #[cfg(feature = "scrypt-l7")]
-        self.register(Box::new(scrypt_l7::ScryptL7Driver::new()));
+        self.register_with_maturity(
+            Box::new(scrypt_l7::ScryptL7Driver::new()),
+            ChipDriverMaturity::Scaffold,
+        );
     }
 
     /// Register a chip driver.
     pub fn register(&mut self, driver: Box<dyn ChipDriver>) {
-        self.drivers.insert(driver.chip_id(), driver);
+        self.register_with_maturity(driver, ChipDriverMaturity::Production);
+    }
+
+    fn register_with_maturity(
+        &mut self,
+        driver: Box<dyn ChipDriver>,
+        maturity: ChipDriverMaturity,
+    ) {
+        let chip_id = driver.chip_id();
+        let recognition = ChipRecognition {
+            chip_id,
+            chip_name: driver.chip_name(),
+            maturity,
+        };
+        self.entries.insert(
+            chip_id,
+            ChipDriverEntry {
+                recognition,
+                driver,
+            },
+        );
     }
 
     /// Register a chip driver under an explicit `chip_id` key that may DIFFER
@@ -937,21 +1136,69 @@ impl ChipRegistry {
     /// fail-closed BM1373 scaffold until a live S23 confirms which is real. The
     /// driver still reports its own canonical `chip_id()` regardless of the key.
     pub fn register_alias(&mut self, chip_id: u16, driver: Box<dyn ChipDriver>) {
-        self.drivers.insert(chip_id, driver);
+        self.register_alias_with_maturity(chip_id, driver, ChipDriverMaturity::Production);
+    }
+
+    fn register_alias_with_maturity(
+        &mut self,
+        chip_id: u16,
+        driver: Box<dyn ChipDriver>,
+        maturity: ChipDriverMaturity,
+    ) {
+        let recognition = ChipRecognition {
+            chip_id,
+            chip_name: driver.chip_name(),
+            maturity,
+        };
+        self.entries.insert(
+            chip_id,
+            ChipDriverEntry {
+                recognition,
+                driver,
+            },
+        );
+    }
+
+    /// Recognize a chip ID without granting executable driver authority.
+    pub fn recognize(&self, chip_id: u16) -> Option<ChipRecognition> {
+        self.entries.get(&chip_id).map(|entry| entry.recognition)
+    }
+
+    /// Mint executable authority for one exact chip identity under this
+    /// registry's immutable policy.
+    pub fn admit(&self, chip_id: u16) -> Option<ChipDriverAdmission> {
+        let recognition = self.recognize(chip_id)?;
+        self.execution_policy
+            .allows(recognition)
+            .then_some(ChipDriverAdmission { recognition })
     }
 
     /// Look up a driver by chip ID.
     ///
     /// Returns None if no driver is registered for the given chip ID.
     pub fn detect(&self, chip_id: u16) -> Option<&dyn ChipDriver> {
-        self.drivers.get(&chip_id).map(|d| d.as_ref())
+        self.entries.get(&chip_id).and_then(|entry| {
+            self.execution_policy
+                .allows(entry.recognition)
+                .then_some(entry.driver.as_ref())
+        })
     }
 
     /// Get a list of all registered chip IDs and names.
     pub fn list_drivers(&self) -> Vec<(u16, &'static str)> {
-        self.drivers
+        self.entries
+            .iter()
+            .filter(|(_, entry)| self.execution_policy.allows(entry.recognition))
+            .map(|(&chip_id, entry)| (chip_id, entry.recognition.chip_name))
+            .collect()
+    }
+
+    /// List every inert recognition, including unadmitted experimental and
+    /// scaffold entries.
+    pub fn list_recognized(&self) -> Vec<ChipRecognition> {
+        self.entries
             .values()
-            .map(|d| (d.chip_id(), d.chip_name()))
+            .map(|entry| entry.recognition)
             .collect()
     }
 }
@@ -976,12 +1223,12 @@ mod tests {
         // over all 65536 chip IDs. A future edit that adds a `_ => default_driver`
         // fallback to ChipRegistry::detect would fail this test.
         let prod = ChipRegistry::production();
-        let known: std::collections::BTreeSet<u16> =
+        let executable: std::collections::BTreeSet<u16> =
             prod.list_drivers().iter().map(|(id, _)| *id).collect();
         for id in 0u16..=u16::MAX {
             let detected = prod.detect(id).is_some();
-            if known.contains(&id) {
-                assert!(detected, "known chip 0x{id:04X} must detect a driver");
+            if executable.contains(&id) {
+                assert!(detected, "admitted chip 0x{id:04X} must detect a driver");
             } else {
                 assert!(
                     !detected,
@@ -989,7 +1236,7 @@ mod tests {
                 );
                 // A truly-unknown chip (not a scaffold that carries metadata-only)
                 // must also have NO MinerProfile — nothing to source a voltage from.
-                if !is_scaffold_driver_chip(id) {
+                if prod.recognize(id).is_none() {
                     assert!(
                         MinerProfile::for_chip(id).is_none(),
                         "non-scaffold unknown chip 0x{id:04X} must have no profile"
@@ -1000,7 +1247,7 @@ mod tests {
     }
 
     #[test]
-    fn production_registry_is_the_chip_id_allowlist() {
+    fn production_registry_is_the_executable_chip_allowlist() {
         let actual: std::collections::BTreeSet<u16> = ChipRegistry::production()
             .list_drivers()
             .iter()
@@ -1008,8 +1255,6 @@ mod tests {
             .collect();
         let expected: std::collections::BTreeSet<u16> = [
             bm1387::CHIP_ID,
-            bm1397::CHIP_ID,
-            bm1398::CHIP_ID,
             bm1362::CHIP_ID,
             bm1366::CHIP_ID,
             bm1368::CHIP_ID,
@@ -1020,8 +1265,42 @@ mod tests {
 
         assert_eq!(
             actual, expected,
-            "production registry is the only source accepted by chain enumeration"
+            "production registry is the default executable-driver authority"
         );
+    }
+
+    #[test]
+    fn bm1398_is_inertly_recognized_and_requires_exact_experimental_policy() {
+        let production = ChipRegistry::production();
+        let recognition = production
+            .recognize(bm1398::CHIP_ID)
+            .expect("BM1398 identity evidence remains catalogued");
+        assert_eq!(recognition.chip_name(), "BM1398");
+        assert_eq!(recognition.maturity(), ChipDriverMaturity::Experimental);
+        assert!(production.detect(bm1398::CHIP_ID).is_none());
+
+        let exact = ChipRegistry::with_experimental_driver(bm1398::CHIP_ID);
+        assert!(exact.detect(bm1398::CHIP_ID).is_some());
+
+        let unrelated = ChipRegistry::with_experimental_driver(0xFFFF);
+        assert!(unrelated.detect(bm1398::CHIP_ID).is_none());
+        assert!(unrelated.detect(bm1387::CHIP_ID).is_some());
+    }
+
+    #[test]
+    fn bm1397_is_recognized_but_not_executable_without_exact_experimental_policy() {
+        let production = ChipRegistry::production();
+        let recognition = production
+            .recognize(bm1397::CHIP_ID)
+            .expect("BM1397 factory-jig identity remains catalogued");
+        assert_eq!(recognition.maturity(), ChipDriverMaturity::Experimental);
+        assert!(production.detect(bm1397::CHIP_ID).is_none());
+        assert!(ChipRegistry::with_experimental_driver(bm1397::CHIP_ID)
+            .detect(bm1397::CHIP_ID)
+            .is_some());
+        assert!(ChipRegistry::with_experimental_driver(bm1398::CHIP_ID)
+            .detect(bm1397::CHIP_ID)
+            .is_none());
     }
 
     #[test]
@@ -1270,6 +1549,18 @@ mod tests {
         assert_eq!(bm1370.cores_per_chip, 1280);
         assert_eq!(bm1370.nonce_attribution_cores, 1280);
 
+        let bm1398 = MinerProfile::for_chip(bm1398::CHIP_ID).expect("BM1398 profile registered");
+        assert_eq!(
+            bm1398.cores_per_chip,
+            dcentrald_silicon_profiles::bm1398::BM1398_CORES_PER_CHIP,
+            "driver and silicon layers must agree on physical BM1398 geometry"
+        );
+        assert_eq!(bm1398.cores_per_chip, 624);
+        assert_eq!(
+            bm1398.nonce_attribution_cores, 672,
+            "legacy BM1398 work-time model remains explicit while Experimental"
+        );
+
         assert!(MinerProfile::for_chip(bm1391::CHIP_ID).is_none());
         assert_eq!(AsicChip::Bm1391.catalog().cores, 0);
         assert!(
@@ -1434,8 +1725,8 @@ mod tests {
     /// registry membership — no value/behavior/API change. Mirrors the
     /// PR-055 `pr055_t21_asic_identity` pin idiom.
     ///
-    /// Verdict: BM1397 (`0x1397`, S17/T17/S17e/T17e) is the registered,
-    /// production-trusted S17-class runtime driver. BM1396 (`0x1396`,
+    /// Verdict: BM1397 (`0x1397`, S17/T17/S17e/T17e) is recognized and has an
+    /// exact-policy Experimental runtime driver. BM1396 (`0x1396`,
     /// S17+/T17+ per the W11.10 family-ID convention `bm1393.rs:172` +
     /// `asics.rs:155`) has NO chip-ID constant and is an unregistered
     /// scaffold — a `0x1396` enumeration resolves to `detect()` → `None`
@@ -1443,8 +1734,8 @@ mod tests {
     /// silent-interchange path.
     #[test]
     fn pr056_bm1396_vs_bm1397_disambiguation() {
-        // BM1397 is the registered S17-class runtime die (0x1397),
-        // production-trusted. Mujina protocol.rs:186 (BM1397 <-> [0x13,
+        // BM1397 is the recognized S17-class runtime die (0x1397).
+        // Mujina protocol.rs:186 (BM1397 <-> [0x13,
         // 0x97]) + genealogy :58 + bm1393.rs:173 ("0x1397 (S17/T17)")
         // all agree.
         assert_eq!(
@@ -1453,14 +1744,19 @@ mod tests {
             "BM1397 S17-class runtime die = 0x1397 per PR-056 corpus resolution"
         );
         let production = ChipRegistry::production();
-        let bm1397_driver = production
-            .detect(bm1397::CHIP_ID)
-            .expect("BM1397 (0x1397) must be a registered production driver");
+        let recognition = production
+            .recognize(bm1397::CHIP_ID)
+            .expect("BM1397 (0x1397) must remain recognized");
         assert_eq!(
-            bm1397_driver.chip_name(),
+            recognition.chip_name(),
             "BM1397",
-            "0x1397 must dispatch to the BM1397 driver (S17/T17/S17e/T17e)"
+            "0x1397 must retain BM1397 identity (S17/T17/S17e/T17e)"
         );
+        assert_eq!(recognition.maturity(), ChipDriverMaturity::Experimental);
+        assert!(production.detect(bm1397::CHIP_ID).is_none());
+        assert!(ChipRegistry::with_experimental_driver(bm1397::CHIP_ID)
+            .detect(bm1397::CHIP_ID)
+            .is_some());
 
         // BM1396 (0x1396, S17+/T17+) is corpus-named but code-
         // UNREGISTERED. A 0x1396 enumeration must fall through to None

@@ -214,8 +214,9 @@ pub struct ThermalController {
     chain_temps: Vec<f32>,
     /// Current fan PWM output.
     current_pwm: u8,
-    /// Fan failure counter (consecutive zero-RPM reads).
-    fan_zero_count: u32,
+    /// Reusable fan-tach safety state shared with mining orchestrators that do
+    /// not otherwise run this PID controller.
+    fan_tach_safety: FanTachSafety,
     /// Thermal control loop interval in seconds.
     #[allow(dead_code)]
     interval_s: u32,
@@ -234,6 +235,156 @@ pub struct ThermalController {
     /// (`EmergencyShutdown`) — never by blasting nonexistent fans. Set via
     /// `enable_immersion()`. See `crate::immersion`.
     immersion_active: bool,
+}
+
+/// Default number of consecutive below-threshold RPM observations required
+/// before an air-cooled mining path must cut hash power.
+pub const DEFAULT_FAN_BELOW_MINIMUM_FAILURE_TICKS: u32 = 3;
+
+/// Result of observing one complete air-cooling tach snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FanTachSafetyState {
+    Healthy,
+    AirflowNotCommanded,
+    Debouncing {
+        consecutive_below_minimum: u32,
+        failure_ticks: u32,
+        minimum_credible_rpm: u32,
+    },
+    Failed {
+        consecutive_below_minimum: u32,
+        failure_ticks: u32,
+        minimum_credible_rpm: u32,
+    },
+    EvidenceUnavailable {
+        expected_channels: usize,
+        observed_channels: usize,
+    },
+}
+
+/// Stateful, hardware-independent fan-tach safety policy.
+///
+/// This type deliberately owns only evidence interpretation. Hardware owners
+/// decide how to obtain a complete snapshot and how to execute safe-off. That
+/// keeps the same below-threshold debounce reusable across the PID daemon,
+/// serial mining, simulators, and future control-board implementations. The
+/// credible-RPM floor is injected by the hardware capability owner; this
+/// generic policy does not embed a particular chassis or fan curve.
+#[derive(Debug, Clone)]
+pub struct FanTachSafety {
+    consecutive_below_minimum: u32,
+    failure_ticks: u32,
+    minimum_credible_rpm: u32,
+}
+
+impl Default for FanTachSafety {
+    fn default() -> Self {
+        Self::new(DEFAULT_FAN_BELOW_MINIMUM_FAILURE_TICKS)
+    }
+}
+
+impl FanTachSafety {
+    /// Construct a policy that treats any positive RPM as credible motion.
+    /// Hardware admission paths should prefer
+    /// [`Self::with_minimum_credible_rpm`] with a capability-derived floor.
+    pub fn new(failure_ticks: u32) -> Self {
+        Self::with_minimum_credible_rpm(failure_ticks, 1)
+    }
+
+    pub fn with_minimum_credible_rpm(failure_ticks: u32, minimum_credible_rpm: u32) -> Self {
+        Self {
+            consecutive_below_minimum: 0,
+            failure_ticks: failure_ticks.max(1),
+            minimum_credible_rpm: minimum_credible_rpm.max(1),
+        }
+    }
+
+    /// Observe an aggregate minimum RPM value from a tach source whose channel
+    /// completeness is owned elsewhere.
+    pub fn observe_minimum(
+        &mut self,
+        tach_available: bool,
+        commanded_pwm: u8,
+        minimum_rpm: u32,
+    ) -> FanTachSafetyState {
+        if !tach_available {
+            self.reset();
+            return FanTachSafetyState::EvidenceUnavailable {
+                expected_channels: 1,
+                observed_channels: 0,
+            };
+        }
+        self.observe_value(commanded_pwm, minimum_rpm)
+    }
+
+    /// Observe one complete per-fan snapshot. Missing channels are evidence
+    /// loss, not stopped-fan measurements; a zero in a complete snapshot enters
+    /// the normal debounce and eventually produces `Failed`.
+    pub fn observe_channels(
+        &mut self,
+        tach_available: bool,
+        commanded_pwm: u8,
+        expected_channels: usize,
+        rpms: &[u32],
+    ) -> FanTachSafetyState {
+        if !tach_available || expected_channels == 0 || rpms.len() != expected_channels {
+            self.reset();
+            return FanTachSafetyState::EvidenceUnavailable {
+                expected_channels,
+                observed_channels: if tach_available { rpms.len() } else { 0 },
+            };
+        }
+        let minimum_rpm = rpms.iter().copied().min().unwrap_or(0);
+        self.observe_value(commanded_pwm, minimum_rpm)
+    }
+
+    /// Observe an air-cooled mining boundary where active airflow is mandatory.
+    /// Unlike the general controller policy, PWM zero is a refusal here rather
+    /// than an intentional stopped-fan state.
+    pub fn observe_required_airflow(
+        &mut self,
+        tach_available: bool,
+        commanded_pwm: u8,
+        expected_channels: usize,
+        rpms: &[u32],
+    ) -> FanTachSafetyState {
+        let evidence =
+            self.observe_channels(tach_available, commanded_pwm, expected_channels, rpms);
+        if matches!(evidence, FanTachSafetyState::EvidenceUnavailable { .. }) {
+            return evidence;
+        }
+        if commanded_pwm == 0 {
+            self.reset();
+            return FanTachSafetyState::AirflowNotCommanded;
+        }
+        evidence
+    }
+
+    pub fn reset(&mut self) {
+        self.consecutive_below_minimum = 0;
+    }
+
+    fn observe_value(&mut self, commanded_pwm: u8, minimum_rpm: u32) -> FanTachSafetyState {
+        if commanded_pwm == 0 || minimum_rpm >= self.minimum_credible_rpm {
+            self.reset();
+            return FanTachSafetyState::Healthy;
+        }
+
+        self.consecutive_below_minimum = self.consecutive_below_minimum.saturating_add(1);
+        if self.consecutive_below_minimum >= self.failure_ticks {
+            FanTachSafetyState::Failed {
+                consecutive_below_minimum: self.consecutive_below_minimum,
+                failure_ticks: self.failure_ticks,
+                minimum_credible_rpm: self.minimum_credible_rpm,
+            }
+        } else {
+            FanTachSafetyState::Debouncing {
+                consecutive_below_minimum: self.consecutive_below_minimum,
+                failure_ticks: self.failure_ticks,
+                minimum_credible_rpm: self.minimum_credible_rpm,
+            }
+        }
+    }
 }
 
 impl ThermalController {
@@ -315,7 +466,7 @@ impl ThermalController {
             profile,
             chain_temps: Vec::new(),
             current_pwm: 0,
-            fan_zero_count: 0,
+            fan_tach_safety: FanTachSafety::default(),
             interval_s: 5,
             last_temp_update: std::time::Instant::now(),
             tach_available: true, // default: assume tach works, caller overrides for Amlogic
@@ -424,6 +575,12 @@ impl ThermalController {
                     Some(FanSafetyTrigger::StaleTemp),
                     self.profile.fan_max_pwm,
                 );
+                // F-thermal-4: latch DangerousShutdown like every other
+                // EmergencyShutdown emitter so the DangerousShutdown arm's
+                // cool-down → RestartInit recovery can actually follow. Without it
+                // this stale-transition shutdown leaves the daemon permanently
+                // hash-cut while the controller still reports NormalMining.
+                self.state = ThermalState::DangerousShutdown;
                 return ThermalAction::EmergencyShutdown;
             }
         }
@@ -526,43 +683,52 @@ impl ThermalController {
         // Fan failure detection: 3 consecutive zero-RPM reads (~15s debounce at 5s interval).
         // Previous threshold of 1 read was too aggressive — fans can briefly report 0 RPM
         // during PWM transitions.
-        // SAFETY (2026-04-11): Skip when tach_available=false (Amlogic — RPM is synthesized).
+        // Skip when the platform cannot provide trustworthy tach evidence.
         // Temperature-based protection still operates: stalled fan → temp rise → throttle → shutdown.
         // IMMERSION: skip when immersion is active — an immersion/hydro rig has no chassis fans
         // (no tach), so "0 RPM" is the expected state, not a failure. The temperature-based
         // hash-cut paths above/below remain the safety net (over-temp / stale-temp → shutdown).
-        if !self.immersion_active && self.tach_available && self.current_pwm > 0 && fan_rpm == 0 {
-            self.fan_zero_count += 1;
-            if self.fan_zero_count >= 3 {
-                tracing::warn!(
-                    pwm = self.current_pwm,
-                    consecutive_zero = self.fan_zero_count,
-                    "SAFETY: fan failure detected — 0 RPM for {} consecutive reads at PWM {}. \
-                     Setting fans to MAX and triggering emergency shutdown.",
-                    self.fan_zero_count,
-                    self.current_pwm,
-                );
-                // SAFETY: Fan failure must set fans to MAX, not zero.
-                // Zero fans with boards powered = thermal runaway in <30 seconds.
-                // Max PWM keeps fans spinning in case it was a tach sensor glitch.
-                // If the fan motor is truly stalled, MAX PWM won't make it worse —
-                // the emergency shutdown will cut hash board power immediately.
-                self.current_pwm = safety_capped_pwm(
-                    self.profile.fan_max_pwm,
-                    Some(FanSafetyTrigger::FanFailure),
-                    self.profile.fan_max_pwm,
-                );
-                self.state = ThermalState::DangerousShutdown;
-                return ThermalAction::FanFailure;
-            }
+        let fan_tach_state = if self.immersion_active {
+            self.fan_tach_safety.reset();
+            FanTachSafetyState::Healthy
         } else {
-            self.fan_zero_count = 0;
+            self.fan_tach_safety
+                .observe_minimum(self.tach_available, self.current_pwm, fan_rpm)
+        };
+        if let FanTachSafetyState::Failed {
+            consecutive_below_minimum,
+            minimum_credible_rpm,
+            ..
+        } = fan_tach_state
+        {
+            tracing::warn!(
+                pwm = self.current_pwm,
+                consecutive_below_minimum,
+                minimum_credible_rpm,
+                "SAFETY: fan failure detected — RPM below {} for {} consecutive reads at PWM {}. \
+                     Setting fans to MAX and triggering emergency shutdown.",
+                minimum_credible_rpm,
+                consecutive_below_minimum,
+                self.current_pwm,
+            );
+            // SAFETY: Fan failure must set fans to MAX, not zero.
+            // Zero fans with boards powered = thermal runaway in <30 seconds.
+            // Max PWM keeps fans spinning in case it was a tach sensor glitch.
+            // If the fan motor is truly stalled, MAX PWM won't make it worse —
+            // the emergency shutdown will cut hash board power immediately.
+            self.current_pwm = safety_capped_pwm(
+                self.profile.fan_max_pwm,
+                Some(FanSafetyTrigger::FanFailure),
+                self.profile.fan_max_pwm,
+            );
+            self.state = ThermalState::DangerousShutdown;
+            return ThermalAction::FanFailure;
         }
 
         // Degraded fan detection: fan spinning but much slower than expected.
         // At PWM > 30 (>24% duty), a healthy fan should spin at >300 RPM.
         // Sub-300 RPM at high PWM indicates bearing failure or obstruction.
-        // Skip when tach unavailable (Amlogic — RPM is synthesized from PWM).
+        // Skip when the platform cannot provide trustworthy tach evidence.
         // IMMERSION: skip — no chassis fans on an immersion/hydro rig.
         if !self.immersion_active
             && self.tach_available
@@ -758,7 +924,7 @@ impl ThermalController {
         }
         self.tach_available = available;
         if !available {
-            self.fan_zero_count = 0;
+            self.fan_tach_safety.reset();
             tracing::info!(
                 "Thermal: fan tach unavailable — fan-failure detection disabled, \
                             relying on temperature thresholds for safety"
@@ -937,6 +1103,53 @@ pub fn reconcile_with_supervisor(
 mod tests {
     use super::*;
 
+    // ── Property tests: the load-bearing home-mining fan-PWM cap ────────────
+    // Rule ( + feedback): in the home profile NO
+    // code path — PID, ramp, safety override, stale-temp, fan-stall — may command
+    // fan PWM above the profile cap (30). Fan blasting is the exact failure the
+    // 2026-05 incidents came from. Example-based coverage lives in
+    // `tests/safety_pwm_cap.rs`; these properties drive the controller with
+    // ARBITRARY sensor streams (including NaN / ±inf / extreme temps, empty reads,
+    // and zero RPM) so an override branch that emits an uncapped value cannot hide
+    // behind an unexercised transition sequence.
+    use proptest::prelude::*;
+
+    proptest! {
+        // The canonical guard clamps any request to the profile cap.
+        #[test]
+        fn safety_capped_pwm_never_exceeds_cap(cap in 0u8..=100, requested in any::<u8>()) {
+            let out = safety_capped_pwm(cap, None, requested);
+            prop_assert!(out <= cap, "safety_capped_pwm({cap}, None, {requested}) = {out} > cap");
+        }
+
+        // tick() over an arbitrary sensor stream never commands PWM above the home
+        // cap on any fan-carrying action, and never panics on degenerate input.
+        #[test]
+        fn home_tick_never_commands_pwm_above_cap(
+            steps in proptest::collection::vec(
+                (proptest::collection::vec(any::<f32>(), 0usize..6), any::<u32>()),
+                1usize..40,
+            ),
+        ) {
+            let profile = ThermalProfile::home_quiet();
+            let cap = profile.fan_max_pwm; // 30
+            let mut controller = ThermalController::new(profile);
+            for (temps, rpm) in steps {
+                match controller.tick(&temps, rpm) {
+                    ThermalAction::SetFanPwm(pwm) => {
+                        prop_assert!(pwm <= cap, "SetFanPwm({pwm}) exceeds home cap {cap}");
+                    }
+                    ThermalAction::ThrottleAndFan { pwm, .. } => {
+                        prop_assert!(pwm <= cap, "ThrottleAndFan pwm {pwm} exceeds home cap {cap}");
+                    }
+                    // EmergencyShutdown / FanFailure / RestartInit carry no PWM value;
+                    // "fans to max" resolves to the profile cap at the HAL layer.
+                    _ => {}
+                }
+            }
+        }
+    }
+
     fn test_profile() -> ThermalProfile {
         ThermalProfile {
             target_temp_c: 60,
@@ -963,19 +1176,126 @@ mod tests {
     #[test]
     fn dynamic_tach_evidence_loss_resets_zero_debounce_and_can_recover() {
         let mut controller = ThermalController::new(test_profile());
-        controller.fan_zero_count = 2;
+        controller.fan_tach_safety.consecutive_below_minimum = 2;
 
         controller.set_tach_available(false);
         assert!(!controller.tach_available);
-        assert_eq!(controller.fan_zero_count, 0);
+        assert_eq!(controller.fan_tach_safety.consecutive_below_minimum, 0);
 
         // An idempotent unavailable update must not manufacture state.
         controller.set_tach_available(false);
-        assert_eq!(controller.fan_zero_count, 0);
+        assert_eq!(controller.fan_tach_safety.consecutive_below_minimum, 0);
 
         controller.set_tach_available(true);
         assert!(controller.tach_available);
-        assert_eq!(controller.fan_zero_count, 0);
+        assert_eq!(controller.fan_tach_safety.consecutive_below_minimum, 0);
+    }
+
+    #[test]
+    fn fan_tach_safety_requires_complete_channel_evidence() {
+        let mut safety = FanTachSafety::default();
+        assert_eq!(
+            safety.observe_channels(true, 30, 4, &[1200, 1300, 1400]),
+            FanTachSafetyState::EvidenceUnavailable {
+                expected_channels: 4,
+                observed_channels: 3,
+            }
+        );
+        assert_eq!(
+            safety.observe_channels(false, 30, 4, &[1200, 1300, 1400, 1500]),
+            FanTachSafetyState::EvidenceUnavailable {
+                expected_channels: 4,
+                observed_channels: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn required_airflow_refuses_zero_pwm_even_when_zero_rpm_is_consistent() {
+        let mut safety = FanTachSafety::default();
+        assert_eq!(
+            safety.observe_required_airflow(true, 0, 4, &[0, 0, 0, 0]),
+            FanTachSafetyState::AirflowNotCommanded
+        );
+    }
+
+    #[test]
+    fn required_airflow_preserves_evidence_failure_precedence_over_zero_pwm() {
+        let mut safety = FanTachSafety::default();
+        assert_eq!(
+            safety.observe_required_airflow(false, 0, 4, &[]),
+            FanTachSafetyState::EvidenceUnavailable {
+                expected_channels: 4,
+                observed_channels: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn fan_tach_safety_fails_on_third_complete_zero_snapshot() {
+        let mut safety = FanTachSafety::default();
+        let stalled = [1200, 1300, 0, 1500];
+        assert_eq!(
+            safety.observe_channels(true, 30, 4, &stalled),
+            FanTachSafetyState::Debouncing {
+                consecutive_below_minimum: 1,
+                failure_ticks: 3,
+                minimum_credible_rpm: 1,
+            }
+        );
+        assert_eq!(
+            safety.observe_channels(true, 30, 4, &stalled),
+            FanTachSafetyState::Debouncing {
+                consecutive_below_minimum: 2,
+                failure_ticks: 3,
+                minimum_credible_rpm: 1,
+            }
+        );
+        assert_eq!(
+            safety.observe_channels(true, 30, 4, &stalled),
+            FanTachSafetyState::Failed {
+                consecutive_below_minimum: 3,
+                failure_ticks: 3,
+                minimum_credible_rpm: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn fan_tach_safety_rejects_implausibly_low_positive_motion() {
+        let mut safety = FanTachSafety::with_minimum_credible_rpm(3, 300);
+        assert_eq!(
+            safety.observe_channels(true, 30, 4, &[1200, 30, 1100, 1300]),
+            FanTachSafetyState::Debouncing {
+                consecutive_below_minimum: 1,
+                failure_ticks: 3,
+                minimum_credible_rpm: 300,
+            }
+        );
+        assert_eq!(
+            safety.observe_channels(true, 30, 4, &[1200, 300, 1100, 1300]),
+            FanTachSafetyState::Healthy,
+            "the configured credible floor is inclusive"
+        );
+    }
+
+    #[test]
+    fn fan_tach_safety_positive_motion_resets_debounce() {
+        let mut safety = FanTachSafety::default();
+        assert!(matches!(
+            safety.observe_minimum(true, 30, 0),
+            FanTachSafetyState::Debouncing { .. }
+        ));
+        assert_eq!(
+            safety.observe_minimum(true, 30, 900),
+            FanTachSafetyState::Healthy
+        );
+        assert_eq!(
+            safety.observe_minimum(true, 0, 0),
+            FanTachSafetyState::Healthy,
+            "zero RPM while fans are intentionally off is not a failure"
+        );
+        assert_eq!(safety.consecutive_below_minimum, 0);
     }
 
     // -- THERMAL-3: sleep-state PWM is owned by the safety cap, not a raw 25 --

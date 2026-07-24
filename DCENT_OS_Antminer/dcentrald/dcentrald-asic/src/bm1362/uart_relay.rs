@@ -289,11 +289,13 @@ pub const ACCEPT_INFERRED_SOC_REGS_ENV_DEPRECATED: &str = "DCENT_CV1835_ACCEPT_I
 /// in every shipping configuration — the function below is then a
 /// byte-identical no-op vs. today's "not wired" behaviour.
 fn inferred_soc_regs_unlocked() -> bool {
-    std::env::var(ACCEPT_INFERRED_SOC_REGS_ENV).ok().as_deref() == Some("1")
-        || std::env::var(ACCEPT_INFERRED_SOC_REGS_ENV_DEPRECATED)
-            .ok()
-            .as_deref()
-            == Some("1")
+    let current = std::env::var(ACCEPT_INFERRED_SOC_REGS_ENV).ok();
+    let deprecated = std::env::var(ACCEPT_INFERRED_SOC_REGS_ENV_DEPRECATED).ok();
+    inferred_soc_regs_unlocked_from_values(current.as_deref(), deprecated.as_deref())
+}
+
+fn inferred_soc_regs_unlocked_from_values(current: Option<&str>, deprecated: Option<&str>) -> bool {
+    current == Some("1") || deprecated == Some("1")
 }
 
 /// Outcome of [`cold_boot_enable_nonce_path`]. Either the path was a
@@ -351,7 +353,14 @@ pub enum NoncePathOutcome {
 // 3-round-trip live verification on the bench unit per
 // .
 pub fn cold_boot_enable_nonce_path(cfg: UartRelayReg) -> NoncePathOutcome {
-    if !inferred_soc_regs_unlocked() {
+    cold_boot_enable_nonce_path_with_unlock(cfg, inferred_soc_regs_unlocked())
+}
+
+fn cold_boot_enable_nonce_path_with_unlock(
+    cfg: UartRelayReg,
+    inferred_soc_regs_unlocked: bool,
+) -> NoncePathOutcome {
+    if !inferred_soc_regs_unlocked {
         // Production default: byte-identical to W12.7 "not wired".
         // No frame composed, no register write, no behaviour change.
         tracing::debug!(
@@ -634,45 +643,9 @@ mod tests {
     // ------------------------------------------------------------------
     // PR-024 — cold_boot_enable_nonce_path env-gate + encode regressions.
     //
-    // These tests mutate process-global env vars, so they MUST run
-    // serialized (a static Mutex) and MUST restore prior env state, or a
-    // leaked `=1` would silently arm the inferred path for OTHER tests in
-    // the same process. The gate-unset no-op test is the load-bearing
-    // PR-024 guarantee.
+    // Policy parsing and behavior are tested through explicit values so the
+    // crate's parallel test runner never mutates process-global state.
     // ------------------------------------------------------------------
-
-    use std::sync::Mutex;
-
-    static ENV_GUARD: Mutex<()> = Mutex::new(());
-
-    /// Save + clear BOTH env-var names, run `f`, then restore. Returns
-    /// `f`'s value. Panics in `f` still restore via the drop guard.
-    fn with_env_clean<R>(f: impl FnOnce() -> R) -> R {
-        let _lock = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        struct Restore {
-            new: Option<String>,
-            old: Option<String>,
-        }
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                match &self.new {
-                    Some(v) => std::env::set_var(ACCEPT_INFERRED_SOC_REGS_ENV, v),
-                    None => std::env::remove_var(ACCEPT_INFERRED_SOC_REGS_ENV),
-                }
-                match &self.old {
-                    Some(v) => std::env::set_var(ACCEPT_INFERRED_SOC_REGS_ENV_DEPRECATED, v),
-                    None => std::env::remove_var(ACCEPT_INFERRED_SOC_REGS_ENV_DEPRECATED),
-                }
-            }
-        }
-        let _restore = Restore {
-            new: std::env::var(ACCEPT_INFERRED_SOC_REGS_ENV).ok(),
-            old: std::env::var(ACCEPT_INFERRED_SOC_REGS_ENV_DEPRECATED).ok(),
-        };
-        std::env::remove_var(ACCEPT_INFERRED_SOC_REGS_ENV);
-        std::env::remove_var(ACCEPT_INFERRED_SOC_REGS_ENV_DEPRECATED);
-        f()
-    }
 
     #[test]
     fn pr024_env_name_matches_hal_orchestrator_byte_for_byte() {
@@ -696,90 +669,73 @@ mod tests {
         // in every shipping configuration), the path composes NO frame
         // and returns Skipped — byte-identical to the W12.7 "data only,
         // NOT wired" state. This is the PR-024 prime-directive proof.
-        with_env_clean(|| {
-            assert!(
-                !inferred_soc_regs_unlocked(),
-                "gate must read unset after with_env_clean"
-            );
-            let any_cfg = UartRelayReg::new(0x07, 0x03, true, true, false);
-            let out = cold_boot_enable_nonce_path(any_cfg);
-            assert_eq!(
-                out,
-                NoncePathOutcome::Skipped,
-                "gate unset MUST be a no-op — no inferred CV1835 register \
-                 write may be composed when the gate is unset"
-            );
-            // Skipped carries no reg/value/frame — there is nothing for a
-            // caller to ever put on the wire.
-            assert!(matches!(out, NoncePathOutcome::Skipped));
-        });
+        assert!(!inferred_soc_regs_unlocked_from_values(None, None));
+        let any_cfg = UartRelayReg::new(0x07, 0x03, true, true, false);
+        let out = cold_boot_enable_nonce_path_with_unlock(any_cfg, false);
+        assert_eq!(
+            out,
+            NoncePathOutcome::Skipped,
+            "gate unset MUST be a no-op — no inferred CV1835 register \
+             write may be composed when the gate is unset"
+        );
+        // Skipped carries no reg/value/frame — there is nothing for a
+        // caller to ever put on the wire.
+        assert!(matches!(out, NoncePathOutcome::Skipped));
     }
 
     #[test]
     fn pr024_gate_unset_even_with_unrelated_env_present() {
         // A stray empty string or "0" must NOT unlock — only exact "1".
-        with_env_clean(|| {
-            std::env::set_var(ACCEPT_INFERRED_SOC_REGS_ENV, "0");
-            std::env::set_var(ACCEPT_INFERRED_SOC_REGS_ENV_DEPRECATED, "");
-            assert!(!inferred_soc_regs_unlocked());
-            let out = cold_boot_enable_nonce_path(UartRelayReg::zero());
-            assert_eq!(out, NoncePathOutcome::Skipped);
-        });
+        assert!(!inferred_soc_regs_unlocked_from_values(Some("0"), Some("")));
+        let out = cold_boot_enable_nonce_path_with_unlock(UartRelayReg::zero(), false);
+        assert_eq!(out, NoncePathOutcome::Skipped);
     }
 
     #[test]
     fn pr024_gate_set_new_name_composes_canonical_broadcast_frame() {
-        with_env_clean(|| {
-            std::env::set_var(ACCEPT_INFERRED_SOC_REGS_ENV, "1");
-            assert!(inferred_soc_regs_unlocked());
-            let cfg = UartRelayReg::new(0x07, 0x03, true, true, false);
-            let out = cold_boot_enable_nonce_path(cfg);
-            // Expected raw: chip=0x07 | gap_cnt=3<<8 | nonce_gap(12) |
-            // ro_relay(13).
-            let expected_val: u32 = 0x07 | (0x03 << 8) | (1 << 12) | (1 << 13);
-            assert_eq!(cfg.raw(), expected_val, "bitfield encode pin");
-            match out {
-                NoncePathOutcome::Frame { reg, value, frame } => {
-                    assert_eq!(reg, UART_RELAY_REG_ADDR, "must target 0x2C");
-                    assert_eq!(value, expected_val);
-                    // Frame == canonical BM1397+ broadcast WRITE builder
-                    // output (reuse proof, not a reinvented encoder).
-                    let canonical = super::super::build_broadcast_write_frame(
-                        UART_RELAY_REG_ADDR,
-                        expected_val,
-                    );
-                    assert_eq!(frame, canonical);
-                    // HDR=0x51 broadcast WRITE, LEN=0x09, chip=0x00.
-                    assert_eq!(&frame[0..3], &[0x51, 0x09, 0x00]);
-                    assert_eq!(frame[3], 0x2C);
-                    // VAL_BE.
-                    assert_eq!(&frame[4..8], &expected_val.to_be_bytes());
-                }
-                NoncePathOutcome::Skipped => {
-                    panic!("gate SET (new name) must compose a Frame")
-                }
+        assert!(inferred_soc_regs_unlocked_from_values(Some("1"), None));
+        let cfg = UartRelayReg::new(0x07, 0x03, true, true, false);
+        let out = cold_boot_enable_nonce_path_with_unlock(cfg, true);
+        // Expected raw: chip=0x07 | gap_cnt=3<<8 | nonce_gap(12) |
+        // ro_relay(13).
+        let expected_val: u32 = 0x07 | (0x03 << 8) | (1 << 12) | (1 << 13);
+        assert_eq!(cfg.raw(), expected_val, "bitfield encode pin");
+        match out {
+            NoncePathOutcome::Frame { reg, value, frame } => {
+                assert_eq!(reg, UART_RELAY_REG_ADDR, "must target 0x2C");
+                assert_eq!(value, expected_val);
+                // Frame == canonical BM1397+ broadcast WRITE builder
+                // output (reuse proof, not a reinvented encoder).
+                let canonical =
+                    super::super::build_broadcast_write_frame(UART_RELAY_REG_ADDR, expected_val);
+                assert_eq!(frame, canonical);
+                // HDR=0x51 broadcast WRITE, LEN=0x09, chip=0x00.
+                assert_eq!(&frame[0..3], &[0x51, 0x09, 0x00]);
+                assert_eq!(frame[3], 0x2C);
+                // VAL_BE.
+                assert_eq!(&frame[4..8], &expected_val.to_be_bytes());
             }
-        });
+            NoncePathOutcome::Skipped => {
+                panic!("gate SET (new name) must compose a Frame")
+            }
+        }
     }
 
     #[test]
     fn pr024_gate_set_deprecated_alias_also_unlocks() {
         // W15.A3 backwards-compat: the old env-var name still unlocks,
         // exactly matching the hal orchestrator's dual-name behaviour.
-        with_env_clean(|| {
-            std::env::set_var(ACCEPT_INFERRED_SOC_REGS_ENV_DEPRECATED, "1");
-            assert!(inferred_soc_regs_unlocked());
-            let out = cold_boot_enable_nonce_path(UartRelayReg::zero());
-            match out {
-                NoncePathOutcome::Frame { reg, value, .. } => {
-                    assert_eq!(reg, UART_RELAY_REG_ADDR);
-                    assert_eq!(value, 0, "zero() cfg → all-zero value");
-                }
-                NoncePathOutcome::Skipped => {
-                    panic!("deprecated alias =1 must unlock")
-                }
+        assert!(inferred_soc_regs_unlocked_from_values(None, Some("1")));
+        let out = cold_boot_enable_nonce_path_with_unlock(UartRelayReg::zero(), true);
+        match out {
+            NoncePathOutcome::Frame { reg, value, .. } => {
+                assert_eq!(reg, UART_RELAY_REG_ADDR);
+                assert_eq!(value, 0, "zero() cfg → all-zero value");
             }
-        });
+            NoncePathOutcome::Skipped => {
+                panic!("deprecated alias =1 must unlock")
+            }
+        }
     }
 
     #[test]

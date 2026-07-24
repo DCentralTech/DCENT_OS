@@ -164,8 +164,20 @@ impl FrameDecoder {
                 self.buffer.drain(..consumed);
                 Ok(Some(frame))
             }
-            Err(FrameError::Incomplete { .. }) => Ok(None),
-            Err(e) => Err(e),
+            // Recoverable: not enough bytes yet — keep buffering and retry when
+            // more data arrives.
+            Err(FrameError::Incomplete { .. }) | Err(FrameError::BufferTooSmall) => Ok(None),
+            // Fatal framing error (oversized payload / invalid message type): the
+            // length-prefixed stream position can no longer be trusted. Leaving the
+            // offending bytes buffered would make EVERY subsequent next_frame()
+            // re-parse them and re-error forever — a poisoned decoder that silently
+            // stops emitting frames until an external reset(). Clear the buffer so
+            // the decoder recovers on the next feed; the caller still receives the
+            // error and can log / drop the connection.
+            Err(e) => {
+                self.buffer.clear();
+                Err(e)
+            }
         }
     }
 
@@ -191,6 +203,33 @@ mod tests {
         assert_eq!(parsed.extension_type, 0x0000);
         assert_eq!(parsed.msg_type, 0x1e);
         assert_eq!(parsed.payload_len, 256);
+    }
+
+    #[test]
+    fn decoder_recovers_after_fatal_frame_error() {
+        let mut dec = FrameDecoder::new();
+        // A hostile/corrupt header claiming a 16 MB payload (> MAX_PAYLOAD_SIZE)
+        // is a FATAL frame error.
+        let bad_header = [0u8, 0, 0, 0xFF, 0xFF, 0xFF];
+        dec.feed(&bad_header);
+        assert!(
+            matches!(dec.next_frame(), Err(FrameError::PayloadTooLarge(_))),
+            "an oversized payload_len must be a fatal PayloadTooLarge error"
+        );
+        // Before the fix the bad bytes stayed buffered and EVERY subsequent call
+        // re-parsed + re-errored forever (poisoned decoder). After the fix the
+        // decoder recovered: a valid frame fed next decodes normally.
+        let good = Sv2Frame::new(0x0000, 0x1F, vec![0xAA, 0xBB, 0xCC]);
+        dec.feed(&good.to_bytes());
+        match dec.next_frame() {
+            Ok(Some(frame)) => {
+                assert_eq!(frame.header.msg_type, 0x1F);
+                assert_eq!(frame.payload, vec![0xAA, 0xBB, 0xCC]);
+            }
+            other => panic!("decoder did not recover after a fatal error: {other:?}"),
+        }
+        // Buffer fully consumed — no leftover / no lingering poison.
+        assert!(matches!(dec.next_frame(), Ok(None)));
     }
 
     #[test]

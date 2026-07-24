@@ -202,12 +202,14 @@ INVOCATION_CAPABILITY=""
 RESULT_STAGE=""
 RESULT_ROOT=""
 RESULT_CAPABILITY=""
+RESULT_CREATE_RESULT_FILE=""
 CARGO_INPUT_SNAPSHOT=""
 CARGO_INPUT_DESTROY_TOKEN=""
 SIGNING_AUTHORITY_STAGE=""
 SIGNING_AUTHORITY_CAPABILITY=""
 SIGNING_AUTHORITY_PRIVATE_KEY=""
 SIGNING_AUTHORITY_PUBLIC_KEY=""
+SIGNING_AUTHORITY_RESULT_FILE=""
 RELEASE_SET_STAGE=""
 RELEASE_SET_CAPABILITY_FILE=""
 RELEASE_SET_MANIFEST=""
@@ -216,37 +218,143 @@ INVOCATION_ID=""
 
 capsule_cleanup() {
     status=${1:-$?}
+    recovery_authority_required=0
+    result_recovery_required=0
     trap - EXIT INT TERM
     set +e
     if [ "$RELEASE_SET_PUBLISHED" != "1" ] \
         && [ -n "$RELEASE_SET_CAPABILITY_FILE" ] \
-        && [ -e "$RELEASE_SET_STAGE" ]; then
-        python3 "$SCRIPT_DIR/release_set_publication.py" destroy-stage \
-            --capability-file "$RELEASE_SET_CAPABILITY_FILE" >/dev/null 2>&1 || status=1
+        && [ -f "$RELEASE_SET_CAPABILITY_FILE" ]; then
+        release_set_destroy_error="$(
+            python3 "$SCRIPT_DIR/release_set_publication.py" destroy-stage \
+                --capability-file "$RELEASE_SET_CAPABILITY_FILE" \
+                2>&1 >/dev/null
+        )"
+        if [ "$?" -eq 0 ]; then
+            rm -f -- "$RELEASE_SET_CAPABILITY_FILE" || status=1
+            RELEASE_SET_CAPABILITY_FILE=""
+        else
+            echo "ERROR: release-set cleanup failed; capability retained for recovery: $RELEASE_SET_CAPABILITY_FILE" >&2
+            if [ -n "$release_set_destroy_error" ]; then
+                printf '%s\n' "$release_set_destroy_error" >&2
+            fi
+            status=1
+            recovery_authority_required=1
+        fi
     fi
     if [ -n "$RELEASE_SET_MANIFEST" ]; then
         rm -f -- "$RELEASE_SET_MANIFEST" || status=1
     fi
-    if [ -n "$RELEASE_SET_CAPABILITY_FILE" ]; then
+    if [ "$RELEASE_SET_PUBLISHED" = "1" ] \
+        && [ -n "$RELEASE_SET_CAPABILITY_FILE" ]; then
         rm -f -- "$RELEASE_SET_CAPABILITY_FILE" || status=1
     fi
-    if [ -n "$RESULT_STAGE" ] && [ -e "$RESULT_STAGE" ]; then
-        python3 "$SCRIPT_DIR/release_result_stage.py" destroy \
+    if [ -n "$RESULT_CREATE_RESULT_FILE" ] \
+        && [ -f "$RESULT_CREATE_RESULT_FILE" ]; then
+        recovered_result_stage="$(python3 "$SCRIPT_DIR/release_result_stage.py" \
+            query-result --field stage < "$RESULT_CREATE_RESULT_FILE" 2>/dev/null)"
+        recovered_result_capability="$(python3 "$SCRIPT_DIR/release_result_stage.py" \
+            query-result --field capability < "$RESULT_CREATE_RESULT_FILE" 2>/dev/null)"
+        if [ -n "$recovered_result_stage" ] \
+            && [ -n "$recovered_result_capability" ]; then
+            RESULT_STAGE="$(normalize_shell_path "$recovered_result_stage")"
+            RESULT_CAPABILITY="$(normalize_shell_path "$recovered_result_capability")"
+        else
+            echo "ERROR: result-stage recovery result is unreadable; retained: $RESULT_CREATE_RESULT_FILE" >&2
+            status=1
+            recovery_authority_required=1
+            result_recovery_required=1
+        fi
+    fi
+    if [ "$result_recovery_required" = "0" ] \
+        && [ -n "$RESULT_CREATE_RESULT_FILE" ] \
+        && [ -n "$RESULT_STAGE" ] && [ -e "$RESULT_STAGE" ] \
+        && { [ ! -f "$RESULT_CAPABILITY" ] \
+            || [ ! -f "$RESULT_STAGE/result-stage.json" ] \
+            || [ ! -d "$RESULT_STAGE/results" ]; }; then
+        result_create_recovery_error="$(python3 "$SCRIPT_DIR/release_result_stage.py" create \
+            --stage-parent "$RESULT_PARENT" \
+            --invocation-stage "$INVOCATION_STAGE" \
+            --result-output "$RESULT_CREATE_RESULT_FILE" 2>&1 >/dev/null)"
+        if [ "$?" -ne 0 ]; then
+            echo "ERROR: result-stage creation recovery failed; locator retained: $RESULT_CREATE_RESULT_FILE" >&2
+            [ -n "$result_create_recovery_error" ] \
+                && printf '%s\n' "$result_create_recovery_error" >&2
+            status=1
+            recovery_authority_required=1
+            result_recovery_required=1
+        fi
+    fi
+    if [ "$result_recovery_required" = "0" ] \
+        && [ -n "$RESULT_STAGE" ] && [ -n "$RESULT_CAPABILITY" ] \
+        && { [ -e "$RESULT_STAGE" ] || [ -e "$RESULT_CAPABILITY" ]; }; then
+        result_destroy_error="$(python3 "$SCRIPT_DIR/release_result_stage.py" destroy \
             --capability "$RESULT_CAPABILITY" \
             --invocation-stage "$INVOCATION_STAGE" \
-            "$RESULT_STAGE" >/dev/null 2>&1 || status=1
+            "$RESULT_STAGE" 2>&1 >/dev/null)"
+        if [ "$?" -ne 0 ]; then
+            echo "ERROR: result-stage cleanup failed; recovery result retained: $RESULT_CREATE_RESULT_FILE" >&2
+            [ -n "$result_destroy_error" ] && printf '%s\n' "$result_destroy_error" >&2
+            status=1
+            recovery_authority_required=1
+            result_recovery_required=1
+        fi
+    fi
+    if [ "$result_recovery_required" = "0" ] \
+        && [ -n "$RESULT_CREATE_RESULT_FILE" ] \
+        && [ -f "$RESULT_CREATE_RESULT_FILE" ]; then
+        rm -f -- "$RESULT_CREATE_RESULT_FILE" || status=1
     fi
     if [ -n "$CARGO_INPUT_SNAPSHOT" ] && [ -e "$CARGO_INPUT_SNAPSHOT" ]; then
         python3 "$SCRIPT_DIR/build_input_snapshot.py" destroy \
             --token "$CARGO_INPUT_DESTROY_TOKEN" "$CARGO_INPUT_SNAPSHOT" \
-            >/dev/null 2>&1 || status=1
+            >/dev/null 2>&1 || {
+                status=1
+                recovery_authority_required=1
+            }
     fi
-    if [ -n "$SIGNING_AUTHORITY_STAGE" ] && [ -e "$SIGNING_AUTHORITY_STAGE" ]; then
-        python3 "$SCRIPT_DIR/release_signing_authority.py" destroy \
+    if [ -n "$SIGNING_AUTHORITY_RESULT_FILE" ]; then
+        if [ -f "$SIGNING_AUTHORITY_RESULT_FILE" ]; then
+            recovered_signing_stage="$(python3 "$SCRIPT_DIR/release_signing_authority.py" \
+                query-result --field stage < "$SIGNING_AUTHORITY_RESULT_FILE" 2>/dev/null)"
+            recovered_signing_capability="$(python3 "$SCRIPT_DIR/release_signing_authority.py" \
+                query-result --field capability < "$SIGNING_AUTHORITY_RESULT_FILE" 2>/dev/null)"
+            if [ -n "$recovered_signing_stage" ] \
+                && [ -n "$recovered_signing_capability" ]; then
+                SIGNING_AUTHORITY_STAGE="$(normalize_shell_path "$recovered_signing_stage")"
+                SIGNING_AUTHORITY_CAPABILITY="$(normalize_shell_path "$recovered_signing_capability")"
+            else
+                echo "ERROR: signing-authority recovery result is unreadable; retained: $SIGNING_AUTHORITY_RESULT_FILE" >&2
+                status=1
+                recovery_authority_required=1
+            fi
+        else
+            echo "ERROR: registered signing-authority recovery result is missing; upstream authority retained: $SIGNING_AUTHORITY_RESULT_FILE" >&2
+            status=1
+            recovery_authority_required=1
+        fi
+    fi
+    if [ -n "$SIGNING_AUTHORITY_STAGE" ] \
+        && [ -n "$SIGNING_AUTHORITY_CAPABILITY" ] \
+        && { [ -e "$SIGNING_AUTHORITY_STAGE" ] \
+            || [ -e "$SIGNING_AUTHORITY_CAPABILITY" ]; }; then
+        signing_destroy_error="$(python3 "$SCRIPT_DIR/release_signing_authority.py" destroy \
             --capability "$SIGNING_AUTHORITY_CAPABILITY" \
-            "$SIGNING_AUTHORITY_STAGE" >/dev/null 2>&1 || status=1
+            "$SIGNING_AUTHORITY_STAGE" 2>&1 >/dev/null)"
+        if [ "$?" -ne 0 ]; then
+            echo "ERROR: signing-authority cleanup failed; recovery result retained: $SIGNING_AUTHORITY_RESULT_FILE" >&2
+            [ -n "$signing_destroy_error" ] && printf '%s\n' "$signing_destroy_error" >&2
+            status=1
+            recovery_authority_required=1
+        fi
     fi
-    if [ -n "$INVOCATION_STAGE" ] && [ -e "$INVOCATION_STAGE" ]; then
+    if [ "$recovery_authority_required" = "0" ] \
+        && [ -n "$SIGNING_AUTHORITY_RESULT_FILE" ] \
+        && [ -f "$SIGNING_AUTHORITY_RESULT_FILE" ]; then
+        rm -f -- "$SIGNING_AUTHORITY_RESULT_FILE" || status=1
+    fi
+    if [ "$recovery_authority_required" = "0" ] \
+        && [ -n "$INVOCATION_STAGE" ] && [ -e "$INVOCATION_STAGE" ]; then
         # Both build drivers must have removed their exact Docker resources
         # before the invocation control stage becomes eligible for destruction.
         external_resources_absent=1
@@ -270,24 +378,37 @@ capsule_cleanup() {
             external_resources_absent=0
         fi
         if [ "$external_resources_absent" = "1" ]; then
-            python3 "$SCRIPT_DIR/release_invocation.py" mark-gc-eligible \
-                --capability "$INVOCATION_CAPABILITY" \
-                --reason external-resources-disposed-and-output-state-finalized \
-                "$INVOCATION_STAGE" >/dev/null 2>&1 \
-                && python3 "$SCRIPT_DIR/release_invocation.py" destroy \
-                    --capability "$INVOCATION_CAPABILITY" "$INVOCATION_STAGE" \
-                    >/dev/null 2>&1 || status=1
+            if ! {
+                python3 "$SCRIPT_DIR/release_invocation.py" mark-gc-eligible \
+                    --capability "$INVOCATION_CAPABILITY" \
+                    --reason external-resources-disposed-and-output-state-finalized \
+                    "$INVOCATION_STAGE" >/dev/null 2>&1 \
+                    && python3 "$SCRIPT_DIR/release_invocation.py" destroy \
+                        --capability "$INVOCATION_CAPABILITY" "$INVOCATION_STAGE" \
+                        >/dev/null 2>&1
+            }; then
+                status=1
+                recovery_authority_required=1
+            fi
         else
             echo "ERROR: capsule Docker resources remain; invocation retained for recovery" >&2
             status=1
+            recovery_authority_required=1
         fi
+    elif [ "$recovery_authority_required" != "0" ] \
+        && [ -n "$INVOCATION_STAGE" ] && [ -e "$INVOCATION_STAGE" ]; then
+        echo "ERROR: dependent cleanup failed; invocation retained for recovery: $INVOCATION_STAGE" >&2
     fi
     # Destroy the authenticated source last because every cleanup authority
     # helper above is itself executed from that snapshot.
-    if [ "$SOURCE_OWNED" = "1" ] && [ -n "$SOURCE_SNAPSHOT" ]; then
+    if [ "$recovery_authority_required" = "0" ] \
+        && [ "$SOURCE_OWNED" = "1" ] && [ -n "$SOURCE_SNAPSHOT" ]; then
         python3 "$SCRIPT_DIR/source_snapshot.py" destroy \
             --token "$SOURCE_DESTROY_TOKEN" "$SOURCE_SNAPSHOT" >/dev/null 2>&1 || status=1
         SOURCE_OWNED=0
+    elif [ "$recovery_authority_required" != "0" ] \
+        && [ "$SOURCE_OWNED" = "1" ] && [ -n "$SOURCE_SNAPSHOT" ]; then
+        echo "ERROR: cleanup helper source retained for recovery: $SOURCE_SNAPSHOT" >&2
     fi
     for empty_directory in \
         "$INVOCATION_PARENT/.dcentos-release-invocation-capabilities" \
@@ -311,16 +432,21 @@ invocation_result_field() {
 }
 INVOCATION_STAGE="$(normalize_shell_path "$(invocation_result_field stage)")"
 INVOCATION_CAPABILITY="$(normalize_shell_path "$(invocation_result_field capability)")"
+INVOCATION_ID="$(python3 "$SCRIPT_DIR/release_invocation.py" query \
+    --field invocation_id "$INVOCATION_STAGE")"
 
 # Convert the two mutable operator pathnames into one invocation-owned private
 # authority before proving or using the keypair. Every later signer/verifier,
 # including Docker mounts, receives only these stable copies. The private stage
 # is never a release-set member and is destroyed before the invocation record.
-SIGNING_AUTHORITY_RESULT="$(python3 "$SCRIPT_DIR/release_signing_authority.py" create \
+SIGNING_AUTHORITY_RESULT_FILE="$WORK_PARENT/signing-authority-${INVOCATION_ID}.result.json"
+python3 "$SCRIPT_DIR/release_signing_authority.py" create \
     --stage-parent "$SIGNING_PARENT" \
     --invocation-stage "$INVOCATION_STAGE" \
     --private-key "$DCENT_RELEASE_SIGNING_KEY" \
-    --public-key "$DCENT_RELEASE_PUBKEY_FILE")"
+    --public-key "$DCENT_RELEASE_PUBKEY_FILE" \
+    --result-output "$SIGNING_AUTHORITY_RESULT_FILE" >/dev/null
+SIGNING_AUTHORITY_RESULT="$(cat -- "$SIGNING_AUTHORITY_RESULT_FILE")"
 signing_authority_result_field() {
     printf '%s\n' "$SIGNING_AUTHORITY_RESULT" \
         | python3 "$SCRIPT_DIR/release_signing_authority.py" query-result --field "$1"
@@ -354,8 +480,11 @@ cargo_input_result_field() {
 CARGO_INPUT_SNAPSHOT="$(normalize_shell_path "$(cargo_input_result_field snapshot)")"
 CARGO_INPUT_DESTROY_TOKEN="$(cargo_input_result_field destroy_token)"
 
-RESULT_CREATE_RESULT="$(python3 "$SCRIPT_DIR/release_result_stage.py" create \
-    --stage-parent "$RESULT_PARENT" --invocation-stage "$INVOCATION_STAGE")"
+RESULT_CREATE_RESULT_FILE="$WORK_PARENT/result-stage-${INVOCATION_ID}.result.json"
+python3 "$SCRIPT_DIR/release_result_stage.py" create \
+    --stage-parent "$RESULT_PARENT" --invocation-stage "$INVOCATION_STAGE" \
+    --result-output "$RESULT_CREATE_RESULT_FILE" >/dev/null
+RESULT_CREATE_RESULT="$(cat -- "$RESULT_CREATE_RESULT_FILE")"
 result_create_field() {
     printf '%s\n' "$RESULT_CREATE_RESULT" \
         | python3 "$SCRIPT_DIR/release_result_stage.py" query-result --field "$1"
@@ -364,15 +493,13 @@ RESULT_STAGE="$(normalize_shell_path "$(result_create_field stage)")"
 RESULT_ROOT="$(normalize_shell_path "$(result_create_field result_root)")"
 RESULT_CAPABILITY="$(normalize_shell_path "$(result_create_field capability)")"
 
-RELEASE_SET_CAPABILITY_JSON="$(python3 "$SCRIPT_DIR/release_set_publication.py" \
-    create-stage --parent "$RELEASE_STAGE_PARENT")"
-RELEASE_SET_STAGE="$(printf '%s\n' "$RELEASE_SET_CAPABILITY_JSON" \
-    | python3 "$SCRIPT_DIR/release_set_publication.py" query --field stage-path)"
-RELEASE_SET_STAGE="$(normalize_shell_path "$RELEASE_SET_STAGE")"
-INVOCATION_ID="$(python3 "$SCRIPT_DIR/release_invocation.py" query \
-    --field invocation_id "$INVOCATION_STAGE")"
 RELEASE_SET_CAPABILITY_FILE="$WORK_PARENT/release-set-${INVOCATION_ID}.capability.json"
-printf '%s\n' "$RELEASE_SET_CAPABILITY_JSON" > "$RELEASE_SET_CAPABILITY_FILE"
+python3 "$SCRIPT_DIR/release_set_publication.py" create-stage \
+    --parent "$RELEASE_STAGE_PARENT" \
+    --capability-output "$RELEASE_SET_CAPABILITY_FILE" >/dev/null
+RELEASE_SET_STAGE="$(python3 "$SCRIPT_DIR/release_set_publication.py" query \
+    --field stage-path < "$RELEASE_SET_CAPABILITY_FILE")"
+RELEASE_SET_STAGE="$(normalize_shell_path "$RELEASE_SET_STAGE")"
 
 export DCENT_PACKAGE_STATUS=release
 export DCENT_RELEASE_IMAGE=1
@@ -426,14 +553,10 @@ python3 "$SCRIPT_DIR/portable_release_evidence.py" create-live \
     --public-key "$DCENT_RELEASE_PUBKEY_FILE" >/dev/null
 PORTABLE_EVIDENCE_PATH="$RELEASE_SET_STAGE/portable-release-evidence.json"
 PORTABLE_EVIDENCE_SIGNATURE_PATH="${PORTABLE_EVIDENCE_PATH}.sig"
-openssl pkeyutl -sign -rawin \
-    -inkey "$DCENT_RELEASE_SIGNING_KEY" \
-    -in "$PORTABLE_EVIDENCE_PATH" \
-    -out "$PORTABLE_EVIDENCE_SIGNATURE_PATH"
-[ "$(wc -c < "$PORTABLE_EVIDENCE_SIGNATURE_PATH" | tr -d '[:space:]')" = 64 ] || {
-    echo "ERROR: portable evidence Ed25519 signature must be exactly 64 bytes" >&2
-    exit 1
-}
+python3 "$SCRIPT_DIR/sign_release_artifact.py" "$PORTABLE_EVIDENCE_PATH" \
+    --key "$DCENT_RELEASE_SIGNING_KEY" \
+    --pubkey "$DCENT_RELEASE_PUBKEY_FILE" \
+    --output-sig "$PORTABLE_EVIDENCE_SIGNATURE_PATH" >/dev/null
 
 RELEASE_SET_MANIFEST="$WORK_PARENT/release-set-${INVOCATION_ID}.files.json"
 python3 "$SCRIPT_DIR/release_set_publication.py" manifest-stage \

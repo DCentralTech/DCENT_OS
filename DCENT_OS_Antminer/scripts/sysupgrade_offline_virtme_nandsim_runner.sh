@@ -233,7 +233,10 @@ else
     GUEST_PREFIX="set -e; cd $PROJECT_Q; export DCENT_SYSUPGRADE_OFFLINE_CONTAINER=1"
     S99_FAILED_HEALTH_CMD="sh scripts/test_s99upgrade_failed_health_no_commit.sh"
     AM1_GUEST_CMD="$GUEST_PREFIX; $S99_FAILED_HEALTH_CMD; bash scripts/sysupgrade_offline_nandsim_harness.sh$NANDSIM_REQUIRE_ARG --target am1-s9 --package $S9_PACKAGE_Q --release-key $RELEASE_KEY_Q --workdir /tmp/dcent-nandsim-proof-am1-s9; bash scripts/sysupgrade_offline_nandsim_harness.sh$NANDSIM_REQUIRE_ARG --current-fw 1 --target am1-s9 --package $S9_PACKAGE_Q --release-key $RELEASE_KEY_Q --workdir /tmp/dcent-nandsim-proof-am1-s9-reverse; bash scripts/stage1_first_install_offline_nandsim_harness.sh$NANDSIM_REQUIRE_ARG --target am1-s9 --package $S9_PACKAGE_Q --workdir /tmp/dcent-first-install-proof-am1-s9"
-    AM2_GUEST_CMD="$GUEST_PREFIX; $S99_FAILED_HEALTH_CMD; bash scripts/sysupgrade_offline_nandsim_harness.sh$NANDSIM_REQUIRE_ARG --target am2-s19jpro --package $S19JPRO_PACKAGE_Q --release-key $RELEASE_KEY_Q --workdir /tmp/dcent-nandsim-proof-am2-s19jpro; bash scripts/sysupgrade_offline_nandsim_harness.sh$NANDSIM_REQUIRE_ARG --current-fw 1 --target am2-s19jpro --package $S19JPRO_PACKAGE_Q --release-key $RELEASE_KEY_Q --workdir /tmp/dcent-nandsim-proof-am2-s19jpro-reverse; bash scripts/stage1_first_install_offline_nandsim_harness.sh$NANDSIM_REQUIRE_ARG --target am2-s19jpro --am2-package $S19JPRO_PACKAGE_Q --workdir /tmp/dcent-first-install-proof-am2-s19jpro"
+    # AM2 coverage is deliberately limited to DCENT_OS-source A/B writer
+    # directions. Vendor-source first install has no authenticated capsule and
+    # must not be simulated by injecting the virtme host's dependency closure.
+    AM2_GUEST_CMD="$GUEST_PREFIX; $S99_FAILED_HEALTH_CMD; bash scripts/sysupgrade_offline_nandsim_harness.sh$NANDSIM_REQUIRE_ARG --target am2-s19jpro --package $S19JPRO_PACKAGE_Q --release-key $RELEASE_KEY_Q --workdir /tmp/dcent-nandsim-proof-am2-s19jpro; bash scripts/sysupgrade_offline_nandsim_harness.sh$NANDSIM_REQUIRE_ARG --current-fw 1 --target am2-s19jpro --package $S19JPRO_PACKAGE_Q --release-key $RELEASE_KEY_Q --workdir /tmp/dcent-nandsim-proof-am2-s19jpro-reverse"
     case "$TARGET" in
         both)
             run_guest_cmd am1-s9 "$AM1_GUEST_CMD"

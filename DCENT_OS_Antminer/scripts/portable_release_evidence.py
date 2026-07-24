@@ -76,6 +76,30 @@ def fail(message: str) -> NoReturn:
     raise PortableEvidenceError(message)
 
 
+class _DuplicateJsonKey(ValueError):
+    """A JSON object repeated a key before policy parsing."""
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, member in pairs:
+        if key in value:
+            raise _DuplicateJsonKey(key)
+        value[key] = member
+    return value
+
+
+def load_unique_json(raw: bytes, label: str) -> Any:
+    """Decode UTF-8 JSON without Python's unsafe duplicate-key last-wins rule."""
+
+    try:
+        return json.loads(raw, object_pairs_hook=_unique_json_object)
+    except _DuplicateJsonKey as error:
+        fail(f"{label} contains duplicate object key {error.args[0]!r}")
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"{label} is invalid JSON: {error}")
+
+
 def canonical_bytes(value: object) -> bytes:
     return (
         json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
@@ -145,10 +169,7 @@ def read_canonical(
     path: Path, label: str, maximum: int = MAX_INDEX_BYTES
 ) -> dict[str, Any]:
     raw = read_regular(path, label, maximum)
-    try:
-        value = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        fail(f"{label} is invalid JSON: {error}")
+    value = load_unique_json(raw, label)
     if not isinstance(value, dict) or raw != canonical_bytes(value):
         fail(f"{label} is not a canonical JSON object")
     return value
@@ -582,6 +603,86 @@ def verify_embedded_manifest_signature(
         )
 
 
+def verify_manifest_payload_bindings(
+    manifest: dict[str, Any],
+    members: list[dict[str, object]],
+    prefix: str,
+) -> None:
+    """Bind every supported write-relevant payload to the retained tar bytes."""
+
+    payloads = manifest.get("payloads")
+    if not isinstance(payloads, dict):
+        fail("target primary artifact manifest payloads must be an object")
+
+    member_by_path = {
+        item["path"]: item
+        for item in members
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    }
+    required = {
+        "kernel": f"{prefix}kernel",
+        "rootfs": f"{prefix}root",
+        "metadata": f"{prefix}METADATA",
+        "verification_key": f"{prefix}release_ed25519.pub",
+    }
+    bitstream_path = f"{prefix}fpga_bitstream.bit"
+    if bitstream_path in member_by_path:
+        required["bitstream"] = bitstream_path
+    if set(payloads) != set(required):
+        fail("target primary artifact manifest has an unsupported payload registry")
+
+    for kind, expected_path in required.items():
+        node = exact_object(
+            payloads[kind], f"target primary artifact {kind} payload", ("path", "size", "sha256")
+        )
+        observed = member_by_path.get(expected_path)
+        if observed is None:
+            fail(f"target primary artifact lacks manifest-declared {kind} payload")
+        if (
+            node.get("path") != expected_path
+            or node.get("size") != observed.get("size")
+            or node.get("sha256") != observed.get("sha256")
+            or not is_digest(node.get("sha256"))
+        ):
+            fail(f"target primary artifact {kind} payload binding disagrees with retained bytes")
+
+
+def verify_current_authority_contract(manifest: dict[str, Any]) -> None:
+    """Require the exact current mutation-authority claims without normalization."""
+
+    if (
+        manifest.get("schema") != 1
+        or manifest.get("manifest_profile")
+        != "dcentos.sysupgrade-authority/v1"
+        or manifest.get("installable") is not True
+        or manifest.get("artifact_maturity") != "experimental"
+        or not isinstance(manifest.get("version"), str)
+        or not manifest["version"]
+        or manifest["version"] != manifest["version"].strip()
+        or not isinstance(manifest.get("status"), str)
+        or not manifest["status"]
+        or manifest["status"] != manifest["status"].strip()
+        or manifest["status"] == "lab_unsigned"
+        or "ota_intermediate_cert" in manifest
+        or "ota_revoked_intermediates" in manifest
+    ):
+        fail("target primary artifact lacks the typed sysupgrade authority contract")
+
+
+def verify_canonical_sysupgrade_directory(
+    archive: tarfile.TarFile, prefix: str
+) -> None:
+    """Require one explicit canonical package-directory member and no aliases."""
+
+    canonical = prefix.removesuffix("/")
+    directories = [member.name for member in archive.getmembers() if member.isdir()]
+    if directories != [canonical]:
+        fail(
+            "target primary artifact must contain exactly one canonical "
+            f"{canonical}/ directory member"
+        )
+
+
 def verify_target_artifact(
     schema: str,
     target: str,
@@ -662,6 +763,7 @@ def verify_target_artifact(
         fail("target primary artifact lacks signed manifest identity members")
     try:
         with tarfile.open(fileobj=io.BytesIO(artifact_raw), mode="r:*") as archive:
+            verify_canonical_sysupgrade_directory(archive, prefix)
             raw_members: dict[str, bytes] = {}
             for name in required:
                 member = archive.getmember(name)
@@ -689,10 +791,9 @@ def verify_target_artifact(
     verify_embedded_manifest_signature(
         public_key, raw_members[manifest_name], raw_members[signature_name]
     )
-    try:
-        manifest = json.loads(raw_members[manifest_name])
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        fail(f"target primary artifact manifest is invalid JSON: {error}")
+    manifest = load_unique_json(
+        raw_members[manifest_name], "target primary artifact manifest"
+    )
     if not isinstance(manifest, dict):
         fail("target primary artifact manifest must be an object")
     if (
@@ -702,6 +803,9 @@ def verify_target_artifact(
         or manifest.get("board_target") != target_policy.package_board
     ):
         fail("target primary artifact manifest disagrees with package-board policy")
+    if schema == SCHEMA:
+        verify_current_authority_contract(manifest)
+        verify_manifest_payload_bindings(manifest, members, prefix)
     provenance = manifest.get("provenance")
     if schema == SCHEMA and (
         not isinstance(provenance, dict)

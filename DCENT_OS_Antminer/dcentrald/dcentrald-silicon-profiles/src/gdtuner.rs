@@ -174,8 +174,11 @@ impl Gdtuner {
     pub fn feed(&mut self, sample: GdtunerSample) -> GdtunerStage {
         self.samples_total += 1;
 
-        // Hard thermal limit: any stage aborts tuning at this temp.
-        if sample.max_chip_temp_c >= self.config.hard_thermal_limit_c {
+        // Hard thermal limit: any stage aborts tuning at this temp. Written as
+        // `!(x < limit)` (not `x >= limit`) so a NaN max_chip_temp_c — a garbled /
+        // failed sensor read — trips the abort fail-closed instead of slipping
+        // through (`NaN >= limit` and `NaN < limit` are both false).
+        if !(sample.max_chip_temp_c < self.config.hard_thermal_limit_c) {
             self.stage = GdtunerStage::Failed;
             return self.stage;
         }

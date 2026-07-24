@@ -6,9 +6,8 @@
 # Provenance: derived from `build_am3_bb_sdcard.sh`. Wave reference:
 # AGENT B3 wave W10.x (2026-05-09).
 #
-# Routes through `build_in_docker.sh --target am3-bb-s19jpro`, which selects
-# `dcentos_am3_bb_s19jpro_defconfig`, the variant
-# board/beaglebone/am3-bb-s19jpro post-build.sh + post-image.sh, and
+# A local Buildroot tree selects `dcentos_am3_bb_s19jpro_defconfig`, the
+# variant board/beaglebone/am3-bb-s19jpro post-build.sh + post-image.sh, and
 # emits the staged SD-card payload tarball
 #   dcentos-am3-bb-s19jpro-sdcard.tar
 # (or, when promoted to a NAND/sysupgrade target,
@@ -78,26 +77,9 @@ EXPECTED_TARBALL="dcentos-${BUILD_TARGET}-sdcard.tar"
 if [ -d "$BUILDROOT_DIR" ] && [ -f "$BUILDROOT_DIR/Makefile" ] && command -v make >/dev/null 2>&1; then
     make -C "$BUILDROOT_DIR" BR2_EXTERNAL="$BR2_EXTERNAL" "$BUILD_DEFCONFIG"
     make -C "$BUILDROOT_DIR"
-elif command -v docker >/dev/null 2>&1; then
-    if [ -n "$ARTIFACT_DIR" ]; then
-        echo "ERROR: --artifacts is not supported by Docker packaging; refusing to ignore carrier boot artifacts" >&2
-        echo "Use a direct Buildroot/staging environment or a dedicated AM3-BB image builder." >&2
-        exit 1
-    fi
-    OUTDIR=$(dirname "$OUTPUT")
-    "$SCRIPT_DIR/build_in_docker.sh" --target "$BUILD_TARGET" --output-dir "$OUTDIR"
-    DOCKER_OUTPUT="$OUTDIR/$EXPECTED_TARBALL"
-    if [ -f "$DOCKER_OUTPUT" ]; then
-        if [ "$DOCKER_OUTPUT" != "$OUTPUT" ]; then
-            cp "$DOCKER_OUTPUT" "$OUTPUT"
-        fi
-        echo "Wrote $OUTPUT"
-        exit 0
-    fi
-    echo "ERROR: Docker build did not produce $DOCKER_OUTPUT" >&2
-    exit 1
 else
-    echo "WARN: Buildroot tree or make not found; packaging existing output only." >&2
+    echo "WARN: local Buildroot tree or make not found; packaging existing output only." >&2
+    echo "      Docker fallback is disabled because am3-bb-s19jpro has no authenticated capsule." >&2
 fi
 
 BINARIES_DIR="${BINARIES_DIR:-$BUILDROOT_DIR/output/images}"

@@ -149,7 +149,10 @@ pub async fn run(config: DcentraldConfig, shutdown: CancellationToken) -> Result
         .default_operating_point()
         .map(|point| (point.voltage_v * 1000.0).round() as u16)
         .unwrap_or(0);
-    let registry = ChipRegistry::production();
+    // Simulation is an explicit offline execution domain. It may exercise an
+    // Experimental driver for the selected profile without changing the
+    // production hardware policy.
+    let registry = ChipRegistry::with_experimental_driver(profile.chip_id);
     let driver = registry
         .detect(profile.chip_id)
         .ok_or_else(|| anyhow!("chip 0x{:04x} is not production-enabled", profile.chip_id))?;

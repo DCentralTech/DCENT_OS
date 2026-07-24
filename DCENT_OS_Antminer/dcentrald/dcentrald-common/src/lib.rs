@@ -25,6 +25,8 @@
 pub mod am2_topology;
 pub mod at3_rail;
 pub mod atomic_file;
+/// Canonical build target and published filename for each artifact claim.
+pub mod artifact_producer;
 /// Declarative control-board composition identity (ADR-0011). Scaffold registry.
 pub mod board_desc;
 pub mod chain_voltage;
@@ -45,11 +47,17 @@ pub mod voltage_rail;
 pub mod wallet_mask;
 
 pub use board_desc::{
-    BoardDesc, BoardFamily, ChainTransportKind, SlotPolicy, VoltageControllerClass, WorkEngineKind,
+    AsicProtocolAdmission, AsicProtocolIdentity, BoardDesc, BoardFamily, ChainTransportKind,
+    SlotPolicy, VoltageControllerClass, WorkEngineKind,
+};
+pub use dcent_schema::hardware::{
+    ArtifactKind, ArtifactMaturity, HardwareEnablementPolicy, ImplementationMaturity,
+    InstallAuthorization, RecoveryMaturity, StorageTopology, UpdateMechanism,
+    HARDWARE_ENABLEMENT_SCHEMA_VERSION,
 };
 pub use install_matrix::{
-    ab_sysupgrade_board_targets, install_matrix, install_matrix_tsv, public_beta_board_targets,
-    InstallMatrixRow,
+    ab_sysupgrade_board_targets, install_matrix, install_matrix_json, install_matrix_tsv,
+    public_beta_board_targets, InstallMatrixRow,
 };
 pub use safety_command::{
     power_precedes_fan_raise, violates_home_fan_cap, FanCommand, PowerCut, PowerCutReason,

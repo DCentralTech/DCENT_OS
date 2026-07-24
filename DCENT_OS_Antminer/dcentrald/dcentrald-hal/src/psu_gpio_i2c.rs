@@ -28,7 +28,9 @@
 //! See `WAVE35-LIVE-FINDINGS.md` for the timing measurement that
 //! motivated this and `feedback_*` memory rules.
 
+use crate::i2c::I2cRawFabricLease;
 use crate::{HalError, Result};
+use dcentrald_fabric_lease::PhysicalI2cFabricId;
 
 ///  (2026-05-24): sum-mod-256 of NON-preamble bytes (LEN + CMD + payload + CRC).
 ///
@@ -137,6 +139,18 @@ pub const AM2_PSU_SDA_BIT: u32 = 1 << 0;
 /// Bit position of SCL (gpio896) within the AXI GPIO DATA/TRI registers.
 /// gpio896 is the SECOND line (base+1) so it occupies bit 1.
 pub const AM2_PSU_SCL_BIT: u32 = 1 << 1;
+
+/// Canonical Linux GPIO numbers for the AM2 dedicated PSU SMBus.
+pub const AM2_PSU_SDA_GPIO: u32 = 895;
+pub const AM2_PSU_SCL_GPIO: u32 = 896;
+
+/// Stable topology ABI for the dedicated AM2 PSU SMBus on GPIO895/896.
+///
+/// These wires are not kernel `/dev/i2c-0`: the hashboard I2C service and PSU
+/// master must coexist, while two GPIO/MMIO PSU masters must still exclude one
+/// another. This numeric identity must never be reused for another fabric.
+pub(crate) const AM2_PSU_GPIO_I2C_FABRIC: PhysicalI2cFabricId =
+    dcentrald_fabric_lease::topology::AM2_PSU_GPIO;
 
 // -----------------------------------------------------------------------------
 //  (2026-05-23): Loki spoof per-byte register-pointer protocol.
@@ -338,6 +352,10 @@ unsafe impl Sync for GpioBackend {}
 pub struct GpioBitBangI2c {
     backend: GpioBackend,
     half_period_us: u64,
+    /// Retains the same local + OS whole-fabric ownership used by kernel I2C
+    /// and service transports. A bit-banged fallback is another bus master,
+    /// not an escape from a lease conflict.
+    _fabric_lease: I2cRawFabricLease,
 }
 
 /// Resolve the runtime half-period: env override OR  default.
@@ -382,13 +400,20 @@ impl GpioBitBangI2c {
     ///
     /// Use `new_mmap_am2` on am2 (S19j Pro Zynq) — it's ~233× faster
     /// because per-bit sysfs overhead (5-10 ms/op) does not apply.
-    /// Use this sysfs path on any other platform that hasn't pinned the
-    /// AXI GPIO IP layout yet, or as a  rollback path.
+    /// Use this sysfs path only for the canonical AM2 PSU GPIO topology,
+    /// including as a  rollback path when MMIO is unavailable.
     ///
     /// # Arguments
-    /// * `sda_gpio` - GPIO number for SDA line (e.g., 895 on S19 Pro)
-    /// * `scl_gpio` - GPIO number for SCL line (e.g., 896 on S19 Pro)
-    pub fn new(sda_gpio: u32, scl_gpio: u32) -> Result<Self> {
+    pub fn new_am2() -> Result<Self> {
+        Self::new_on_physical_fabric(AM2_PSU_GPIO_I2C_FABRIC, AM2_PSU_SDA_GPIO, AM2_PSU_SCL_GPIO)
+    }
+
+    fn new_on_physical_fabric(
+        fabric: PhysicalI2cFabricId,
+        sda_gpio: u32,
+        scl_gpio: u32,
+    ) -> Result<Self> {
+        let fabric_lease = I2cRawFabricLease::reserve_bitbang(fabric)?;
         // Export GPIOs if not already exported (ignore errors if already exported)
         let _ = std::fs::write("/sys/class/gpio/export", format!("{}", sda_gpio));
         let _ = std::fs::write("/sys/class/gpio/export", format!("{}", scl_gpio));
@@ -408,6 +433,7 @@ impl GpioBitBangI2c {
         let i2c = Self {
             backend: GpioBackend::Sysfs { sda_gpio, scl_gpio },
             half_period_us,
+            _fabric_lease: fabric_lease,
         };
         // Start with both lines HIGH (input = released = pull-up)
         i2c.sda_high();
@@ -451,6 +477,7 @@ impl GpioBitBangI2c {
         use nix::sys::mman::{MapFlags, ProtFlags};
         use std::num::NonZeroUsize;
 
+        let fabric_lease = I2cRawFabricLease::reserve_bitbang(AM2_PSU_GPIO_I2C_FABRIC)?;
         let half_period_us = resolve_half_period_us();
         let bit_rate_hz = 1_000_000 / (2 * half_period_us);
         tracing::info!(
@@ -499,6 +526,7 @@ impl GpioBitBangI2c {
         let i2c = Self {
             backend: GpioBackend::Mmap { base_ptr },
             half_period_us,
+            _fabric_lease: fabric_lease,
         };
         // Start with both lines HIGH (input = released = pull-up). The
         // first writes RMW the TRI register so any other bits in the bank
@@ -753,6 +781,7 @@ impl GpioBitBangI2c {
     /// Sends START, address+W, data bytes, STOP.
     /// Returns error if the slave NACKs the address or any data byte.
     pub fn write_to(&self, addr: u8, data: &[u8]) -> Result<()> {
+        self._fabric_lease.validate_current_process()?;
         self.start();
         if !self.write_byte_raw(addr << 1) {
             // Write address
@@ -782,6 +811,7 @@ impl GpioBitBangI2c {
     /// Sends START, address+R, reads `buf.len()` bytes (ACK all except last), STOP.
     /// Returns the number of bytes read (always `buf.len()` on success).
     pub fn read_from(&self, addr: u8, buf: &mut [u8]) -> Result<usize> {
+        self._fabric_lease.validate_current_process()?;
         self.start();
         if !self.write_byte_raw((addr << 1) | 1) {
             // Read address
@@ -817,6 +847,7 @@ impl GpioBitBangI2c {
     /// Use this instead of `write_to` when the APW12 family is
     /// gpio_bitbang-attached AND `DCENT_AM2_PSU_LOKI_REGISTER_POINTER=1`.
     pub fn write_apw12_loki_frame(&self, addr: u8, frame: &[u8]) -> Result<()> {
+        self._fabric_lease.validate_current_process()?;
         // ----  (2026-05-29): bosminer-faithful BULK write branch ----
         //
         // ENV-GATED (`DCENT_AM2_LOKI_BOSMINER_BULK=1`), default OFF. When ON,
@@ -1005,6 +1036,7 @@ impl GpioBitBangI2c {
     /// See the APW12 V71 PIC firmware RE +
     /// .
     pub fn read_apw12_loki_response(&self, addr: u8, buf: &mut [u8]) -> Result<usize> {
+        self._fabric_lease.validate_current_process()?;
         let want = buf.len();
         if want == 0 {
             return Ok(0);
@@ -1234,6 +1266,7 @@ impl GpioBitBangI2c {
     /// (transactions #9-14, #57-62). Use `write_apw12_loki_frame` for
     /// the init-frame `[55 AA 04 02 06 00]` (transactions #1-6, #49-54).
     pub fn write_apw12_loki_frame_bare(&self, addr: u8, frame: &[u8]) -> Result<()> {
+        self._fabric_lease.validate_current_process()?;
         // wave55c_crc_diagnostic — log computed-vs-provided CRC for byte-level
         // RE comparison. Per PHASE2B-APW12-PIC-PROTOCOL.md §"Gaps", the CRC
         // formula is MED-confidence sum-mod-256 of non-preamble bytes. The
@@ -1298,7 +1331,8 @@ impl GpioBitBangI2c {
     /// If a transaction was interrupted mid-byte, the slave may be holding SDA
     /// low waiting for clocks. Sending 9 clocks gives the slave enough edges
     /// to release SDA, then a STOP condition resets the bus.
-    pub fn bus_recovery(&self) {
+    pub fn bus_recovery(&self) -> Result<()> {
+        self._fabric_lease.validate_current_process()?;
         for _ in 0..9 {
             self.scl_high();
             self.delay();
@@ -1306,6 +1340,7 @@ impl GpioBitBangI2c {
             self.delay();
         }
         self.stop();
+        Ok(())
     }
 }
 
@@ -1337,6 +1372,31 @@ impl Drop for GpioBitBangI2c {
 #[cfg(test)]
 mod wave36_tests {
     use super::*;
+
+    #[test]
+    fn every_public_gpio_wire_entry_revalidates_process_ownership() {
+        let source = include_str!("psu_gpio_i2c.rs");
+        for signature in [
+            "pub fn write_to(",
+            "pub fn read_from(",
+            "pub fn write_apw12_loki_frame(",
+            "pub fn read_apw12_loki_response(",
+            "pub fn write_apw12_loki_frame_bare(",
+            "pub fn bus_recovery(",
+        ] {
+            let body = source
+                .split_once(signature)
+                .unwrap_or_else(|| panic!("missing {signature}"))
+                .1
+                .split("\n    pub fn ")
+                .next()
+                .unwrap();
+            assert!(
+                body.contains("self._fabric_lease.validate_current_process()?;"),
+                "{signature} must refuse fork-inherited state before GPIO/MMIO"
+            );
+        }
+    }
 
     /// : pin the AXI GPIO bank base address for the am2 PSU SMBus.
     ///

@@ -60,6 +60,10 @@
   button.ghost { background: transparent; color: var(--text);
                  border: 1px solid var(--border); }
   button.ghost:hover { background: var(--border); }
+  a.button { background: transparent; color: var(--text); border: 1px solid var(--border);
+             padding: 8px 14px; border-radius: 6px; font-weight: 600;
+             font-size: 13px; text-decoration: none; }
+  a.button:hover { background: var(--border); }
   .key { color: var(--muted); }
   .val { font-family: var(--mono); }
   #notif { position: fixed; bottom: 16px; right: 16px; background: var(--panel);
@@ -83,7 +87,7 @@
 </div>
 
 <div class="row">
-  <button onclick="restartDaemon()">Restart dcentrald</button>
+  <a class="button ghost" href="/recovery#manual-recovery">Open manual recovery</a>
   <button class="ghost" onclick="reportIp()">Report IP (broadcast)</button>
   <button class="ghost" onclick="refresh()">Refresh now</button>
   <span class="key" style="margin-left:auto">Auto-refresh: every 5s</span>
@@ -196,15 +200,6 @@ async function refresh() {
     setBanner("dead");
     $("banner-msg").textContent = "Dashboard endpoint unreachable: " + e.message;
   }
-}
-async function restartDaemon() {
-  if (!confirm("Restart dcentrald? Mining will pause for ~5-30s.")) return;
-  try {
-    const r = await fetch("/api/dashboard/restart-dcentrald", { method: "POST" });
-    const d = await r.json();
-    notify("Restart initiated · " + (d.status || "ok"));
-    setTimeout(refresh, 3000);
-  } catch (e) { notify("Error: " + e.message); }
 }
 async function reportIp() {
   try {

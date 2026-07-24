@@ -4,6 +4,12 @@
 fn main() {
     embuild::espidf::sysenv::output();
 
+    // Declare the ESP-IDF sdkconfig cfg the `eth-w5500` feature branches on
+    // (`eth_w5500.rs`), so rustc's check-cfg lint knows it is expected even on
+    // builds where the sdkconfig overlay (and thus the propagated cfg) is
+    // absent. Zero behavioral impact — it only silences unexpected_cfgs.
+    println!("cargo:rustc-check-cfg=cfg(esp_idf_eth_spi_ethernet_w5500)");
+
     if std::env::var_os("DCENT_ENFORCE_SIGNED_OTA").is_some()
         && std::env::var_os("DCENT_OTA_PUBLIC_KEY_HEX").is_none()
     {

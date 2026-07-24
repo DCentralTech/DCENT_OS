@@ -164,6 +164,53 @@ mod tests {
         assert_eq!(crc16_false(&data), 0xFFFF);
     }
 
+    #[test]
+    fn crc16_xmodem_known_answer() {
+        // crc16() is init=0x0000, poly 0x1021, no reflection = CRC-16/XMODEM,
+        // whose canonical "123456789" check value is 0x31C3. This pins the table.
+        assert_eq!(crc16(b"123456789"), 0x31C3);
+    }
+
+    #[test]
+    fn crc16_false_known_answer() {
+        // CRC-16/CCITT-FALSE (init=0xFFFF) canonical "123456789" check = 0x29B1.
+        // This CRC trailers EVERY job packet, so a table/init typo here = every job
+        // silently rejected by every chip (zero hashrate). Was previously tested
+        // ONLY on empty input.
+        assert_eq!(crc16_false(b"123456789"), 0x29B1);
+    }
+
+    #[test]
+    fn crc16_unrolled_matches_naive_bitwise() {
+        // The 4-byte loop-unrolled crc16() must equal an INDEPENDENT naive bitwise
+        // CRC-16/XMODEM across every `len % 4` remainder boundary (0..=64), so an
+        // unrolled-path or table divergence can never slip in silently.
+        fn crc16_naive(data: &[u8]) -> u16 {
+            let mut crc: u16 = 0;
+            for &b in data {
+                crc ^= (b as u16) << 8;
+                for _ in 0..8 {
+                    crc = if crc & 0x8000 != 0 {
+                        (crc << 1) ^ 0x1021
+                    } else {
+                        crc << 1
+                    };
+                }
+            }
+            crc
+        }
+        for len in 0..=64usize {
+            let data: Vec<u8> = (0..len)
+                .map(|i| i.wrapping_mul(31).wrapping_add(7) as u8)
+                .collect();
+            assert_eq!(
+                crc16(&data),
+                crc16_naive(&data),
+                "unrolled crc16 diverged from the naive reference at len={len}"
+            );
+        }
+    }
+
     // ── crc8_0x31 (KF1950) ──────────────────────────────────────────────
 
     #[test]

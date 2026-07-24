@@ -47,6 +47,8 @@ grep -Fq -- '-v "${POSIX_PROJECT_DIR}:/src:ro"' "$SCRIPT_DIR/build_in_docker.sh"
 grep -Fq -- '--output-dir for its private release-set stage' "$SCRIPT_DIR/build_in_docker.sh"
 grep -Fq 'portable_release_evidence.py" create-live' \
     "$SCRIPT_DIR/build_s9_release_capsule.sh"
+grep -Fq 'sign_release_artifact.py" "$PORTABLE_EVIDENCE_PATH"' \
+    "$SCRIPT_DIR/build_s9_release_capsule.sh"
 grep -Fq 'RELEASE_TARGET=s9' "$SCRIPT_DIR/build_s9_release_capsule.sh"
 grep -Fq 'release_capsule_target_policy.py' \
     "$SCRIPT_DIR/build_s9_release_capsule.sh"
@@ -55,6 +57,24 @@ grep -Fq 'portable_release_evidence.py" verify-stage' \
 grep -Fq 'portable_release_evidence.py" verify' \
     "$SCRIPT_DIR/build_s9_release_capsule.sh"
 grep -Fq 'release_signing_authority.py" create' \
+    "$SCRIPT_DIR/build_s9_release_capsule.sh"
+grep -Fq -- '--result-output "$RESULT_CREATE_RESULT_FILE"' \
+    "$SCRIPT_DIR/build_s9_release_capsule.sh"
+grep -Fq 'result-stage cleanup failed; recovery result retained:' \
+    "$SCRIPT_DIR/build_s9_release_capsule.sh"
+grep -Fq 'result-stage creation recovery failed; locator retained:' \
+    "$SCRIPT_DIR/build_s9_release_capsule.sh"
+grep -Fq 'result-stage recovery result is unreadable; retained:' \
+    "$SCRIPT_DIR/build_s9_release_capsule.sh"
+grep -Fq -- '--result-output "$SIGNING_AUTHORITY_RESULT_FILE"' \
+    "$SCRIPT_DIR/build_s9_release_capsule.sh"
+grep -Fq 'signing-authority cleanup failed; recovery result retained:' \
+    "$SCRIPT_DIR/build_s9_release_capsule.sh"
+grep -Fq 'registered signing-authority recovery result is missing; upstream authority retained:' \
+    "$SCRIPT_DIR/build_s9_release_capsule.sh"
+grep -Fq 'dependent cleanup failed; invocation retained for recovery:' \
+    "$SCRIPT_DIR/build_s9_release_capsule.sh"
+grep -Fq 'cleanup helper source retained for recovery:' \
     "$SCRIPT_DIR/build_s9_release_capsule.sh"
 grep -Fq 'DCENT_RELEASE_SIGNING_KEY="$SIGNING_AUTHORITY_PRIVATE_KEY"' \
     "$SCRIPT_DIR/build_s9_release_capsule.sh"
@@ -66,14 +86,26 @@ if grep -Fq 'VOLUME_NAME="dcentos-build-work"' \
 fi
 
 for helper in \
+    atomic_publish_directory.py atomic_publish_file.py durable_file_io.py \
     build_s9_release_capsule.sh source_snapshot.py release_invocation.py \
     release_result_stage.py release_set_publication.py release_publication.py \
     release_docker_resources.py release_signing_authority.py \
-    release_capsule_target_policy.py \
+    release_capsule_target_policy.py sign_release_artifact.py \
+    sign_release_receipt.py \
     firmware_release_name.sh verify_release_keypair.sh; do
     cp "$SCRIPT_DIR/$helper" "$LIVE_REPO/DCENT_OS_Antminer/scripts/$helper"
 done
+grep -Fq 'from atomic_publish_file import' \
+    "$LIVE_REPO/DCENT_OS_Antminer/scripts/release_set_publication.py"
+grep -Fq 'from atomic_publish_directory import' \
+    "$LIVE_REPO/DCENT_OS_Antminer/scripts/release_set_publication.py"
+grep -Fq 'from durable_file_io import' \
+    "$LIVE_REPO/DCENT_OS_Antminer/scripts/atomic_publish_file.py"
 chmod +x "$LIVE_REPO/DCENT_OS_Antminer/scripts/build_s9_release_capsule.sh"
+grep -Fq 'release-set cleanup failed; capability retained for recovery:' \
+    "$LIVE_REPO/DCENT_OS_Antminer/scripts/build_s9_release_capsule.sh"
+grep -Fq 'release_set_destroy_error' \
+    "$LIVE_REPO/DCENT_OS_Antminer/scripts/build_s9_release_capsule.sh"
 
 # The orchestrator needs only create/query/destroy from this outer-owned input
 # authority. The production helper has its own exhaustive adversarial suite.
@@ -324,6 +356,8 @@ test ! -e "$FAKE_STATE/volumes/dcentos-build-work"
 test -z "$(find "$FAKE_STATE/volumes" -mindepth 1 -print -quit)"
 test ! -d "$OUTPUT_ROOT/.dcent-release-capsules/signing-authorities" \
     || test -z "$(find "$OUTPUT_ROOT/.dcent-release-capsules/signing-authorities" -name private-key.pem -print -quit)"
+test ! -d "$OUTPUT_ROOT/.dcent-release-capsules" \
+    || test -z "$(find "$OUTPUT_ROOT/.dcent-release-capsules" -name 'result-stage-*.result.json' -print -quit)"
 
 # A TERM while the private stage is active is never reported as success and
 # cannot create a public set.
@@ -341,6 +375,8 @@ test ! -d "$OUTPUT_ROOT/releases" || ! find "$OUTPUT_ROOT/releases" -mindepth 1 
 # A successful run publishes one exact directory only after the private driver
 # returned; live mutation B never becomes a source mount or artifact input.
 run_capsule > "$TMPDIR_TEST/success.out"
+test ! -d "$OUTPUT_ROOT/.dcent-release-capsules" \
+    || test -z "$(find "$OUTPUT_ROOT/.dcent-release-capsules" -name 'result-stage-*.result.json' -print -quit)"
 PUBLISHED="$(find "$OUTPUT_ROOT/releases" -mindepth 1 -maxdepth 1 -type d -print -quit)"
 test -n "$PUBLISHED"
 test "$(cat "$PUBLISHED/dcentos-sysupgrade-118.tar")" = 'private firmware bytes from snapshot A'
@@ -395,7 +431,8 @@ i1="$(python3 "$SCRIPT_DIR/release_invocation.py" create --stage-parent "$CONTRO
 i2="$(python3 "$SCRIPT_DIR/release_invocation.py" create --stage-parent "$CONTROL" --name two)"
 s1="$(printf '%s\n' "$i1" | python3 "$SCRIPT_DIR/release_invocation.py" query-result --field stage)"
 s2="$(printf '%s\n' "$i2" | python3 "$SCRIPT_DIR/release_invocation.py" query-result --field stage)"
-r1="$(python3 "$SCRIPT_DIR/release_result_stage.py" create --stage-parent "$CONTROL" --invocation-stage "$s1")"
+r1="$(python3 "$SCRIPT_DIR/release_result_stage.py" create --stage-parent "$CONTROL" \
+    --invocation-stage "$s1" --result-output "$TMPDIR_TEST/swap-result.json")"
 r1s="$(printf '%s\n' "$r1" | python3 "$SCRIPT_DIR/release_result_stage.py" query-result --field stage)"
 if python3 "$SCRIPT_DIR/release_result_stage.py" verify --invocation-stage "$s2" "$r1s" \
     > "$TMPDIR_TEST/swap.out" 2>&1; then

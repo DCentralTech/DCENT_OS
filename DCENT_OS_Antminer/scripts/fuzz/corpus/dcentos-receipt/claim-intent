@@ -1,0 +1,16 @@
+schema=dcentos-sysupgrade-reconcile-intent-abi1
+binding_sha256=0000000000000000000000000000000000000000000000000000000000000000
+transaction_id=Tx-1
+claim_id=Claim-1
+reconciler_boot_id=abcdef12-3456-7890-abcd-ef1234567890
+reconciler_pid=321
+reconciler_starttime=987654
+reconciler_mount_namespace=3:77
+maintenance_lock_path=/run/dcentos-maintenance.lock
+maintenance_lock_device_inode=4:88
+owner=zynq-sysupgrade-reconciler
+evidence_type=owner-death-v1
+evidence_size=16
+evidence_sha256=05baab6bf2dcd85144682ad66aca7829977c1458c1c85d9f8a1d7917f84cffc0
+
+owner_dead=true

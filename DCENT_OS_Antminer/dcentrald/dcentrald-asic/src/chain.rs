@@ -9,11 +9,13 @@ use dcentrald_hal::serial_chain::SerialChainBackend;
 
 use crate::drivers::{ChipDriver, PicType};
 use crate::Result;
+use dcentrald_api_types::asic_command::LinearAddressPlan;
+use dcentrald_api_types::bm1398_protocol::AddressedRegisterWrite;
 
 #[inline]
-fn production_chip_id_known(chip_id: u16) -> bool {
+fn recognized_chip_id_known(chip_id: u16) -> bool {
     crate::drivers::ChipRegistry::production()
-        .detect(chip_id)
+        .recognize(chip_id)
         .is_some()
 }
 
@@ -128,7 +130,7 @@ fn validate_fpga_enumeration_words(
         });
     }
     let first_chip_id = normalize_enumerated_chip_id(words[0]);
-    if !production_chip_id_known(first_chip_id) {
+    if !recognized_chip_id_known(first_chip_id) {
         return Err(crate::AsicError::EnumerationIntegrity {
             chain_id,
             reason: EnumerationIdentityIneligibility::UnknownChipId {
@@ -139,7 +141,7 @@ fn validate_fpga_enumeration_words(
     }
     for (response_index, pair) in words.chunks_exact(2).enumerate() {
         let chip_id = normalize_enumerated_chip_id(pair[0]);
-        if !production_chip_id_known(chip_id) {
+        if !recognized_chip_id_known(chip_id) {
             return Err(crate::AsicError::EnumerationIntegrity {
                 chain_id,
                 reason: EnumerationIdentityIneligibility::UnknownChipId {
@@ -230,7 +232,7 @@ fn validate_serial_enumeration_responses(
             });
         }
         let chip_id = normalize_serial_enumerated_chip_id(response);
-        if !production_chip_id_known(chip_id) {
+        if !recognized_chip_id_known(chip_id) {
             return Err(crate::AsicError::EnumerationIntegrity {
                 chain_id,
                 reason: EnumerationIdentityIneligibility::UnknownChipId {
@@ -306,7 +308,7 @@ pub fn driver_for_chain_with_policy(
     if latched_chip_id == 0 || chain_chip_id == 0 || latched_chip_id == chain_chip_id {
         return ChainDriverDecision::Drive;
     }
-    if production_chip_id_known(latched_chip_id) && production_chip_id_known(chain_chip_id) {
+    if recognized_chip_id_known(latched_chip_id) && recognized_chip_id_known(chain_chip_id) {
         return match policy {
             DivergentChipPolicy::Enforce => ChainDriverDecision::SkipDivergent,
             DivergentChipPolicy::LogOnly => ChainDriverDecision::LogOnlyDivergent,
@@ -317,6 +319,116 @@ pub fn driver_for_chain_with_policy(
 
 pub fn driver_for_chain(latched_chip_id: u16, chain_chip_id: u16) -> ChainDriverDecision {
     driver_for_chain_with_policy(latched_chip_id, chain_chip_id, DivergentChipPolicy::Enforce)
+}
+
+/// Command bytes and immutable geometry admitted for one FPGA address pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FpgaAddressCommandDialect {
+    Bm1387,
+    Bm1397Plus,
+}
+
+/// Board-level relay ownership admitted alongside an address composition.
+///
+/// Relay programming is topology state, not a chip-family default. An explicit
+/// `Unavailable` value keeps a recognized ASIC usable for diagnostics while
+/// making a destructive cold transition fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoardRelayAdmission {
+    NotRequired,
+    AddressedBm139x(&'static [AddressedRegisterWrite]),
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FpgaAddressAssignmentPlan {
+    pub chip_id: u16,
+    pub dialect: FpgaAddressCommandDialect,
+    pub addresses: LinearAddressPlan,
+    pub board_relay: BoardRelayAdmission,
+}
+
+impl FpgaAddressAssignmentPlan {
+    const fn chain_inactive_word(self) -> u32 {
+        match self.dialect {
+            FpgaAddressCommandDialect::Bm1387 => crate::protocol::FIFO_CMD_CHAIN_INACTIVE,
+            FpgaAddressCommandDialect::Bm1397Plus => {
+                crate::protocol::FIFO_CMD_CHAIN_INACTIVE_BM139X
+            }
+        }
+    }
+
+    fn set_address_word(self, address: u8) -> u32 {
+        match self.dialect {
+            FpgaAddressCommandDialect::Bm1387 => crate::protocol::fifo_cmd_set_address(address),
+            FpgaAddressCommandDialect::Bm1397Plus => {
+                crate::protocol::fifo_cmd_set_address_bm139x(address)
+            }
+        }
+    }
+}
+
+fn resolve_fpga_address_assignment_plan(
+    chip_id: u16,
+    observed_chip_count: u8,
+) -> Result<FpgaAddressAssignmentPlan> {
+    if observed_chip_count == 0 {
+        return Err(crate::AsicError::InvalidParameter(
+            "cannot resolve address assignment for an empty chain".into(),
+        ));
+    }
+
+    let (dialect, addresses, board_relay) = match chip_id {
+        0x1387 => (
+            FpgaAddressCommandDialect::Bm1387,
+            LinearAddressPlan::try_new(0, observed_chip_count as u16, 4),
+            BoardRelayAdmission::NotRequired,
+        ),
+        0x1398 => {
+            let exact = dcentrald_api_types::bm1398_protocol::S19_PRO_NBP1901_CHAIN_SPEC;
+            if observed_chip_count as u16 != exact.expected_chip_count {
+                return Err(crate::AsicError::InvalidParameter(format!(
+                    "BM1398 population {} does not identify the admitted {}-chip NBP1901/S19 Pro composition; a board-specific composition is required",
+                    observed_chip_count,
+                    exact.expected_chip_count
+                )));
+            }
+            return Ok(FpgaAddressAssignmentPlan {
+                chip_id,
+                dialect: FpgaAddressCommandDialect::Bm1397Plus,
+                addresses: exact.address_plan,
+                board_relay: BoardRelayAdmission::AddressedBm139x(
+                    exact.production_uart_relay_writes,
+                ),
+            });
+        }
+        0x1397 => (
+            FpgaAddressCommandDialect::Bm1397Plus,
+            LinearAddressPlan::from_truncated_byte_space(observed_chip_count as u16),
+            BoardRelayAdmission::Unavailable,
+        ),
+        0x1362 | 0x1366 | 0x1368 | 0x1370 => (
+            FpgaAddressCommandDialect::Bm1397Plus,
+            LinearAddressPlan::from_truncated_byte_space(observed_chip_count as u16),
+            BoardRelayAdmission::NotRequired,
+        ),
+        _ => {
+            return Err(crate::AsicError::InvalidParameter(format!(
+                "chip 0x{chip_id:04X} has no admitted FPGA address-assignment dialect"
+            )))
+        }
+    };
+    let addresses = addresses.map_err(|error| {
+        crate::AsicError::InvalidParameter(format!(
+            "chip 0x{chip_id:04X} address geometry is invalid: {error:?}"
+        ))
+    })?;
+    Ok(FpgaAddressAssignmentPlan {
+        chip_id,
+        dialect,
+        addresses,
+        board_relay,
+    })
 }
 
 /// Represents one hash board chain with its detected chips.
@@ -338,6 +450,11 @@ pub struct Chain {
 
     /// Detected chip ID (e.g., 0x1387 for BM1387).
     pub chip_id: u16,
+
+    /// Immutable address geometry admitted from composition/identity evidence.
+    /// Nonce attribution must consume this value rather than recomputing a
+    /// stride from a mutable responding-chip count.
+    address_assignment: Option<FpgaAddressAssignmentPlan>,
 
     /// Current ASIC frequency in MHz.
     pub frequency_mhz: u16,
@@ -373,6 +490,7 @@ impl Chain {
             chain_id,
             chip_count: 0,
             chip_id: 0,
+            address_assignment: None,
             frequency_mhz: 0,
             voltage_mv: 0,
             mining: false,
@@ -393,12 +511,78 @@ impl Chain {
             chain_id,
             chip_count: 0,
             chip_id: 0,
+            address_assignment: None,
             frequency_mhz: 0,
             voltage_mv: 0,
             mining: false,
             fpga_midstate_cnt: 2,
             pic_address: None,
             pic_type: PicType::Pic16F1704,
+        }
+    }
+
+    pub fn address_plan(&self) -> Option<LinearAddressPlan> {
+        self.address_assignment
+            .filter(|assignment| {
+                assignment.chip_id == self.chip_id
+                    && assignment.addresses.chip_count() == self.chip_count as u16
+            })
+            .map(|assignment| assignment.addresses)
+    }
+
+    /// Admit and retain command/address authority for the current identity.
+    /// Used after parser-backed enumeration and after an explicitly admitted
+    /// passthrough model supplies both chip identity and exact population.
+    pub fn admit_address_assignment_for_current_identity(&mut self) -> Result<()> {
+        // Clear first so a failed re-admission can never retain authority for
+        // a previous public chip_id/chip_count pair.
+        self.address_assignment = None;
+        let assignment = resolve_fpga_address_assignment_plan(self.chip_id, self.chip_count)?;
+        self.address_assignment = Some(assignment);
+        Ok(())
+    }
+
+    /// Apply board-level relay state owned by the admitted composition.
+    ///
+    /// This must run after address assignment and before chip initialization.
+    /// The method refuses stale identity/geometry and explicitly unavailable
+    /// recipes rather than falling back to a chip-generic register broadcast.
+    pub fn apply_admitted_board_relay(&self) -> Result<usize> {
+        let assignment = self
+            .address_assignment
+            .filter(|assignment| {
+                assignment.chip_id == self.chip_id
+                    && assignment.addresses.chip_count() == self.chip_count as u16
+            })
+            .ok_or_else(|| crate::AsicError::InitFailed {
+                chain_id: self.chain_id,
+                detail: format!(
+                    "chip 0x{:04X} has no identity-bound board composition",
+                    self.chip_id
+                ),
+            })?;
+
+        match assignment.board_relay {
+            BoardRelayAdmission::NotRequired => Ok(0),
+            BoardRelayAdmission::Unavailable => Err(crate::AsicError::InitFailed {
+                chain_id: self.chain_id,
+                detail: format!(
+                    "chip 0x{:04X} cold initialization has no admitted board relay recipe",
+                    self.chip_id
+                ),
+            }),
+            BoardRelayAdmission::AddressedBm139x(writes) => {
+                for write in writes {
+                    let (word0, word1) = crate::drivers::bm139x::fifo_write_reg_single(
+                        write.chip_address,
+                        write.register,
+                        write.value,
+                    );
+                    self.write_cmd_words(word0, word1);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Ok(writes.len())
+            }
         }
     }
 
@@ -573,6 +757,7 @@ impl Chain {
         )?;
         self.chip_count = report.chip_count();
         self.chip_id = report.chip_id();
+        self.admit_address_assignment_for_current_identity()?;
 
         tracing::info!(
             chain_id = self.chain_id,
@@ -609,11 +794,31 @@ impl Chain {
             return self.assign_addresses_serial();
         }
 
-        use crate::protocol;
-
         if self.chip_count == 0 {
             return Err(crate::AsicError::NoChipsDetected {
                 chain_id: self.chain_id,
+            });
+        }
+
+        let assignment = self
+            .address_assignment
+            .filter(|assignment| assignment.chip_id == self.chip_id)
+            .ok_or_else(|| crate::AsicError::InitFailed {
+                chain_id: self.chain_id,
+                detail: format!(
+                    "chip 0x{:04X} has no retained address-assignment authority",
+                    self.chip_id
+                ),
+            })?;
+        if assignment.addresses.chip_count() != self.chip_count as u16 {
+            return Err(crate::AsicError::InitFailed {
+                chain_id: self.chain_id,
+                detail: format!(
+                    "chip 0x{:04X} composition requires {} addresses but enumeration retained {} chips; partial cold assignment is refused",
+                    self.chip_id,
+                    assignment.addresses.chip_count(),
+                    self.chip_count
+                ),
             });
         }
 
@@ -628,7 +833,7 @@ impl Chain {
         );
         for i in 0..3 {
             self.fpga.reset_fifos();
-            self.fpga.write_cmd(protocol::FIFO_CMD_CHAIN_INACTIVE);
+            self.fpga.write_cmd(assignment.chain_inactive_word());
             std::thread::sleep(std::time::Duration::from_millis(100));
             tracing::debug!(
                 chain_id = self.chain_id,
@@ -643,32 +848,33 @@ impl Chain {
             let _ = self.fpga.read_cmd_response();
         }
 
-        // Step 2: Assign addresses with spacing of 4 (matching bosminer)
-        // Bosminer uses: ChipAddress::One(i) -> hw_addr = i * 4
-        // This gives each chip a unique address for individual register access.
-        let addr_spacing: u16 = 4; // BM1387 standard: 256 / 63 ??? 4
+        // Step 2: Assign every address from the immutable admitted plan.
         self.fpga.reset_fifos();
 
         for i in 0..self.chip_count {
-            let addr = (i as u16 * addr_spacing) as u8;
-            self.fpga.write_cmd(protocol::fifo_cmd_set_address(addr));
+            let addr = assignment
+                .addresses
+                .hardware_address(i as u16)
+                .ok_or_else(|| crate::AsicError::InitFailed {
+                    chain_id: self.chain_id,
+                    detail: format!("address plan has no entry for dense chip index {i}"),
+                })?;
+            self.fpga.write_cmd(assignment.set_address_word(addr));
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
 
         tracing::info!(
             chain_id = self.chain_id,
             chips = self.chip_count,
-            addr_spacing = addr_spacing,
-            first_addr = format_args!("0x{:02X}", 0),
-            last_addr = format_args!(
-                "0x{:02X}",
-                ((self.chip_count - 1) as u16 * addr_spacing) as u8
-            ),
+            dialect = ?assignment.dialect,
+            addr_spacing = assignment.addresses.address_interval(),
+            first_addr = format_args!("0x{:02X}", assignment.addresses.first_address()),
+            last_addr = format_args!("0x{:02X}", assignment.addresses.last_address()),
             "Chain {} addresses assigned: {} chips, spacing {} (0x00 to 0x{:02X})",
             self.chain_id,
             self.chip_count,
-            addr_spacing,
-            ((self.chip_count - 1) as u16 * addr_spacing) as u8,
+            assignment.addresses.address_interval(),
+            assignment.addresses.last_address(),
         );
 
         Ok(())
@@ -838,6 +1044,7 @@ impl Chain {
                         );
                         self.chip_count = chip_count;
                         self.chip_id = chip_id;
+                        self.admit_address_assignment_for_current_identity()?;
                         return Ok(report);
                     }
                     Err(error) => {
@@ -885,6 +1092,27 @@ impl Chain {
                 chain_id: self.chain_id,
                 detail: "serial backend not initialized for chain init".to_string(),
             })?;
+        let assignment = self
+            .address_assignment
+            .filter(|assignment| assignment.chip_id == self.chip_id)
+            .ok_or_else(|| crate::AsicError::InitFailed {
+                chain_id: self.chain_id,
+                detail: format!(
+                    "chip 0x{:04X} has no retained serial address-assignment authority",
+                    self.chip_id
+                ),
+            })?;
+        if assignment.addresses.chip_count() != self.chip_count as u16 {
+            return Err(crate::AsicError::InitFailed {
+                chain_id: self.chain_id,
+                detail: format!(
+                    "chip 0x{:04X} composition requires {} addresses but serial enumeration retained {} chips; partial assignment is refused",
+                    self.chip_id,
+                    assignment.addresses.chip_count(),
+                    self.chip_count
+                ),
+            });
+        }
 
         // Step 1: Triple Chain Inactive (same pattern as FPGA path)
         tracing::debug!(
@@ -892,57 +1120,43 @@ impl Chain {
             "Serial: sending Chain Inactive broadcast x3"
         );
         for i in 0..3 {
-            // Send BOTH ChainInactive formats ? BM1387 uses 0x55, BM1397+ uses 0x53.
-            if let Err(e) = serial.send_chain_inactive() {
-                tracing::warn!(
-                    chain_id = self.chain_id,
-                    error = %e,
-                    iteration = i + 1,
-                    "Serial Chain Inactive (BM1387) send failed"
-                );
-            }
-            if let Err(e) = serial.send_chain_inactive_bm1397plus() {
-                tracing::warn!(
-                    chain_id = self.chain_id,
-                    error = %e,
-                    iteration = i + 1,
-                    "Serial Chain Inactive (BM1397+) send failed"
-                );
-            }
+            let result = match assignment.dialect {
+                FpgaAddressCommandDialect::Bm1387 => serial.send_chain_inactive(),
+                FpgaAddressCommandDialect::Bm1397Plus => serial.send_chain_inactive_bm1397plus(),
+            };
+            result.map_err(|error| crate::AsicError::InitFailed {
+                chain_id: self.chain_id,
+                detail: format!(
+                    "serial {:?} Chain Inactive iteration {} failed: {error}",
+                    assignment.dialect,
+                    i + 1
+                ),
+            })?;
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
         // Flush any stale responses
         let _ = serial.flush_io();
 
-        // Step 2: Assign addresses with spacing based on chip count
-        let addr_spacing: u16 = if self.chip_count > 0 {
-            256 / self.chip_count as u16
-        } else {
-            4
-        };
-
         for i in 0..self.chip_count {
-            let addr = (i as u16 * addr_spacing) as u8;
-            // Send BOTH SetAddress formats ? BM1387 uses 0x41, BM1397+ uses 0x40.
-            if let Err(e) = serial.send_set_address(addr) {
-                tracing::warn!(
-                    chain_id = self.chain_id,
-                    chip = i,
-                    addr = format_args!("0x{:02X}", addr),
-                    error = %e,
-                    "Serial SetAddress (BM1387) failed"
-                );
-            }
-            if let Err(e) = serial.send_set_address_bm1397plus(addr) {
-                tracing::warn!(
-                    chain_id = self.chain_id,
-                    chip = i,
-                    addr = format_args!("0x{:02X}", addr),
-                    error = %e,
-                    "Serial SetAddress (BM1397+) failed"
-                );
-            }
+            let addr = assignment
+                .addresses
+                .hardware_address(i as u16)
+                .ok_or_else(|| crate::AsicError::InitFailed {
+                    chain_id: self.chain_id,
+                    detail: format!("address plan has no entry for dense chip index {i}"),
+                })?;
+            let result = match assignment.dialect {
+                FpgaAddressCommandDialect::Bm1387 => serial.send_set_address(addr),
+                FpgaAddressCommandDialect::Bm1397Plus => serial.send_set_address_bm1397plus(addr),
+            };
+            result.map_err(|error| crate::AsicError::InitFailed {
+                chain_id: self.chain_id,
+                detail: format!(
+                    "serial {:?} SetAddress failed for dense chip {} address 0x{addr:02X}: {error}",
+                    assignment.dialect, i
+                ),
+            })?;
             // Pace to avoid overwhelming the UART
             if i % 16 == 15 {
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -952,10 +1166,11 @@ impl Chain {
         tracing::info!(
             chain_id = self.chain_id,
             chips = self.chip_count,
-            addr_spacing = addr_spacing,
+            dialect = ?assignment.dialect,
+            addr_spacing = assignment.addresses.address_interval(),
             "Serial addresses assigned: {} chips, spacing {}",
             self.chip_count,
-            addr_spacing,
+            assignment.addresses.address_interval(),
         );
 
         Ok(())
@@ -966,14 +1181,56 @@ impl Chain {
 mod tests {
     use super::{
         chain_meets_min_fraction, driver_for_chain, driver_for_chain_with_policy,
-        production_chip_id_known, validate_fpga_enumeration_words,
-        validate_serial_enumeration_responses, ChainDriverDecision, DivergentChipPolicy,
-        EnumerationIdentityIneligibility,
+        recognized_chip_id_known, resolve_fpga_address_assignment_plan,
+        validate_fpga_enumeration_words, validate_serial_enumeration_responses,
+        BoardRelayAdmission, ChainDriverDecision, DivergentChipPolicy,
+        EnumerationIdentityIneligibility, FpgaAddressCommandDialect,
     };
     use crate::drivers::{bm1362, bm1366, bm1368, bm1370, bm1373, bm1387, bm1397, bm1398};
 
     #[test]
-    fn chain_enumeration_chip_allowlist_uses_production_registry() {
+    fn bm1398_nbp1901_address_assignment_is_exact_and_alias_free() {
+        let assignment = resolve_fpga_address_assignment_plan(bm1398::CHIP_ID, 114).unwrap();
+        assert_eq!(assignment.dialect, FpgaAddressCommandDialect::Bm1397Plus);
+        assert_eq!(assignment.chain_inactive_word(), 0x0000_0553);
+        assert_eq!(assignment.addresses.address_interval(), 2);
+        assert_eq!(assignment.addresses.last_address(), 226);
+        let BoardRelayAdmission::AddressedBm139x(relay_writes) = assignment.board_relay else {
+            panic!("NBP1901 must own an addressed BM139x relay recipe");
+        };
+        assert_eq!(relay_writes.len(), 12);
+        assert_eq!(relay_writes[0].chip_address, 214);
+        assert_eq!(relay_writes[11].chip_address, 16);
+
+        let mut addresses = std::collections::BTreeSet::new();
+        for dense_index in 0..114u16 {
+            let address = assignment.addresses.hardware_address(dense_index).unwrap();
+            assert!(
+                addresses.insert(address),
+                "duplicate address 0x{address:02X}"
+            );
+            assert_eq!(assignment.set_address_word(address) & 0xffff, 0x0540);
+        }
+        assert_eq!(addresses.len(), 114);
+        assert_eq!(addresses.first().copied(), Some(0));
+        assert_eq!(addresses.last().copied(), Some(226));
+    }
+
+    #[test]
+    fn bm1398_partial_observation_cannot_redefine_composition_geometry() {
+        assert!(resolve_fpga_address_assignment_plan(bm1398::CHIP_ID, 76).is_err());
+        assert!(resolve_fpga_address_assignment_plan(bm1398::CHIP_ID, 113).is_err());
+        assert!(resolve_fpga_address_assignment_plan(bm1398::CHIP_ID, 115).is_err());
+    }
+
+    #[test]
+    fn bm1397_is_recognized_but_cold_relay_remains_unavailable() {
+        let assignment = resolve_fpga_address_assignment_plan(bm1397::CHIP_ID, 48).unwrap();
+        assert_eq!(assignment.board_relay, BoardRelayAdmission::Unavailable);
+    }
+
+    #[test]
+    fn chain_enumeration_recognizes_catalog_without_granting_execution() {
         for chip_id in [
             bm1387::CHIP_ID,
             bm1397::CHIP_ID,
@@ -984,17 +1241,17 @@ mod tests {
             bm1370::CHIP_ID,
         ] {
             assert!(
-                production_chip_id_known(chip_id),
-                "production chip 0x{chip_id:04X} must be accepted"
+                recognized_chip_id_known(chip_id),
+                "catalog chip 0x{chip_id:04X} must be recognized"
             );
         }
 
         assert!(
-            !production_chip_id_known(bm1373::CHIP_ID),
-            "scaffold chip IDs must stay out of production enumeration"
+            recognized_chip_id_known(bm1373::CHIP_ID),
+            "scaffold identities may be recognized without executable authority"
         );
         assert!(
-            !production_chip_id_known(0xFFFF),
+            !recognized_chip_id_known(0xFFFF),
             "noise chip IDs must stay fail-closed"
         );
     }
