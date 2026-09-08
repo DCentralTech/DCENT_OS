@@ -134,7 +134,7 @@ export const POOL_TEMPLATES: PoolTemplate[] = [
   { name: 'AtlasPool', url: 'stratum+tcp://solo.atlaspool.io:3333', category: 'solo', description: 'Global solo pool with 100+ points of presence — 1.5% fee, anycast routing' },
   { name: 'SoloMining.xyz', url: 'stratum+tcp://btc.solomining.xyz:1313', category: 'solo', description: 'Solo pool with real-time worker dashboard — 1% fee, direct-to-wallet payouts' },
   { name: 'Kano', url: 'stratum+tcp://stratum.kano.is:3333', category: 'solo', description: 'Long-running small pool (est. 2014) — personal payout, low minimum threshold' },
-  { name: 'SoloLuck', url: 'stratum+tcp://stratum.sololuck.io:8081', category: 'solo', description: 'Southeast Asia (Jakarta) solo pool — 0% fee, no account, no KYC' },
+  { name: 'SoloLuck', url: 'stratum+tcp://stratum.sololuck.io:4334', category: 'solo', description: 'Global 0% fee solo pool — nodes in Asia and North America, no account, no KYC' },
 ];
 
 // Heater noise icons
